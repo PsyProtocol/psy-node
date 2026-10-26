@@ -13,15 +13,11 @@ use crate::hash::traits::hasher::FieldQHasher;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-pub fn compute_deploy_contract_content_hash(deployer: &[u8; 32], function_tree_root: &[u8; 32], state_tree_height: u64) -> [u8; 32] {
-    let deployer_felts = bytes32_to_felts(deployer);
+pub fn compute_deploy_contract_content_hash(deployer: u64, function_tree_root: &[u8; 32], state_tree_height: u64) -> [u8; 32] {
     let function_root_felts = bytes32_to_felts(function_tree_root);
 
     let hash = PoseidonHash::q_hash_many(&[
-        deployer_felts[0],
-        deployer_felts[1],
-        deployer_felts[2],
-        deployer_felts[3],
+        u64_to_felt(deployer),
         function_root_felts[0],
         function_root_felts[1],
         function_root_felts[2],
@@ -34,19 +30,15 @@ pub fn compute_deploy_contract_content_hash(deployer: &[u8; 32], function_tree_r
 
 pub fn compute_update_contract_content_hash(
     contract_id: u64,
-    deployer: &[u8; 32],
+    deployer: u64,
     function_tree_root: &[u8; 32],
     state_tree_height: u64,
 ) -> [u8; 32] {
-    let deployer_felts = bytes32_to_felts(deployer);
     let function_root_felts = bytes32_to_felts(function_tree_root);
 
     let hash = PoseidonHash::q_hash_many(&[
         u64_to_felt(contract_id),
-        deployer_felts[0],
-        deployer_felts[1],
-        deployer_felts[2],
-        deployer_felts[3],
+        u64_to_felt(deployer),
         function_root_felts[0],
         function_root_felts[1],
         function_root_felts[2],

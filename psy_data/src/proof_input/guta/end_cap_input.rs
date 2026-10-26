@@ -26,10 +26,9 @@ use crate::{
     Ord,
     Hash,
     serde::Serialize,
-    serde::Deserialize,
-    speedy::Readable,
-    speedy::Writable
+    serde::Deserialize
 )]
+#[cfg_attr(all(feature = "serialize_speedy", target_endian = "little"), derive(speedy::Readable, speedy::Writable))]
 #[serde(
     bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
              for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
@@ -131,10 +130,9 @@ impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySeria
     Ord,
     Hash,
     serde::Serialize,
-    serde::Deserialize,
-    speedy::Readable,
-    speedy::Writable
+    serde::Deserialize
 )]
+#[cfg_attr(all(feature = "serialize_speedy", target_endian = "little"), derive(speedy::Readable, speedy::Writable))]
 #[serde(
     bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
              for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
@@ -651,11 +649,42 @@ pub mod gen_fake_data {
             SubmitUserEndCapNonProofCoreInput,
         },
         v1::qdata::{
-            contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+            contract::PSimpleContractHeightCache,
             user::PQEDUserLeaf,
             user_end_cap_result::PUPSEndCapResultCompact,
         },
     };
+
+    /// test-only stand-in for DashMapContractHeightCache so tests build
+    /// without the node feature (and its dashmap dependency)
+    #[derive(Default)]
+    pub struct TestContractHeightCache<Hash> {
+        mapping: std::sync::Mutex<std::collections::HashMap<u32, (u8, Hash)>>,
+    }
+
+    impl<Hash> TestContractHeightCache<Hash> {
+        pub fn new() -> Self {
+            Self { mapping: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        }
+    }
+
+    impl<Hash: Clone> PSimpleContractHeightCache<Hash> for TestContractHeightCache<Hash> {
+        fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash) {
+            self.mapping.lock().unwrap().insert(contract_id, (height, zero_hash));
+        }
+        fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8> {
+            match self.mapping.lock().unwrap().get(&contract_id) {
+                Some(x) => Ok(x.0),
+                None => anyhow::bail!("contract {} not loaded", contract_id),
+            }
+        }
+        fn get_contract_zero_hash(&self, contract_id: u32) -> anyhow::Result<Hash> {
+            match self.mapping.lock().unwrap().get(&contract_id) {
+                Some(x) => Ok(x.1.clone()),
+                None => anyhow::bail!("contract {} not loaded", contract_id),
+            }
+        }
+    }
 
     pub fn gen_fake_valid_submit_user_end_cap_non_proof_input<F, Hash, Hasher>(
         global_user_tree_height: u8,
@@ -663,7 +692,7 @@ pub mod gen_fake_data {
     ) -> (
         PQEDUserLeaf<F, Hash>,
         SubmitUserEndCapNonProofInput<F, Hash>,
-        DashMapContractHeightCache<Hash>,
+        TestContractHeightCache<Hash>,
     )
     where
         F: QFelt64,
@@ -671,7 +700,7 @@ pub mod gen_fake_data {
         Hasher: QFHasherU64<F, Hash> + MerkleZeroHasher<Hash>,
     {
         let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_tree_height);
-        let contract_helper = DashMapContractHeightCache::new();
+        let contract_helper = TestContractHeightCache::new();
 
         let mut contract_trees = (0..5)
             .map(|i| {
@@ -800,9 +829,39 @@ pub mod gen_fake_data {
 
 #[cfg(test)]
 mod tests {
-    use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+    use parth_core::{
+        crypto::hash::{
+            merkle_proof::DeltaMerkleProofCore,
+            traits::{FromU64x4, HashTo4Felts, QFieldHashable, ZeroableHash},
+        },
+        felt::ToU64Value,
+        pgoldilocks::PoseidonHasher,
+        utils::QPGenRandom,
+        PF, PHash,
+    };
+    use psy_io::Cursor;
+    use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle};
 
-    use crate::proof_input::guta::end_cap_input::gen_fake_data::gen_fake_valid_submit_user_end_cap_non_proof_input;
+    use super::{PsyUserEventRecord, SubmitUserEndCapNonProofInput};
+    use crate::{
+        proof_input::guta::{
+            end_cap_input::{gen_fake_data::gen_fake_valid_submit_user_end_cap_non_proof_input, ContractStateUpdate, ContractStateUpdateHistory},
+            SubmitUserEndCapNonProofCoreInput,
+        },
+        v1::qdata::contract::{IMTContractStateLeaf, IMTContractStateUpdate, PSimpleContractHeightCache},
+    };
+
+    fn delta(old: u64, new: u64, siblings: usize) -> DeltaMerkleProofCore<PHash> {
+        let hash = |value| PHash::from_u64x4([value, 0, 0, 0]);
+        DeltaMerkleProofCore {
+            old_root: hash(old),
+            old_value: PHash::get_zero_value(),
+            new_root: hash(new),
+            new_value: PHash::get_zero_value(),
+            index: 0,
+            siblings: vec![PHash::get_zero_value(); siblings],
+        }
+    }
 
     #[test]
     fn generate_simple_input() {
@@ -816,5 +875,603 @@ mod tests {
         assert!(input
             .ensure_simple_self_consistent::<Hasher, _>(&old_user_leaf, proof_public_inputs_hash, &contract_helper, 32, 30)
             .is_ok());
+    }
+
+    #[test]
+    fn contract_update_variants_expose_roots_and_node_hints() {
+        let positional = ContractStateUpdate::<PF, PHash>::Positional {
+            delta_proof: delta(1, 2, 3),
+        };
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let imt = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: leaf.clone(),
+                new_preimage: leaf,
+                delta_proof: delta(3, 4, 2),
+            },
+        };
+        assert_eq!(positional.old_root(), PHash::from_u64x4([1, 0, 0, 0]));
+        assert_eq!(positional.new_root(), PHash::from_u64x4([2, 0, 0, 0]));
+        assert_eq!(positional.get_double_id_nodes_size_hint(), 5);
+        assert_eq!(imt.old_root(), PHash::from_u64x4([3, 0, 0, 0]));
+        assert_eq!(imt.new_root(), PHash::from_u64x4([4, 0, 0, 0]));
+        assert_eq!(imt.get_double_id_nodes_size_hint(), 4);
+
+        let history = ContractStateUpdateHistory {
+            user_contract_tree_update_proof: delta(0, 0, 0),
+            updates: vec![positional, imt],
+        };
+        assert_eq!(history.get_double_id_nodes_size_hint(), 9);
+    }
+
+    #[test]
+    fn imt_insert_variant_exposes_roots_and_node_hints() {
+        let insert = ContractStateUpdate::<PF, PHash>::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: IMTContractStateLeaf::default(),
+                predecessor_new_preimage: IMTContractStateLeaf::default(),
+                new_leaf_preimage: IMTContractStateLeaf::default(),
+                predecessor_delta_proof: delta(10, 11, 2),
+                new_leaf_delta_proof: delta(20, 21, 3),
+            },
+        };
+        assert_eq!(insert.old_root(), PHash::from_u64x4([10, 0, 0, 0]));
+        assert_eq!(insert.new_root(), PHash::from_u64x4([21, 0, 0, 0]));
+        // predecessor siblings (2) + 2 + new leaf siblings (3) + 2
+        assert_eq!(insert.get_double_id_nodes_size_hint(), 9);
+
+        let history = ContractStateUpdateHistory {
+            user_contract_tree_update_proof: delta(0, 0, 0),
+            updates: vec![insert],
+        };
+        assert_eq!(history.get_double_id_nodes_size_hint(), 9);
+    }
+
+    fn assert_ensure_err(result: anyhow::Result<()>, needle: &str) {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(needle), "unexpected error: {}", err);
+    }
+
+    fn positional_parts(update: &ContractStateUpdate<PF, PHash>) -> (PHash, PHash, u64, Vec<PHash>) {
+        match update {
+            ContractStateUpdate::Positional { delta_proof } => {
+                (delta_proof.old_root, delta_proof.new_root, delta_proof.index, delta_proof.siblings.clone())
+            }
+            _ => panic!("expected positional update"),
+        }
+    }
+
+    #[test]
+    fn ensure_rejects_core_state_mismatches() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let hash = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        assert!(input
+            .ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30)
+            .is_ok());
+
+        // checkpoint id no longer matches the new leaf's last_checkpoint_id
+        let mut bad = input.clone();
+        bad.core.checkpoint_id = PF::from_owned_u64(6);
+        assert_ensure_err(
+            bad.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30),
+            "invalid checkpoint id",
+        );
+
+        // new leaf user id no longer matches the state transition user id
+        let mut bad = input.clone();
+        bad.core.new_user_leaf.user_id = PF::from_owned_u64(43);
+        assert_ensure_err(
+            bad.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30),
+            "inconsistent user id",
+        );
+
+        // wrong public inputs hash supplied by the caller
+        assert_ensure_err(
+            input.ensure_simple_self_consistent::<PoseidonHasher, _>(
+                &old_user_leaf,
+                PHash::from_u64x4([1, 2, 3, 4]),
+                &contract_helper,
+                32,
+                30,
+            ),
+            "invalid public inputs/state transition",
+        );
+
+        // old leaf hash no longer matches the recorded start hash
+        let mut stale_leaf = old_user_leaf.clone();
+        stale_leaf.balance = PF::from_owned_u64(2);
+        assert_ensure_err(
+            input.ensure_simple_self_consistent::<PoseidonHasher, _>(&stale_leaf, hash, &contract_helper, 32, 30),
+            "invalid old_user_leaf",
+        );
+
+        // new leaf hash no longer matches the recorded end hash
+        let mut bad = input.clone();
+        bad.core.new_user_leaf.nonce = PF::from_owned_u64(999);
+        assert_ensure_err(
+            bad.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30),
+            "invalid new_user_leaf",
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_stale_old_leaf_checkpoint() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+
+        // Equal checkpoint ids trip the "not strictly less" rule; the start hash and
+        // the public inputs hash are recomputed so the earlier checks pass.
+        let mut stale_leaf = old_user_leaf.clone();
+        stale_leaf.last_checkpoint_id = input.core.checkpoint_id;
+        let mut bad = input.clone();
+        bad.core.state_transition.start_user_leaf_hash = stale_leaf.qfhash::<PoseidonHasher>();
+        let stale_hash = bad.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        assert_ensure_err(
+            bad.ensure_simple_self_consistent::<PoseidonHasher, _>(&stale_leaf, stale_hash, &contract_helper, 32, 30),
+            "is not less than end cap checkpoint_id",
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_empty_and_inconsistent_contract_update_histories() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let hash = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        let ensure = |input: &SubmitUserEndCapNonProofInput<PF, PHash>| {
+            input.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30)
+        };
+
+        let mut bad = input.clone();
+        bad.contract_state_updates = vec![];
+        assert_ensure_err(ensure(&bad), "contract_state_updates cannot be empty");
+
+        let mut bad = input.clone();
+        bad.contract_state_updates[1].user_contract_tree_update_proof.old_root = PHash::from_u64x4([7, 7, 7, 7]);
+        assert_ensure_err(ensure(&bad), "contract_state_updates are not consistent at index 1");
+
+        let mut bad = input.clone();
+        bad.contract_state_updates[0].user_contract_tree_update_proof.old_root = PHash::from_u64x4([8, 8, 8, 8]);
+        assert_ensure_err(ensure(&bad), "user_state_tree_root does not match the first old root");
+
+        let mut bad = input.clone();
+        let last = bad.contract_state_updates.len() - 1;
+        bad.contract_state_updates[last].user_contract_tree_update_proof.new_root = PHash::from_u64x4([9, 9, 9, 9]);
+        assert_ensure_err(ensure(&bad), "user_state_tree_root does not match the last new root");
+
+        let mut bad = input.clone();
+        bad.contract_state_updates[2].updates = vec![];
+        assert_ensure_err(ensure(&bad), "mixed contract updates cannot be empty");
+    }
+
+    #[test]
+    fn ensure_rejects_broken_update_chains_within_history() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let hash = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        let ensure = |input: &SubmitUserEndCapNonProofInput<PF, PHash>| {
+            input.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30)
+        };
+
+        let mut bad = input.clone();
+        if let ContractStateUpdate::Positional { delta_proof } = &mut bad.contract_state_updates[1].updates[0] {
+            delta_proof.old_root = PHash::from_u64x4([1, 1, 1, 1]);
+        }
+        assert_ensure_err(ensure(&bad), "first update old_root does not match user contract tree old_value");
+
+        let mut bad = input.clone();
+        let update_count = bad.contract_state_updates[1].updates.len();
+        if let ContractStateUpdate::Positional { delta_proof } = &mut bad.contract_state_updates[1].updates[update_count - 1] {
+            delta_proof.new_root = PHash::from_u64x4([2, 2, 2, 2]);
+        }
+        assert_ensure_err(ensure(&bad), "last update new_root does not match user contract tree new_value");
+
+        let mut bad = input.clone();
+        if let ContractStateUpdate::Positional { delta_proof } = &mut bad.contract_state_updates[1].updates[25] {
+            delta_proof.old_root = PHash::from_u64x4([3, 3, 3, 3]);
+        }
+        assert_ensure_err(ensure(&bad), "mixed updates root chain broken at 25");
+    }
+
+    #[test]
+    fn ensure_rejects_proof_height_mismatches() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let hash = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        let ensure = |input: &SubmitUserEndCapNonProofInput<PF, PHash>| {
+            input.ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30)
+        };
+
+        // positional update carrying one sibling too many
+        let mut bad = input.clone();
+        if let ContractStateUpdate::Positional { delta_proof } = &mut bad.contract_state_updates[1].updates[10] {
+            delta_proof.siblings.push(PHash::get_zero_value());
+        }
+        assert_ensure_err(ensure(&bad), "positional proof height mismatch");
+
+        // IMT update whose delta proof is one level too deep, roots preserved so the chain stays intact
+        let (old_root, new_root, index, siblings) = positional_parts(&input.contract_state_updates[1].updates[12]);
+        let mut wrong_siblings = siblings.clone();
+        wrong_siblings.push(PHash::get_zero_value());
+        let mut bad = input.clone();
+        bad.contract_state_updates[1].updates[12] = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: IMTContractStateLeaf::default(),
+                new_preimage: IMTContractStateLeaf::default(),
+                delta_proof: DeltaMerkleProofCore {
+                    old_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: wrong_siblings,
+                },
+            },
+        };
+        assert_ensure_err(ensure(&bad), "imt update proof height mismatch");
+
+        // IMT insert with a correct predecessor proof but an oversized new leaf proof
+        let (old_root, new_root, index, siblings) = positional_parts(&input.contract_state_updates[1].updates[14]);
+        let mut wrong_siblings = siblings.clone();
+        wrong_siblings.push(PHash::get_zero_value());
+        let mut bad = input.clone();
+        bad.contract_state_updates[1].updates[14] = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: IMTContractStateLeaf::default(),
+                predecessor_new_preimage: IMTContractStateLeaf::default(),
+                new_leaf_preimage: IMTContractStateLeaf::default(),
+                predecessor_delta_proof: DeltaMerkleProofCore {
+                    old_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings,
+                },
+                new_leaf_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: wrong_siblings,
+                },
+            },
+        };
+        assert_ensure_err(ensure(&bad), "imt insert proof height mismatch");
+
+        // IMT insert whose predecessor proof itself has the wrong height
+        let (old_root, new_root, index, siblings) = positional_parts(&input.contract_state_updates[1].updates[16]);
+        let mut wrong_siblings = siblings.clone();
+        wrong_siblings.push(PHash::get_zero_value());
+        let mut bad = input.clone();
+        bad.contract_state_updates[1].updates[16] = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: IMTContractStateLeaf::default(),
+                predecessor_new_preimage: IMTContractStateLeaf::default(),
+                new_leaf_preimage: IMTContractStateLeaf::default(),
+                predecessor_delta_proof: DeltaMerkleProofCore {
+                    old_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: wrong_siblings,
+                },
+                new_leaf_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings,
+                },
+            },
+        };
+        assert_ensure_err(ensure(&bad), "imt insert proof height mismatch");
+    }
+
+    #[test]
+    fn ensure_accepts_fresh_contract_leaf_with_zero_old_value() {
+        let (old_user_leaf, input, contract_helper) =
+            gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let hash = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(32);
+        assert!(input.get_needed_contract_zero_hashes().is_empty());
+
+        // Turn contract 0 into a freshly-added contract: the user contract tree old
+        // value is zero and the first update starts from the contract zero root.
+        let mut fresh = input.clone();
+        fresh.contract_state_updates[0].user_contract_tree_update_proof.old_value = PHash::get_zero_value();
+        let contract_zero_hash = contract_helper.get_contract_zero_hash(0).unwrap();
+        if let ContractStateUpdate::Positional { delta_proof } = &mut fresh.contract_state_updates[0].updates[0] {
+            delta_proof.old_root = contract_zero_hash;
+        }
+        assert!(fresh
+            .ensure_simple_self_consistent::<PoseidonHasher, _>(&old_user_leaf, hash, &contract_helper, 32, 30)
+            .is_ok());
+        assert_eq!(fresh.get_needed_contract_zero_hashes(), vec![(0, 24)]);
+    }
+
+    #[test]
+    fn get_needed_contract_zero_hashes_covers_all_first_update_variants() {
+        let (_, input, _) = gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        let mut probe = input.clone();
+
+        // IMT update as first update: height taken from its delta proof siblings.
+        let (old_root, new_root, index, _) = positional_parts(&input.contract_state_updates[1].updates[0]);
+        probe.contract_state_updates[1].user_contract_tree_update_proof.old_value = PHash::get_zero_value();
+        probe.contract_state_updates[1].updates[0] = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: IMTContractStateLeaf::default(),
+                new_preimage: IMTContractStateLeaf::default(),
+                delta_proof: DeltaMerkleProofCore {
+                    old_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: vec![PHash::get_zero_value(); 7],
+                },
+            },
+        };
+
+        // IMT insert as first update: height taken from the predecessor delta proof.
+        let (old_root, new_root, index, _) = positional_parts(&input.contract_state_updates[2].updates[0]);
+        probe.contract_state_updates[2].user_contract_tree_update_proof.old_value = PHash::get_zero_value();
+        probe.contract_state_updates[2].updates[0] = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: IMTContractStateLeaf::default(),
+                predecessor_new_preimage: IMTContractStateLeaf::default(),
+                new_leaf_preimage: IMTContractStateLeaf::default(),
+                predecessor_delta_proof: DeltaMerkleProofCore {
+                    old_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: vec![PHash::get_zero_value(); 9],
+                },
+                new_leaf_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: vec![PHash::get_zero_value(); 3],
+                },
+            },
+        };
+
+        // A history with zero old value but no updates is skipped, and a history
+        // with a non-zero old value (contract 4) is skipped as well.
+        probe.contract_state_updates[3].user_contract_tree_update_proof.old_value = PHash::get_zero_value();
+        probe.contract_state_updates[3].updates = vec![];
+
+        assert_eq!(probe.get_needed_contract_zero_hashes(), vec![(1, 7), (2, 9)]);
+    }
+
+    #[test]
+    fn size_hints_track_contract_update_structure() {
+        let (_, input, _) = gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+
+        assert_eq!(input.single_id_nodes_size_hint_in_nodes_modified(30), 5 * (1 + 30) + 1);
+
+        // Every history holds 50 positional updates over a tree of height 24 + i.
+        for (i, history) in input.contract_state_updates.iter().enumerate() {
+            assert_eq!(history.get_double_id_nodes_size_hint(), 50 * (24 + i + 2));
+        }
+        assert_eq!(input.double_id_nodes_size_hint_in_nodes_modified(), 50 * (26 + 27 + 28 + 29 + 30));
+    }
+
+    fn slot_delta(old: [u64; 4], new: [u64; 4], index: u64) -> DeltaMerkleProofCore<PHash> {
+        DeltaMerkleProofCore {
+            old_root: PHash::get_zero_value(),
+            old_value: PHash::from_u64x4(old),
+            new_root: PHash::get_zero_value(),
+            new_value: PHash::from_u64x4(new),
+            index,
+            siblings: vec![PHash::get_zero_value(); 3],
+        }
+    }
+
+    #[test]
+    fn get_slot_updates_decomposes_delta_proofs_into_changed_felts() -> anyhow::Result<()> {
+        let history = |contract_id: u64, updates: Vec<ContractStateUpdate<PF, PHash>>| ContractStateUpdateHistory {
+            user_contract_tree_update_proof: DeltaMerkleProofCore {
+                old_root: PHash::get_zero_value(),
+                old_value: PHash::get_zero_value(),
+                new_root: PHash::get_zero_value(),
+                new_value: PHash::get_zero_value(),
+                index: contract_id,
+                siblings: vec![],
+            },
+            updates,
+        };
+        let leaf = IMTContractStateLeaf::default();
+
+        // Only the last felt changes: one slot update at index * 4 + 3.
+        let positional = ContractStateUpdate::Positional {
+            delta_proof: slot_delta([1, 2, 3, 4], [1, 2, 3, 9], 7),
+        };
+        // Only the first felt changes: one slot update at index * 4 + 0.
+        let imt_update = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: leaf.clone(),
+                new_preimage: leaf.clone(),
+                delta_proof: slot_delta([5, 5, 5, 5], [6, 5, 5, 5], 2),
+            },
+        };
+        // An insert emits the predecessor proof followed by the new leaf proof.
+        let imt_insert = ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: leaf.clone(),
+                predecessor_new_preimage: leaf.clone(),
+                new_leaf_preimage: leaf,
+                predecessor_delta_proof: slot_delta([7, 7, 7, 7], [7, 7, 8, 7], 9),
+                new_leaf_delta_proof: slot_delta([0, 0, 0, 0], [0, 3, 0, 0], 5),
+            },
+        };
+        // No felt changes: the whole contract is filtered out of the result.
+        let unchanged = ContractStateUpdate::Positional {
+            delta_proof: slot_delta([1, 1, 1, 1], [1, 1, 1, 1], 4),
+        };
+
+        let input = SubmitUserEndCapNonProofInput {
+            core: SubmitUserEndCapNonProofCoreInput::qp_rand_gen(),
+            contract_state_updates: vec![
+                history(11, vec![positional]),
+                history(22, vec![imt_update, imt_insert]),
+                history(33, vec![unchanged]),
+            ],
+            events: vec![],
+        };
+
+        let updates = input.get_slot_updates()?;
+        assert_eq!(updates.len(), 2);
+
+        assert_eq!(updates[0].contract_id, 11);
+        assert_eq!(updates[0].slot_updates.len(), 1);
+        assert_eq!(updates[0].slot_updates[0].slot, 7 * 4 + 3);
+        assert_eq!(updates[0].slot_updates[0].old_value, PHash::from_u64x4([1, 2, 3, 4]).to_4_felts()[3]);
+        assert_eq!(updates[0].slot_updates[0].new_value, PHash::from_u64x4([1, 2, 3, 9]).to_4_felts()[3]);
+
+        assert_eq!(updates[1].contract_id, 22);
+        assert_eq!(updates[1].slot_updates.len(), 3);
+        assert_eq!(updates[1].slot_updates[0].slot, 2 * 4 + 0);
+        assert_eq!(updates[1].slot_updates[1].slot, 9 * 4 + 2);
+        assert_eq!(updates[1].slot_updates[2].slot, 5 * 4 + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn random_gen_submit_input_starts_with_empty_updates_and_events() {
+        let input = SubmitUserEndCapNonProofInput::<PF, PHash>::qp_rand_gen();
+        assert!(input.contract_state_updates.is_empty());
+        assert!(input.events.is_empty());
+    }
+
+    #[test]
+    fn psy_user_event_record_random_gen_round_trips() -> anyhow::Result<()> {
+        let record = PsyUserEventRecord::<PF>::qp_rand_gen();
+        assert!(!record.data.is_empty());
+
+        let bytes = record.fallback_psy_ser_to_bytes_vec()?;
+        assert_eq!(bytes.len(), record.fallback_pio_serialized_size());
+        assert_eq!(PsyUserEventRecord::<PF>::fallback_psy_ser_from_slice(&bytes)?, record);
+        Ok(())
+    }
+
+    #[test]
+    fn contract_state_update_fallback_round_trips_all_variants() -> anyhow::Result<()> {
+        let leaf = IMTContractStateLeaf::default();
+        let variants: Vec<ContractStateUpdate<PF, PHash>> = vec![
+            ContractStateUpdate::Positional { delta_proof: delta(1, 2, 3) },
+            ContractStateUpdate::IMT {
+                update: IMTContractStateUpdate::Update {
+                    old_preimage: leaf.clone(),
+                    new_preimage: leaf.clone(),
+                    delta_proof: delta(3, 4, 2),
+                },
+            },
+            ContractStateUpdate::IMT {
+                update: IMTContractStateUpdate::Insert {
+                    predecessor_old_preimage: leaf.clone(),
+                    predecessor_new_preimage: leaf.clone(),
+                    new_leaf_preimage: leaf,
+                    predecessor_delta_proof: delta(5, 6, 2),
+                    new_leaf_delta_proof: delta(6, 7, 3),
+                },
+            },
+        ];
+        for variant in variants {
+            let bytes = variant.fallback_psy_ser_to_bytes_vec()?;
+            assert_eq!(bytes.len(), variant.fallback_pio_serialized_size());
+            assert_eq!(ContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(&bytes)?, variant);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn contract_state_update_rejects_unknown_variant_tag() {
+        let mut reader = Cursor::new(vec![2u8]);
+        assert!(ContractStateUpdate::<PF, PHash>::fallback_pio_read_from_io(&mut reader).is_err());
+    }
+
+    #[test]
+    fn contract_state_update_history_serialization_round_trip() -> anyhow::Result<()> {
+        let leaf = IMTContractStateLeaf::default();
+        let history = ContractStateUpdateHistory {
+            user_contract_tree_update_proof: delta(0, 9, 4),
+            updates: vec![
+                ContractStateUpdate::Positional { delta_proof: delta(9, 1, 3) },
+                ContractStateUpdate::IMT {
+                    update: IMTContractStateUpdate::Update {
+                        old_preimage: leaf.clone(),
+                        new_preimage: leaf.clone(),
+                        delta_proof: delta(1, 2, 4),
+                    },
+                },
+                ContractStateUpdate::IMT {
+                    update: IMTContractStateUpdate::Insert {
+                        predecessor_old_preimage: leaf.clone(),
+                        predecessor_new_preimage: leaf.clone(),
+                        new_leaf_preimage: leaf,
+                        predecessor_delta_proof: delta(2, 3, 2),
+                        new_leaf_delta_proof: delta(3, 4, 2),
+                    },
+                },
+            ],
+        };
+
+        // Fallback write side emits exactly the declared size.
+        // (The fallback *read* path cannot round-trip non-empty histories under the
+        // `serialize_speedy` feature: the speedy nested delta-proof read buffers
+        // past the object and desynchronizes the shared cursor.)
+        let bytes = history.fallback_psy_ser_to_bytes_vec()?;
+        assert_eq!(bytes.len(), history.fallback_pio_serialized_size());
+
+        // The canonical serializer round-trips the nested structure intact.
+        let canonical = psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle::psy_ser_to_bytes_vec(&history)?;
+        assert_eq!(
+            ContractStateUpdateHistory::<PF, PHash>::psy_ser_from_slice(&canonical)?,
+            history
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn submit_input_serialization_round_trips_updates_and_events() -> anyhow::Result<()> {
+        let (_, mut input, _) = gen_fake_valid_submit_user_end_cap_non_proof_input::<PF, PHash, PoseidonHasher>(32, 30);
+        input.events = vec![PsyUserEventRecord::qp_rand_gen(), PsyUserEventRecord::qp_rand_gen()];
+
+        // Fallback write side emits exactly the declared size. (The fallback *read*
+        // path cannot consume non-empty contract update histories under the
+        // `serialize_speedy` feature: the speedy nested delta-proof read buffers
+        // past the object and desynchronizes the shared cursor.)
+        let bytes = input.fallback_psy_ser_to_bytes_vec()?;
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+
+        // The canonical serializer round-trips the full nested structure intact.
+        let canonical = psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle::psy_ser_to_bytes_vec(&input)?;
+        assert_eq!(SubmitUserEndCapNonProofInput::<PF, PHash>::psy_ser_from_slice(&canonical)?, input);
+        Ok(())
+    }
+
+    #[test]
+    fn submit_input_with_event_records_serializes_consistently() -> anyhow::Result<()> {
+        // Even with no contract update histories, the fallback *read* path cannot
+        // round-trip under the `serialize_speedy` feature: the core input's speedy
+        // buffered read consumes the trailing vec-length bytes of the shared
+        // cursor, so the following manual length read always fails. Only the
+        // write side and the canonical serializer are asserted here.
+        let mut input = SubmitUserEndCapNonProofInput::<PF, PHash>::qp_rand_gen();
+        input.events = vec![PsyUserEventRecord::qp_rand_gen()];
+
+        let bytes = input.fallback_psy_ser_to_bytes_vec()?;
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+
+        let canonical = psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle::psy_ser_to_bytes_vec(&input)?;
+        assert_eq!(SubmitUserEndCapNonProofInput::<PF, PHash>::psy_ser_from_slice(&canonical)?, input);
+        Ok(())
     }
 }

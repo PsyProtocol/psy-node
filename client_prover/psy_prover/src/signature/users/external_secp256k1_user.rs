@@ -161,8 +161,17 @@ impl SignatureUser for ExternalSecp256K1User {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use k256::ecdsa::SigningKey;
+    use psy_crypto::signature::secp256k1::wallet::secp256k1_sign;
+
     use super::*;
+
+    fn valid_signature() -> PsyCompressedSecp256K1Signature {
+        let key = SigningKey::from_slice(&[1_u8; 32]).unwrap();
+        secp256k1_sign(key, QHashOut::<GoldilocksField>::from_values(1, 2, 3, 4)).unwrap()
+    }
 
     #[test]
     fn rejects_malformed_external_signature() {
@@ -172,5 +181,66 @@ mod tests {
             message: Hash256([7; 32]),
         };
         assert!(ExternalSecp256K1User::with_signature(malformed).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_public_key_and_signature_with_same_identity() {
+        let signature = valid_signature();
+        let key_only = ExternalSecp256K1User::new(CompressedPublicKey(signature.public_key)).unwrap();
+        let signed = ExternalSecp256K1User::with_signature(signature).unwrap();
+
+        assert!(key_only.signature.is_none());
+        assert!(signed.signature.is_some());
+        assert_eq!(key_only.public_key_param(), signed.public_key_param());
+    }
+
+    #[test]
+    fn rejects_invalid_public_key_and_tampered_signature() {
+        assert!(ExternalSecp256K1User::new(CompressedPublicKey([0_u8; 33])).is_err());
+        let mut signature = valid_signature();
+        signature.signature[0] ^= 1;
+        assert!(ExternalSecp256K1User::with_signature(signature).is_err());
+    }
+
+    #[tokio::test]
+    async fn external_secp_user_reports_public_key_and_circuit_info() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let session = session.read();
+        let wallet = &session.wallet;
+        let manager = wallet.random_circuit_manager();
+
+        let user = ExternalSecp256K1User::with_signature(valid_signature()).unwrap();
+        let info = user.public_key_info(wallet, manager.as_ref()).await.unwrap();
+        assert_eq!(info.public_key_param, user.public_key_param());
+
+        let circuit_info = user
+            .circuit_info(wallet, manager.as_ref(), &SignContext::new(QHashOut::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(circuit_info.circuit_fingerprint, info.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn external_secp_sign_rejects_missing_and_mismatched_signatures() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let session = session.read();
+        let wallet = &session.wallet;
+        let manager = wallet.random_circuit_manager();
+        let context = SignContext::new(QHashOut::ZERO);
+
+        let signature = valid_signature();
+        let key_only = ExternalSecp256K1User::new(CompressedPublicKey(signature.public_key)).unwrap();
+        let error = key_only
+            .sign(wallet, manager.as_ref(), &context, QHashOut::from_values(1, 2, 3, 4))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("signature missing"));
+
+        let signed = ExternalSecp256K1User::with_signature(signature).unwrap();
+        let error = signed
+            .sign(wallet, manager.as_ref(), &context, QHashOut::from_values(9, 9, 9, 9))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match session sighash"));
     }
 }

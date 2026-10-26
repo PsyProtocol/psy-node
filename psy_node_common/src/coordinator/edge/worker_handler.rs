@@ -592,3 +592,282 @@ impl<
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod signature_tests {
+    use parth_common::secp256k1::MemorySecp256K1Wallet;
+    use parth_core::{
+        crypto::secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
+        data::hash::hash256::Hash256,
+    };
+
+    use super::verify_api_signature;
+
+    #[test]
+    fn accepts_genuine_signature_and_rejects_tampering() -> anyhow::Result<()> {
+        let mut wallet = MemorySecp256K1Wallet::new();
+        let public_key = wallet.add_private_key(Hash256([7u8; 32]))?;
+        let (signature, request) = SimpleTimedRequest::create_signed_timed_request_for_request_proof_work::<
+            MemorySecp256K1Wallet,
+            parth_crypto::hash::sha256::CoreSha256Hasher,
+        >(&wallet, &public_key, 60_000, [9u8; 32]);
+
+        // a genuinely signed request verifies
+        assert!(verify_api_signature(&signature, &request));
+
+        // the same signature over a different request fails the message check
+        let tampered = SimpleTimedRequest {
+            for_target: request.for_target,
+            request_type: request.request_type,
+            valid_until: request.valid_until,
+            nonce: request.nonce + 1,
+            tag: request.tag,
+        };
+        assert!(!verify_api_signature(&signature, &tampered));
+
+        // a corrupted signature fails secp256k1 verification
+        let mut corrupted_signature = signature.signature;
+        corrupted_signature[0] ^= 0xFF;
+        let bad_signature = QEDCompressedSecp256K1Signature {
+            public_key: signature.public_key,
+            signature: corrupted_signature,
+            message: signature.message,
+        };
+        assert!(!verify_api_signature(&bad_signature, &request));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::edge::handler::tests::EdgeTestEnv;
+    use crate::test_common::TestNetworkConfig;
+    use parth_core::{
+        crypto::secp256k1::{Secp256K1WalletProvider, SimpleTimedRequest, REQUEST_TYPE_SUBMIT_PROOF},
+        data::queue::queue_key::PCoreQueueItemBase,
+        utils::QPGenRandom,
+        PHash,
+    };
+    use psy_data::worker::metadata::{
+        PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+        PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+    };
+    use psy_node_core::psy_temp_db::{
+        QTempDBJobClaimInfoWriter, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataWriter,
+        QTempDBRewardsTreeWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter,
+    };
+
+    type N = TestNetworkConfig;
+
+    /// Deterministic secp256k1 wallet whose signatures satisfy the miner API
+    /// signature checks in the handler.
+    struct TestWallet {
+        wallet: parth_common::secp256k1::MemorySecp256K1SinglePrivateKeyWallet,
+    }
+
+    impl TestWallet {
+        fn new() -> anyhow::Result<Self> {
+            Ok(Self {
+                wallet: parth_common::secp256k1::MemorySecp256K1SinglePrivateKeyWallet::new_from_private_key_bytes(&[7u8; 32])?,
+            })
+        }
+        fn public_key(&self) -> [u8; 33] {
+            self.wallet.get_public_key().0
+        }
+        fn submit_request(&self) -> anyhow::Result<(QEDCompressedSecp256K1Signature, SimpleTimedRequest)> {
+            let request = SimpleTimedRequest {
+                for_target: 0,
+                request_type: REQUEST_TYPE_SUBMIT_PROOF,
+                valid_until: parth_core::crypto::secp256k1::get_current_time_ms() + 60_000,
+                nonce: 1,
+                tag: [0u8; 32],
+            };
+            let sig_hash = request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>();
+            let signature = self.wallet.sign(&self.wallet.get_public_key(), sig_hash)?;
+            Ok((signature, request))
+        }
+    }
+
+    fn leaf_metadata() -> PsyProvingJobMetadata<PHash, psy_core::job::job_id::QProvingJobDataID> {
+        PsyProvingJobMetadata {
+            expected_public_inputs_hash: PHash::from_values(31, 0, 0, 0),
+            reward_tree_node_index: 0,
+            reward_tree_node_level: 3,
+            reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            reward_tree_node_children: 0,
+            dependencies: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn signature_and_reputation_gate_proving_work() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let wallet = TestWallet::new()?;
+        let (signature, request) = wallet.submit_request()?;
+
+        // signature from a different key over the same request is rejected
+        let mut bad_signature = signature.clone();
+        bad_signature.signature = [9u8; 64];
+        let err = handler
+            .verify_miner_api_signature_and_check_reputation(&bad_signature, &request)
+            .await
+            .expect_err("invalid signature must be rejected");
+        assert!(err.to_string().contains("invalid signature"), "unexpected error: {err}");
+
+        // valid signature but zero reputation is rejected; a fresh wallet
+        // defaults to INITIAL_WORKER_REPUTATION = 5, so seed 0 explicitly
+        env.temp_db
+            .set_worker_reputation(&handler.realm_identifier, &wallet.public_key(), 0)
+            .await?;
+        let err = handler
+            .verify_miner_api_signature_and_check_reputation(&signature, &request)
+            .await
+            .expect_err("zero reputation must be rejected");
+        assert!(err.to_string().contains("reputation must be positive"), "unexpected error: {err}");
+
+        // positive reputation passes
+        env.temp_db
+            .set_worker_reputation(&env.handler.realm_identifier, &wallet.public_key(), 5)
+            .await?;
+        handler.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        assert_eq!(handler.get_worker_reputation_internal(&wallet.public_key()).await?, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_submission_status_tracks_rewards_tree_value() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let job_id = psy_core::job::job_id::QProvingJobDataID::qp_rand_gen();
+
+        assert!(!handler.has_job_id_already_been_submitted(0, job_id).await?);
+        assert!(!handler.get_job_id_submission_status(0, &job_id).await?);
+
+        env.temp_db
+            .set_proof_miner_rewards_tree_value(&handler.realm_identifier, 0, job_id, PHash::from_values(41, 0, 0, 0))
+            .await?;
+        assert!(handler.has_job_id_already_been_submitted(0, job_id).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_proving_work_returns_next_queue_item() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let wallet = TestWallet::new()?;
+        let (signature, request) = wallet.submit_request()?;
+        env.temp_db
+            .set_worker_reputation(&handler.realm_identifier, &wallet.public_key(), 5)
+            .await?;
+
+        // empty queue: no work available
+        let err = handler
+            .get_proving_work_internal(signature.clone(), request.clone())
+            .await
+            .expect_err("empty work queue must fail");
+        assert!(err.to_string().contains("no proving work available"), "unexpected error: {err}");
+
+        // preload one leaf job without dependencies and its witness
+        let work_item = PsyProvingJobMetadataWithJobId::<PHash, psy_core::job::job_id::QProvingJobDataID> {
+            job_id: psy_core::job::job_id::QProvingJobDataID::qp_rand_gen(),
+            metadata: leaf_metadata(),
+        };
+        let witness = vec![1u8; 16];
+        env.temp_db
+            .set_tdb_proof_witnesses_tuple_owned_raw(
+                &handler.realm_identifier,
+                0,
+                vec![(work_item.job_id.get_input_witness_id(), witness.clone())],
+            )
+            .await?;
+        env.work_queue.add_items(vec![work_item.encode_queue_item_vec()?]);
+
+        let response = handler.get_proving_work_internal(signature, request).await?;
+        assert_eq!(response.realm_id, 1);
+        assert_eq!(response.realm_sub_id, 2);
+        assert_eq!(response.unique_pending_id, 0);
+        assert_eq!(response.node_type, PROVING_JOB_NODE_TYPE_COORDINATOR);
+        assert_eq!(response.witness, witness);
+        assert!(response.child_proof_tag_values.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_proof_raw_gates_on_signature_tag_and_claim() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let wallet = TestWallet::new()?;
+        let (signature, request) = wallet.submit_request()?;
+        env.temp_db
+            .set_worker_reputation(&handler.realm_identifier, &wallet.public_key(), 5)
+            .await?;
+        let job_id = psy_core::job::job_id::QProvingJobDataID::qp_rand_gen();
+        let tag = PHash::from_values(55, 0, 0, 0);
+
+        // wrong request type is rejected
+        let mut wrong_type_req = request.clone();
+        wrong_type_req.request_type = REQUEST_TYPE_SUBMIT_PROOF + 1;
+        let mut wrong_type_sig = signature.clone();
+        wrong_type_sig.message = wrong_type_req.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>();
+        let err = handler
+            .submit_proof_raw_internal(wrong_type_sig, wrong_type_req, job_id, tag, vec![])
+            .await
+            .expect_err("wrong request type must fail");
+        assert!(err.to_string().contains("invalid signature for submit_proof_raw"), "unexpected error: {err}");
+
+        // seed a different expected claim tag: the submitted tag cannot match,
+        // so the worker's reputation is slashed
+        let output_id = job_id.get_output_id();
+        env.temp_db
+            .set_proof_claim_tag(&handler.realm_identifier, 0, output_id.get_input_witness_id(), PHash::from_values(56, 0, 0, 0))
+            .await?;
+        let err = handler
+            .submit_proof_raw_internal(signature.clone(), request.clone(), job_id, tag, vec![])
+            .await
+            .expect_err("tag mismatch must fail");
+        assert!(err.to_string().contains("does not match expected tag"), "unexpected error: {err}");
+        // DEFAULT_REPUTATION_SLASH = 5 saturates the seeded 5 down to 0
+        assert_eq!(handler.get_worker_reputation_internal(&wallet.public_key()).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_proof_raw_happy_path_finalizes_job() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let handler = &env.handler;
+        let wallet = TestWallet::new()?;
+        let (signature, request) = wallet.submit_request()?;
+        env.temp_db
+            .set_worker_reputation(&handler.realm_identifier, &wallet.public_key(), 5)
+            .await?;
+
+        let job_id = psy_core::job::job_id::QProvingJobDataID::qp_rand_gen();
+        // submit_proof_raw_internal rewrites the submitted id to its output id
+        // FIRST and resolves the claim/tag/metadata under that id
+        let output_id = job_id.get_output_id();
+        let tag = PHash::from_values(55, 0, 0, 0);
+        let metadata = leaf_metadata();
+
+        // seed the claim tag, job metadata and the claim record for the worker
+        env.temp_db
+            .set_proof_claim_tag(&handler.realm_identifier, 0, output_id.get_input_witness_id(), tag)
+            .await?;
+        env.temp_db
+            .set_proving_job_metadata(&handler.realm_identifier, 0, output_id.get_output_id(), &metadata)
+            .await?;
+        env.temp_db
+            .set_job_claim(&handler.realm_identifier, 0, output_id, &wallet.public_key(), parth_core::crypto::secp256k1::get_current_time_ms())
+            .await?;
+
+        handler.submit_proof_raw_internal(signature, request, job_id, tag, vec![1, 2, 3]).await?;
+
+        // the reward tree value is finalized (keyed by the output id), marking
+        // the job as submitted
+        assert!(handler.has_job_id_already_been_submitted(0, output_id).await?);
+        // the on-time claim bumped the worker reputation
+        assert_eq!(handler.get_worker_reputation_internal(&wallet.public_key()).await?, 6);
+        Ok(())
+    }
+}

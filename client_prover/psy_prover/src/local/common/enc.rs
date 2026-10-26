@@ -42,3 +42,44 @@ impl SimpleEncryptionHelper for SimpleZeroPadEncryptionHelper {
         encrypted_data ^ key
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_round_trip_depends_on_key_and_salt() {
+        let key = Hash256([7; 32]);
+        let salt = Hash256([11; 32]);
+        let data = Hash256([19; 32]);
+        let helper = SimpleZeroPadEncryptionHelper::new(key);
+
+        let encrypted = helper.encrypt_32(salt, data);
+
+        assert_ne!(encrypted, data);
+        assert_eq!(helper.decrypt_32(salt, encrypted), data);
+        assert_ne!(helper.encrypt_32(Hash256([12; 32]), data), encrypted);
+        assert_ne!(SimpleZeroPadEncryptionHelper::new(Hash256([8; 32])).encrypt_32(salt, data), encrypted);
+        assert_eq!(helper.get_decryption_key(), key);
+    }
+
+    #[test]
+    fn no_encrypt_constructor_still_round_trips() {
+        let helper = SimpleZeroPadEncryptionHelper::new_no_encrypt();
+        let salt = Hash256([1; 32]);
+        let data = Hash256([2; 32]);
+
+        assert_eq!(helper.get_decryption_key(), Hash256::ZERO);
+        assert_eq!(helper.decrypt_32(salt, helper.encrypt_32(salt, data)), data);
+    }
+
+    #[test]
+    fn random_constructor_produces_a_usable_key() {
+        let helper = SimpleZeroPadEncryptionHelper::new_rand();
+        let salt = Hash256([3; 32]);
+        let data = Hash256([4; 32]);
+
+        assert_eq!(helper.decrypt_32(salt, helper.encrypt_32(salt, data)), data);
+    }
+}

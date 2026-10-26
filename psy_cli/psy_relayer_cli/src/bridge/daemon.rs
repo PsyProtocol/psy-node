@@ -11,7 +11,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 use anyhow::{Context, ensure};
@@ -119,11 +119,16 @@ pub(crate) struct BridgeProposeDaemonConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct L1Config {
+    #[serde(default)]
+    pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     #[serde(default = "default_evm_family")]
     pub family: String,
     pub chain_index: u8,
     pub network_id: String,
+    #[serde(default)]
     pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: String,
     #[serde(default)]
     pub state_manager: Option<String>,
@@ -150,13 +155,19 @@ impl L1Config {
     ) -> anyhow::Result<BridgeProposeDaemonConfig> {
         let mut config = base.clone();
         config.chains.clear();
-        config.finalize.l1_rpc_url = Some(
-            self.rpc_urls
-                .first()
-                .cloned()
-                .context("EVM chain rpc_urls must not be empty")?,
+        // Raw, user-supplied fields: warn here (not inside `resolve_rpc_providers`,
+        // which downstream callers also invoke with already-derived config).
+        crate::bridge::rpc_providers::warn_if_rpc_urls_ignored(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
         );
-        config.finalize.l1_rpc_fallback_url = self.rpc_urls.get(1).cloned();
+        let providers = crate::bridge::rpc_providers::resolve_rpc_providers(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
+        )?;
+        // The first provider URL is the scope identity for provider factories.
+        config.finalize.l1_rpc_url = Some(providers[0].url.clone());
+        config.finalize.l1_rpc_fallback_url = None;
+        config.finalize.l1_rpc_providers = providers;
+        config.finalize.fee_policy = self.fee_policy.clone();
         config.finalize.deployments_network = Some(self.deployments_network.clone());
         config.finalize.state_manager = self.state_manager.clone();
         config.finalize.bridge_address = self.bridge_address.clone();
@@ -167,7 +178,27 @@ impl L1Config {
     }
 }
 
+/// URL list for the single-chain `[finalize]` path. The default URL is only a
+/// stand-in for a missing config; with `l1_rpc_providers` set it would be
+/// reported as an ignored `rpc_urls` entry the operator never wrote.
+fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
+    let primary = match finalize.l1_rpc_url.clone() {
+        Some(url) => Some(url),
+        None if finalize.l1_rpc_providers.is_empty() => Some(DEFAULT_L1_RPC_URL.to_string()),
+        None => None,
+    };
+    let mut rpc_urls: Vec<String> = primary.into_iter().collect();
+    if let Some(url) = finalize.l1_rpc_fallback_url.clone() {
+        if !url.trim().is_empty() && !rpc_urls.contains(&url) {
+            rpc_urls.push(url);
+        }
+    }
+    rpc_urls
+}
+
 fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
+    ensure!(config.chains.is_empty() || config.finalize.fee_policy.is_none(),
+        "with [[chains]], configure fees in [chains.fee_policy], not [finalize.fee_policy]");
     let mut chains = if config.chains.is_empty() {
         let deployments_network = config
             .finalize
@@ -180,21 +211,13 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .map(|protocol| protocol.chain.l1_chain_index)
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
-        let mut rpc_urls = vec![config
-            .finalize
-            .l1_rpc_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string())];
-        if let Some(url) = config.finalize.l1_rpc_fallback_url.clone() {
-            if !url.trim().is_empty() && !rpc_urls.contains(&url) {
-                rpc_urls.push(url);
-            }
-        }
         vec![L1Config {
+            fee_policy: config.finalize.fee_policy.clone(),
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
-            rpc_urls,
+            rpc_urls: legacy_rpc_urls(&config.finalize),
+            rpc_providers: config.finalize.l1_rpc_providers.clone(),
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
             bridge_address: config.finalize.bridge_address.clone(),
@@ -208,8 +231,17 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
     ensure!(!chains.is_empty(), "bridge relayer requires at least one chain");
     let mut seen = HashSet::with_capacity(chains.len());
     for chain in &chains {
+        if let Some(policy) = &chain.fee_policy {
+            policy.validate()?;
+            ensure!(chain.network_id == "bscTestnet" && chain.deployments_network == "bscTestnet",
+                "BSC fee policy may only be enabled for bscTestnet");
+        }
         ensure!(chain.family.eq_ignore_ascii_case("evm"), "unsupported bridge chain family {}", chain.family);
-        ensure!(!chain.rpc_urls.is_empty(), "chain {} has no RPC URL", chain.network_id);
+        ensure!(
+            !chain.rpc_urls.is_empty() || !chain.rpc_providers.is_empty(),
+            "chain {} has no RPC URL",
+            chain.network_id
+        );
         ensure!(
             seen.insert(chain.chain_index),
             "duplicate bridge chain_index {}",
@@ -232,8 +264,12 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct DaemonFinalizeConfig {
+    #[serde(default)]
+    pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     pub l1_rpc_url: Option<String>,
     pub l1_rpc_fallback_url: Option<String>,
+    #[serde(default)]
+    pub l1_rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: Option<String>,
     pub state_manager: Option<String>,
     pub bridge_address: Option<String>,
@@ -845,7 +881,7 @@ async fn run_multichain(
         let state_manager = resolve_state_manager_address(&effective)?;
         chains.push(ChainRuntime {
             chain_index: chain.chain_index,
-            l1: L1Client::from_finalize_config(&effective.finalize),
+            l1: L1Client::from_finalize_config(&effective.finalize, &chain.network_id)?,
             config: effective,
             bridge,
             state_manager,
@@ -904,7 +940,7 @@ async fn run_multichain(
 
         let mut round_withdrawals = Vec::new();
         let to_checkpoint = if state.pending_finalization_range.is_none() {
-            let (progress, plan) = match build_multichain_l2_plan(
+            let (_progress, plan) = match build_multichain_l2_plan(
                 &config, &provider, &chains, latest, from_checkpoint, window.to_checkpoint,
                 !window.is_catchup_batch, &propose_args,
             ).await {
@@ -927,24 +963,40 @@ async fn run_multichain(
             } else {
                 window.to_checkpoint
             };
-            // Settle each chain's L1 deposit accumulator before finalization.
-            for item in progress {
-                let chain = chains.iter().find(|c| c.chain_index == item.chain_index).unwrap();
-                let target = fetch_deposit_tree_next_index(&provider, endpoint, u64::from(item.chain_index)).await?;
-                if target > u64::from(item.proved_deposit_count) {
-                    chain.l1.submit_deposit_batch_appends(&chain.config, u32::try_from(target)?).await?;
-                }
-            }
-            let range = PendingFinalizationRange { from_checkpoint, to_checkpoint: endpoint };
-            state.pending_finalization_range = Some(range);
-            insert_pending_claims(&round_withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
-            save_multichain_state(&state_path, &state)?;
             endpoint
         } else {
             window.to_checkpoint
         };
 
         let range = PendingFinalizationRange { from_checkpoint, to_checkpoint };
+        let chain_cursors = chains.iter()
+            .map(|chain| (chain.chain_index, cursors[&chain.chain_index]))
+            .collect::<Vec<_>>();
+        if !persist_and_sync_multichain_range(
+            &state_path, &mut state, range, &round_withdrawals, &chain_cursors,
+            |chain_index, endpoint| {
+                let chain = chains.iter().find(|chain| chain.chain_index == chain_index).unwrap();
+                let provider = &provider;
+                async move {
+                    let target = fetch_deposit_tree_next_index(provider, endpoint, u64::from(chain_index)).await?;
+                    let target = u32::try_from(target)?;
+                    sync_deposit_if_behind(
+                        target,
+                        chain.l1.with_rpc_failover("read_deposit_sync_progress", |url| {
+                            let url = url.to_string();
+                            async move {
+                                let provider = crate::bridge::l1_provider::connect_l1_readonly(url.parse()?)?;
+                                fetch_proved_deposit_count(&provider, chain.bridge).await
+                            }
+                        }),
+                        || chain.l1.submit_deposit_batch_appends(&chain.config, target),
+                    ).await
+                }
+            },
+        ).await? {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
         let shared_path = proof_dir.join(format!("bridge_proof_{}.json", to_checkpoint));
         let needs_finalize = chains.iter().any(|chain| cursors[&chain.chain_index] < to_checkpoint);
         if needs_finalize && !shared_path.exists() {
@@ -964,6 +1016,7 @@ async fn run_multichain(
                 tracing::error!(chain_index=chain.chain_index, %error, "build per-chain witness failed"); continue;
             }
             let finalize_args = FinalizeBridgeAggArgs {
+                l1_fee_policy: chain.config.finalize.fee_policy.clone(),
                 proof_json: chain_path.clone(), to_checkpoint, rpc_config: config.rpc_config.clone(),
                 l1_rpc_url: chain.config.finalize.l1_rpc_url.clone().unwrap(),
                 deployments_network: chain.config.finalize.deployments_network.clone().unwrap(),
@@ -1034,7 +1087,10 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
-    let l1 = L1Client::from_finalize_config(&config.finalize);
+    let l1 = L1Client::from_finalize_config(
+        &config.finalize,
+        config.finalize.deployments_network.as_deref().unwrap_or("l1"),
+    )?;
     let bridge_address = resolve_bridge_address(&config)?;
     let bridge = bridge_address
         .parse::<Address>()
@@ -1346,6 +1402,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         // ═══════════════════════════════════════════════════════════════════
 
         let finalize_args = FinalizeBridgeAggArgs {
+            l1_fee_policy: config.finalize.fee_policy.clone(),
             proof_json: proof_path.clone(),
             to_checkpoint,
             rpc_config: config.rpc_config.clone(),
@@ -1496,7 +1553,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     let rpc_url = l1_rpc
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc))?;
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
+    let provider = crate::bridge::l1_provider::connect_l1_with_wallet(rpc_url, wallet)?;
     let proved_before = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
     let expected_proved_after = U256::from(target_deposit_count);
     ensure!(
@@ -1512,6 +1569,11 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
         );
         return Ok(());
     }
+
+    // Refuse unaffordable fees before proving, then refresh before sending.
+    super::l1_fees::prepare_l1_fees(
+        &provider, &mut TransactionRequest::default(), config.finalize.fee_policy.as_ref(),
+    ).await?;
 
     let calls = if let Some(proxy_url) = prove_proxy_url {
         prove_bridge::build_deposit_batch_append_calls_remote(
@@ -1610,6 +1672,8 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
             "sending deposit batchAppend aggregate3 tx"
         );
 
+        let mut tx = tx;
+        super::l1_fees::prepare_l1_fees(&provider, &mut tx, config.finalize.fee_policy.as_ref()).await?;
         let pending = provider
             .send_transaction(tx)
             .await
@@ -1802,6 +1866,56 @@ fn load_multichain_state(path: &Path, namespace: &str) -> anyhow::Result<Multich
     Ok(state)
 }
 
+// L1 may already be ahead of an older catch-up target. Keep the actual append
+// function's strict target check, and skip satisfied historical targets here.
+async fn sync_deposit_if_behind<Read, Append, AppendFuture>(
+    target: u32,
+    read_proved: Read,
+    append: Append,
+) -> anyhow::Result<()>
+where
+    Read: Future<Output = anyhow::Result<u32>>,
+    Append: FnOnce() -> AppendFuture,
+    AppendFuture: Future<Output = anyhow::Result<()>>,
+{
+    if read_proved.await? >= target { return Ok(()); }
+    append().await
+}
+
+// Both fresh and resumed ranges pass this gate before proof/finalize. A fee
+// refusal retains the landing endpoint and claims, without spending attempts.
+async fn persist_and_sync_multichain_range<Sync, SyncFuture>(
+    path: &Path,
+    state: &mut MultichainDaemonState,
+    range: PendingFinalizationRange,
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+    chain_cursors: &[(u8, u64)],
+    mut sync: Sync,
+) -> anyhow::Result<bool>
+where
+    Sync: FnMut(u8, u64) -> SyncFuture,
+    SyncFuture: Future<Output = anyhow::Result<()>>,
+{
+    ensure!(state.pending_finalization_range.is_none_or(|saved| saved == range),
+        "cannot replace an unfinished multichain range");
+    state.pending_finalization_range = Some(range);
+    insert_pending_claims(withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+    save_multichain_state(path, state)?;
+
+    for &(chain_index, cursor) in chain_cursors {
+        if !chain_finalization_required(cursor, range)? { continue; }
+        if let Err(error) = sync(chain_index, range.to_checkpoint).await {
+            if super::l1_fees::is_fee_preparation_error(&error) {
+                tracing::warn!(chain_index, %error,
+                    "deposit fees unavailable; durable range and claims retained, deferring round");
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
 fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
     let raw = toml::to_string(state)?;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -1964,7 +2078,7 @@ pub(crate) fn resolve_bridge_address(config: &BridgeProposeDaemonConfig) -> anyh
         .ok_or_else(|| anyhow::anyhow!("Bridge not found in {}", path.display()))
 }
 
-fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
+pub(crate) fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
     if let Some(addr) = config.finalize.state_manager.as_deref() {
         return addr
             .parse::<Address>()
@@ -1978,11 +2092,12 @@ fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::
     crate::bridge::api_client::resolve_contract_address_from_deployments(network, "StateManager")
 }
 
-pub(crate) async fn run_l2_bridge_round_with_l1_provider(
+pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     config: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
-    l1_provider: &impl Provider,
-    bridge: Address,
+    source_chain_index: u64,
+    proved_deposit_count: u32,
+    pending_deposit_count: u32,
     from_checkpoint: u64,
     to_checkpoint: u64,
     confirmation_lag_checkpoints: u64,
@@ -1997,17 +2112,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
         .unwrap_or_else(|| Path::new(DEFAULT_PROOF_DIR));
     let state_path = proof_dir.join("daemon_state.toml");
     propose_args.poll_timeout_secs = 0;
-    let deployments_network = config
-        .finalize
-        .deployments_network
-        .as_deref()
-        .unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
-    let state_manager = resolve_state_manager_address(config)?;
-    let source_chain_index =
-        u64::from(crate::bridge::api_client::resolve_l1_chain_index(l1_provider, deployments_network, state_manager).await?);
-
-    let proved_deposit_count = fetch_proved_deposit_count(l1_provider, bridge).await?;
-    let pending_deposit_count = fetch_pending_deposit_count(l1_provider, bridge).await?;
     ensure!(
         pending_deposit_count >= proved_deposit_count,
         "pendingDepositCount is behind provedDepositCount: pending={} proved={}",
@@ -2108,8 +2212,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
             &config.services_url,
             source_chain_index,
             provider,
-            l1_provider,
-            bridge,
             &propose_args,
             from_checkpoint,
             to_checkpoint,
@@ -2562,8 +2664,6 @@ async fn build_l2_call_plan(
     services_url: &str,
     source_chain_index: u64,
     provider: &RpcProvider,
-    _l1_provider: &impl Provider,
-    _bridge: Address,
     propose_args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint: u64,
@@ -2732,7 +2832,7 @@ async fn build_multichain_l2_plan(
     for chain in chains {
         let (proved, pending) = chain
             .l1
-            .with_retry("read_deposit_progress", 10, |url| {
+            .with_rpc_failover("read_deposit_progress", |url| {
                 let url = url.to_string();
                 async move {
                     let l1_provider = crate::bridge::l1_provider::connect_l1_readonly(
@@ -2765,7 +2865,7 @@ async fn build_multichain_l2_plan(
         }
 
         if append_business && pending > l2_count {
-            let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
+            let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
                 &http,
                 &base.services_url,
                 u64::from(chain.chain_index),
@@ -3242,12 +3342,12 @@ async fn chunk_deposit_batch_append_by_gas(
     chunks
 }
 
-async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let proved = crate::bridge::api_client::eth_call_u256(provider, bridge, provedDepositCountCall {}).await?;
     u32::try_from(proved).context("provedDepositCount exceeds u32")
 }
 
-async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let pending = crate::bridge::api_client::eth_call_u256(provider, bridge, pendingDepositCountCall {}).await?;
     u32::try_from(pending).context("pendingDepositCount exceeds u32")
 }
@@ -5383,7 +5483,7 @@ mod tests {
 
     // ── inner-loop catch-up break (run_l2_bridge_round mid-round stop) ────
 
-    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_provider`:
+    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_snapshot`:
     /// while still in a normal round (`is_catchup_batch == false`), re-check the
     /// window against the latest planning checkpoint and break once the gap
     /// has crossed into catch-up. Catch-up rounds never take this path
@@ -6089,6 +6189,267 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    #[test]
+    fn legacy_urls_skip_the_default_when_finalize_providers_are_set() {
+        let provider = crate::bridge::rpc_providers::RpcProviderConfig {
+            name: "alchemy".into(),
+            url: "https://a".into(),
+            priority_weight: 10,
+            operator: String::new(),
+            quota_group: String::new(),
+        };
+        let providers_only = DaemonFinalizeConfig {
+            l1_rpc_providers: vec![provider.clone()],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert!(legacy_rpc_urls(&providers_only).is_empty());
+
+        // An explicit l1_rpc_url next to providers is a real conflict and stays visible.
+        let both = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_providers: vec![provider],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&both), vec!["https://z".to_string()]);
+    }
+
+    #[test]
+    fn legacy_urls_default_and_deduplicate_without_providers() {
+        assert_eq!(
+            legacy_rpc_urls(&DaemonFinalizeConfig::default()),
+            vec![DEFAULT_L1_RPC_URL.to_string()]
+        );
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://z".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string()]);
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://a".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string(), "https://a".to_string()]);
+    }
+
+    #[test]
+    fn chain_rpc_providers_take_precedence_and_legacy_urls_keep_order() {
+        let raw = r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:3000"
+withdraw_method_id = 1
+
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["https://ignored"]
+[[chains.rpc_providers]]
+name = "alchemy"
+url = "https://a"
+priority_weight = 11
+[[chains.rpc_providers]]
+name = "infura"
+url = "https://i"
+
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_urls = ["https://z", "https://a"]
+"#;
+        let config: BridgeProposeDaemonConfig = toml::from_str(raw).unwrap();
+        let first = config.chains[0].effective_config(&config).unwrap().finalize;
+        assert_eq!(first.l1_rpc_url.as_deref(), Some("https://a"));
+        assert_eq!(
+            first.l1_rpc_providers.iter().map(|p| (p.name.as_str(), p.priority_weight)).collect::<Vec<_>>(),
+            vec![("alchemy", 11), ("infura", 10)]
+        );
+        let second = config.chains[1].effective_config(&config).unwrap().finalize;
+        assert_eq!(
+            second.l1_rpc_providers.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://z", "https://a"]
+        );
+        assert_eq!(second.l1_rpc_fallback_url, None);
+    }
+
+    #[test]
+    fn l1_fees_named_pool_policy_is_chain_local_and_legacy_config_still_loads() {
+        let config: BridgeProposeDaemonConfig = toml::from_str(r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:1"
+withdraw_method_id = 1
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["http://127.0.0.1:1"]
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_providers = [{ name = "first", url = "http://127.0.0.1:2" }, { name = "second", url = "http://127.0.0.1:3" }]
+[chains.fee_policy]
+expected_chain_id = 97
+min_priority_fee_wei = 1000000000
+max_priority_fee_wei = 2000000000
+max_fee_per_gas_wei = 10000000000
+[[chains]]
+chain_index = 2
+network_id = "baseSepolia"
+deployments_network = "baseSepolia"
+rpc_urls = ["http://127.0.0.1:4"]
+"#).unwrap();
+        let chains = &config.chains;
+        assert_eq!(chains.len(), 3);
+        let bsc = chains[1].effective_config(&config).unwrap();
+        assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().min_priority_fee_wei, 1_000_000_000);
+        assert_eq!(bsc.finalize.l1_rpc_providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
+        for index in [0, 2] {
+            assert!(chains[index].effective_config(&bsc).unwrap().finalize.fee_policy.is_none());
+        }
+        let mut invalid = config.clone();
+        invalid.finalize.fee_policy = bsc.finalize.fee_policy.clone();
+        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("not [finalize.fee_policy]"));
+        invalid.finalize.fee_policy = None;
+        invalid.chains[0].fee_policy = bsc.finalize.fee_policy.clone();
+        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("only be enabled for bscTestnet"));
+        let mut legacy = config;
+        legacy.chains[1].fee_policy = None;
+        assert!(legacy.chains.iter().all(|c| c.fee_policy.is_none()));
+    }
+
+    #[test]
+    fn l1_fees_deferrals_do_not_spend_claim_attempts() {
+        let withdrawal = withdrawal_for_chain("fee-pending", 1);
+        let mut pending = HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            requested: 1,
+            submitted_count: 0,
+            already_claimed_count: 0,
+            resolved_leaf_hashes: Vec::new(),
+            failure_reasons: HashMap::new(),
+            deferrals: HashMap::from([(withdrawal.leaf_hash.clone(), "fee source unavailable".into())]),
+        };
+        for round in 0..10 {
+            record_claim_result(&[withdrawal.clone()], &Ok(report.clone()), &mut pending, &mut retry, &mut retired, round);
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(retry.is_empty());
+        assert!(retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn l1_fees_deposit_sync_skips_satisfied_targets_and_fails_closed_on_read_error() {
+        for (proved, expected_calls) in [(166, 1), (167, 0), (168, 0)] {
+            let mut calls = 0;
+            sync_deposit_if_behind(167, std::future::ready(Ok(proved)), || {
+                calls += 1;
+                std::future::ready(Ok(()))
+            }).await.unwrap();
+            assert_eq!(calls, expected_calls);
+        }
+        let result = sync_deposit_if_behind(167,
+            std::future::ready(Err(anyhow::anyhow!("injected RPC failure"))), || {
+                panic!("append must not run without a successful progress read");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            }).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_survives_refusal_and_resume_syncs_before_finalize() {
+        let path = temp_state_path("fee-range-resume");
+        let withdrawal = withdrawal_for_chain("landed-bsc", 1);
+        let range = PendingFinalizationRange { from_checkpoint: 198846, to_checkpoint: 198905 };
+        let mut state = MultichainDaemonState {
+            identity_namespace: "fee-resume".into(),
+            last_finalized_checkpoint: 198845,
+            ..Default::default()
+        };
+        let mut attempted = Vec::new();
+        let ready = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[withdrawal.clone()],
+            &[(0, 198845), (1, 198845), (2, 198845)],
+            |chain, endpoint| {
+                // Fault injection runs only after the actual production save.
+                let saved = load_multichain_state(&path, "fee-resume").unwrap();
+                assert_eq!(saved.pending_finalization_range, Some(range));
+                assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+                attempted.push((chain, endpoint));
+                std::future::ready(if chain == 1 {
+                    Err(anyhow::Error::from(super::super::l1_fees::FeeSourceError("injected fee refusal")))
+                } else { Ok(()) })
+            },
+        ).await.unwrap();
+        assert!(!ready, "fee refusal must block proof/finalize dispatch");
+        assert_eq!(attempted, vec![(0, range.to_checkpoint), (1, range.to_checkpoint)]);
+
+        let mut restarted = load_multichain_state(&path, "fee-resume").unwrap();
+        assert_eq!(restarted.last_finalized_checkpoint, 198845);
+        assert!(restarted.finalized_chains.is_empty());
+        assert!(restarted.claim_retry.is_empty());
+        assert!(restarted.retired_claim_withdrawals.is_empty());
+        attempted.clear();
+        let ready = persist_and_sync_multichain_range(
+            &path, &mut restarted, range, &[],
+            &[(0, range.to_checkpoint), (1, 198845), (2, 198845)],
+            |chain, endpoint| {
+                attempted.push((chain, endpoint));
+                std::future::ready(Ok(()))
+            },
+        ).await.unwrap();
+        assert!(ready);
+        // A finalized chain is skipped, but every unfinished chain is synced
+        // again at the original endpoint before finalization can proceed.
+        assert_eq!(attempted, vec![(1, range.to_checkpoint), (2, range.to_checkpoint)]);
+        let saved = load_multichain_state(&path, "fee-resume").unwrap();
+        assert_eq!(saved.pending_finalization_range, Some(range));
+        assert_eq!(saved.pending_claim_withdrawals.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_save_failure_blocks_deposit_dispatch() {
+        let path = temp_state_path("fee-range-save-failure");
+        fs::create_dir(&path).unwrap();
+        let mut state = MultichainDaemonState::default();
+        let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 80 };
+        let result = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[], &[(1, 9)],
+            |_, _| {
+                panic!("deposit dispatch must not run if the ledger cannot be installed");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            },
+        ).await;
+        assert!(result.is_err());
+        fs::remove_dir(&path).unwrap();
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if tmp.exists() { fs::remove_file(tmp).unwrap(); }
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_retains_claims_on_non_fee_deposit_error() {
+        let path = temp_state_path("fee-range-rpc-error");
+        let mut state = MultichainDaemonState { identity_namespace: "rpc-error".into(), ..Default::default() };
+        let range = PendingFinalizationRange { from_checkpoint: 1, to_checkpoint: 5 };
+        let withdrawal = withdrawal_for_chain("landed-rpc-error", 1);
+        let result = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[withdrawal.clone()], &[(1, 0)],
+            |_, _| std::future::ready(Err(anyhow::anyhow!("injected deposit RPC error"))),
+        ).await;
+        assert!(result.is_err());
+        let saved = load_multichain_state(&path, "rpc-error").unwrap();
+        assert_eq!(saved.pending_finalization_range, Some(range));
+        assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+        fs::remove_file(path).unwrap();
     }
 
     fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {

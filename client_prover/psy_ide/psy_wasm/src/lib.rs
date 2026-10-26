@@ -211,7 +211,7 @@ struct HashValueInput {
 #[derive(Deserialize)]
 struct DeployerInput {
     contract_id: u64,
-    deployer: [u64; 4],
+    deployer: u64,
 }
 
 #[derive(Deserialize)]
@@ -529,6 +529,7 @@ fn default_execution_context() -> ExecutionContext {
         checkpoint_id: 0,
         nonce: 0,
         user_public_key_hash: [0; 4],
+        session_proof_tree_root: [0; 4],
     }
 }
 
@@ -541,6 +542,7 @@ impl From<ExecutionContextInput> for ExecutionContext {
             checkpoint_id: value.checkpoint_id.unwrap_or(0),
             nonce: value.nonce.unwrap_or(0),
             user_public_key_hash: value.user_public_key_hash.unwrap_or([0; 4]),
+            session_proof_tree_root: [0; 4],
         }
     }
 }
@@ -846,6 +848,7 @@ pub fn call_contract(caller_id: u64, contract_id: u64, method_name: &str, args_j
             checkpoint_id: chain.checkpoint_id,
             nonce: chain.transaction_log.len() as u64,
             user_public_key_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
         };
 
         // Clone the state to create the executor

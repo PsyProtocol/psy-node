@@ -233,9 +233,17 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
     { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
 );
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F> {}
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F, Hash> {}
 
-pser::impl_psy_ser_basic_tests_fallback!(PPMJobsCompletedStats, { parth_core::PF }, test_ser_ppm_jobs_completed_stats);
+// PPMJobsCompletedStats intentionally preserves its legacy fallback field order,
+// which differs from Speedy's struct-field order. Test each canonical path's
+// round trip without asserting byte-for-byte equality between those formats.
+pser::impl_psy_ser_basic_tests!(PPMJobsCompletedStats, { parth_core::PF }, test_ser_ppm_jobs_completed_stats);
+pser::impl_psy_ser_basic_tests_fallback!(
+    PQEDCheckpointLeafStats,
+    { parth_core::PF, parth_core::PHash },
+    pqed_checkpoint_leaf_stats_ser_tests
+);
 
 impl<F: QFelt, Hash: QHashBase> PQEDCheckpointLeafStats<F, Hash> {
     pub fn new_empty() -> Self {
@@ -357,6 +365,58 @@ pser::impl_bytemuck_ffs_tests!(
     160
 );
 
+// fallback for big endian platforms, not zero copy
+#[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
+impl<Hash: Q256BitHash> FastFixedSerializable<160> for PQEDCheckpointGlobalStateRoots<Hash> {
+    fn ffs_from_owned_bytes(data: [u8; 160]) -> Self {
+        PQEDCheckpointGlobalStateRoots {
+            contract_tree_root: Hash::from_ref_32bytes(&data[0..32].try_into().unwrap()),
+            deposit_tree_root: Hash::from_ref_32bytes(&data[32..64].try_into().unwrap()),
+            user_tree_root: Hash::from_ref_32bytes(&data[64..96].try_into().unwrap()),
+            withdrawal_tree_root: Hash::from_ref_32bytes(&data[96..128].try_into().unwrap()),
+            user_registration_tree_root: Hash::from_ref_32bytes(&data[128..160].try_into().unwrap()),
+        }
+    }
+
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        if data.len() != 160 {
+            panic!("Invalid number of bytes for PQEDCheckpointGlobalStateRoots");
+        }
+        let mut arr = [0u8; 160];
+        arr.copy_from_slice(data);
+        Self::ffs_from_owned_bytes(arr)
+    }
+
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 160 {
+            anyhow::bail!("Invalid number of bytes for PQEDCheckpointGlobalStateRoots");
+        }
+        let mut arr = [0u8; 160];
+        arr.copy_from_slice(data);
+        Ok(Self::ffs_from_owned_bytes(arr))
+    }
+
+    fn ffs_to_bytes(&self) -> [u8; 160] {
+        let mut bytes = [0u8; 160];
+        bytes[0..32].copy_from_slice(&self.contract_tree_root.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.deposit_tree_root.into_owned_32bytes());
+        bytes[64..96].copy_from_slice(&self.user_tree_root.into_owned_32bytes());
+        bytes[96..128].copy_from_slice(&self.withdrawal_tree_root.into_owned_32bytes());
+        bytes[128..160].copy_from_slice(&self.user_registration_tree_root.into_owned_32bytes());
+        bytes
+    }
+
+    fn ffs_into_bytes(self) -> [u8; 160] {
+        let mut bytes = [0u8; 160];
+        bytes[0..32].copy_from_slice(&self.contract_tree_root.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.deposit_tree_root.into_owned_32bytes());
+        bytes[64..96].copy_from_slice(&self.user_tree_root.into_owned_32bytes());
+        bytes[96..128].copy_from_slice(&self.withdrawal_tree_root.into_owned_32bytes());
+        bytes[128..160].copy_from_slice(&self.user_registration_tree_root.into_owned_32bytes());
+        bytes
+    }
+}
+
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointGlobalStateRoots<Hash> {
     const IS_FIXED_SIZE: bool = true;
     const FIXED_SIZE: usize = 32 * 5;
@@ -374,73 +434,6 @@ fn _ensure_compile_time_size_match() {
         PQEDCheckpointGlobalStateRoots::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
     let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS] =
         PQEDCheckpointGlobalStateRoots::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
-}
-
-// fallback for big endian platforms, not zero copy
-#[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
-impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDContractLeaf<F, Hash> {
-    fn ffs_from_owned_bytes(data: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF]) -> Self {
-        let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
-        let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
-        PQEDContractLeaf {
-            deployer,
-            function_tree_root,
-            code_root,
-            state_tree_height,
-        }
-    }
-
-    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
-        if data.len() != PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF {
-            panic!("Invalid number of bytes for PQEDContractLeaf");
-        }
-        let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
-        let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
-        PQEDContractLeaf {
-            deployer,
-            function_tree_root,
-            code_root,
-            state_tree_height,
-        }
-    }
-
-    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() != PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF {
-            anyhow::bail!("Invalid number of bytes for PQEDContractLeaf");
-        }
-        let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
-        let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
-        Ok(PQEDContractLeaf {
-            deployer,
-            function_tree_root,
-            code_root,
-            state_tree_height,
-        })
-    }
-
-    fn ffs_to_bytes(&self) -> [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF] {
-        let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
-        bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
-        bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
-        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
-        bytes
-    }
-
-    fn ffs_into_bytes(self) -> [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF] {
-        let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
-        bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
-        bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
-        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
-        bytes
-    }
 }
 
 pser::impl_psy_ser_basic_tests!(
@@ -842,7 +835,7 @@ impl PsyCanonicalSerializeMetadata for QEDL2BlockState {
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(QEDL2BlockState);
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl AutoImplementFallbackPsySerializeCanonical for QEDL2BlockState {}
+impl psy_serialize::AutoImplementFallbackPsySerializeCanonical for QEDL2BlockState {}
 
 impl QEDL2BlockState {
     pub fn get_genesis_value() -> Self {
@@ -965,3 +958,227 @@ impl_qpd_serialize_params!(
     PCheckpointSyncInfo,
     { F: QFelt, Hash: QHashBase } => { F, Hash }
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::{
+        crypto::hash::traits::QFieldHashable,
+        felt::{FromPrimitiveValuesFelt, QFeltSized, ToQFelts},
+        generic_traits::psy_debug_printable::PsyDebugPrintable,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        utils::QPGenRandom,
+        PF,
+    };
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn empty_checkpoint_stats_round_trip_through_felts() {
+        let stats = PQEDCheckpointLeafStats::<PF, Hash>::get_empty_stats();
+        assert_eq!(stats, PQEDCheckpointLeafStats::new_empty());
+        assert_eq!(stats, PQEDCheckpointLeafStats::get_genesis_value());
+        let felts: Vec<PF> = stats.to_qfelts();
+        assert_eq!(felts.len(), PQEDCheckpointLeafStats::<PF, Hash>::q_felt_size());
+        assert_eq!(PQEDCheckpointLeafStats::from_qfelts(&felts), stats);
+        assert_ne!(stats.qfhash::<PoseidonHasher>(), Hash::default());
+        assert!(stats.psy_debug_print().contains("guta_fees_collected"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for QEDCheckpointLeafStats")]
+    fn checkpoint_stats_reject_wrong_felt_count() {
+        let _ = <PQEDCheckpointLeafStats<PF, Hash> as ToQFelts<PF>>::from_qfelts(&[]);
+    }
+
+    #[test]
+    fn global_roots_round_trip_and_hash() {
+        let roots = PQEDCheckpointGlobalStateRoots::<Hash>::qp_rand_gen();
+        let felts: Vec<PF> = roots.to_qfelts();
+        assert_eq!(felts.len(), 20);
+        assert_eq!(PQEDCheckpointGlobalStateRoots::from_qfelts(&felts), roots);
+        assert_ne!(roots.qfhash::<PoseidonHasher>(), Hash::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for QEDCheckpointGlobalStateRoots")]
+    fn global_roots_reject_wrong_felt_count() {
+        let _ = PQEDCheckpointGlobalStateRoots::<Hash>::from_qfelts(&[PF::from_u64_value(1)]);
+    }
+
+    #[test]
+    fn checkpoint_leaf_and_compact_forms_are_consistent() {
+        let leaf = PQEDCheckpointLeaf::<PF, Hash>::qp_rand_gen();
+        let felts: Vec<PF> = leaf.to_qfelts();
+        assert_eq!(felts.len(), PQEDCheckpointLeaf::<PF, Hash>::q_felt_size());
+        assert_eq!(PQEDCheckpointLeaf::from_qfelts(&felts), leaf);
+
+        let compact = leaf.to_compact::<PoseidonHasher>();
+        assert_eq!(compact.global_chain_root, leaf.global_chain_root);
+        assert_eq!(compact.stats_hash, leaf.stats.qfhash::<PoseidonHasher>());
+        let compact_felts: Vec<PF> = compact.to_qfelts();
+        assert_eq!(PQEDCheckpointLeafCompact::from_qfelts(&compact_felts), compact);
+        assert_eq!(compact.qfhash::<PoseidonHasher>(), leaf.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn compact_leaf_with_roots_round_trips_and_hashes_leaf_only() {
+        let value = PQEDCheckpointLeafCompactWithStateRoots::<Hash>::qp_rand_gen();
+        let felts: Vec<PF> = value.to_qfelts();
+        assert_eq!(
+            felts.len(),
+            PQEDCheckpointLeafCompactWithStateRoots::<Hash>::q_felt_size()
+        );
+        assert_eq!(
+            PQEDCheckpointLeafCompactWithStateRoots::from_qfelts(&felts),
+            value
+        );
+        assert_eq!(
+            value.qfhash::<PoseidonHasher>(),
+            value.checkpoint_leaf.qfhash::<PoseidonHasher>()
+        );
+    }
+
+    #[test]
+    fn l2_block_genesis_debug_and_canonical_round_trip() {
+        let state = QEDL2BlockState::get_genesis_value();
+        assert_eq!(state.checkpoint_id, 0);
+        assert_eq!(state.next_contract_id, 0);
+        assert!(state.psy_debug_print().contains("checkpoint_id: 0"));
+
+        let bytes = state.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), QEDL2BlockState::FIXED_SIZE);
+        assert_eq!(QEDL2BlockState::psy_ser_from_slice(&bytes).unwrap(), state);
+    }
+
+    #[test]
+    fn l2_block_state_fallback_round_trips_both_random_and_genesis() {
+        let state = QEDL2BlockState::qp_rand_gen();
+        let bytes = state.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), state.fallback_pio_serialized_size());
+        assert_eq!(QEDL2BlockState::fallback_psy_ser_from_slice(&bytes).unwrap(), state);
+
+        let genesis = QEDL2BlockState::get_genesis_value();
+        let genesis_bytes = genesis.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(genesis_bytes.len(), QEDL2BlockState::FIXED_SIZE);
+        assert_eq!(QEDL2BlockState::fallback_psy_ser_from_slice(&genesis_bytes).unwrap(), genesis);
+    }
+
+    #[test]
+    fn final_reward_tag_updates_all_reward_roots_equally() {
+        let mut leaf = PQEDCheckpointLeaf::<PF, Hash>::qp_rand_gen();
+        let tag = Hash::rand();
+        leaf.modify_with_final_reward_tag::<PoseidonHasher>(&tag);
+        assert_eq!(
+            leaf.stats.pm_rewards_commitment.register_users_root,
+            leaf.stats.pm_rewards_commitment.gutas_root
+        );
+        assert_eq!(
+            leaf.stats.pm_rewards_commitment.register_users_root,
+            leaf.stats.pm_rewards_commitment.deploy_contracts_root
+        );
+    }
+
+    #[test]
+    fn populated_stats_debug_print_lists_every_section() {
+        let stats = PQEDCheckpointLeafStats::<PF, Hash>::qp_rand_gen();
+        let printed = stats.psy_debug_print();
+        assert!(printed.contains("guta_fees_collected"));
+        assert!(printed.contains("da_fees_collected"));
+        assert!(printed.contains("user_ops_processed"));
+        assert!(printed.contains("total_transactions"));
+        assert!(printed.contains("slots_modified"));
+        assert!(printed.contains("PPMJobsCompletedStats"));
+        assert!(printed.contains("deploy_contracts_completed"));
+        assert!(printed.contains("register_users_completed"));
+        assert!(printed.contains("gutas_completed"));
+        assert!(printed.contains("block_time"));
+        assert!(printed.contains("random_seed"));
+        assert!(printed.contains("PPMRewardCommitment"));
+        assert!(printed.contains("register_users_root"));
+        assert!(printed.contains("gutas_root"));
+        assert!(printed.contains("deploy_contracts_root"));
+        assert!(printed.contains("da_challenges_claimed: ["));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for QEDCheckpointLeaf")]
+    fn checkpoint_leaf_rejects_wrong_felt_count() {
+        let _ = <PQEDCheckpointLeaf<PF, Hash> as ToQFelts<PF>>::from_qfelts(&[PF::from_u64_value(1)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for QEDCheckpointLeafCompact")]
+    fn compact_leaf_rejects_wrong_felt_count() {
+        let _ = <PQEDCheckpointLeafCompact<Hash> as ToQFelts<PF>>::from_qfelts(&[PF::from_u64_value(1)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for QEDCheckpointLeafCompactWithStateRoots")]
+    fn compact_with_roots_rejects_wrong_felt_count() {
+        let _ = <PQEDCheckpointLeafCompactWithStateRoots<Hash> as ToQFelts<PF>>::from_qfelts(&[]);
+    }
+
+    #[test]
+    fn l2_block_state_qpd_round_trip_random_and_genesis() {
+        use parth_core::data::serializable::QPDSerializable;
+
+        let state = QEDL2BlockState::qp_rand_gen();
+        let bytes = state.to_bytes().unwrap();
+        assert_eq!(QEDL2BlockState::from_bytes(&bytes).unwrap(), state);
+
+        let genesis = QEDL2BlockState::get_genesis_value();
+        let genesis_bytes = genesis.to_bytes().unwrap();
+        assert_eq!(genesis_bytes.len(), QEDL2BlockState::FIXED_SIZE);
+        assert_eq!(QEDL2BlockState::from_bytes(&genesis_bytes).unwrap(), genesis);
+    }
+
+    #[test]
+    fn checkpoint_sync_info_qpd_and_serde_round_trip() {
+        use parth_core::data::serializable::QPDSerializable;
+
+        let info = PCheckpointSyncInfo::<PF, Hash> {
+            latest_checkpoint_id: 7,
+            description: Some("synced from peer".to_string()),
+            source_coordinator_edge_id: Some("edge-1".to_string()),
+            sync_timestamp: 1_234_567_890,
+            compact: PQEDCheckpointSyncInfoCompact::qp_rand_gen(),
+            realm_root: Hash::qp_rand_gen(),
+        };
+        let bytes = info.to_bytes().unwrap();
+        assert_eq!(PCheckpointSyncInfo::<PF, Hash>::from_bytes(&bytes).unwrap(), info);
+
+        let none_options = PCheckpointSyncInfo::<PF, Hash> {
+            latest_checkpoint_id: 0,
+            description: None,
+            source_coordinator_edge_id: None,
+            sync_timestamp: 0,
+            compact: PQEDCheckpointSyncInfoCompact::qp_rand_gen(),
+            realm_root: Hash::qp_rand_gen(),
+        };
+        let bytes = none_options.to_bytes().unwrap();
+        assert_eq!(PCheckpointSyncInfo::<PF, Hash>::from_bytes(&bytes).unwrap(), none_options);
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(serde_json::from_str::<PCheckpointSyncInfo<PF, Hash>>(&json).unwrap(), info);
+    }
+
+    #[test]
+    fn stats_fallback_read_rejects_truncated_bytes() {
+        use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+        let stats = PQEDCheckpointLeafStats::<PF, Hash>::qp_rand_gen();
+        let bytes = stats.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), <PQEDCheckpointLeafStats<PF, Hash> as PsyCanonicalSerializeMetadata>::FIXED_SIZE);
+        assert!(PQEDCheckpointLeafStats::<PF, Hash>::psy_ser_from_slice(&bytes).is_ok());
+        assert!(PQEDCheckpointLeafStats::<PF, Hash>::psy_ser_from_slice(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn compile_time_ffs_size_helpers_execute() {
+        super::_ensure_compile_time_size_match();
+        super::_ensure_compile_time_size_match_pqed_checkpoint_leaf_compact();
+    }
+}

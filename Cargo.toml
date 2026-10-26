@@ -28,6 +28,7 @@ members = [
     "psy_plonky2_testbed",
     "psy_worker_core",
     "psy_api_core",
+    "psy_rpc_pool",
     "psy_dummy_prover",
     "psy_cli/psy_worker_cli",
     "psy_cli/psy_cli_common",
@@ -159,7 +160,7 @@ ripemd = "0.1.3"
 blake2 = { version = "0.10", default-features = false }
 blake3 = { version = "1.5", default-features = false }
 tiny-keccak = { version = "2.0", features = ["sha3", "keccak"] }
-gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "aebd3683cd6a2bcf83113113c142344e94d05367" }
 alloy-signer = { version = "=1.6.3", default-features = false }
 alloy-signer-local = { version = "=1.6.3", features = ["mnemonic", "keystore"] }
 alloy-primitives = { version = "1.3.1", features = [
@@ -265,7 +266,7 @@ ts-rs = "10.1.0"
 plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
 plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
 plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
-gnark-plonky2-wrapper = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+gnark-plonky2-wrapper = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "aebd3683cd6a2bcf83113113c142344e94d05367" }
 
 # ---- WASM ----
 wasm-bindgen = "0.2"
@@ -363,3 +364,15 @@ psy_ups_circuit = { path = "./client_prover/psy_circuit/psy_ups_circuit", defaul
 psy_dpn_circuit = { path = "./client_prover/psy_circuit/psy_dpn_circuit", default-features = false }
 
 [profile.release]
+
+# The proving hot paths (batched Poseidon Merkle hashing, packed gate
+# evaluation, fused FFT layers) live on a plonky2-hwa branch. Third-party
+# crates pin the older revision themselves, so the revision is replaced for
+# the whole dependency graph instead of being bumped above. The URL differs
+# from the patched one only by a doubled slash because Cargo refuses to patch a
+# source with itself.
+[patch."https://github.com/PsyProtocol/plonky2-hwa"]
+plonky2 = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_field = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_util = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }

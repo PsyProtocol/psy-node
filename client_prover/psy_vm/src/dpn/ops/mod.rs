@@ -1,6 +1,7 @@
 pub mod context_trait;
 pub mod exec_context;
 pub mod op_types;
+pub mod semantics;
 pub mod state_cmd;
 pub mod state_phase;
 pub mod sym_felt;

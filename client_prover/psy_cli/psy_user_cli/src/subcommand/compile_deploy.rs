@@ -12,10 +12,14 @@ use psy_provider::{
     request::QDeployContractRPCRequest,
 };
 
-use super::{args::CompileAndDeployArgs, contract_abi_upload};
+use super::{args::CompileAndDeployArgs, contract_abi_upload, resolve_deployer_user_id};
 
 pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     tracing::info!("compile-and-deploy from: {}", args.source);
+
+    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
+    let rpc_config = psy_config.get_current_network()?.clone();
+    let rpc_provider = RpcProvider::new_with_config(&rpc_config)?;
 
     let source_path = Path::new(&args.source);
     if !source_path.exists() {
@@ -67,7 +71,8 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
         .map(|f| QHashOut::<F>::from_str(f).map_err(|e| anyhow::anyhow!("parse fingerprint error: {}", e)))
         .transpose()?;
     let fingerprint = fingerprint.unwrap_or_else(|| get_zk_fingerprint());
-    let deployer = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let public_key_hash = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let deployer = resolve_deployer_user_id(&rpc_provider, public_key_hash, args.user_id).await?;
 
     // Use the compiler-computed state tree height (not MAX)
     let state_tree_height = output.state_tree_height() as u8;
@@ -96,10 +101,6 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     }
 
     tracing::info!("deploying contract to coordinator...");
-
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
-    let rpc_config = psy_config.get_current_network()?.clone();
-    let rpc_provider = RpcProvider::new_with_config(&rpc_config)?;
 
     let abi_json = output.abi_to_json()?;
     let content_hash = contract_abi_upload::upload_contract_abi(&rpc_config, &deploy_cmd, &abi_json).await?;

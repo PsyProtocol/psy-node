@@ -208,3 +208,30 @@ pub fn u32x8_to_bytes32_hex(felts: &[F]) -> String {
     }
     format!("0x{}", hex::encode(out))
 }
+
+/// Parses the internal u32x8 word encoding (eight big-endian u32 words per
+/// 32-byte hash, little-endian limb pairs within each u64 felt).
+pub fn parse_internal_u32x8_qhashout(hex_str: &str) -> anyhow::Result<ParthQHashOut<F>> {
+    let hex_str = hex_str.trim_start_matches("0x");
+    anyhow::ensure!(hex_str.len() == 64, "expected 64 hex chars, got {}", hex_str.len());
+    let bytes = hex::decode(hex_str)?;
+    let mut words = [0u32; 8];
+    for i in 0..8 {
+        words[i] = u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into()?);
+    }
+    let elems = [
+        ((words[1] as u64) << 32) | words[0] as u64,
+        ((words[3] as u64) << 32) | words[2] as u64,
+        ((words[5] as u64) << 32) | words[4] as u64,
+        ((words[7] as u64) << 32) | words[6] as u64,
+    ];
+    Ok(ParthQHashOut(HashOut {
+        elements: elems.map(F::from_canonical_u64),
+    }))
+}
+
+pub fn qhashout_from_felts(elems: &[F]) -> parth_core::pgoldilocks::QHashOut<F> {
+    parth_core::pgoldilocks::QHashOut(HashOut {
+        elements: [elems[0], elems[1], elems[2], elems[3]],
+    })
+}

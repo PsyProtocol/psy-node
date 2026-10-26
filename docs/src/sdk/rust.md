@@ -140,7 +140,7 @@ User account state in the merkle tree:
 
 ### PsyContractLeaf  
 Contract state in the merkle tree:
-- `deployer`: Contract deployer's public key hash
+- `deployer`: Contract deployer's user id
 - `function_tree_root`: Root of contract function tree
 - `state_tree_height`: Height of contract state tree
 

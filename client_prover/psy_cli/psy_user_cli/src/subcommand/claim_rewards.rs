@@ -839,7 +839,7 @@ pub async fn build_claim_calls_from_proofs(
 
     all_contract_calls.push(ContractCallArgs {
         contract_id: TOKEN_CONTRACT_ID as u64,
-        method_name: "simple_claim_pow_rewards".to_string(),
+        method_name: "claim_pow_rewards".to_string(),
         inputs: vec![last_checkpoint],
     });
 

@@ -1,6 +1,6 @@
 [
     {
-        "method_name": "simple_mint",
+        "method_name": "mint",
         "inputs": [
             10000000000
         ],

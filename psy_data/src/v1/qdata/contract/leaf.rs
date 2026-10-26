@@ -236,3 +236,29 @@ pser::impl_psy_ser_basic_tests!(
     { parth_core::PF, parth_core::PHash },
     qed_contract_leaf_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn qfelt_round_trip_default_and_hash_are_consistent() {
+        let leaf = PQEDContractLeaf::<PF, Hash>::qp_rand_gen();
+        let felts = leaf.to_qfelts();
+        assert_eq!(felts.len(), 13);
+        assert_eq!(PQEDContractLeaf::from_qfelts(&felts), leaf);
+        assert_eq!(leaf.qfhash::<PoseidonHasher>(), PoseidonHasher::q_hash_many(&felts));
+        assert_eq!(<PQEDContractLeaf<PF, Hash> as ToQFelts<PF>>::to_qfelts(&PQEDContractLeaf::default()).len(), 13);
+        assert_eq!(leaf.self_qsize(), PQEDContractLeaf::<PF, Hash>::q_felt_size());
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements")]
+    fn qfelt_decode_rejects_wrong_length() {
+        let felts: Vec<PF> = vec![];
+        let _ = <PQEDContractLeaf<PF, Hash> as ToQFelts<PF>>::from_qfelts(&felts);
+    }
+}

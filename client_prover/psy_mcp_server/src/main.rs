@@ -300,7 +300,7 @@ struct MintAgentAccountArgs {
     /// Psy config network. Omit to use the server's --network default.
     #[serde(default)]
     network: Option<String>,
-    /// Capabilities as "contract_id:method_name", e.g. ["0:simple_transfer", "0:simple_claim"].
+    /// Capabilities as "contract_id:method_name", e.g. ["0:transfer", "0:claim"].
     /// This IS the agent's authority — anything omitted is unprovable.
     capabilities: Vec<String>,
     /// Exact number of contract calls per transaction (equality-enforced by the
@@ -1226,10 +1226,10 @@ struct ClaimBatchArgs {
     #[serde(default)]
     network: Option<String>,
     session: String,
-    /// Public `simple_claim` items — one per sender, any mix of PSY/USDT.
+    /// Public `claim` items — one per sender, any mix of PSY/USDT.
     #[serde(default)]
     public_claims: Vec<PublicClaimSpec>,
-    /// Public `simple_transfer` legs fused into the SAME proof — any mix of
+    /// Public `transfer` legs fused into the SAME proof — any mix of
     /// PSY/USDT, different recipients, all-or-nothing with the rest.
     #[serde(default)]
     transfers: Vec<TransferLegSpec>,

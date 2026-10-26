@@ -7,11 +7,11 @@ use parth_core::{
     pgoldilocks::QHashOut,
     protocol::core_types::QFHashBase,
 };
-use plonky2::plonk::{
+use plonky2::{field::types::PrimeField64, plonk::{
     circuit_data::CircuitData,
     config::{AlgebraicHasher, GenericConfig},
     proof::ProofWithPublicInputs,
-};
+}};
 use web_time::Instant;
 use psy_core::{
     constants::protocol::{
@@ -94,11 +94,18 @@ where
         self.fingerprint
     }
 
-    pub fn verify_serialized_proof(&self, proof_bytes: &[u8]) -> anyhow::Result<()> {
+    pub fn verify_serialized_proof(&self, proof_bytes: &[u8]) -> anyhow::Result<[u64; 19]> {
         let proof = deserialize_plonky2_proof::<C, D>(proof_bytes)?;
+        anyhow::ensure!(proof.public_inputs.len() == 19, "canonical layout proof has an unexpected public input count");
+        let public_inputs: [u64; 19] = proof.public_inputs.iter()
+            .map(|value| value.to_canonical_u64())
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("canonical layout proof public input count mismatch"))?;
         self.circuit_data
             .verify(proof)
-            .map_err(|error| anyhow::anyhow!("invalid canonical layout proof: {error}"))
+            .map_err(|error| anyhow::anyhow!("invalid canonical layout proof: {error}"))?;
+        Ok(public_inputs)
     }
 }
 

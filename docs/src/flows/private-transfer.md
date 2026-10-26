@@ -196,7 +196,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 |-------|-------|------------|
 | `receiver does not match claiming user` | Wrong private key or wrong `r0`/`r1` | Ensure the receiver key and randoms match the note owner |
 | `nullifier already claimed` | Note was already claimed by someone | Check claim status before attempting |
-| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund receiver with `simple_mint` first |
+| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund receiver with `mint` first |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
 

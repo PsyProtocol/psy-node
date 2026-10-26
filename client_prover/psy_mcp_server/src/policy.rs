@@ -200,7 +200,7 @@ fn denial_reason(policy: &Policy, recipients: &[&str], amount: u64, method: &str
 ///
 /// Deny-by-default is right, but a default that omits the wallet's own
 /// capabilities makes those tools permanently unusable rather than merely
-/// restricted. Claims (`simple_claim`, `private_claim`) only fold in funds
+/// restricted. Claims (`claim`, `private_claim`) only fold in funds
 /// already addressed to this wallet; the spend caps still apply to the rest.
 ///
 /// Shared with the creation-widening check so the two cannot drift: if this
@@ -208,14 +208,14 @@ fn denial_reason(policy: &Policy, recipients: &[&str], amount: u64, method: &str
 /// what existing policies actually grant.
 pub fn default_methods() -> Vec<String> {
     vec![
-        "simple_transfer".into(),
+        "transfer".into(),
         "private_transfer".into(),
-        "simple_claim".into(),
+        "claim".into(),
         "private_claim".into(),
         "withdraw".into(),
         "deposit".into(),
         "claim_deposit".into(),
-        // Distinct from simple_transfer so an owner can allow direct transfers
+        // Distinct from transfer so an owner can allow direct transfers
         // while forbidding agent-driven paid fetches (or the reverse), and so
         // the audit trail tells them apart.
         "x402_fetch".into(),
@@ -2016,15 +2016,15 @@ mod tests {
     #[test]
     fn no_allowlist_permits_any_recipient() {
         let (mut e, _, t) = engine_with(open_limits(), None);
-        assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_ok());
+        assert!(e.authorize(&t, "1234", 1, "transfer").is_ok());
         assert!(e.authorize(&t, "0xdeadbeef", 1, "private_transfer").is_ok());
     }
 
     #[test]
     fn allowlist_permits_listed_and_denies_the_rest() {
         let (mut e, _, t) = engine_with(open_limits(), Some(vec!["1234".into(), "5678".into()]));
-        assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_ok());
-        let err = e.authorize(&t, "9999", 1, "simple_transfer").unwrap_err().to_string();
+        assert!(e.authorize(&t, "1234", 1, "transfer").is_ok());
+        let err = e.authorize(&t, "9999", 1, "transfer").unwrap_err().to_string();
         assert!(err.contains("9999"), "the denial must name the attempted recipient: {err}");
         assert!(err.contains('2'), "the denial states the allowlist SIZE: {err}");
         assert!(!err.contains("5678"), "the denial must not leak the allowlist itself: {err}");
@@ -2034,15 +2034,15 @@ mod tests {
     fn an_empty_allowlist_blocks_every_outbound_payment() {
         // Some(vec![]) is a real instruction ("pay nobody"), distinct from None.
         let (mut e, _, t) = engine_with(open_limits(), Some(vec![]));
-        assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_err());
+        assert!(e.authorize(&t, "1234", 1, "transfer").is_err());
         // ...but funds coming IN are unaffected.
-        assert!(e.authorize(&t, SELF_RECIPIENT, 0, "simple_claim").is_ok());
+        assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim").is_ok());
     }
 
     #[test]
     fn claims_are_never_blocked_by_the_recipient_allowlist() {
         let (mut e, _, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
-        assert!(e.authorize(&t, SELF_RECIPIENT, 0, "simple_claim").is_ok());
+        assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim").is_ok());
         assert!(e.authorize(&t, SELF_RECIPIENT, 0, "private_claim").is_ok());
         assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim_deposit").is_ok());
     }
@@ -2057,14 +2057,14 @@ mod tests {
                 "https://api.example.com/paid/thing".into(),
             ]),
         );
-        assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_ok(), "Psy-id entry vs raw user id");
+        assert!(e.authorize(&t, "1234", 1, "transfer").is_ok(), "Psy-id entry vs raw user id");
         assert!(e.authorize(&t, "deadbeef", 1, "private_transfer").is_ok(), "0x-prefixed vs bare hex");
         assert!(
-            e.authorize_aliases(&t, &["999", "api.example.com"], 1, "simple_transfer").is_ok(),
+            e.authorize_aliases(&t, &["999", "api.example.com"], 1, "transfer").is_ok(),
             "an x402 host alias satisfies a URL entry even though the payee id is unlisted"
         );
         assert!(
-            e.authorize_aliases(&t, &["999", "evil.example.com"], 1, "simple_transfer").is_err(),
+            e.authorize_aliases(&t, &["999", "evil.example.com"], 1, "transfer").is_err(),
             "a different host with an unlisted payee id is still denied"
         );
     }
@@ -2095,27 +2095,27 @@ mod tests {
         const PSY: u64 = 1_000_000_000;
         let limits = Limits { per_month: Some(150 * PSY), ..open_limits() };
         let (mut e, _, t) = engine_with(limits, None);
-        assert!(e.authorize(&t, "1", 100 * PSY, "simple_transfer").is_ok());
-        let err = e.authorize(&t, "1", 100 * PSY, "simple_transfer").unwrap_err().to_string();
+        assert!(e.authorize(&t, "1", 100 * PSY, "transfer").is_ok());
+        let err = e.authorize(&t, "1", 100 * PSY, "transfer").unwrap_err().to_string();
         assert!(err.contains("30-day cap"), "{err}");
         assert!(err.contains("100 PSY") && err.contains("150 PSY"), "states attempt and limit in PSY: {err}");
-        assert!(e.authorize(&t, "1", 50 * PSY, "simple_transfer").is_ok(), "exactly at the cap is allowed");
+        assert!(e.authorize(&t, "1", 50 * PSY, "transfer").is_ok(), "exactly at the cap is allowed");
     }
 
     #[test]
     fn no_monthly_cap_means_only_the_daily_one_applies() {
         let limits = Limits { per_day: 100, per_month: None, ..open_limits() };
         let (mut e, _, t) = engine_with(limits, None);
-        assert!(e.authorize(&t, "1", 100, "simple_transfer").is_ok());
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "daily cap still binds");
+        assert!(e.authorize(&t, "1", 100, "transfer").is_ok());
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "daily cap still binds");
     }
 
     #[test]
     fn monthly_window_rolls_over_when_the_bucket_changes() {
         let limits = Limits { per_month: Some(100), ..open_limits() };
         let (mut e, pid, t) = engine_with(limits, None);
-        e.authorize(&t, "1", 100, "simple_transfer").unwrap();
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "exhausted within the period");
+        e.authorize(&t, "1", 100, "transfer").unwrap();
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "exhausted within the period");
 
         // Pretend the wall clock crossed into the next 30-day bucket (and the
         // next day) — the same thing `rollover` sees at midnight/period end.
@@ -2124,7 +2124,7 @@ mod tests {
             p.last_month -= 1;
             p.last_day -= 1;
         }
-        assert!(e.authorize(&t, "1", 100, "simple_transfer").is_ok(), "a new period restores the budget");
+        assert!(e.authorize(&t, "1", 100, "transfer").is_ok(), "a new period restores the budget");
         let d = e.describe(&pid).unwrap();
         assert_eq!(d.spent_this_month_nano, 100, "the new period counts only its own spend");
         assert_eq!(d.spent_total_nano, 200, "the lifetime total never rolls over");
@@ -2156,7 +2156,7 @@ mod tests {
         assert!(d.summary.contains("1 PSY per day"), "{}", d.summary);
         assert!(d.summary.contains("20 PSY per 30 days"), "{}", d.summary);
         assert!(d.summary.contains("3 approved recipients"), "{}", d.summary);
-        assert!(d.summary.contains("simple_transfer"), "the method list is named: {}", d.summary);
+        assert!(d.summary.contains("transfer"), "the method list is named: {}", d.summary);
         assert!(d.summary.contains("Session expires in 60 minutes"), "{}", d.summary);
         assert!(d.summary.contains("pause_policy"), "{}", d.summary);
         assert_eq!(d.allowed_recipient_count, Some(3));
@@ -2184,7 +2184,7 @@ mod tests {
     fn describe_reflects_spend_as_it_happens() {
         let limits = Limits { per_day: 1_000, per_month: Some(2_000), total_budget: Some(3_000), ..open_limits() };
         let (mut e, pid, t) = engine_with(limits, None);
-        e.authorize(&t, "1", 400, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 400, "transfer").unwrap();
         let d = e.describe(&pid).unwrap();
         assert_eq!(d.spent_today_nano, 400);
         assert_eq!(d.remaining_day_nano, 600);
@@ -2206,14 +2206,14 @@ mod tests {
     #[test]
     fn spend_log_records_authorized_spends_newest_first() {
         let (mut e, pid, t) = engine_with(open_limits(), None);
-        e.authorize(&t, "1234", 10, "simple_transfer").unwrap();
+        e.authorize(&t, "1234", 10, "transfer").unwrap();
         e.authorize(&t, "0xdead", 20, "private_transfer").unwrap();
         let log = e.spend_log(10, None);
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].method, "private_transfer", "newest first");
         assert_eq!(log[0].amount_nano, 20);
         assert_eq!(log[0].recipient, "0xdead", "recorded as the tool passed it");
-        assert_eq!(log[1].method, "simple_transfer");
+        assert_eq!(log[1].method, "transfer");
         assert_eq!(log[0].policy_id, pid);
         assert_eq!(log[0].agent_id, "agent-1");
         assert!(log[0].timestamp > 0);
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn denied_spends_are_not_recorded_as_spends() {
         let (mut e, _, t) = engine_with(Limits { per_transaction: 5, ..open_limits() }, None);
-        assert!(e.authorize(&t, "1", 500, "simple_transfer").is_err());
+        assert!(e.authorize(&t, "1", 500, "transfer").is_err());
         assert!(e.authorize(&t, "1", 1, "nope_method").is_err());
         assert_eq!(e.spend_log(10, None).len(), 0, "the log is a record of what WAS allowed");
     }
@@ -2231,7 +2231,7 @@ mod tests {
     fn spend_log_is_capped_and_keeps_the_newest() {
         let (mut e, _, t) = engine_with(open_limits(), None);
         for i in 0..(SPEND_LOG_CAPACITY as u64 + 25) {
-            e.authorize(&t, "1", i, "simple_transfer").unwrap();
+            e.authorize(&t, "1", i, "transfer").unwrap();
         }
         assert_eq!(e.spend_log_len(), SPEND_LOG_CAPACITY, "the ring is bounded");
         let log = e.spend_log(1_000, None);
@@ -2247,9 +2247,9 @@ mod tests {
         let b = e.create_policy("agent-b", open_limits(), None, vec![]);
         let (ta, _) = e.issue_session(&a, 60, None).unwrap();
         let (tb, _) = e.issue_session(&b, 60, None).unwrap();
-        e.authorize(&ta, "1", 1, "simple_transfer").unwrap();
-        e.authorize(&tb, "1", 2, "simple_transfer").unwrap();
-        e.authorize(&ta, "1", 3, "simple_transfer").unwrap();
+        e.authorize(&ta, "1", 1, "transfer").unwrap();
+        e.authorize(&tb, "1", 2, "transfer").unwrap();
+        e.authorize(&ta, "1", 3, "transfer").unwrap();
         assert_eq!(e.spend_log(10, Some(&a)).len(), 2);
         assert_eq!(e.spend_log(10, Some(&b)).len(), 1);
         assert_eq!(e.spend_log(1, None).len(), 1, "limit applies to the newest end");
@@ -2262,17 +2262,17 @@ mod tests {
     fn existing_gates_still_deny() {
         let limits = Limits { per_transaction: 100, per_day: 150, ..open_limits() };
         let (mut e, pid, t) = engine_with(limits, None);
-        assert!(e.authorize("not-a-token", "1", 1, "simple_transfer").is_err(), "unknown session");
-        assert!(e.authorize(&t, "1", 101, "simple_transfer").is_err(), "per-transaction cap");
+        assert!(e.authorize("not-a-token", "1", 1, "transfer").is_err(), "unknown session");
+        assert!(e.authorize(&t, "1", 101, "transfer").is_err(), "per-transaction cap");
         assert!(e.authorize(&t, "1", 1, "sudo_drain").is_err(), "method allowlist");
-        e.authorize(&t, "1", 100, "simple_transfer").unwrap();
-        assert!(e.authorize(&t, "1", 100, "simple_transfer").is_err(), "daily cap");
+        e.authorize(&t, "1", 100, "transfer").unwrap();
+        assert!(e.authorize(&t, "1", 100, "transfer").is_err(), "daily cap");
         e.pause(&pid);
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "paused");
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "paused");
         e.resume(&pid);
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_ok());
+        assert!(e.authorize(&t, "1", 1, "transfer").is_ok());
         assert!(e.revoke(&t));
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "revoked");
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "revoked");
     }
 
     #[test]
@@ -2281,7 +2281,7 @@ mod tests {
         let pid = e.create_policy("agent-1", open_limits(), None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         e.sessions.get_mut(&t).unwrap().expires_at = now_secs() - 1;
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string().contains("expired"));
+        assert!(e.authorize(&t, "1", 1, "transfer").unwrap_err().to_string().contains("expired"));
         assert!(e.policy_id_for_session(&t).is_none(), "an expired token is removed, not left to leak");
         assert_eq!(e.describe(&pid).unwrap().active_sessions, 0);
     }
@@ -2292,14 +2292,14 @@ mod tests {
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", Limits { per_transaction: 100, per_day: 1000, per_month: None, total_budget: Some(150) }, None, vec![]);
         let (t, _) = e.issue_session(&pid, 10, None).unwrap();
-        e.authorize(&t, "9", 100, "simple_transfer").unwrap();
+        e.authorize(&t, "9", 100, "transfer").unwrap();
 
         // "Restart": a fresh engine over the same directory.
         let mut e2 = PolicyEngine::load_or_new(&dir);
         let (t2, _) = e2.issue_session(&pid, 10, None).unwrap();
-        let err = e2.authorize(&t2, "9", 100, "simple_transfer").unwrap_err().to_string();
+        let err = e2.authorize(&t2, "9", 100, "transfer").unwrap_err().to_string();
         assert!(err.contains("total budget"), "lifetime budget must survive the restart, got: {err}");
-        assert!(e2.authorize(&t2, "9", 50, "simple_transfer").is_ok());
+        assert!(e2.authorize(&t2, "9", 50, "transfer").is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2312,15 +2312,15 @@ mod tests {
             None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         // Spend a little, then the owner tightens the per-payment cap.
-        e.authorize(&t, "1908736", 3 * PSY, "simple_transfer").unwrap();
+        e.authorize(&t, "1908736", 3 * PSY, "transfer").unwrap();
         e.update_policy(&pid, Some(2 * PSY), Some(100 * PSY), None, None,
             Some(Some(vec!["Psy-01908736".into()])), vec![]).unwrap();
         // The SAME live session now binds to the new cap immediately...
-        let err = e.authorize(&t, "1908736", 5 * PSY, "simple_transfer").unwrap_err().to_string();
+        let err = e.authorize(&t, "1908736", 5 * PSY, "transfer").unwrap_err().to_string();
         assert!(err.contains("per-transaction cap"), "the tightened cap binds on the live session: {err}");
         // ...the recipient allow-list took effect (normalized)...
-        assert!(e.authorize(&t, "1908736", 1 * PSY, "simple_transfer").is_ok(), "approved recipient still works");
-        assert!(e.authorize(&t, "630784", 1 * PSY, "simple_transfer").is_err(), "an unlisted recipient is now refused");
+        assert!(e.authorize(&t, "1908736", 1 * PSY, "transfer").is_ok(), "approved recipient still works");
+        assert!(e.authorize(&t, "630784", 1 * PSY, "transfer").is_err(), "an unlisted recipient is now refused");
         // ...and the already-spent counter was preserved across the edit.
         assert_eq!(e.describe(&pid).unwrap().spent_today_nano, 4 * PSY, "3 + 1 authorized (the two denials cost nothing); the edit kept the counter");
         assert!(e.update_policy("no-such-policy", None, None, None, None, None, vec![]).is_err());
@@ -2341,12 +2341,12 @@ mod tests {
         // Budget-only edit: recipients omitted (None).
         e.update_policy(&pid, Some(2 * PSY), Some(10 * PSY), None, None, None, vec![]).unwrap();
         assert_eq!(e.describe(&pid).unwrap().allowed_recipient_count, Some(1), "the allow-list survived an unrelated edit");
-        assert!(e.authorize(&t, "630784", 1 * PSY, "simple_transfer").is_err(), "an unlisted payee is still refused");
+        assert!(e.authorize(&t, "630784", 1 * PSY, "transfer").is_err(), "an unlisted payee is still refused");
 
         // Explicit clear: Some(None) → pay anyone.
         e.update_policy(&pid, Some(2 * PSY), Some(10 * PSY), None, None, Some(None), vec![]).unwrap();
         assert_eq!(e.describe(&pid).unwrap().allowed_recipient_count, None, "an explicit null clears the list");
-        assert!(e.authorize(&t, "630784", 1 * PSY, "simple_transfer").is_ok(), "now anyone may be paid");
+        assert!(e.authorize(&t, "630784", 1 * PSY, "transfer").is_ok(), "now anyone may be paid");
     }
 
     #[test]
@@ -2359,8 +2359,8 @@ mod tests {
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         // An over-cap attempt to an approved payee, and an approved-size attempt
         // to an UNapproved payee — both refused, both recorded.
-        let over = e.authorize(&t, "1908736", 8 * PSY, "simple_transfer").unwrap_err().to_string();
-        let off = e.authorize(&t, "630784", 1 * PSY, "simple_transfer").unwrap_err().to_string();
+        let over = e.authorize(&t, "1908736", 8 * PSY, "transfer").unwrap_err().to_string();
+        let off = e.authorize(&t, "630784", 1 * PSY, "transfer").unwrap_err().to_string();
         assert!(over.contains("per-transaction cap"));
         assert!(off.contains("allowlist"));
         let blocked = e.denied_log(10, None);
@@ -2371,7 +2371,7 @@ mod tests {
         assert_eq!(blocked[1].amount_nano, 8 * PSY);
         assert!(blocked[1].reason.contains("per-transaction cap"));
         // A successful spend is NOT in the blocked log.
-        e.authorize(&t, "1908736", 2 * PSY, "simple_transfer").unwrap();
+        e.authorize(&t, "1908736", 2 * PSY, "transfer").unwrap();
         assert_eq!(e.denied_log(10, None).len(), 2, "an allowed spend does not add a blocked row");
     }
 
@@ -2380,10 +2380,10 @@ mod tests {
         let mut e = PolicyEngine::new();
         let pid = e.create_policy("a", Limits { per_transaction: 100, per_day: 100, per_month: Some(100), total_budget: Some(100) }, None, vec![]);
         let (t, _) = e.issue_session(&pid, 10, None).unwrap();
-        let auth = e.authorize(&t, "9", 100, "simple_transfer").unwrap();
-        assert!(e.authorize(&t, "9", 1, "simple_transfer").is_err(), "budget exhausted");
+        let auth = e.authorize(&t, "9", 100, "transfer").unwrap();
+        assert!(e.authorize(&t, "9", 1, "transfer").is_err(), "budget exhausted");
         e.refund(&auth, 100);
-        assert!(e.authorize(&t, "9", 100, "simple_transfer").is_ok(), "headroom restored");
+        assert!(e.authorize(&t, "9", 100, "transfer").is_ok(), "headroom restored");
         assert_eq!(e.spend_log(10, None).len(), 2, "both decisions stay on the log");
     }
 
@@ -2413,7 +2413,7 @@ mod tests {
             per_month: Some(100_000_000_000),
             total_budget: Some(500_000_000_000),
             allowed_recipients: Some(vec!["1234".into(), "5678".into()]),
-            allowed_methods: vec!["simple_transfer".into(), "simple_claim".into()],
+            allowed_methods: vec!["transfer".into(), "claim".into()],
         }
     }
 
@@ -2430,7 +2430,7 @@ mod tests {
             per_month: Some(Some(3)),
             total_budget: Some(Some(4)),
             allowed_recipients: Some(Some(vec!["1234".into()])),
-            allowed_methods: vec!["simple_claim".into()],
+            allowed_methods: vec!["claim".into()],
         };
         assert!(
             widening_reason(&shape(), &edit).is_none(),
@@ -2552,8 +2552,8 @@ mod tests {
 
     #[test]
     fn a_narrowed_method_set_is_tightening() {
-        let e = AuthorityEdit { allowed_methods: vec!["simple_claim".into()], ..Default::default() };
-        assert!(widening_reason(&shape(), &e).is_none(), "dropping simple_transfer is tightening");
+        let e = AuthorityEdit { allowed_methods: vec!["claim".into()], ..Default::default() };
+        assert!(widening_reason(&shape(), &e).is_none(), "dropping transfer is tightening");
     }
 
     #[test]
@@ -2576,7 +2576,7 @@ mod tests {
     #[test]
     fn the_engine_agrees_with_the_pure_rule_and_reports_an_unknown_policy() {
         let mut e = PolicyEngine::new();
-        let id = e.create_policy("a", open_limits(), Some(vec!["1234".into()]), vec!["simple_transfer".into()]);
+        let id = e.create_policy("a", open_limits(), Some(vec!["1234".into()]), vec!["transfer".into()]);
 
         assert!(e.update_widens(&id, None, None, None, None, &None, &[]).unwrap().is_none());
         assert!(
@@ -2607,7 +2607,7 @@ mod tests {
                 total_budget: Some(20_000_000_000),
             },
             Some(vec!["1234".into()]),
-            vec!["simple_transfer".into()],
+            vec!["transfer".into()],
         )
     }
 
@@ -2636,7 +2636,7 @@ mod tests {
             total_budget: None,
         };
         let reason = e
-            .creation_widens(&wide, &None, &["simple_transfer".into()])
+            .creation_widens(&wide, &None, &["transfer".into()])
             .expect("this is the create_wallet bypass");
         assert!(reason.contains("per-payment"), "{reason}");
         assert!(reason.contains("anyone"), "{reason}");
@@ -2663,7 +2663,7 @@ mod tests {
             per_month: Some(1),
             total_budget: Some(1),
         };
-        assert!(e.creation_widens(&tighter, &Some(vec![]), &["simple_transfer".into()]).is_none());
+        assert!(e.creation_widens(&tighter, &Some(vec![]), &["transfer".into()]).is_none());
     }
 
     #[test]
@@ -2671,7 +2671,7 @@ mod tests {
         let mut e = PolicyEngine::new();
         let (l, r, m) = narrow();
         e.create_policy("tight", l, r, m);
-        e.create_policy("loose", open_limits(), None, vec!["simple_transfer".into()]);
+        e.create_policy("loose", open_limits(), None, vec!["transfer".into()]);
         let mid = Limits {
             per_transaction: 5_000_000_000,
             per_day: 5_000_000_000,
@@ -2679,7 +2679,7 @@ mod tests {
             total_budget: None,
         };
         assert!(
-            e.creation_widens(&mid, &None, &["simple_transfer".into()]).is_none(),
+            e.creation_widens(&mid, &None, &["transfer".into()]).is_none(),
             "the owner already granted at least this much somewhere"
         );
     }
@@ -2690,7 +2690,7 @@ mod tests {
         // otherwise the widest possible method grant slips through as "unchanged".
         let mut e = PolicyEngine::new();
         let (l, r, _) = narrow();
-        e.create_policy("a", l.clone(), r.clone(), vec!["simple_transfer".into()]);
+        e.create_policy("a", l.clone(), r.clone(), vec!["transfer".into()]);
         let reason = e
             .creation_widens(&l, &r, &[])
             .expect("empty means every method, including withdraw");
@@ -2738,25 +2738,25 @@ mod tests {
         let pid = e.create_policy("capped", Limits { per_transaction: 1_000_000_000_000, per_day: 1_000_000_000_000, per_month: None, total_budget: None }, None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
         // First spend fits.
-        e.authorize(&t, "1", 600_000_000, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 600_000_000, "transfer").unwrap();
         // Second would exceed the session total — refused even though the
         // policy itself is open.
-        let err = e.authorize(&t, "1", 600_000_000, "simple_transfer").unwrap_err();
+        let err = e.authorize(&t, "1", 600_000_000, "transfer").unwrap_err();
         assert!(err.to_string().contains("exhaust the session"), "got: {err}");
         // The refused spend did not consume the session: exactly the remaining
         // 0.4 still passes.
-        e.authorize(&t, "1", 400_000_000, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 400_000_000, "transfer").unwrap();
         // And now the session is spent to the cap, one more nano is refused.
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err());
 
         // A batch that would blow the remaining budget is refused whole.
         let (t2, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
         let err = e
-            .authorize_batch(&t2, &[("1", 900_000_000), ("2", 200_000_000)], "simple_transfer")
+            .authorize_batch(&t2, &[("1", 900_000_000), ("2", 200_000_000)], "transfer")
             .unwrap_err();
         assert!(err.to_string().contains("exhaust the session"), "got: {err}");
         // Nothing from the refused batch was charged.
-        e.authorize(&t2, "1", 1_000_000_000, "simple_transfer").unwrap();
+        e.authorize(&t2, "1", 1_000_000_000, "transfer").unwrap();
     }
 
     #[test]
@@ -2764,8 +2764,8 @@ mod tests {
         let mut e = PolicyEngine::new();
         let pid = e.create_policy("uncapped", Limits { per_transaction: 1_000_000_000_000, per_day: 1_000_000_000_000, per_month: None, total_budget: None }, None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
-        e.authorize(&t, "1", 5_000_000_000, "simple_transfer").unwrap();
-        e.authorize(&t, "1", 5_000_000_000, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 5_000_000_000, "transfer").unwrap();
+        e.authorize(&t, "1", 5_000_000_000, "transfer").unwrap();
     }
 
     #[test]
@@ -2780,20 +2780,20 @@ mod tests {
         let (t, _) = e.issue_session(&pid, 60, Some(900_000_000)).unwrap();
 
         let auth = e
-            .authorize_batch(&t, &[("1", 450_000_000), ("2", 450_000_000)], "simple_transfer")
+            .authorize_batch(&t, &[("1", 450_000_000), ("2", 450_000_000)], "transfer")
             .unwrap();
         e.refund(&auth, 900_000_000); // the balance gate refuses it after the policy gate
 
         // The full session budget is available again.
-        e.authorize(&t, "1", 900_000_000, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 900_000_000, "transfer").unwrap();
         // ...and is now genuinely exhausted.
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err());
 
         // Same for a single transfer that fails after the gate.
         let (t2, _) = e.issue_session(&pid, 60, Some(1_000_000_000)).unwrap();
-        let auth2 = e.authorize(&t2, "1", 800_000_000, "simple_transfer").unwrap();
+        let auth2 = e.authorize(&t2, "1", 800_000_000, "transfer").unwrap();
         e.refund(&auth2, 800_000_000);
-        e.authorize(&t2, "1", 1_000_000_000, "simple_transfer").unwrap();
+        e.authorize(&t2, "1", 1_000_000_000, "transfer").unwrap();
     }
 
     #[test]
@@ -2807,7 +2807,7 @@ mod tests {
         e.set_current_user(1);
         let a_policy = e.create_policy("agent-a", Limits { per_transaction: 1, per_day: 1, per_month: None, total_budget: None }, None, vec![]);
         let (ta, _) = e.issue_session(&a_policy, 60, None).unwrap();
-        e.authorize(&ta, "9", 1, "simple_transfer").unwrap();
+        e.authorize(&ta, "9", 1, "transfer").unwrap();
         drop(e);
         // B boots on the same volume: sees NOTHING of A's, sole-policy works.
         let mut b = PolicyEngine::load_or_new(&dir);
@@ -2815,7 +2815,7 @@ mod tests {
         assert!(b.policies.is_empty(), "A's policies must be hidden from B");
         let b_policy = b.create_policy("agent-b", Limits { per_transaction: 1, per_day: 1, per_month: None, total_budget: None }, None, vec![]);
         let (tb, _) = b.issue_session(&b_policy, 60, None).unwrap();
-        b.authorize(&tb, "9", 1, "simple_transfer").unwrap();
+        b.authorize(&tb, "9", 1, "transfer").unwrap();
         // B's save persists the WHOLE map (both wallets) — A's counters intact.
         drop(b);
         let mut a = PolicyEngine::load_or_new(&dir);

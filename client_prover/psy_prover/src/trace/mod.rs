@@ -689,11 +689,84 @@ pub mod proof_schedule;
 pub mod proof_tree_meta;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod ordering_tests;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod simulation_tests {
+    use plonky2::field::types::Field;
+    use psy_client_data::guta::api::PsyContractStateUpdateHistory;
+
     use super::*;
+
+    #[test]
+    fn trace_step_id_round_trips_through_usize() {
+        let id = TraceStepId::from(17usize);
+        assert_eq!(id.0, 17);
+        assert_eq!(usize::from(id), 17);
+    }
+
+    #[test]
+    fn proved_result_constructor_preserves_all_fields() {
+        let result = ProvedTxResultJson::new("sig".to_string(), "tx".to_string(), Some(9), "submitted".to_string());
+        assert_eq!(result.sig_hash, "sig");
+        assert_eq!(result.tx_hash, "tx");
+        assert_eq!(result.checkpoint_id, Some(9));
+        assert_eq!(result.status, "submitted");
+    }
+
+    #[test]
+    fn sign_circuit_source_serde_applies_defaults_and_tags() {
+        let plonky: TraceSignCircuitSource = serde_json::from_value(serde_json::json!({
+            "kind": "plonky2_software_defined"
+        }))
+        .unwrap();
+        match plonky {
+            TraceSignCircuitSource::Plonky2SoftwareDefined {
+                contract_state_tree_height,
+                input_len,
+            } => {
+                assert_eq!(contract_state_tree_height, psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT);
+                assert_eq!(input_len, 0);
+            }
+            _ => panic!("unexpected sign circuit source"),
+        }
+
+        for kind in ["zk_builtin", "secp_builtin", "eth_personal_secp_builtin"] {
+            let source: TraceSignCircuitSource = serde_json::from_value(serde_json::json!({ "kind": kind })).unwrap();
+            assert_eq!(serde_json::to_value(source).unwrap()["kind"], kind);
+        }
+
+        let sd_key = TraceSignCircuitSource::SdKey {
+            allowed_contract_ids: vec![1, 2],
+            allowed_method_ids: vec![3],
+            expected_tx_count: 4,
+        };
+        let json = serde_json::to_value(sd_key).unwrap();
+        assert_eq!(json["kind"], "sd_key");
+        assert_eq!(json["expected_tx_count"], 4);
+
+        let psy = TraceSignCircuitSource::PsySoftwareDefined {
+            circuit_def: Vec::new(),
+            force_four_align: true,
+        };
+        let json = serde_json::to_value(psy).unwrap();
+        assert!(json.get("circuit_def").is_none());
+        assert_eq!(json["force_four_align"], true);
+    }
+
+    #[test]
+    fn persisted_proof_records_omit_empty_byte_vectors() {
+        assert_eq!(serde_json::to_value(UpsStartProofRecord::default()).unwrap(), serde_json::json!({}));
+        assert_eq!(serde_json::to_value(CfcProofRecord::default()).unwrap(), serde_json::json!({}));
+
+        let code = TraceContractCode {
+            contract_id: 7,
+            code: Vec::new(),
+        };
+        assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!({ "contract_id": 7 }));
+    }
 
     #[test]
     fn simulation_and_view_json_have_disjoint_required_fields() {
@@ -732,5 +805,275 @@ mod simulation_tests {
         assert!(view.get("generated").is_none());
         assert!(view.get("metadata").is_none());
         assert!(view.get("tx_hash").is_none());
+    }
+
+    fn qhash(seed: u64) -> QHashOut<F> {
+        QHashOut::from_values(seed, seed + 1, seed + 2, seed + 3)
+    }
+
+    fn state_delta_proof(index: u64, old_value: QHashOut<F>, new_value: QHashOut<F>) -> DeltaMerkleProofCore<QHashOut<F>> {
+        DeltaMerkleProofCore {
+            old_root: QHashOut::ZERO,
+            old_value,
+            new_root: QHashOut::ZERO,
+            new_value,
+            index,
+            siblings: Vec::new(),
+        }
+    }
+
+    fn cfc_state_delta() -> CfcStateDelta {
+        CfcStateDelta {
+            cfc_transaction_input_context: Default::default(),
+            user_contract_tree_update_proof: state_delta_proof(21, qhash(60), qhash(61)),
+            deferred_tx_debt_pivot_proof: Default::default(),
+            inline_tx_debt_pivot_proof: Default::default(),
+        }
+    }
+
+    fn alt_verifier_data() -> AltVerifierOnlyCircuitData<F> {
+        AltVerifierOnlyCircuitData {
+            constants_sigmas_cap: Vec::new(),
+            circuit_digest: QHashOut::ZERO,
+        }
+    }
+
+    fn cfc_step(id: usize, contract_id: u64, method_name: &str) -> TraceStep {
+        TraceStep::Standard(CfcStep {
+            id: TraceStepId(id),
+            parent: None,
+            inlined: Vec::new(),
+            deferred: Vec::new(),
+            contract_id,
+            fn_id: 1,
+            method_id: 2,
+            method_name: method_name.to_string(),
+            cfc_fingerprint: QHashOut::ZERO,
+            ups_fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            cfc_witness: DapenContractFunctionCircuitInput {
+                inputs: vec![F::from_canonical_u64(7), F::from_canonical_u64(8)],
+                outputs: vec![F::from_canonical_u64(9)],
+                ..Default::default()
+            },
+            state_delta: cfc_state_delta(),
+            cfc_inclusion_proof: Default::default(),
+            end_header: Default::default(),
+            debt_removal_proof: None,
+            proof: None,
+        })
+    }
+
+    fn external_proof_step() -> TraceStep {
+        TraceStep::ExternalProof(ExternalProofStep {
+            fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            proof: Vec::new(),
+            verifier_data_alt: alt_verifier_data(),
+            siblings: Vec::new(),
+        })
+    }
+
+    fn zk_sign_step() -> TraceStep {
+        TraceStep::ZkSign(ZkSignStep {
+            fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            sign_circuit_source: TraceSignCircuitSource::ZkBuiltin,
+            sign_witness: Vec::new(),
+            public_key_param: QHashOut::ZERO,
+            sign_verifier_data_alt: alt_verifier_data(),
+        })
+    }
+
+    fn end_cap_input(user_id: u64) -> SubmitUserEndCapNonProofInput<F> {
+        let mut input = SubmitUserEndCapNonProofInput::<F>::default();
+        input.core.checkpoint_id = F::from_canonical_u64(33);
+        input.core.state_transition.user_id = F::from_canonical_u64(user_id);
+        input.core.state_transition.start_user_leaf_hash = qhash(1);
+        input.core.state_transition.end_user_leaf_hash = qhash(2);
+        input.core.state_transition.checkpoint_tree_root_hash = qhash(3);
+        input.contract_state_updates = vec![PsyContractStateUpdateHistory {
+            user_contract_tree_update_proof: state_delta_proof(11, qhash(70), qhash(71)),
+            contract_state_tree_updates: vec![
+                ContractStateUpdate::Positional {
+                    delta_proof: state_delta_proof(1, qhash(10), qhash(11)),
+                },
+                ContractStateUpdate::IMT {
+                    update: IMTContractStateUpdate::Update {
+                        old_preimage: Default::default(),
+                        new_preimage: Default::default(),
+                        delta_proof: state_delta_proof(2, qhash(20), qhash(21)),
+                    },
+                },
+                ContractStateUpdate::IMT {
+                    update: IMTContractStateUpdate::Insert {
+                        predecessor_old_preimage: Default::default(),
+                        predecessor_new_preimage: Default::default(),
+                        new_leaf_preimage: Default::default(),
+                        predecessor_delta_proof: state_delta_proof(3, qhash(30), qhash(31)),
+                        new_leaf_delta_proof: state_delta_proof(4, qhash(40), qhash(41)),
+                    },
+                },
+                // no-op positional update: old == new must be skipped
+                ContractStateUpdate::Positional {
+                    delta_proof: state_delta_proof(5, qhash(50), qhash(50)),
+                },
+            ],
+        }];
+        input
+    }
+
+    fn trace_with(steps: Vec<TraceStep>, finalization: TxFinalization) -> TxTrace {
+        TxTrace {
+            meta: TraceMeta {
+                network_magic: 1,
+                user_id: 2,
+                public_key: qhash(90),
+            },
+            anchor: SessionAnchor {
+                start_checkpoint_id: 3,
+                checkpoint_leaf: Default::default(),
+                global_state_roots: Default::default(),
+                ups_step_circuit_whitelist_root: QHashOut::ZERO,
+            },
+            ups_start_witness: UpsStartWitness {
+                ups_header: Default::default(),
+                state_roots: Default::default(),
+                checkpoint_tree_proof: Default::default(),
+                user_tree_proof: Default::default(),
+                user_registration_tree_proof: None,
+                proof: Some(UpsStartProofRecord { proof: vec![1] }),
+            },
+            contract_codes: Vec::new(),
+            steps,
+            finalization,
+        }
+    }
+
+    fn finalization(end_cap: SubmitUserEndCapNonProofInput<F>) -> TxFinalization {
+        TxFinalization {
+            submit_end_cap_input: end_cap,
+            nonce: F::from_canonical_u64(1),
+            tx_hash: qhash(80),
+            software_defined_call: DPNSoftwareDefinedCallData::default(),
+            sig_hash: qhash(81),
+        }
+    }
+
+    #[test]
+    fn generated_trace_json_envelopes_and_round_trips_the_trace() {
+        let trace = trace_with(
+            vec![cfc_step(0, 5, "set_value"), external_proof_step(), zk_sign_step()],
+            finalization(end_cap_input(2)),
+        );
+
+        let envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::json!({"calls": 1})).unwrap();
+        assert_eq!(envelope.user_id, "2");
+        assert_eq!(envelope.pk_hash, qhash(90).to_string());
+        assert_eq!(envelope.sig_hash, qhash(81).to_string());
+        assert_eq!(envelope.tx_hash, qhash(80).to_string());
+        assert_eq!(envelope.tx_count, 3);
+        assert_eq!(envelope.call_data, serde_json::json!({"calls": 1}));
+        assert_eq!(envelope.trace.encoding, "json");
+
+        let decoded: TxTrace = serde_json::from_str(&envelope.trace.payload).unwrap();
+        assert_eq!(decoded.meta.user_id, 2);
+        assert_eq!(decoded.steps.len(), 3);
+        assert_eq!(decoded.finalization.tx_hash, qhash(80));
+    }
+
+    #[test]
+    fn contract_call_results_include_callable_cfc_kinds_and_filter_burn_fee() {
+        let base = match cfc_step(0, 5, "standard") {
+            TraceStep::Standard(cfc) => cfc,
+            _ => unreachable!(),
+        };
+        let mut inlined = base.clone();
+        inlined.id = TraceStepId(1);
+        inlined.method_name = "inlined".to_string();
+        let mut deferred = base.clone();
+        deferred.id = TraceStepId(2);
+        deferred.method_name = "deferred".to_string();
+        let mut burn = base.clone();
+        burn.id = TraceStepId(3);
+        burn.method_name = "burn".to_string();
+
+        let calls = contract_call_results(&[
+            TraceStep::Standard(base),
+            TraceStep::Inlined(inlined),
+            TraceStep::Deferred(deferred),
+            TraceStep::BurnFee(burn),
+            external_proof_step(),
+            zk_sign_step(),
+        ]);
+
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls.iter().map(|call| call.method_name.as_str()).collect::<Vec<_>>(),
+            vec!["standard", "inlined", "deferred"]
+        );
+        assert!(calls.iter().all(|call| call.contract_id == 5));
+        assert!(calls.iter().all(|call| call.inputs == vec![7, 8] && call.outputs == vec![9]));
+    }
+
+    #[test]
+    fn tx_metadata_collects_end_cap_storage_and_contract_call_results() {
+        let trace = trace_with(
+            vec![cfc_step(0, 5, "set_value"), external_proof_step(), zk_sign_step()],
+            finalization(end_cap_input(9)),
+        );
+
+        let metadata = TxMetadata::from_trace(&trace);
+
+        assert_eq!(metadata.tx_hash, qhash(80));
+        assert_eq!(metadata.end_cap_data.checkpoint_id, 33);
+        assert_eq!(metadata.end_cap_data.user_id, 9);
+        assert_eq!(metadata.end_cap_data.start_user_leaf_hash, qhash(1));
+        assert_eq!(metadata.end_cap_data.end_user_leaf_hash, qhash(2));
+        assert_eq!(metadata.end_cap_data.checkpoint_tree_root_hash, qhash(3));
+        assert_eq!(
+            metadata.end_cap_data.global_user_tree_height,
+            psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT
+        );
+
+        // only the CFC step contributes a call result
+        assert_eq!(metadata.contract_call_data.contract_calls.len(), 1);
+        let call = &metadata.contract_call_data.contract_calls[0];
+        assert_eq!(call.contract_id, 5);
+        assert_eq!(call.method_name, "set_value");
+        assert_eq!(call.inputs, vec![7, 8]);
+        assert_eq!(call.outputs, vec![9]);
+
+        // storage writes: positional + IMT update + IMT insert (two proofs);
+        // the no-op positional update (old == new) is skipped
+        assert!(metadata.storage_data.reads.is_empty());
+        let writes = &metadata.storage_data.writes;
+        assert_eq!(writes.len(), 4);
+        for write in writes {
+            assert_eq!(write.user_id, 9);
+            assert_eq!(write.contract_id, 11);
+        }
+        assert_eq!(writes[0].slot_index, 1);
+        assert_eq!(writes[0].old_value, qhash(10));
+        assert_eq!(writes[0].new_value, qhash(11));
+        assert_eq!(writes[1].slot_index, 2);
+        assert_eq!(writes[2].slot_index, 3);
+        assert_eq!(writes[3].slot_index, 4);
+        assert_eq!(writes[3].old_value, qhash(40));
+        assert_eq!(writes[3].new_value, qhash(41));
+    }
+
+    #[test]
+    fn cfc_state_delta_converts_to_and_from_ups_standard_delta_input() {
+        let delta = cfc_state_delta();
+        let ups: psy_client_data::ups::ups_standard_cfc_input::UPSCFCStandardStateDeltaInput<F> = delta.clone().into();
+        assert_eq!(ups.user_contract_tree_update_proof.index, 21);
+        assert_eq!(ups.user_contract_tree_update_proof.old_value, qhash(60));
+
+        let round_tripped: CfcStateDelta = ups.into();
+        assert_eq!(serde_json::to_value(&delta).unwrap(), serde_json::to_value(&round_tripped).unwrap());
     }
 }

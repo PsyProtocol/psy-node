@@ -540,3 +540,91 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     global_user_tree_aggregator_header_with_job_id_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn extended_header_hashes_commit_only_to_documented_fields() {
+        let value = GlobalUserTreeAggregatorHeaderWithTagValue::<PF, Hash>::qp_rand_gen();
+        let expected = PoseidonHasher::q_two_to_one(
+            value.header.qfhash::<PoseidonHasher>(),
+            value.new_tag_tree_node_value,
+        );
+        assert_eq!(value.qfhash::<PoseidonHasher>(), expected);
+
+        let preimage = GlobalUserTreeAggregatorHeaderWithTagPreimage::<PF, Hash>::qp_rand_gen();
+        assert_eq!(
+            preimage.qfhash::<PoseidonHasher>(),
+            PoseidonHasher::q_two_to_one(
+                preimage.header.qfhash::<PoseidonHasher>(),
+                preimage.new_tag_tree_node_preimage.get_node_hash::<PoseidonHasher>(),
+            )
+        );
+
+        let with_type = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType::<PF, Hash>::qp_rand_gen();
+        let with_serialized = GlobalUserTreeAggregatorHeaderWithTagValueAndSerializedJobID::<PF, Hash>::qp_rand_gen();
+        let with_id = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::qp_rand_gen();
+        assert_eq!(with_type.qfhash::<PoseidonHasher>(), with_type.header.qfhash::<PoseidonHasher>());
+        assert_eq!(with_serialized.qfhash::<PoseidonHasher>(), with_serialized.header.qfhash::<PoseidonHasher>());
+        assert_eq!(with_id.qfhash::<PoseidonHasher>(), with_id.header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn queue_item_and_metadata_helpers_preserve_identity_and_dependencies() {
+        let item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::qp_rand_gen();
+        let encoded = item.encode_queue_item_vec().unwrap();
+        assert!(GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::is_queue_item(&encoded));
+        assert!(!GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::is_queue_item(&encoded[..encoded.len() - 1]));
+        assert_eq!(item.get_restorable_job_id(), item.job_id.to_fixed_bytes());
+        assert_eq!(GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::get_size_hint(), encoded.len());
+        assert!(GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::has_fixed_size());
+        let decoded = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<PF, Hash>::decode_queue_item_ref(&encoded).unwrap();
+        assert_eq!(decoded, item);
+
+        let header = GlobalUserTreeAggregatorHeaderWithJobId::<PF, Hash>::qp_rand_gen();
+        let dependencies = vec![QProvingJobDataID::qp_rand_gen(), QProvingJobDataID::qp_rand_gen()];
+        let metadata = header.to_metadata_with_job_standard_children::<PoseidonHasher>(dependencies.clone());
+        assert_eq!(metadata.job_id, header.job_id);
+        assert_eq!(metadata.metadata.dependencies, dependencies);
+        assert_eq!(metadata.metadata.reward_tree_node_children, 2);
+        assert_eq!(metadata.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD);
+        assert_eq!(metadata.metadata.expected_public_inputs_hash, header.header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn to_metadata_with_job_standard_children_defaults_for_empty_dependencies() {
+        let header = GlobalUserTreeAggregatorHeaderWithJobId::<PF, Hash>::qp_rand_gen();
+        let metadata = header.to_metadata_with_job_standard_children::<PoseidonHasher>(vec![]);
+
+        assert_eq!(metadata.job_id, header.job_id);
+        assert!(metadata.metadata.dependencies.is_empty());
+        assert_eq!(metadata.metadata.reward_tree_node_children, 0);
+        assert_eq!(metadata.metadata.reward_tree_node_index, 0);
+        assert_eq!(metadata.metadata.reward_tree_node_level, 0);
+        assert_eq!(metadata.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD);
+        assert_eq!(metadata.metadata.expected_public_inputs_hash, header.header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn queue_item_decoding_rejects_malformed_payloads() {
+        type QueueItem = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<PF, Hash>;
+
+        let item = QueueItem::qp_rand_gen();
+        let encoded = item.encode_queue_item_vec().unwrap();
+        assert_eq!(encoded.len(), QueueItem::get_size_hint());
+
+        // The queue-item check is purely length based: any buffer of the fixed size qualifies.
+        assert!(QueueItem::is_queue_item(&vec![0u8; QueueItem::FIXED_SIZE]));
+        assert!(!QueueItem::is_queue_item(&[]));
+        assert!(!QueueItem::is_queue_item(&encoded[..encoded.len() - 1]));
+
+        // Decoding must fail for truncated or empty payloads.
+        assert!(QueueItem::decode_queue_item_ref(&[]).is_err());
+        assert!(QueueItem::decode_queue_item_ref(&encoded[..encoded.len() - 1]).is_err());
+    }
+}

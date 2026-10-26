@@ -26,24 +26,24 @@ const DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#" {
 
 const END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#"{
     "constants_sigmas_cap": [
-        "e0cae52f4b68e6e59e8708695a46840f683ca2ee2bfbccaf66e448e8689541e8",
-        "228124eb7fcf75c9070aea3d990ae763f4b592aa4c95222e51d6df71c2df512d",
-        "5dda73280531cde9b7825cc9f738ae75fa4376365e1e79adf4efba02ae2f5f87",
-        "238ad96c40ae7d847efd83a650d06d051273e82efdbbbaebfc6ef95e93b0f519",
-        "74e508297a90ef320cc617ee4106dead3daa876145a6f2e7c95dea42905b8461",
-        "cdaa9f0b53cc79134d67fae273dccaabfabdaeb15a3a7dd4cac71fcb58656c8a",
-        "a29c15fbd52c4fa422ee3e421bdc7c90bea053fe43947ceb1539b545bab59e37",
-        "d987d13e2c665605bd5eae9cfa499c200670a4a0f6c47e7955910e3fc2ff8e0f",
-        "009ea650923a0c10069bff732b9de52f8a57fc38c49804aaa1cbf34fcaa9177d",
-        "57a9a66ecb90def2b2b357926f3a35eac42643dd077794891fc297fc9bfa9565",
-        "812556c138b606f2effc3e14b2b4b3fe97c3a0338db415ef6e89b7a2d9d8c902",
-        "01cf233ace984676374a08a8fe5f13c4659a7c79faa5c5aab00139d9439ae68b",
-        "c4b0b40ffbf74dd32bb32ae7041abd54b69f89e2ec47a1db7b6ff1178e168135",
-        "ed8ae34bb299ab82e6ab69310f5d94523cbd7347b556763e6c7e3f07cc54f9a4",
-        "fd8771454df8edc10239faaff461d8d4e1159ee5a30919f66962c5d4c340ef22",
-        "7493c458c28b19990a7abe864c26c36bb5fdf390fb43307a4d9b140c5be8808f"
+        "43c51664c381f49ccc4584cc2e7a6d43d9240ccbe06375047c021e47ecd6f684",
+        "c227fc97b9afaff4f83a6cf1ea709ba14099181d6cac9e17cff101d6ff73e91a",
+        "3f91b1f8a66992ddab13636718bb387eb0253ab1edeef2fb5590019007b71108",
+        "adeba3fda531fe0a061b1fda72e16b96e57b5004ee1a7cfaae8adc4762e4699c",
+        "988c24bab5dae45e3923d70491b4b1077af5ffe85993dfccb8c029facc67a17a",
+        "efe89920435ef9dd42201d5f85b3c94875afe655f4c73b70658f53aac65d249c",
+        "a67f8590e67a05e22eefbe9a718bcc2efb07b4bdf61bb459606d02458f857b6c",
+        "c33e7ea5bac60ed48d9546955d61e6462c3915c559366186def8739d4e6c448d",
+        "3a4c0dc3f94a94515bbb49063b0798c633d0d465486ca26e52f8b3f28f230b1c",
+        "a2a57e6a9fe462a0402a5424557ce1b70de023725713748be42d74bf7386df86",
+        "ff77879a06d0d8f2e3571c4345a37c63c1078fa54119de24ca32120cd1f4ffef",
+        "e5bdc13e2f52be79b6985634aeee3e25d5c0efe785d2b6379f5bceeed0e6111a",
+        "7f297646467e637756725a9c1fcde590ade4d73859b53d0e40853fb0e778aea4",
+        "3ebc3d5ec8502ba1200437063cc5bac62c7189b1f4c1b6174b16ed05a77360c8",
+        "8802c0e8222ff877397c3b83756ab4c6ace84a4da4c2f111e609374cc04d8a6c",
+        "b74611baff625c90647e8edff11909324c1157f0116424732e4b8bd28315a00c"
     ],
-    "circuit_digest": "16c57f84549eac3e4d7a8b3796c353c7d4177364ba993b1e7e4770cd310762c6"
+    "circuit_digest": "65ba308a80b71ec118a47088f6967df9843aeb07340801febfd71f4e0778aaf6"
 }"#;
 
 pub fn get_end_cap_alt_verifier_data_for_network<F: RichField>(network: PsyChainNetworkType) -> anyhow::Result<AltVerifierOnlyCircuitData<F>> {

@@ -1,35 +1,39 @@
 [
     {
-        "name": "simple_mint_debug",
-        "method_id": 2864679118,
+        "name": "mint",
+        "method_id": 3374273625,
         "circuit_inputs": [
             0
         ],
-        "circuit_outputs": [
-            4
-        ],
+        "circuit_outputs": [],
         "state_commands": [
             {
-                "type": "GetSelfUserCurrentContractStateSlotHash",
-                "slot_index": 1
+                "type": "GetContractLeaf",
+                "contract_id": 1
             },
             {
-                "type": "SetContractStateSlotHash",
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 2
+            },
+            {
+                "type": "SetContractStateSlotSingle",
                 "condition": 4294967296,
-                "slot_index": 1,
-                "value": [
-                    4,
-                    6,
-                    8,
-                    10
-                ]
+                "sub_slot_index": 2,
+                "value": 4
             }
         ],
         "state_command_resolution_indices": [
             2,
-            13
+            3,
+            6
         ],
-        "assertions": [],
+        "assertions": [
+            {
+                "left": 4294967303,
+                "right": 4294967296,
+                "message": "only deployer can mint"
+            }
+        ],
         "definitions": [
             {
                 "data_type": 0,
@@ -42,23 +46,7 @@
             {
                 "data_type": 0,
                 "index": 1,
-                "op_type": 46,
-                "inputs": [
-                    0
-                ]
-            },
-            {
-                "data_type": 1,
-                "index": 0,
-                "op_type": 2,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 3,
-                "index": 0,
-                "op_type": 53,
+                "op_type": 47,
                 "inputs": [
                     0
                 ]
@@ -72,12 +60,19 @@
                 ]
             },
             {
+                "data_type": 1,
+                "index": 0,
+                "op_type": 2,
+                "inputs": [
+                    1
+                ]
+            },
+            {
                 "data_type": 0,
                 "index": 3,
-                "op_type": 20,
+                "op_type": 54,
                 "inputs": [
-                    12884901888,
-                    2
+                    1
                 ]
             },
             {
@@ -90,11 +85,28 @@
                 ]
             },
             {
+                "data_type": 5,
+                "index": 0,
+                "op_type": 55,
+                "inputs": [
+                    0
+                ]
+            },
+            {
                 "data_type": 0,
                 "index": 5,
-                "op_type": 1,
+                "op_type": 20,
                 "inputs": [
-                    1
+                    21474836480,
+                    2
+                ]
+            },
+            {
+                "data_type": 3,
+                "index": 0,
+                "op_type": 50,
+                "inputs": [
+                    0
                 ]
             },
             {
@@ -103,7 +115,16 @@
                 "op_type": 20,
                 "inputs": [
                     12884901888,
-                    5
+                    2
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 1,
+                "op_type": 13,
+                "inputs": [
+                    5,
+                    6
                 ]
             },
             {
@@ -111,7 +132,7 @@
                 "index": 7,
                 "op_type": 1,
                 "inputs": [
-                    2
+                    1
                 ]
             },
             {
@@ -119,13 +140,84 @@
                 "index": 8,
                 "op_type": 20,
                 "inputs": [
-                    12884901888,
+                    21474836480,
                     7
                 ]
             },
             {
                 "data_type": 0,
                 "index": 9,
+                "op_type": 20,
+                "inputs": [
+                    12884901888,
+                    7
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 2,
+                "op_type": 13,
+                "inputs": [
+                    8,
+                    9
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 3,
+                "op_type": 9,
+                "inputs": [
+                    4294967297,
+                    4294967298
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 10,
+                "op_type": 1,
+                "inputs": [
+                    2
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 11,
+                "op_type": 20,
+                "inputs": [
+                    21474836480,
+                    10
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 12,
+                "op_type": 20,
+                "inputs": [
+                    12884901888,
+                    10
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 4,
+                "op_type": 13,
+                "inputs": [
+                    11,
+                    12
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 5,
+                "op_type": 9,
+                "inputs": [
+                    4294967299,
+                    4294967300
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 13,
                 "op_type": 1,
                 "inputs": [
                     3
@@ -133,62 +225,110 @@
             },
             {
                 "data_type": 0,
-                "index": 10,
+                "index": 14,
+                "op_type": 20,
+                "inputs": [
+                    21474836480,
+                    13
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 15,
                 "op_type": 20,
                 "inputs": [
                     12884901888,
-                    9
+                    13
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 6,
+                "op_type": 13,
+                "inputs": [
+                    14,
+                    15
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 7,
+                "op_type": 9,
+                "inputs": [
+                    4294967301,
+                    4294967302
                 ]
             }
-        ]
+        ],
+        "events": []
     },
     {
-        "name": "simple_transfer",
-        "method_id": 354447671,
+        "name": "transfer",
+        "method_id": 2789897329,
         "circuit_inputs": [
             0,
             1
         ],
-        "circuit_outputs": [
-            4
-        ],
+        "circuit_outputs": [],
         "state_commands": [
             {
-                "type": "GetSelfUserCurrentContractStateSlotHash",
-                "slot_index": 2
+                "type": "GetContractLeaf",
+                "contract_id": 2
             },
             {
-                "type": "SetContractStateSlotHash",
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 3
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 7
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 9
+            },
+            {
+                "type": "SetContractStateSlotSingle",
                 "condition": 4294967296,
-                "slot_index": 2,
-                "value": [
-                    5,
-                    7,
-                    9,
-                    11
-                ]
+                "sub_slot_index": 7,
+                "value": 11
             },
             {
-                "type": "GetSelfUserCurrentContractStateSlotHash",
-                "slot_index": 0
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 9
             },
             {
-                "type": "SetContractStateSlotHash",
+                "type": "SetContractStateSlotSingle",
                 "condition": 4294967296,
-                "slot_index": 0,
-                "value": [
-                    12,
-                    13,
-                    15,
-                    16
-                ]
+                "sub_slot_index": 9,
+                "value": 12
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 3
+            },
+            {
+                "type": "SetContractStateSlotSingle",
+                "condition": 4294967296,
+                "sub_slot_index": 3,
+                "value": 14
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 3
             }
         ],
         "state_command_resolution_indices": [
             3,
+            4,
+            8,
+            10,
+            13,
+            13,
             14,
             14,
-            20
+            16,
+            16
         ],
         "assertions": [
             {
@@ -199,284 +339,17 @@
             {
                 "left": 4294967298,
                 "right": 4294967296,
-                "message": "user balance overflow"
+                "message": "Index out of bounds"
             },
             {
                 "left": 4294967299,
                 "right": 4294967296,
-                "message": "sent amount overflow"
-            }
-        ],
-        "definitions": [
-            {
-                "data_type": 0,
-                "index": 0,
-                "op_type": 0,
-                "inputs": [
-                    0
-                ]
+                "message": "amount sent overflow"
             },
-            {
-                "data_type": 0,
-                "index": 1,
-                "op_type": 0,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 2,
-                "op_type": 46,
-                "inputs": [
-                    0
-                ]
-            },
-            {
-                "data_type": 1,
-                "index": 0,
-                "op_type": 2,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 3,
-                "index": 0,
-                "op_type": 53,
-                "inputs": [
-                    0
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 3,
-                "op_type": 1,
-                "inputs": [
-                    0
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 4,
-                "op_type": 20,
-                "inputs": [
-                    12884901888,
-                    3
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 5,
-                "op_type": 5,
-                "inputs": [
-                    4,
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 6,
-                "op_type": 1,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 7,
-                "op_type": 20,
-                "inputs": [
-                    12884901888,
-                    6
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 8,
-                "op_type": 1,
-                "inputs": [
-                    2
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 9,
-                "op_type": 20,
-                "inputs": [
-                    12884901888,
-                    8
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 10,
-                "op_type": 1,
-                "inputs": [
-                    3
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 11,
-                "op_type": 20,
-                "inputs": [
-                    12884901888,
-                    10
-                ]
-            },
-            {
-                "data_type": 3,
-                "index": 1,
-                "op_type": 53,
-                "inputs": [
-                    2
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 12,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    3
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 13,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    6
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 14,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    8
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 15,
-                "op_type": 4,
-                "inputs": [
-                    14,
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 16,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    10
-                ]
-            },
-            {
-                "data_type": 1,
-                "index": 1,
-                "op_type": 14,
-                "inputs": [
-                    1,
-                    4
-                ]
-            },
-            {
-                "data_type": 1,
-                "index": 2,
-                "op_type": 17,
-                "inputs": [
-                    5,
-                    4
-                ]
-            },
-            {
-                "data_type": 1,
-                "index": 3,
-                "op_type": 16,
-                "inputs": [
-                    15,
-                    14
-                ]
-            }
-        ]
-    },
-    {
-        "name": "simple_claim",
-        "method_id": 2293029357,
-        "circuit_inputs": [
-            0
-        ],
-        "circuit_outputs": [
-            14
-        ],
-        "state_commands": [
-            {
-                "type": "GetSelfUserCurrentContractStateSlotHash",
-                "slot_index": 1
-            },
-            {
-                "type": "GetSelfUserCurrentContractStateSlotHash",
-                "slot_index": 0
-            },
-            {
-                "type": "GetOtherUserContractStateSlotHash",
-                "user_id": 0,
-                "contract_id": 2,
-                "slot_index": 1,
-                "contract_state_tree_height": 32
-            },
-            {
-                "type": "SetContractStateSlotHash",
-                "condition": 4294967296,
-                "slot_index": 0,
-                "value": [
-                    4,
-                    6,
-                    7,
-                    9
-                ]
-            },
-            {
-                "type": "SetContractStateSlotHash",
-                "condition": 4294967296,
-                "slot_index": 1,
-                "value": [
-                    14,
-                    15,
-                    16,
-                    17
-                ]
-            }
-        ],
-        "state_command_resolution_indices": [
-            2,
-            2,
-            3,
-            13,
-            22
-        ],
-        "assertions": [
             {
                 "left": 4294967298,
                 "right": 4294967296,
-                "message": "you cannot claim from your self"
-            },
-            {
-                "left": 4294967299,
-                "right": 4294967296,
-                "message": "no tokens to claim from this sender"
-            },
-            {
-                "left": 4294967300,
-                "right": 4294967296,
-                "message": "balance overflow"
+                "message": "Index out of bounds"
             }
         ],
         "definitions": [
@@ -491,9 +364,9 @@
             {
                 "data_type": 0,
                 "index": 1,
-                "op_type": 46,
+                "op_type": 0,
                 "inputs": [
-                    0
+                    1
                 ]
             },
             {
@@ -505,6 +378,65 @@
                 ]
             },
             {
+                "data_type": 0,
+                "index": 3,
+                "op_type": 1,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 4,
+                "op_type": 1,
+                "inputs": [
+                    3
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 5,
+                "op_type": 1,
+                "inputs": [
+                    2
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 6,
+                "op_type": 6,
+                "inputs": [
+                    0,
+                    5
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 7,
+                "op_type": 4,
+                "inputs": [
+                    4,
+                    6
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 8,
+                "op_type": 1,
+                "inputs": [
+                    1
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 9,
+                "op_type": 4,
+                "inputs": [
+                    7,
+                    8
+                ]
+            },
+            {
                 "data_type": 1,
                 "index": 0,
                 "op_type": 2,
@@ -513,175 +445,71 @@
                 ]
             },
             {
-                "data_type": 3,
-                "index": 0,
-                "op_type": 53,
-                "inputs": [
-                    2
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 3,
-                "op_type": 1,
-                "inputs": [
-                    2
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 4,
-                "op_type": 20,
-                "inputs": [
-                    12884901888,
-                    3
-                ]
-            },
-            {
-                "data_type": 3,
-                "index": 1,
-                "op_type": 53,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 5,
-                "op_type": 1,
-                "inputs": [
-                    1
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 6,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    5
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 7,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    3
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 8,
-                "op_type": 1,
-                "inputs": [
-                    3
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 9,
-                "op_type": 20,
-                "inputs": [
-                    12884901889,
-                    8
-                ]
-            },
-            {
                 "data_type": 0,
                 "index": 10,
-                "op_type": 1,
+                "op_type": 54,
                 "inputs": [
-                    0
+                    2
                 ]
             },
             {
                 "data_type": 0,
                 "index": 11,
-                "op_type": 20,
+                "op_type": 4,
                 "inputs": [
-                    12884901889,
-                    10
+                    10,
+                    1
                 ]
             },
             {
                 "data_type": 0,
                 "index": 12,
-                "op_type": 5,
+                "op_type": 54,
                 "inputs": [
-                    4,
-                    11
-                ]
-            },
-            {
-                "data_type": 3,
-                "index": 2,
-                "op_type": 53,
-                "inputs": [
-                    0
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 13,
-                "op_type": 20,
-                "inputs": [
-                    12884901890,
-                    10
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 14,
-                "op_type": 4,
-                "inputs": [
-                    12,
-                    13
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 15,
-                "op_type": 20,
-                "inputs": [
-                    12884901890,
-                    5
-                ]
-            },
-            {
-                "data_type": 0,
-                "index": 16,
-                "op_type": 20,
-                "inputs": [
-                    12884901890,
                     3
                 ]
             },
             {
                 "data_type": 0,
-                "index": 17,
-                "op_type": 20,
+                "index": 13,
+                "op_type": 54,
                 "inputs": [
-                    12884901890,
-                    8
+                    1
                 ]
             },
             {
-                "data_type": 1,
-                "index": 1,
-                "op_type": 13,
+                "data_type": 0,
+                "index": 14,
+                "op_type": 5,
                 "inputs": [
-                    0,
+                    13,
                     1
                 ]
             },
             {
                 "data_type": 1,
-                "index": 2,
-                "op_type": 8,
+                "index": 1,
+                "op_type": 15,
                 "inputs": [
-                    4294967297
+                    13,
+                    1
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 15,
+                "op_type": 1,
+                "inputs": [
+                    4294967296
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 2,
+                "op_type": 17,
+                "inputs": [
+                    0,
+                    15
                 ]
             },
             {
@@ -689,16 +517,396 @@
                 "index": 3,
                 "op_type": 16,
                 "inputs": [
+                    11,
+                    10
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 16,
+                "op_type": 48,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 17,
+                "op_type": 46,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 18,
+                "op_type": 54,
+                "inputs": [
+                    7
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 19,
+                "op_type": 54,
+                "inputs": [
+                    9
+                ]
+            }
+        ],
+        "events": [
+            {
+                "condition": 4294967296,
+                "checkpoint_id": 16,
+                "user_id": 17,
+                "contract_id": 2,
+                "data": [
+                    0,
+                    1
+                ]
+            },
+            {
+                "condition": 4294967296,
+                "checkpoint_id": 16,
+                "user_id": 17,
+                "contract_id": 2,
+                "data": [
+                    18
+                ]
+            },
+            {
+                "condition": 4294967296,
+                "checkpoint_id": 16,
+                "user_id": 17,
+                "contract_id": 2,
+                "data": [
+                    19
+                ]
+            }
+        ]
+    },
+    {
+        "name": "claim",
+        "method_id": 3824212239,
+        "circuit_inputs": [
+            0
+        ],
+        "circuit_outputs": [],
+        "state_commands": [
+            {
+                "type": "GetContractLeaf",
+                "contract_id": 1
+            },
+            {
+                "type": "GetOtherUserContractStateSlotSingle",
+                "user_id": 0,
+                "contract_id": 1,
+                "sub_slot_index": 8,
+                "contract_state_tree_height": 3
+            },
+            {
+                "type": "GetOtherUserContractStateSlotSingle",
+                "user_id": 0,
+                "contract_id": 1,
+                "sub_slot_index": 10,
+                "contract_state_tree_height": 3
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 12
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 13
+            },
+            {
+                "type": "SetContractStateSlotSingle",
+                "condition": 4294967296,
+                "sub_slot_index": 13,
+                "value": 14
+            },
+            {
+                "type": "GetSelfUserCurrentContractStateSlotSingle",
+                "sub_slot_index": 15
+            },
+            {
+                "type": "SetContractStateSlotSingle",
+                "condition": 4294967296,
+                "sub_slot_index": 15,
+                "value": 19
+            }
+        ],
+        "state_command_resolution_indices": [
+            2,
+            10,
+            12,
+            14,
+            15,
+            17,
+            18,
+            22
+        ],
+        "assertions": [
+            {
+                "left": 4294967297,
+                "right": 4294967296,
+                "message": "Index out of bounds"
+            },
+            {
+                "left": 4294967298,
+                "right": 4294967296,
+                "message": "Index out of bounds"
+            },
+            {
+                "left": 4294967299,
+                "right": 4294967296,
+                "message": "no tokens to claim from this sender"
+            },
+            {
+                "left": 4294967298,
+                "right": 4294967296,
+                "message": "Index out of bounds"
+            }
+        ],
+        "definitions": [
+            {
+                "data_type": 0,
+                "index": 0,
+                "op_type": 0,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 1,
+                "op_type": 47,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 5,
+                "index": 0,
+                "op_type": 55,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 2,
+                "op_type": 1,
+                "inputs": [
+                    12
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 3,
+                "op_type": 20,
+                "inputs": [
+                    21474836480,
+                    2
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 4,
+                "op_type": 1,
+                "inputs": [
+                    3
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 5,
+                "op_type": 46,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 6,
+                "op_type": 1,
+                "inputs": [
+                    2
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 7,
+                "op_type": 6,
+                "inputs": [
+                    5,
+                    6
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 8,
+                "op_type": 4,
+                "inputs": [
+                    4,
+                    7
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 9,
+                "op_type": 1,
+                "inputs": [
+                    1
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 10,
+                "op_type": 4,
+                "inputs": [
+                    8,
+                    9
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 11,
+                "op_type": 6,
+                "inputs": [
+                    0,
+                    6
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 12,
+                "op_type": 4,
+                "inputs": [
                     4,
                     11
                 ]
             },
             {
+                "data_type": 0,
+                "index": 13,
+                "op_type": 4,
+                "inputs": [
+                    12,
+                    9
+                ]
+            },
+            {
                 "data_type": 1,
-                "index": 4,
+                "index": 0,
+                "op_type": 2,
+                "inputs": [
+                    1
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 14,
+                "op_type": 54,
+                "inputs": [
+                    1
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 15,
+                "op_type": 1,
+                "inputs": [
+                    0
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 16,
+                "op_type": 54,
+                "inputs": [
+                    6
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 17,
+                "op_type": 54,
+                "inputs": [
+                    4
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 18,
+                "op_type": 5,
+                "inputs": [
+                    14,
+                    17
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 19,
+                "op_type": 4,
+                "inputs": [
+                    16,
+                    18
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 20,
+                "op_type": 1,
+                "inputs": [
+                    4294967296
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 1,
                 "op_type": 17,
                 "inputs": [
-                    13,
+                    5,
+                    20
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 2,
+                "op_type": 17,
+                "inputs": [
+                    0,
+                    20
+                ]
+            },
+            {
+                "data_type": 1,
+                "index": 3,
+                "op_type": 17,
+                "inputs": [
+                    17,
+                    14
+                ]
+            },
+            {
+                "data_type": 0,
+                "index": 21,
+                "op_type": 48,
+                "inputs": [
+                    0
+                ]
+            }
+        ],
+        "events": [
+            {
+                "condition": 4294967296,
+                "checkpoint_id": 21,
+                "user_id": 5,
+                "contract_id": 1,
+                "data": [
+                    0,
+                    18,
                     14
                 ]
             }

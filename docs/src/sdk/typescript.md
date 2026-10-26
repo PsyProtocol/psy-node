@@ -278,7 +278,7 @@ async function claimTokens(
 ) {
   const contractCallArgs: ContractCallArgs = {
     contract_id: "token-contract-id",
-    method_name: "simple_claim",
+    method_name: "claim",
     inputs: [senderUserId]
   };
   

@@ -109,3 +109,54 @@ pub struct SubmitGUTARealmResultAPIWithProof<F, Hash, Proof> {
     pub input: SubmitGUTARealmResultAPINoProofInput<F, Hash>,
     pub proof: Proof,
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+    use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn end_cap_public_inputs_hash_binds_transition_stats_and_height() {
+        let input = SubmitUserEndCapNonProofCoreInput::<PF, Hash>::qp_rand_gen();
+
+        for height in [16u8, 32u8] {
+            let expected = PoseidonHasher::q_two_to_one(
+                input.state_transition.qfhash_with_guta_height::<PoseidonHasher>(height),
+                input.stats.qfhash::<PoseidonHasher>(),
+            );
+            assert_eq!(input.get_proof_public_inputs_hash::<PoseidonHasher>(height), expected);
+        }
+
+        // The global user tree height is committed inside the state transition hash.
+        assert_ne!(
+            input.get_proof_public_inputs_hash::<PoseidonHasher>(16),
+            input.get_proof_public_inputs_hash::<PoseidonHasher>(32)
+        );
+    }
+
+    #[test]
+    fn end_cap_input_fallback_write_matches_canonical_encoding() {
+        let input = SubmitUserEndCapNonProofCoreInput::<PF, Hash>::qp_rand_gen();
+
+        assert!(SubmitUserEndCapNonProofCoreInput::<PF, Hash>::IS_FIXED_SIZE);
+        assert_eq!(
+            input.fallback_pio_serialized_size(),
+            SubmitUserEndCapNonProofCoreInput::<PF, Hash>::FIXED_SIZE
+        );
+
+        // The fallback writer must emit exactly the canonical (speedy) encoding.
+        // The fallback reader cannot be exercised here: chained nested speedy
+        // stream reads desynchronize the shared cursor (reported production bug),
+        // so the payload is validated through the canonical reader instead.
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), SubmitUserEndCapNonProofCoreInput::<PF, Hash>::FIXED_SIZE);
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(
+            SubmitUserEndCapNonProofCoreInput::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(),
+            input
+        );
+    }
+}

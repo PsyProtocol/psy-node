@@ -233,7 +233,7 @@ mod tests {
             wallet_password,
             fingerprint: None,
             sd_key_allowed_contract_id: vec![5, 0, 0],
-            sd_key_allowed_method_id: vec![3375543263, 354447671, 2923993647],
+            sd_key_allowed_method_id: vec![3375543263, 2789897329, 3998182541],
             sd_key_expected_tx_count: 3,
         };
         let info = load_wallet_key_info(&wallet_args, false)?;
@@ -282,7 +282,7 @@ mod tests {
         let mut private_keys = Vec::with_capacity(1 << 19);
 
         let zk_fingerprint = QHashOut::<F>::from_values(ZK_FINGERPRINT_U64[0], ZK_FINGERPRINT_U64[1], ZK_FINGERPRINT_U64[2], ZK_FINGERPRINT_U64[3]);
-        let sd_key_fingerprint = QHashOut::<F>::from_str("38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb")?;
+        let sd_key_fingerprint = QHashOut::<F>::from_str("86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278")?;
 
         let relayer_private_key = resolve_bridge_relayer_private_key()?;
 
@@ -445,7 +445,7 @@ mod tests {
             faucet_per_claim_amount: "1000000000000".to_string(),
             sd_key_expected_tx_count: 3,
             sd_key_allowed_contract_ids: vec![5, 0, 0],
-            sd_key_allowed_method_ids: vec![3375543263, 354447671, 2923993647],
+            sd_key_allowed_method_ids: vec![3375543263, 2789897329, 3998182541],
             operators,
         };
 

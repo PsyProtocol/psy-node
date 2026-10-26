@@ -222,6 +222,170 @@ pser::impl_psy_ser_basic_tests_fallback!(
     psy_worker_get_proving_work_api_response_tests
 );
 
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::pgoldilocks::QHashOut;
+    use parth_core::PF;
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    use super::*;
+    use crate::worker::metadata::PsyProvingJobMetadata;
+
+    type Hash = QHashOut<PF>;
+
+    fn job(circuit_type: ProvingJobCircuitType, task: u32) -> QProvingJobDataID {
+        QProvingJobDataID::new_proof_job_id(7, 1, circuit_type, 0, task)
+    }
+
+    fn response(dependencies: Vec<QProvingJobDataID>) -> PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID> {
+        let count = dependencies.len();
+        PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
+            base: PsyWorkerGetProvingWorkAPIResponse {
+                job: PsyProvingJobMetadataWithJobId {
+                    job_id: job(ProvingJobCircuitType::Unknown, 99),
+                    metadata: PsyProvingJobMetadata {
+                        expected_public_inputs_hash: Hash::default(),
+                        reward_tree_node_index: 0,
+                        reward_tree_node_level: 0,
+                        reward_tree_hash_mode: 0,
+                        reward_tree_node_children: count as u16,
+                        dependencies,
+                    },
+                },
+                child_proof_tag_values: vec![Hash::default(); count],
+                realm_id: 1,
+                realm_sub_id: 2,
+                unique_pending_id: 3,
+                node_type: PROVING_JOB_NODE_TYPE_REALM,
+                witness: vec![4, 5],
+            },
+            input_proofs: vec![vec![6]; count],
+        }
+    }
+
+    #[test]
+    fn expected_hash_dependency_encoding_round_trips_and_rejects_bad_data() {
+        let hash = [42u8; 32];
+        let dependencies = vec![
+            job(ProvingJobCircuitType::UserEndCap, 1),
+            job(ProvingJobCircuitType::GUTATwoGUTA, 2),
+        ];
+        let encoded = encode_expected_public_inputs_hash_and_dependencies(&hash, &dependencies);
+        let (decoded_hash, decoded_dependencies) =
+            decode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&encoded).unwrap();
+        assert_eq!(decoded_hash, hash);
+        assert_eq!(decoded_dependencies, dependencies);
+
+        let empty = encode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&hash, &[]);
+        assert_eq!(decode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&empty).unwrap(), (hash, vec![]));
+        assert!(decode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&encoded[..35]).is_err());
+
+        let mut wrong_length = encoded.clone();
+        wrong_length[32..36].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&wrong_length).is_err());
+
+        let mut invalid_job = encoded;
+        invalid_job[36] = 200;
+        assert!(decode_expected_public_inputs_hash_and_dependencies::<QProvingJobDataID>(&invalid_job).is_err());
+    }
+
+    #[test]
+    fn child_count_validation_reports_each_mismatch() {
+        let dependencies = vec![job(ProvingJobCircuitType::UserEndCap, 1)];
+        let valid = response(dependencies);
+        assert!(valid.ensure_expected_child_proof_count(1).is_ok());
+        assert!(valid.ensure_expected_child_proof_count_with_tags(1).is_ok());
+
+        let mut bad_proofs = valid.clone();
+        bad_proofs.input_proofs.clear();
+        assert!(bad_proofs.ensure_expected_child_proof_count(1).unwrap_err().to_string().contains("input_proofs"));
+
+        let mut bad_tags = valid.clone();
+        bad_tags.base.child_proof_tag_values.clear();
+        assert!(bad_tags.ensure_expected_child_proof_count_with_tags(1).unwrap_err().to_string().contains("child_proof_tag_values"));
+
+        let mut bad_dependencies = valid;
+        bad_dependencies.base.job.metadata.dependencies.clear();
+        assert!(bad_dependencies.ensure_expected_child_proof_count(1).unwrap_err().to_string().contains("dependencies"));
+    }
+
+    #[test]
+    fn circuit_type_helpers_validate_order_and_bounds() {
+        let expected = [ProvingJobCircuitType::UserEndCap, ProvingJobCircuitType::GUTATwoGUTA];
+        let value = response(vec![job(expected[0], 1), job(expected[1], 2)]);
+        assert!(value.ensure_expected_child_proof_circuit_types_with_tags(&expected).is_ok());
+        assert_eq!(value.get_child_proof_circuit_type(0).unwrap(), expected[0]);
+        assert_eq!(value.get_child_proof_circuit_types(), expected);
+        assert!(value.get_child_proof_circuit_type(2).is_err());
+
+        let reversed = [expected[1], expected[0]];
+        assert!(value.ensure_expected_child_proof_circuit_types_with_tags(&reversed).is_err());
+    }
+
+    #[test]
+    fn child_proofs_response_fallback_serialization_handles_empty_and_non_empty_proofs() {
+        let base = PsyWorkerGetProvingWorkAPIResponse {
+            job: PsyProvingJobMetadataWithJobId {
+                job_id: job(ProvingJobCircuitType::Unknown, 99),
+                metadata: PsyProvingJobMetadata {
+                    expected_public_inputs_hash: Hash::default(),
+                    reward_tree_node_index: 0,
+                    reward_tree_node_level: 0,
+                    reward_tree_hash_mode: 0,
+                    reward_tree_node_children: 0,
+                    dependencies: vec![],
+                },
+            },
+            child_proof_tag_values: vec![Hash::default(), Hash::default()],
+            realm_id: 1,
+            realm_sub_id: 2,
+            unique_pending_id: 3,
+            node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
+            witness: vec![4, 5],
+        };
+        let empty_proofs = PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
+            base: base.clone(),
+            input_proofs: vec![],
+        };
+        let with_proofs = PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
+            base,
+            input_proofs: vec![vec![7; 10], vec![]],
+        };
+
+        let empty_bytes = empty_proofs.fallback_psy_ser_to_bytes_vec().unwrap();
+        let proof_bytes = with_proofs.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(empty_bytes.len(), empty_proofs.fallback_pio_serialized_size());
+        assert_eq!(proof_bytes.len(), with_proofs.fallback_pio_serialized_size());
+        // Only the two proof length prefixes plus the 10 proof bytes differ.
+        assert_eq!(proof_bytes.len() - empty_bytes.len(), 4 + 4 + 10);
+
+        // The fallback decoder cannot be used for this type: the speedy-buffered
+        // read of `base` drains a small cursor into its 8 KiB circular buffer, so
+        // the trailing direct reads of `input_proofs` hit EOF. Decode through the
+        // active in-memory reader instead.
+        let decoded = PsyWorkerGetProvingWorkWithChildProofsAPIResponse::<Hash, QProvingJobDataID>::psy_ser_from_slice(&proof_bytes).unwrap();
+        assert_eq!(decoded, with_proofs);
+        assert_eq!(decoded.input_proofs, vec![vec![7u8; 10], vec![]]);
+        assert_eq!(decoded.base.node_type, PROVING_JOB_NODE_TYPE_COORDINATOR);
+        assert_eq!(decoded.base.child_proof_tag_values.len(), 2);
+
+        let decoded_empty = PsyWorkerGetProvingWorkWithChildProofsAPIResponse::<Hash, QProvingJobDataID>::psy_ser_from_slice(&empty_bytes).unwrap();
+        assert_eq!(decoded_empty, empty_proofs);
+        assert!(decoded_empty.input_proofs.is_empty());
+    }
+
+    #[test]
+    fn raw_proof_with_job_id_keeps_its_fields() {
+        let raw = PsyRawProofWithJobId {
+            job_id: job(ProvingJobCircuitType::UserEndCap, 1),
+            proof: vec![1, 2, 3],
+        };
+        assert_eq!(raw.job_id, job(ProvingJobCircuitType::UserEndCap, 1));
+        assert_eq!(raw.proof, vec![1, 2, 3]);
+    }
+}
+
 
 // ================================================================================================
 // PsyWorkerGetProvingWorkWithChildProofsAPIResponse

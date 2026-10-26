@@ -40,3 +40,37 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GUTAHeaderWithJobMetadat
         }
     }
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn job_metadata_hash_matches_bare_header_hash() {
+        let value = GUTAHeaderWithJobMetadata::<PF, Hash>::qp_rand_gen();
+        assert_eq!(
+            value.qfhash::<PoseidonHasher>(),
+            value.header.qfhash::<PoseidonHasher>()
+        );
+    }
+
+    #[test]
+    fn global_user_tree_key_reflects_transition_position() {
+        let mut value = GUTAHeaderWithJobMetadata::<PF, Hash>::qp_rand_gen();
+        value.header.state_transition.node_level = PF::from_u64_value(9);
+        value.header.state_transition.node_index = PF::from_u64_value(1234);
+
+        let key = value.get_global_user_tree_key();
+        assert_eq!(key, SimpleMerkleNodeKey { level: 9, index: 1234 });
+    }
+
+    #[test]
+    fn rand_gen_produces_distinct_values() {
+        let first = GUTAHeaderWithJobMetadata::<PF, Hash>::qp_rand_gen();
+        let second = GUTAHeaderWithJobMetadata::<PF, Hash>::qp_rand_gen();
+        assert_ne!(first, second);
+    }
+}

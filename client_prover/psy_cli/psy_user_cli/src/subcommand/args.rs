@@ -68,6 +68,10 @@ pub struct DeployContractArgs {
     /// sources use `--keystore-path` and optional `--wallet-password`.
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
     #[clap(long)]
     pub contract_path: String,
     #[clap(long, env)]
@@ -88,11 +92,13 @@ pub struct UpdateContractArgs {
     pub fingerprint: Option<String>,
     #[clap(long)]
     pub contract_id: u64,
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
     #[clap(long)]
     pub contract_path: String,
-    /// ABI JSON of the currently deployed contract layout. When omitted the old
-    /// ABI is assumed to match the new ABI in the compilation artifact supplied
-    /// to `--contract-path`.
+    /// ABI JSON of the currently deployed contract layout. Required for updates.
     #[clap(long)]
     pub old_abi_path: Option<String>,
     /// ABI JSON produced for the updated contract. When omitted the new ABI is
@@ -599,6 +605,11 @@ pub struct CompileAndDeployArgs {
 
     #[clap(long, env)]
     pub fingerprint: Option<String>,
+
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
 
     /// Output directory for compiled artifacts
     #[clap(long)]

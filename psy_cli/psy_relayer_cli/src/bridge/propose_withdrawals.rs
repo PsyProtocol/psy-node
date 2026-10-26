@@ -274,16 +274,15 @@ async fn fetch_bridge_withdrawals(
     destination_chain_index: Option<u64>,
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
     let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
-    let limit: u32 = 10_000;
+    let limit: u32 = 1_000;
     let mut offset: u64 = initial_event_offset;
 
     loop {
-        let chain_param = destination_chain_index
-            .map(|index| format!("&destination_chain_index={index}"))
-            .unwrap_or_default();
-        let url = format!(
-            "{}/api/v1/bridge/withdrawals?limit={}&offset={}{}",
-            base_url, limit, offset, chain_param,
+        let url = bridge_withdrawals_url(
+            base_url,
+            limit,
+            offset,
+            destination_chain_index,
         );
         tracing::debug!(url = %url, "fetching bridge withdrawals page");
 
@@ -318,21 +317,35 @@ async fn fetch_bridge_withdrawals(
         }
 
         let data = resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))?;
-        let page_len = data.withdrawals.len() as u64;
         all_withdrawals.extend(data.withdrawals);
 
-        // psy-services caps pages below the requested limit (handler max is
-        // 1,000), so a short page does NOT mean the stream is exhausted — only
-        // the reported total is authoritative. Keep paging until the filtered
-        // total is fully collected (or an empty page makes further progress
-        // impossible).
-        if page_len == 0 || all_withdrawals.len() as i64 >= data.total {
+        // Match the services page cap and advance by raw event rows: services
+        // can omit undecodable events from a page without reducing its total.
+        let total = u64::try_from(data.total.max(0)).unwrap_or(u64::MAX);
+        let next_offset = offset.saturating_add(u64::from(limit));
+        if next_offset >= total {
             break;
         }
-        offset += page_len;
+        offset = next_offset;
     }
 
     Ok(all_withdrawals)
+}
+
+fn bridge_withdrawals_url(
+    base_url: &str,
+    limit: u32,
+    offset: u64,
+    destination_chain_index: Option<u64>,
+) -> String {
+    let mut url = format!(
+        "{}/api/v1/bridge/withdrawals?limit={}&offset={}",
+        base_url, limit, offset,
+    );
+    if let Some(chain_index) = destination_chain_index {
+        url.push_str(&format!("&destination_chain_index={chain_index}"));
+    }
+    url
 }
 
 async fn fetch_services_latest_checkpoint(http: &reqwest::Client, base_url: &str) -> anyhow::Result<u64> {
@@ -834,6 +847,71 @@ mod tests {
             "hex helper must match limb helper"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn multichain_withdrawal_query_selects_destination_chain() {
+        assert_eq!(
+            bridge_withdrawals_url("https://services.example", 1_000, 42, Some(2)),
+            "https://services.example/api/v1/bridge/withdrawals?limit=1000&offset=42&destination_chain_index=2"
+        );
+        assert_eq!(
+            bridge_withdrawals_url("https://services.example", 1_000, 42, None),
+            "https://services.example/api/v1/bridge/withdrawals?limit=1000&offset=42"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_uses_chain_cursor_and_raw_page_offsets() -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            // An empty decoded page can still cover 1,000 raw events. The next
+            // page must keep the same chain filter and advance from its cursor.
+            for (offset, withdrawals) in [(42, serde_json::json!([])), (1042, serde_json::json!([{
+                "event_id": 1043, "checkpoint_id": 10, "user_id": 1,
+                "sender_user_id": 1, "contract_id": 2,
+                "destination_chain_index": 2, "leaf_hash": "0x01"
+            }]))] {
+                let (socket, _) = listener.accept().await?;
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await?;
+                assert_eq!(line, format!(
+                    "GET /api/v1/bridge/withdrawals?limit=1000&offset={offset}&destination_chain_index=2 HTTP/1.1\r\n"
+                ));
+                loop {
+                    line.clear();
+                    anyhow::ensure!(socket.read_line(&mut line).await? > 0, "incomplete request headers");
+                    if line == "\r\n" { break; }
+                }
+                let body = serde_json::json!({
+                    "success": true, "data": {"withdrawals": withdrawals, "total": 1043}
+                }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket.get_mut().write_all(response.as_bytes()).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build()?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5), fetch_bridge_withdrawals(&http, &url, 42, Some(2))
+        ).await;
+        let mut server = server;
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        server.abort();
+        joined???;
+        let withdrawals = result??;
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0].event_id, 1043);
+        assert_eq!(withdrawals[0].destination_chain_index, 2);
         Ok(())
     }
 }
