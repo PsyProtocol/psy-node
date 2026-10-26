@@ -1,0 +1,35 @@
+diff --git a/apps/bridge/vite.config.ts b/apps/bridge/vite.config.ts
+--- a/apps/bridge/vite.config.ts
++++ b/apps/bridge/vite.config.ts
+@@ -102,6 +102,7 @@ export default defineConfig({
+   },
+   server: {
+     host: '0.0.0.0',
++    allowedHosts: ['app-local.psy-protocol.xyz'],
+     port: 5177,
+     proxy: {
+       '/psy-services': {
+@@ -111,7 +112,7 @@ export default defineConfig({
+         rewrite: (p) => p.replace(/^\/psy-services/, ''),
+       },
+       '/indexer': {
+-        target: 'http://127.0.0.1:8080',
++        target: `http://127.0.0.1:${process.env.PSY_ENVIO_HASURA_PORT || '8080'}`,
+         changeOrigin: true,
+         rewrite: (p) => p.replace(/^\/indexer/, ''),
+       },
+diff --git a/apps/explorer/vite.config.ts b/apps/explorer/vite.config.ts
+--- a/apps/explorer/vite.config.ts
++++ b/apps/explorer/vite.config.ts
+@@ -53,6 +53,11 @@ export default defineConfig({
+       },
+     ],
+   },
++  server: {
++    host: "0.0.0.0",
++    port: 5178,
++    allowedHosts: ["explorer-local.psy-protocol.xyz"],
++  },
+   build: {
+     outDir: "dist",
+   },

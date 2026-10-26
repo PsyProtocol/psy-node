@@ -1,0 +1,18 @@
+[info]
+name = "psy-local-acceptance"
+[database]
+engine = "sqlite"
+data_directory = "/usr/src/app/db"
+[network]
+address = "0.0.0.0"
+port = 8081
+[limits]
+max_event_bytes = 5242880
+max_ws_message_bytes = 5242880
+max_ws_frame_bytes = 5242880
+messages_per_sec = 20
+subscriptions_per_min = 200
+event_kind_allowlist = [1059]
+[authorization]
+nip42_auth = false
+nip42_dms = false

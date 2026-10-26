@@ -1,0 +1,30 @@
+# ID<TAB>legacy script or topology:<component-step><TAB>description
+04	04_prepare_local_bundle.sh	Build and verify the new cohort BEFORE interruption
+01	01_stop_parth_services.sh	BLOCKED until full-fleet stop and backup inventory is implemented
+02	02_clear_parth_state.sh	BLOCKED until explicit chain-state path allowlist is reviewed
+03	03_clear_database_state.sh	BLOCKED until database/queue/Nostr reset scope is reviewed
+05	05_deploy_scylla.sh	Start Scylla and check private CQL access
+06	06_deploy_redis.sh	Start Valkey and check private access
+07	07_deploy_nats.sh	Start NATS JetStream and check private access
+08	08_deploy_postgres.sh	Start PostgreSQL and check private access
+10	10_deploy_l1_contracts.sh	Deploy fresh pUSDT and bridge contracts on Sepolia/BSC/Base
+11	11_deploy_envio.sh	Deploy three-chain Envio; verify polling and schema patches
+12	topology:12-coordinator-edges	Three Coordinator Edges, independent placement from Processor
+40	topology:12-realm0-edges	Three Realm0 Edges on cp-ce, edge-1 and edge-2
+41	topology:12-realm1-edges	Three Realm1 Edges on cp-ce, edge-1 and edge-2
+42	topology:12-coordinator-processor	Coordinator Processor on cp-ce; no machine resizing
+43	topology:12-realm0-processor	Realm0 Processor on gcp-realm-processor
+44	topology:12-realm1-processor	Realm1 Processor remains on cp-ce
+14	topology:14-workers	Five c4d Workers: one Coordinator, two per Realm
+13	13_deploy_prove_proxy.sh	BLOCKED until multi-host role-specific proxy installer is adapted
+45	topology:12-services	Services API on gcp-psy-service
+46	topology:12-indexers	Coordinator/Realm1 indexers on cp-ce; Realm0 indexer on processor host
+47	topology:13-faucet	Standalone Faucet on gcp-coordinator-worker
+16	topology:16-relayer	Three-chain Relayer on gcp-faucet
+17	topology:17-caddy	Generate Edge pools and dedicated API/Faucet/Proxy routes
+29	29_publish_public_trust_setup.sh	Publish matching new-cohort proving artifacts
+18	18_check_public_entrypoints.sh	Verify all public endpoints and L1 chain IDs
+27	27_deploy_cf_staging_config.sh	Publish new three-chain configuration cohort
+30	30_deploy_cf_sdk_frontends.sh	BLOCKED until handoff to DApp/Wallet deployment workflows is verified
+23	23_smoke_test_simple_mint.sh	Protocol smoke; all-three-chain E2E acceptance is additionally required
+32	32_deploy_monitoring.sh	BLOCKED until monitoring covers expanded fleet; monitoring LAST

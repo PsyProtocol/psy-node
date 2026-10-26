@@ -1,0 +1,9 @@
+[Unit]
+Description=Record Parth WireGuard gateway traffic counters
+Wants=wg-quick@wg0.service
+After=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+Environment=LOG_FILE=/var/log/parth/wireguard-traffic.jsonl
+ExecStart=/usr/local/sbin/parth-wireguard-traffic-snapshot

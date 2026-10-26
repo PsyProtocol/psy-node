@@ -1,0 +1,10 @@
+[Interface]
+Address = 10.250.0.12/24
+PrivateKey = REPLACE_WITH_ARC99X2_PRIVATE_KEY
+MTU = 1380
+
+[Peer]
+PublicKey = REPLACE_WITH_GCP_GATEWAY_PUBLIC_KEY
+Endpoint = REPLACE_WITH_GCP_GATEWAY_PUBLIC_IP:51820
+AllowedIPs = 10.250.0.0/24
+PersistentKeepalive = 15

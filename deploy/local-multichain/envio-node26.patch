@@ -1,0 +1,22 @@
+diff --git a/dev/locSetupV4.ts b/dev/locSetupV4.ts
+--- a/dev/locSetupV4.ts
++++ b/dev/locSetupV4.ts
+@@ -2947,6 +2947,18 @@ async function startEnvioIndexerForRelayer(
+ 
+     await ensurePnpmBuildScriptsApproved(envioGeneratedDir, ["rescript"]);
+     await pnpmInstallWithAutoApprove(envioGeneratedDir);
++    const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] || "0", 10);
++    const yargsPackageJsonPath = path.join(envioGeneratedDir, "node_modules", "yargs", "package.json");
++    if (nodeMajor >= 22 && await exists(yargsPackageJsonPath)) {
++        const yargsPackage = JSON.parse(await Bun.file(yargsPackageJsonPath).text()) as Record<string, unknown>;
++        if (yargsPackage.type === "module") {
++            // yargs 17 ships a CJS extensionless entry inside a type=module package.
++            // Node 22+ interprets that entry as ESM and crashes Envio's ts-node runtime.
++            yargsPackage.type = "commonjs";
++            await Bun.write(yargsPackageJsonPath, `${JSON.stringify(yargsPackage, null, 2)}\n`);
++            console.log(`[DevNet] Applied yargs 17 compatibility for Node ${process.versions.node}`);
++        }
++    }
+     const buildGenerated = await runAndCapture(["pnpm", "build"], envioGeneratedDir);
+     if (buildGenerated.code !== 0) {
+         throw new Error(`envio generated build failed: ${buildGenerated.stderr || buildGenerated.stdout}`);

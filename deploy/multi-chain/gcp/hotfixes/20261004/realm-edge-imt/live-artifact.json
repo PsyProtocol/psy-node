@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "kind": "observed-component-rollout",
+  "date_utc": "2026-10-04",
+  "host": "gcp-cp-ce",
+  "units": ["parth-realm-edge@0.service", "parth-realm-edge@1.service"],
+  "repository": "PsyProtocol/psy-node",
+  "source_branch": "hotfix/imt-predecessor-20261004",
+  "source_commit": "5f1d3070cdc127715c4ad899afcc3bdcf46ded2b",
+  "source_parent": "32bfd3da73b4f05b9dfe2f3aa2f6b2278aa2a3b6",
+  "genesis_source_commit": "cb3ea4a1e743c3c01037ae968e10f27389788a7d",
+  "binary_sha256": "9d29dafa9e998b400e74ad966b953121c5f9e6b8b592adef183f92d3f93ffd8a",
+  "rollback_binary_sha256": "0c99368e55ebb01ee31de1d77199b4afd8f48d8118895c996a263ee9827df155",
+  "genesis_sha256": "569e58c901cdf7bd9edfc25bab70c4b0aafe0f5d2ec782781290d963ae63b710",
+  "release_directory": "/opt/parth/edge-hotfix/20261004-imt-5f1d3070",
+  "installer_sha256": "12d23099eb457d330dc854263ce309ec3cbbdd96339a75651b013e6195d23f68",
+  "build": {
+    "image": "psy-bookworm-builder:nightly-2025-09-20",
+    "rust_toolchain": "nightly-2025-09-20",
+    "go_version": "1.22.3",
+    "psy_network": "testnet",
+    "cpu": "portable; no target-cpu=native or AVX-512 override",
+    "command": "cargo +nightly-2025-09-20 build --offline --locked --release -p psy_node_cli"
+  },
+  "relayer_restarted": false,
+  "deployment_wrote_database": false,
+  "full_cohort_manifest_changed": false
+}

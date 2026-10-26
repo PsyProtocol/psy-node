@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/lib/common.sh"
+
+NAME="${ANVIL_VM_NAME:-${NODE_VM_NAME:-gcp-cp-ce}}"
+ANVIL_PORT="${ANVIL_PORT:-8545}"
+ANVIL_CHAIN_ID="${ANVIL_CHAIN_ID:-${CHAIN_ID:-31337}}"
+
+provision_vm "$NAME"
+run_remote_script "$NAME" "$GCP_DIR/remote/install-anvil.sh" \
+  "ANVIL_DOCKER_IMAGE=${ANVIL_DOCKER_IMAGE:-ghcr.io/foundry-rs/foundry:stable}" \
+  "ANVIL_HOST_BIND=${ANVIL_HOST_BIND:-0.0.0.0}" \
+  "ANVIL_PORT=$ANVIL_PORT" \
+  "ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID" \
+  "ANVIL_PERSIST_STATE=${ANVIL_PERSIST_STATE:-1}" \
+  "ANVIL_STATE_INTERVAL_SECONDS=${ANVIL_STATE_INTERVAL_SECONDS:-5}" \
+  "ANVIL_EXTRA_ARGS=${ANVIL_EXTRA_ARGS:---steps-tracing -vvvv}"
+
+run_health_check "$NAME" "anvil" \
+  "ANVIL_PORT=$ANVIL_PORT" \
+  "ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID" \
+  "SYSTEMD_UNIT=parth-anvil.service" \
+  "HEALTHCHECK_START_DELAY=${ANVIL_HEALTHCHECK_START_DELAY:-5}" \
+  "HEALTHCHECK_ATTEMPTS=${ANVIL_HEALTHCHECK_ATTEMPTS:-60}" \
+  "HEALTHCHECK_DELAY=${ANVIL_HEALTHCHECK_DELAY:-2}"

@@ -1,0 +1,27 @@
+[Unit]
+Description=Parth offsite worker %i
+Wants=network-online.target wg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=parth
+Group=parth
+UMask=0027
+EnvironmentFile=/etc/parth/offsite-worker-%i.env
+WorkingDirectory=/opt/parth/current
+ExecStart=/opt/parth/current/deploy/bin/run-parth-service worker
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=60
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/parth/checkpoints
+
+[Install]
+WantedBy=multi-user.target

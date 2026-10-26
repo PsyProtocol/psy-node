@@ -1,0 +1,13 @@
+{
+  "networks": {
+    "testnet": {
+      "whitelist": {
+        "enabled": true,
+        "secp256k1": [
+          "03c0a27e1918d34a2722b510f4f3d19640139b43333d419ee1b7d99f9340c0b224",
+          "02a4a04c6745b49bf1abe78a86839c47e41db7f0e963acd0aa8af2af0fdd38ab50"
+        ]
+      }
+    }
+  }
+}

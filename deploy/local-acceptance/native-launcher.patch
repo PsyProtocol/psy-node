@@ -1,0 +1,166 @@
+diff --git a/dev/locSetupV4.ts b/dev/locSetupV4.ts
+index 70d15fa1..4d0de19e 100644
+--- a/dev/locSetupV4.ts
++++ b/dev/locSetupV4.ts
+@@ -3,6 +3,7 @@ import { rmdir, rm, exists, mkdir, writeFile } from "fs/promises";
+ import fs from "fs";
+ import path from "path";
+ import net from "node:net";
++import { acceptance, configureAcceptanceCompose } from "../deploy/local-acceptance/isolation";
+ import { createHash } from "node:crypto";
+ import { once } from "node:events";
+ import { availableParallelism } from "node:os";
+@@ -104,6 +105,7 @@ type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
+ // this is an insecure, obviously fake private key for local devnet use only
+ const FAKE_MINER_PRIVATE_KEY = "691337BADFACE067320cb499a730fa6c81a756ed912f181f0f20a6b1fa5c1337";
+ async function killDocker() {
++    if (acceptance) return;
+     try {
+         const proc = Bun.spawn(['docker', 'stop', 'valkey-server', 'scylla-server', 'nats-server'], {
+             stderr: "ignore",
+@@ -1030,7 +1032,7 @@ function uiStartedDetector(line: string): boolean { return line.includes('ready
+  * AFTER envio has created the tables (i.e. after Hasura health check passes).
+  */
+ async function ensureEnvioHasuraPublicAccess(): Promise<void> {
+-    const hasuraUrl = 'http://127.0.0.1:8080';
++    const hasuraUrl = acceptance.hasuraUrl;
+     const adminSecret = 'testing';
+     const tables = ['Deposit', 'DepositTreeMeta', 'DepositTreeNode', 'FinalizedBatch', 'WithdrawalClaim'];
+     type HasuraMetadataExport = {
+@@ -2460,7 +2462,8 @@ async function ensureDevEnvironment(
+     await ensureAllReposCloned();
+     const contractsDir = path.join(cwd, "psy-contracts");
+     const sdk = await ensurePsySdkArtifacts(cwd);
+-    await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
++    // CLI acceptance does not build or launch frontend applications.
++    await ensurePsyContractsDependencies(contractsDir);
+     const { generated } = await ensureKeystoreFiles(contractsDir);
+     await ensureGenesisFiles(cwd);
+     await ensureAllBinariesBuilt(cwd);
+@@ -2822,6 +2825,7 @@ async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: s
+     if (configured !== original) {
+         await Bun.write(composePath, configured);
+     }
++    await configureAcceptanceCompose(composePath);
+ }
+
+ function stringRecord(value: unknown): Record<string, string> {
+@@ -2844,8 +2848,7 @@ async function startEnvioIndexerForRelayer(
+     if (!(await exists(cfgPath))) return null;
+     const relayerRaw = await Bun.file(cfgPath).text();
+     const databaseUrl =
+-        parseTomlScalar(relayerRaw, "database_url") ||
+-        "postgres://postgres:testing@127.0.0.1:5433/envio-dev";
++        acceptance.databaseUrl;
+     const deploymentsNetwork =
+         deploymentsNetworkOverride || parseTomlScalar(relayerRaw, "deployments_network") || "localhost";
+     const primaryRpcUrl =
+@@ -2974,7 +2977,7 @@ async function startEnvioIndexerForRelayer(
+
+     console.log("[DevNet] Installing Envio indexer dependencies...");
+     await ensurePnpmBuildScriptsApproved(envioDir, ["esbuild"]);
+-    await pnpmInstallWithAutoApprove(envioDir);
++    await pnpmInstallWithAutoApprove(envioDir, ["--frozen-lockfile"]);
+
+     console.log("[DevNet] Generating Envio indexer...");
+     const codegen = await runAndCapture(["pnpm", "codegen"], envioDir);
+@@ -3004,17 +3007,17 @@ async function startEnvioIndexerForRelayer(
+     if (composeStart.code !== 0) {
+         throw new Error(`[DevNet] Failed to start Envio docker services: ${composeStart.stderr || composeStart.stdout}`);
+     }
+-    await waitForTcpPort("127.0.0.1", 5433, {
++    await waitForTcpPort("127.0.0.1", acceptance.postgresPort, {
+         attempts: 600,
+         delayMs: 1000,
+         timeoutMs: 1500,
+         name: "Envio Postgres",
+     });
+     await waitForCommandSuccess(
+-        ["docker", "exec", "generated-envio-postgres-1", "psql", "-U", "postgres", "-d", "postgres", "-c", "select 1"],
++        ["docker", "compose", "-f", envioComposeFile, "exec", "-T", "envio-postgres", "psql", "-U", "postgres", "-d", "postgres", "-c", "select 1"],
+         { attempts: 600, delayMs: 1000, name: "Envio Postgres SQL readiness" },
+     );
+-    await waitForHttpUrl("http://127.0.0.1:8080/healthz", {
++    await waitForHttpUrl(`${acceptance.hasuraUrl}/healthz`, {
+         attempts: 600,
+         delayMs: 1000,
+         timeoutMs: 1500,
+@@ -3038,7 +3041,7 @@ async function startEnvioIndexerForRelayer(
+             TUI_OFF: "true",
+             LOG_LEVEL: "info",
+             FILE_LOG_LEVEL: "trace",
+-            HASURA_GRAPHQL_ENDPOINT: "http://localhost:8080/v1/metadata",
++            HASURA_GRAPHQL_ENDPOINT: `${acceptance.hasuraUrl}/v1/metadata`,
+         },
+     });
+     return envioProcess;
+@@ -3118,6 +3121,11 @@ async function killKnownPorts(): Promise<void> {
+ }
+
+ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promise<void> {
++    if (acceptance) {
++        // The process manager stops its tracked children. Never scan host PIDs
++        // or ports; infrastructure is owned by the acceptance wrapper.
++        return;
++    }
+     console.log(`
+ [DevNet] Tearing down...${purge ? " (purge)" : ""}`);
+     await killKnownProcesses();
+@@ -3540,6 +3548,7 @@ class DevNetProcessManager {
+
+         // 2. Start Database
+         if (this.needsStartDb) {
++            throw new Error("Acceptance infrastructure must be started by its scoped Compose file, not --db");
+             if (cleanState) {
+                 console.log("[DevNet] Cleaning local checkpoints...");
+                 await cleanCheckpoint('./local_checkpoints', cwd);
+@@ -4022,7 +4031,7 @@ class DevNetProcessManager {
+             // frontend (which never sends X-Hasura-Admin-Secret) can query them.
+             await ensureEnvioHasuraPublicAccess();
+
+-            const psyServicesCwd = path.resolve(cwd, '../psy-services');
++            const psyServicesCwd = path.resolve(resolveProjectsDir(), 'psy-services');
+             const psyServicesBin = path.join(psyServicesCwd, 'target', 'release', 'psy-services');
+             const psyServicesGenesisAbi = path.join(path.resolve(cwd), 'psy-genesis', 'genesis_contracts.json');
+             const psyServicesGenesisUser = path.join(psyServicesCwd, 'genesis_users.bin');
+@@ -4081,12 +4090,11 @@ class DevNetProcessManager {
+                 };
+             }));
+
+-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'], {
+-                stdio: ['ignore', 'ignore', 'ignore'],
+-            }).exited;
+-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'createdb', '-U', 'postgres', 'psy_services'], {
+-                stdio: ['ignore', 'ignore', 'ignore'],
+-            }).exited;
++            const acceptanceCompose = path.join(cwd, 'psy_cli/psy_relayer_cli/indexer/envio/generated/docker-compose.yaml');
++            for (const args of [['dropdb', '-U', 'postgres', '--if-exists', 'psy_services'], ['createdb', '-U', 'postgres', 'psy_services']]) {
++                const result = await runAndCapture(['docker', 'compose', '-f', acceptanceCompose, 'exec', '-T', 'envio-postgres', ...args]);
++                if (result.code !== 0) throw new Error(`Acceptance database preparation failed: ${result.stderr}`);
++            }
+             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
+                 psyServicesCmd,
+                 psyServicesStartedDetector,
+@@ -4095,9 +4103,9 @@ class DevNetProcessManager {
+                     ...getLogPaths('psy_services', false),
+                     env: {
+                         ...this.getEnvWithRustLogDirective('psy_services=info'),
+-                        DATABASE_URL: 'postgres://postgres:testing@127.0.0.1:5433/psy_services',
+-                        REDIS_URL: 'redis://localhost:6379',
+-                        INDEXER_GRAPHQL_URL: 'http://127.0.0.1:8080/v1/graphql',
++                        PSY_DATABASE_URL: `postgres://postgres:testing@127.0.0.1:${acceptance.postgresPort}/psy_services`,
++                        PSY_REDIS_URL: 'redis://127.0.0.1:6379',
++                        INDEXER_GRAPHQL_URL: `${acceptance.hasuraUrl}/v1/graphql`,
+                         PSY_NODE_URL: 'http://127.0.0.1:1337',
+                         PSY_NOSTR_ENABLED: 'true',
+                         PSY_NOSTR_RELAY_URL: 'ws://127.0.0.1:8081',
+@@ -4105,7 +4113,8 @@ class DevNetProcessManager {
+                         BRIDGE_L1_CHAINS_JSON: JSON.stringify(bridgeL1Chains),
+                         BRIDGE_ADDRESS: bridgeAddress,
+                         STATE_MANAGER_ADDRESS: stateManagerAddress,
+-                        API_LISTEN: '0.0.0.0:3000',
++                        PSY_API_HOST: '127.0.0.1',
++                        PSY_API_PORT: '3000',
+                     },
+                     maxRetries: 3,
+                     retryDelayMs: 2000

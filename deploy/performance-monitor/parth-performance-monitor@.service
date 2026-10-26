@@ -1,0 +1,30 @@
+[Unit]
+Description=Parth performance monitor (%i)
+After=local-fs.target systemd-journald.service
+Wants=systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0027
+EnvironmentFile=/etc/parth/performance-monitor-%i.env
+EnvironmentFile=-/etc/parth/performance-monitor-alerts.env
+ExecStart=/usr/local/bin/parth-perf-monitor collect
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=5%
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/parth-performance-monitor
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Parth offsite prove-proxy
+Wants=network-online.target wg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=parth
+Group=parth
+UMask=0027
+Environment=HOME=/var/lib/parth
+EnvironmentFile=/etc/parth/offsite-prove-proxy.env
+WorkingDirectory=/opt/parth/current
+ExecStart=/opt/parth/current/deploy/bin/run-parth-service prove-proxy
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=90
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/parth
+
+[Install]
+WantedBy=multi-user.target

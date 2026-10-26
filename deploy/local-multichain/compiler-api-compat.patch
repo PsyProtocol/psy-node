@@ -1,0 +1,12 @@
+diff --git a/psy-interpreter/src/lib.rs b/psy-interpreter/src/lib.rs
+--- a/psy-interpreter/src/lib.rs
++++ b/psy-interpreter/src/lib.rs
+@@ -1130,7 +1130,7 @@ impl<F: ContextFelt + From<u32>, C: DPNContext<F> + 'static> Interpreter<F, C> {
+                         let contract_id = self.interpret_expr(program, contract_id.clone(), ctx)?.to_felt();
+                         let offset = self.interpret_expr(program, offset.clone(), ctx)?.to_felt();
+                         let value = self.context.op_get_state_felt(
+-                            u16::try_from(self.context.get_constant_value(contract_state_tree_height)).unwrap(),
++                            F::from(u32::try_from(self.context.get_constant_value(contract_state_tree_height)).unwrap()),
+                             contract_id,
+                             user_id,
+                             offset,

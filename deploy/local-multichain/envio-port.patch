@@ -1,0 +1,57 @@
+diff --git a/dev/locSetupV4.ts b/dev/locSetupV4.ts
+--- a/dev/locSetupV4.ts
++++ b/dev/locSetupV4.ts
+@@ -960,6 +960,8 @@ function psyIndexerStartedDetector(line: string): boolean {
+     return line.includes('Starting PSY Indexer');
+ }
+ function uiStartedDetector(line: string): boolean { return line.includes('ready in'); }
++const ENVIO_HASURA_PORT = Number.parseInt(process.env.PSY_ENVIO_HASURA_PORT || "8080", 10);
++const ENVIO_HASURA_URL = `http://127.0.0.1:${ENVIO_HASURA_PORT}`;
+ 
+ /**
+  * Grant public select permissions on all Envio-indexed tables so the frontend
+@@ -967,7 +969,7 @@ function uiStartedDetector(line: string): boolean { return line.includes('ready
+  * AFTER envio has created the tables (i.e. after Hasura health check passes).
+  */
+ async function ensureEnvioHasuraPublicAccess(): Promise<void> {
+-    const hasuraUrl = 'http://127.0.0.1:8080';
++    const hasuraUrl = ENVIO_HASURA_URL;
+     const adminSecret = 'testing';
+     const tables = ['Deposit', 'DepositTreeMeta', 'DepositTreeNode', 'FinalizedBatch', 'WithdrawalClaim'];
+     type HasuraMetadataExport = {
+@@ -2939,7 +2941,7 @@ async function startEnvioIndexerForRelayer(
+         ["docker", "exec", "generated-envio-postgres-1", "psql", "-U", "postgres", "-d", "postgres", "-c", "select 1"],
+         { attempts: 600, delayMs: 1000, name: "Envio Postgres SQL readiness" },
+     );
+-    await waitForHttpUrl("http://127.0.0.1:8080/healthz", {
++    await waitForHttpUrl(`${ENVIO_HASURA_URL}/healthz`, {
+         attempts: 600,
+         delayMs: 1000,
+         timeoutMs: 1500,
+@@ -2963,7 +2965,7 @@ async function startEnvioIndexerForRelayer(
+             TUI_OFF: "true",
+             LOG_LEVEL: "info",
+             FILE_LOG_LEVEL: "trace",
+-            HASURA_GRAPHQL_ENDPOINT: "http://localhost:8080/v1/metadata",
++            HASURA_GRAPHQL_ENDPOINT: `${ENVIO_HASURA_URL}/v1/metadata`,
+         },
+     });
+     return envioProcess;
+@@ -3029,7 +3031,7 @@ async function killKnownProcesses(): Promise<void> {
+ }
+ 
+ async function killKnownPorts(): Promise<void> {
+-    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
++    const ports: number[] = [3000, 5433, ENVIO_HASURA_PORT, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
+     for (let p = 1337; p <= 1346; p++) ports.push(p);
+     for (let p = 9999; p <= 10008; p++) ports.push(p);
+     for (let p = 13380; p <= 14670; p += 10) ports.push(p);
+@@ -4023,7 +4025,7 @@ class DevNetProcessManager {
+                         ...this.getEnvWithRustLogDirective('psy_services=info'),
+                         DATABASE_URL: 'postgres://postgres:testing@127.0.0.1:5433/psy_services',
+                         REDIS_URL: 'redis://localhost:6379',
+-                        INDEXER_GRAPHQL_URL: 'http://127.0.0.1:8080/v1/graphql',
++                        INDEXER_GRAPHQL_URL: `${ENVIO_HASURA_URL}/v1/graphql`,
+                         PSY_NODE_URL: 'http://127.0.0.1:1337',
+                         PSY_NOSTR_ENABLED: 'true',
+                         PSY_NOSTR_RELAY_URL: 'ws://127.0.0.1:8081',

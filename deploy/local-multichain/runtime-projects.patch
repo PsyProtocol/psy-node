@@ -1,0 +1,27 @@
+diff --git a/dev/locSetupV4.ts b/dev/locSetupV4.ts
+index 17d9776..8a73c51 100644
+--- a/dev/locSetupV4.ts
++++ b/dev/locSetupV4.ts
+@@ -1301,10 +1301,10 @@ const S3_BASE_URL = (
+ ).replace(/\/+$/, "");
+ 
+ const REPO_CONFIGS = [
+-    { name: "psy-services", url: "https://github.com/PsyProtocol/psy-services.git", branch: "mainnet-beta" },
++    { name: "psy-services", url: "git@github.com:PsyProtocol/psy-services.git", branch: "multi_chain" },
+-    { name: "psy-wallet", url: "https://github.com/PsyProtocol/psy-wallet.git", branch: "mainnet-beta" },
++    { name: "psy-wallet", url: "git@github.com:PsyProtocol/psy-wallet.git", branch: "mainnet-beta" },
+-    { name: "psy-sdk", url: "https://github.com/PsyProtocol/psy-sdk.git", branch: "mainnet-beta" },
++    { name: "psy-sdk", url: "git@github.com:PsyProtocol/psy-sdk.git", branch: "mainnet-beta" },
+-    { name: "psy-compiler", url: "https://github.com/PsyProtocol/psy-compiler.git", branch: "mainnet-beta" },
++    { name: "psy-compiler", url: "git@github.com:QEDProtocol/psy-compiler.git", branch: "mainnet-beta" },
+ ] as const;
+ 
+ // Resolve the psy-node repository root from the script location so the
+@@ -3948,6 +3948,6 @@ class DevNetProcessManager {
+             await ensureEnvioHasuraPublicAccess();
+ 
+-            const psyServicesCwd = path.resolve(cwd, '../psy-services');
++            const psyServicesCwd = path.resolve(resolveProjectsDir(), 'psy-services');
+             const psyServicesBin = path.join(psyServicesCwd, 'target', 'release', 'psy-services');
+             const psyServicesGenesisAbi = path.join(path.resolve(cwd), 'psy-genesis', 'genesis_contracts.json');
+             const psyServicesGenesisUser = path.join(psyServicesCwd, 'genesis_users.bin');

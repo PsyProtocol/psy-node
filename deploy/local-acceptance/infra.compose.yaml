@@ -1,0 +1,38 @@
+services:
+  valkey:
+    image: valkey/valkey:latest
+    command: [valkey-server, --appendonly, "yes"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: ["valkey:/data"]
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  nats:
+    image: nats:2.10
+    command: [-js, -sd, /data]
+    ports: ["127.0.0.1:4222:4222"]
+    volumes: ["nats:/data"]
+  scylla:
+    image: scylladb/scylla:2026.1.5
+    command: [--smp, "2", --memory, 4G, --overprovisioned, "1", --developer-mode, "1", --experimental-features=lwt]
+    mem_limit: 6g
+    ports: ["127.0.0.1:9042:9042"]
+    volumes: ["scylla:/var/lib/scylla"]
+    healthcheck:
+      test: [CMD-SHELL, "cqlsh -e 'SELECT release_version FROM system.local;' >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 36
+  nostr:
+    image: scsibug/nostr-rs-relay:latest
+    ports: ["127.0.0.1:8081:8081"]
+    volumes:
+      - nostr:/usr/src/app/db
+      - ./nostr.toml:/usr/src/app/config.toml:ro
+volumes:
+  valkey: {}
+  nats: {}
+  scylla: {}
+  nostr: {}

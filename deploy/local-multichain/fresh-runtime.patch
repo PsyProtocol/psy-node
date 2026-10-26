@@ -1,0 +1,48 @@
+diff --git a/dev/locSetupV4.ts b/dev/locSetupV4.ts
+--- a/dev/locSetupV4.ts
++++ b/dev/locSetupV4.ts
+@@ -5,0 +6 @@
++import { configureEnvioFile, envioEnvironment } from "../deploy/local-multichain/fresh-envio";
+@@ -208 +209 @@
+-    for (const port of [6379, 4222, 9042, 8081, 5433, 8080, 8545, 9545, 10545]) {
++    for (const port of [6379, 4222, 9042, 8081, 15433, 9080, 8545, 9545, 10545]) {
+@@ -1688 +1689 @@
+-    const hasuraUrl = 'http://127.0.0.1:8080';
++    const hasuraUrl = 'http://127.0.0.1:9080';
+@@ -4364 +4365 @@
+-async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: string | undefined, networkName: string): Promise<void> {
++async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: string | undefined, networkName: string, names: DevnetDbNames): Promise<void> {
+@@ -4375,0 +4377 @@
++    await configureEnvioFile(composePath, names);
+@@ -4428 +4430,4 @@
+-        "postgres://postgres:testing@127.0.0.1:5433/envio-dev";
++        "postgres://postgres:testing@127.0.0.1:15433/envio-dev";
++    if (databaseUrl !== "postgres://postgres:testing@127.0.0.1:15433/envio-dev") {
++        throw new Error("[DevNet] isolated Envio requires the local port 15433 database");
++    }
+@@ -4550 +4555 @@
+-    await configureEnvioDockerCompose(envioComposeFile, runtimeCpuSet, names.envioNetwork);
++    await configureEnvioDockerCompose(envioComposeFile, runtimeCpuSet, names.envioNetwork, names);
+@@ -4571 +4576 @@
+-    await waitForTcpPort("127.0.0.1", 5433, {
++    await waitForTcpPort("127.0.0.1", 15433, {
+@@ -4581 +4586 @@
+-    await waitForHttpUrl("http://127.0.0.1:8080/healthz", {
++    await waitForHttpUrl("http://127.0.0.1:9080/healthz", {
+@@ -4603 +4608 @@
+-        env: {
++        env: envioEnvironment({
+@@ -4608,2 +4613,2 @@
+-            HASURA_GRAPHQL_ENDPOINT: "http://localhost:8080/v1/metadata",
+-        },
++            HASURA_GRAPHQL_ENDPOINT: "http://localhost:9080/v1/metadata",
++        }),
+@@ -4958 +4963 @@
+-    const ports = [3000, 5433, 8080, 8081, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
++    const ports = [3000, 15433, 9080, 8081, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
+@@ -6679 +6684 @@
+-                        DATABASE_URL: 'postgres://postgres:testing@127.0.0.1:5433/psy_services',
++                        DATABASE_URL: 'postgres://postgres:testing@127.0.0.1:15433/psy_services',
+@@ -6681 +6686 @@
+-                        INDEXER_GRAPHQL_URL: 'http://127.0.0.1:8080/v1/graphql',
++                        INDEXER_GRAPHQL_URL: 'http://127.0.0.1:9080/v1/graphql',

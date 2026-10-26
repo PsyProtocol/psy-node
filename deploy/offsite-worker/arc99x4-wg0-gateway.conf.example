@@ -1,0 +1,11 @@
+# Copy this file outside git, replace every placeholder, and set mode 0600.
+[Interface]
+Address = 10.250.0.11/24
+PrivateKey = <existing-arc99x4-private-key>
+MTU = 1380
+
+[Peer]
+PublicKey = <dedicated-gateway-public-key>
+Endpoint = <dedicated-gateway-static-public-ip>:51820
+AllowedIPs = 10.148.0.25/32, 10.250.0.0/24
+PersistentKeepalive = 15

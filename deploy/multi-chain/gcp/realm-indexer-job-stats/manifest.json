@@ -1,0 +1,18 @@
+{
+  "repository": "PsyProtocol/psy-services",
+  "source_ref": "fix/realm-indexer-job-stats-20261014",
+  "source_commit": "e00e203429c238d595893b3dbd6e21ed82864008",
+  "binary": "psy-indexer",
+  "binary_sha256": "b224fbd838a018998076864d8e7d5b80bb78d1cfbb33fb1a2d03e806b406c53f",
+  "builder_image": "psy-services-release-builder:20260922",
+  "builder_image_id": "sha256:02a4dd5c2ea776982084a4a856610836fc9f944203e85948fd4b475177f6b4af",
+  "toolchain": "nightly-2025-09-20",
+  "build_command": "cargo +nightly-2025-09-20 build --locked --offline --release --bin psy-indexer",
+  "tests_passed": 291,
+  "tests_failed": 0,
+  "tests_ignored": 3,
+  "independent_review": "approved source and rollout; exact artifact hash verified",
+  "previous_binary_sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
+  "scope": "Realm0 and Realm1 Indexers only; no Coordinator Indexer, protocol, schema or cursor reset",
+  "coordinator_edge_rpc_url": "http://10.148.0.25:1337"
+}

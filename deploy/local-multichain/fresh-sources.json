@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-23",
+  "network": "localhost",
+  "repositories": {
+    "psy-node": {"checkout": "psy-node-testnet-dev", "commit": "b805a6701c5f3a381c5b77fb89cb1be4dea9d931"},
+    "psy-compiler": {"checkout": "psy-compiler-testnet-dev", "commit": "daa7efc3d31df32918c98a3df077127bf7ed695c"},
+    "psy-genesis": {"checkout": "psy-genesis-testnet-dev", "commit": "2996c98f01094df0f667e87b9e77b21431506bfd"},
+    "psy-contracts": {"checkout": "psy-contracts-testnet-dev", "commit": "a6f362d3121b6d75b358c03e1f69ea8db624e15f"},
+    "psy-sdk": {"checkout": "psy-sdk-testnet-dev", "commit": "3df57e5cc1d042a7e3f52b2e841b0337e7a43ede"},
+    "psy-services": {"checkout": "psy-services-testnet-dev", "commit": "74f4026f89a21cfce5e321e98e0d40d91cd695da"},
+    "psy-dapp": {"checkout": "psy-dapp-testnet-dev", "commit": "53c930108cc7513f61ce1f652e08226e3b9f9fcf"},
+    "psy-wallet": {"checkout": "psy-wallet-testnet-dev", "commit": "d73568dbc428807209f6311ebaa7493a803fe5e5"}
+  }
+}

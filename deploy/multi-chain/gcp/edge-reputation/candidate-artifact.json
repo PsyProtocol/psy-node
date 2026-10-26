@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "edge-only-candidate",
+  "repository": "PsyProtocol/psy-node",
+  "source_branch": "hotfix/edge-reputation-20261008",
+  "source_commit": "876c1432da302941acfba8485763e3f0549ec284",
+  "stable_runtime_commit": "1c0863fa5c2aa48197e9d820d0271633d70fd6cb",
+  "binary_sha256": "55abcc1bee0683e3529ab9f3e86c6711d0492f12999ec0a2f20ad20584ee4702",
+  "genesis_sha256": "569e58c901cdf7bd9edfc25bab70c4b0aafe0f5d2ec782781290d963ae63b710",
+  "genesis_source_commit": "cb3ea4a1e743c3c01037ae968e10f27389788a7d",
+  "host": "gcp-cp-ce",
+  "units": [
+    "parth-realm-edge@0.service",
+    "parth-realm-edge@1.service",
+    "parth-coordinator-edge@0.service"
+  ],
+  "build": {
+    "image": "psy-bookworm-builder:nightly-2025-09-20",
+    "image_id": "sha256:02a4dd5c2ea776982084a4a856610836fc9f944203e85948fd4b475177f6b4af",
+    "rust_toolchain": "nightly-2025-09-20",
+    "go_version": "1.22.3",
+    "psy_network": "testnet",
+    "cpu": "portable; no target-cpu=native or AVX-512 override",
+    "command": "cargo +nightly-2025-09-20 build --offline --locked --release -p psy_node_cli"
+  },
+  "tests": {
+    "reputation_passed": 36,
+    "core_passed": 52,
+    "memory_passed": 6,
+    "real_valkey_replay_passed": 2,
+    "bookworm_cli_help": "passed",
+    "target_host_library_resolution": "passed"
+  },
+  "activation_evidence": "See VERIFICATION.md after rollout; this candidate manifest alone does not prove deployment."
+}

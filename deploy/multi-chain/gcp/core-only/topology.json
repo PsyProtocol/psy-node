@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "release_id": "core-testnet-20261026",
+  "runtime_commit": null,
+  "runtime_source_base": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
+  "runtime_patch_sha256": "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa",
+  "psy_network": "testnet",
+  "network": "psy-public-testnet",
+  "proving_backend": "plonky2-poseidon-goldilocks",
+  "faucet_operator_count": 100,
+  "hosts": {
+    "gcp-cp-ce": "10.148.0.25",
+    "gcp-realm-processor": "10.148.0.37",
+    "realm-processors-b": "10.148.0.42",
+    "realm-processors-c": "10.148.0.43",
+    "gcp-edge-1": "10.148.0.36",
+    "gcp-edge-2": "10.148.0.35"
+  },
+  "infrastructure": {
+    "scylla_db_url": "10.148.0.23:9042",
+    "redis_url": "redis://10.148.0.12:6379",
+    "nats_jetstream_url": "nats://10.148.0.20:4222"
+  },
+  "coordinator": {
+    "host": "gcp-cp-ce",
+    "namespace": "fresh20261026_coordinator",
+    "edge_ports": [15370, 15371, 15372]
+  },
+  "realms": [
+    {
+      "id": 0,
+      "validators": [
+        {"registration_id": 0, "validator_user_id": 0, "processor_host": "gcp-realm-processor", "processor_port": 41001, "edge_host": "gcp-edge-1", "edge_port": 41101, "http_port": 15380, "namespace": "fresh20261026_r0_v1"},
+        {"registration_id": 4, "validator_user_id": 262144, "processor_host": "realm-processors-b", "processor_port": 41002, "edge_host": "gcp-edge-1", "edge_port": 41102, "http_port": 15381, "namespace": "fresh20261026_r0_v2"},
+        {"registration_id": 6, "validator_user_id": 786432, "processor_host": "realm-processors-c", "processor_port": 41003, "edge_host": "gcp-edge-1", "edge_port": 41103, "http_port": 15382, "namespace": "fresh20261026_r0_v3"}
+      ]
+    },
+    {
+      "id": 1,
+      "validators": [
+        {"registration_id": 1, "validator_user_id": 1048576, "processor_host": "gcp-realm-processor", "processor_port": 41021, "edge_host": "gcp-edge-2", "edge_port": 41121, "http_port": 15383, "namespace": "fresh20261026_r1_v1"},
+        {"registration_id": 3, "validator_user_id": 1572864, "processor_host": "realm-processors-b", "processor_port": 41022, "edge_host": "gcp-edge-2", "edge_port": 41122, "http_port": 15384, "namespace": "fresh20261026_r1_v2"},
+        {"registration_id": 5, "validator_user_id": 1310720, "processor_host": "realm-processors-c", "processor_port": 41023, "edge_host": "gcp-edge-2", "edge_port": 41123, "http_port": 15385, "namespace": "fresh20261026_r1_v3"}
+      ]
+    }
+  ]
+}

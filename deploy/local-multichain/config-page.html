@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Psy Local Multichain Config</title>
+    <style>
+      :root {
+        --bg: #080b10;
+        --panel: rgba(19, 24, 33, 0.88);
+        --panel-strong: #141a24;
+        --line: rgba(255, 255, 255, 0.09);
+        --muted: #8e9aac;
+        --text: #f4f7fb;
+        --green: #62e6a7;
+        --green-soft: rgba(98, 230, 167, 0.12);
+        --blue: #77a7ff;
+        --orange: #ffb86b;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 12% -5%, rgba(46, 130, 95, 0.22), transparent 34rem),
+          radial-gradient(circle at 95% 15%, rgba(53, 92, 170, 0.18), transparent 30rem),
+          var(--bg);
+      }
+
+      a { color: inherit; }
+      button { font: inherit; }
+      .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        border-bottom: 1px solid var(--line);
+        background: rgba(8, 11, 16, 0.82);
+        backdrop-filter: blur(18px);
+      }
+      .nav { min-height: 70px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+      .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+      .mark {
+        display: grid;
+        width: 36px;
+        height: 36px;
+        place-items: center;
+        border-radius: 11px;
+        background: var(--green);
+        color: #07110c;
+        font-size: 20px;
+        font-weight: 900;
+      }
+      .brand-copy strong { display: block; letter-spacing: -0.02em; }
+      .brand-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+      .nav-links { display: flex; align-items: center; gap: 8px; }
+      .nav-links a, .button {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 9px 12px;
+        color: #d8e0eb;
+        background: rgba(255, 255, 255, 0.025);
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .nav-links a:hover, .button:hover { border-color: rgba(98, 230, 167, 0.42); background: var(--green-soft); }
+
+      main { padding: 72px 0 80px; }
+      .hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 32px; margin-bottom: 42px; }
+      .eyebrow { margin: 0 0 14px; color: var(--green); font-size: 13px; font-weight: 750; letter-spacing: 0.12em; text-transform: uppercase; }
+      h1 { margin: 0; max-width: 760px; font-size: clamp(42px, 7vw, 76px); line-height: 0.98; letter-spacing: -0.055em; }
+      .lead { max-width: 720px; margin: 22px 0 0; color: #aeb8c7; font-size: 18px; line-height: 1.65; }
+      .live {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 10px 14px;
+        border: 1px solid rgba(98, 230, 167, 0.25);
+        border-radius: 999px;
+        color: var(--green);
+        background: var(--green-soft);
+        white-space: nowrap;
+      }
+      .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--green); box-shadow: 0 0 16px var(--green); }
+
+      .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 38px; }
+      .metric, .section, .chain-card { border: 1px solid var(--line); background: var(--panel); box-shadow: 0 18px 70px rgba(0, 0, 0, 0.16); }
+      .metric { padding: 18px; border-radius: 14px; }
+      .metric span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+      .metric strong { display: block; margin-top: 8px; font-size: 18px; overflow: hidden; text-overflow: ellipsis; }
+
+      .section { margin-top: 18px; padding: 24px; border-radius: 18px; }
+      .section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+      h2 { margin: 0; font-size: 22px; letter-spacing: -0.025em; }
+      .hint { color: var(--muted); font-size: 13px; }
+      .chains { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+      .chain-card { min-width: 0; padding: 20px; border-radius: 16px; }
+      .chain-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+      .chain-name { margin: 0; font-size: 20px; letter-spacing: -0.025em; }
+      .chain-short { margin-top: 5px; color: var(--muted); font-size: 13px; }
+      .index { padding: 6px 9px; border-radius: 8px; color: var(--blue); background: rgba(119, 167, 255, 0.11); font-size: 12px; font-weight: 700; }
+      .facts { display: grid; gap: 9px; margin: 20px 0; }
+      .fact { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font-size: 13px; }
+      .fact code { color: #e8edf5; }
+      .chain-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .button.primary { border-color: rgba(98, 230, 167, 0.32); color: #07110c; background: var(--green); font-weight: 750; }
+      .button.small { padding: 8px 10px; font-size: 12px; }
+      details { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }
+      summary { color: #bac4d2; font-size: 13px; cursor: pointer; }
+      .kv { display: grid; gap: 8px; margin-top: 12px; }
+      .kv-row { min-width: 0; }
+      .kv-row span { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; }
+      code { font-family: "SFMono-Regular", Consolas, monospace; }
+      .address { display: block; overflow: hidden; color: #d7deea; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+
+      .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      .link-list { display: grid; gap: 8px; }
+      .link-row { display: grid; grid-template-columns: 130px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-width: 0; padding: 11px 0; border-bottom: 1px solid var(--line); }
+      .link-row:last-child { border-bottom: 0; }
+      .link-row > span { color: var(--muted); font-size: 13px; }
+      .link-row a { overflow: hidden; color: #cfdaea; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+      .source { display: flex; flex-wrap: wrap; gap: 10px; }
+      .source code { padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--orange); background: rgba(255, 184, 107, 0.07); font-size: 12px; }
+      .error { padding: 20px; border: 1px solid rgba(255, 92, 92, 0.35); border-radius: 14px; color: #ffadad; background: rgba(255, 92, 92, 0.08); }
+      .toast { position: fixed; right: 20px; bottom: 20px; padding: 11px 14px; border-radius: 10px; color: #07110c; background: var(--green); font-weight: 750; opacity: 0; transform: translateY(8px); transition: 160ms ease; pointer-events: none; }
+      .toast.show { opacity: 1; transform: translateY(0); }
+
+      @media (max-width: 900px) {
+        .chains { grid-template-columns: 1fr; }
+        .summary { grid-template-columns: 1fr 1fr; }
+        .two-col { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 620px) {
+        .nav-links a:not(:last-child) { display: none; }
+        main { padding-top: 48px; }
+        .hero { grid-template-columns: 1fr; align-items: start; }
+        .live { width: max-content; }
+        .summary { grid-template-columns: 1fr; }
+        .section { padding: 18px; }
+        .link-row { grid-template-columns: 1fr auto; }
+        .link-row > span { grid-column: 1 / -1; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="shell nav">
+        <a class="brand" href="/">
+          <span class="mark">P</span>
+          <span class="brand-copy"><strong>Psy Config</strong><span>Local development network</span></span>
+        </a>
+        <nav class="nav-links">
+          <a id="nav-app" href="#">App</a>
+          <a id="nav-explorer" href="#">Explorer</a>
+          <a href="./client-config.json">Client JSON</a>
+          <a href="./config.json">Multichain JSON</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Psy local testnet</p>
+          <h1>One Psy network.<br />Three L1 chains.</h1>
+          <p class="lead">Live endpoints and deployment addresses for the local Ethereum, BSC, and Base bridge cohort. This page is regenerated on every deployment.</p>
+        </div>
+        <div class="live"><span class="dot"></span><span>Local stack online</span></div>
+      </section>
+
+      <div id="content"><div class="metric">Loading deployment config…</div></div>
+    </main>
+    <div class="toast" id="toast">Copied</div>
+
+    <script>
+      const html = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+      const short = (value, n = 10) => String(value ?? "").slice(0, n);
+      const hexChainId = (value) => `0x${Number(value).toString(16)}`;
+      const toast = document.getElementById("toast");
+
+      async function copy(value) {
+        await navigator.clipboard.writeText(String(value));
+        toast.classList.add("show");
+        setTimeout(() => toast.classList.remove("show"), 900);
+      }
+
+      function kvRows(object, names) {
+        return names.filter((name) => object?.[name]).map((name) => `
+          <div class="kv-row"><span>${html(name)}</span><code class="address" data-copy="${html(object[name])}" title="Click to copy">${html(object[name])}</code></div>
+        `).join("");
+      }
+
+      function chainCard(chain) {
+        const contracts = ["Bridge", "StateManager", "Router", "ERC20Gateway", "ETHGateway", "TokenFaucetManager", "PsyToken", "USDTToken"];
+        return `
+          <article class="chain-card">
+            <div class="chain-top">
+              <div><h3 class="chain-name">${html(chain.name)}</h3><div class="chain-short">${html(chain.bridge_chain)} · ${html(chain.network)}</div></div>
+              <span class="index">Psy index ${html(chain.chain_index)}</span>
+            </div>
+            <div class="facts">
+              <div class="fact"><span>Chain ID</span><code>${html(chain.chain_id)}</code></div>
+              <div class="fact"><span>Native token</span><code>${html(chain.native_currency?.symbol)}</code></div>
+              <div class="fact"><span>RPC</span><code>${html(new URL(chain.rpc_url).hostname)}</code></div>
+              <div class="fact"><span>Tokens</span><code>${html(chain.tokens.map((token) => token.symbol).join(" · "))}</code></div>
+            </div>
+            <div class="chain-actions">
+              <button class="button primary small" data-add-chain="${html(chain.chain_id)}">Add to wallet</button>
+              <button class="button small" data-copy="${html(chain.rpc_url)}">Copy RPC</button>
+              <a class="button small" href="${html(chain.gas_faucet_url)}" target="_blank" rel="noreferrer">Gas faucet</a>
+            </div>
+            <details>
+              <summary>Contracts and token addresses</summary>
+              <div class="kv">${kvRows(chain.contracts, contracts)}${chain.tokens.map((token) => `
+                <div class="kv-row"><span>${html(token.symbol)} L1 token</span><code class="address" data-copy="${html(token.l1_address)}" title="Click to copy">${html(token.l1_address)}</code></div>
+              `).join("")}</div>
+            </details>
+          </article>
+        `;
+      }
+
+      function linkRows(object, labels) {
+        return Object.entries(labels).filter(([key]) => object?.[key]).map(([key, label]) => `
+          <div class="link-row"><span>${html(label)}</span><a href="${html(object[key])}" target="_blank" rel="noreferrer">${html(object[key])}</a><button class="button small" data-copy="${html(object[key])}">Copy</button></div>
+        `).join("");
+      }
+
+      async function addChain(chain) {
+        if (!window.ethereum?.request) throw new Error("An EVM wallet was not detected.");
+        const params = {
+          chainId: hexChainId(chain.chain_id),
+          chainName: `Psy ${chain.name}`,
+          nativeCurrency: chain.native_currency,
+          rpcUrls: [chain.rpc_url],
+        };
+        try {
+          await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: params.chainId }] });
+        } catch (error) {
+          if (error?.code !== 4902) throw error;
+          await window.ethereum.request({ method: "wallet_addEthereumChain", params: [params] });
+        }
+      }
+
+      function render(config) {
+        document.getElementById("nav-app").href = config.frontends.app;
+        document.getElementById("nav-explorer").href = config.frontends.explorer;
+        const serviceLabels = {
+          coordinator_rpc: "Coordinator", prove_proxy: "Prove proxy", faucet_rpc: "Psy faucet",
+          psy_services: "Psy services", indexer_graphql: "Envio GraphQL", nostr_relay: "Nostr relay",
+        };
+        const frontendLabels = { app: "Psy App", explorer: "Explorer", ide: "Web IDE", config: "Psy Config" };
+        document.getElementById("content").innerHTML = `
+          <section class="summary">
+            <div class="metric"><span>L1 chains</span><strong>${config.l1_chains.length}</strong></div>
+            <div class="metric"><span>Psy node</span><strong>${html(short(config.source.psy_node.commit))}</strong></div>
+            <div class="metric"><span>Psy services</span><strong>${html(short(config.source.psy_services.commit))}</strong></div>
+            <div class="metric"><span>Generated</span><strong>${html(new Date(config.generated_at).toLocaleTimeString())}</strong></div>
+          </section>
+          <section class="section">
+            <div class="section-head"><h2>L1 bridge cohort</h2><span class="hint">Atomic deployment · chain indices 0–2</span></div>
+            <div class="chains">${config.l1_chains.map(chainCard).join("")}</div>
+          </section>
+          <div class="two-col">
+            <section class="section"><div class="section-head"><h2>Services</h2></div><div class="link-list">${linkRows(config.services, serviceLabels)}</div></section>
+            <section class="section"><div class="section-head"><h2>Frontends</h2></div><div class="link-list">${linkRows(config.frontends, frontendLabels)}</div></section>
+          </div>
+          <section class="section">
+            <div class="section-head"><h2>Source versions</h2><a class="button small" href="./config.json">Open raw JSON</a></div>
+            <div class="source"><code>psy-node/${html(config.source.psy_node.branch)}@${html(config.source.psy_node.commit)}</code><code>psy-services/${html(config.source.psy_services.branch)}@${html(config.source.psy_services.commit)}</code></div>
+          </section>
+        `;
+        document.addEventListener("click", async (event) => {
+          const target = event.target.closest("[data-copy], [data-add-chain]");
+          if (!target) return;
+          if (target.dataset.copy) await copy(target.dataset.copy);
+          if (target.dataset.addChain) {
+            const chain = config.l1_chains.find((item) => String(item.chain_id) === target.dataset.addChain);
+            if (!chain) return;
+            const old = target.textContent;
+            target.textContent = "Open wallet";
+            try { await addChain(chain); target.textContent = "Connected"; }
+            catch (error) { target.textContent = "Failed"; alert(error?.message || String(error)); }
+            setTimeout(() => { target.textContent = old; }, 1400);
+          }
+        });
+      }
+
+      fetch("./config.json", { cache: "no-store" })
+        .then((response) => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
+        .then(render)
+        .catch((error) => { document.getElementById("content").innerHTML = `<div class="error">Failed to load multichain config: ${html(error.message)}</div>`; });
+    </script>
+  </body>
+</html>
