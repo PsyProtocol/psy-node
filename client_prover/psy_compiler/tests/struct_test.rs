@@ -1,7 +1,6 @@
 mod common;
 
 use common::{assert_write, default_context, execute};
-use psy_compiler::compile;
 
 #[test]
 fn local_struct_temp_variable_read_write() {
@@ -41,7 +40,7 @@ fn local_struct_temp_variable_read_write() {
 }
 
 #[test]
-fn local_struct_field_compound_assign_should_work_but_currently_fails() {
+fn local_struct_field_compound_assign_updates_the_local_value() {
     let source = r#"
         const PSY_TOTAL_USERS: usize = 4;
         const PSY_TOTAL_CONTRACTS: usize = 4;
@@ -68,18 +67,14 @@ fn local_struct_field_compound_assign_should_work_but_currently_fails() {
         }
     "#;
 
-    // Intentionally failing regression test:
-    // desired behavior is that local struct field compound assignment works.
-    // Current compiler does not support it yet.
-    let output = compile(source).expect("expected compiler to support local struct field compound-assign");
-    assert!(
-        output.abi.contract.methods.iter().any(|m| m.name == "local_struct_compound_assign"),
-        "method should appear in ABI after successful compile"
-    );
+    let ctx = default_context();
+    let result = execute(source, "local_struct_compound_assign", &ctx, &[7]);
+    assert!(result.success, "failure={:?}", result.failure);
+    assert_write(&result, ctx.user_id, ctx.contract_id, 0, &[10]);
 }
 
 #[test]
-fn non_state_struct_methods_should_work_but_currently_fails() {
+fn non_state_struct_methods_update_local_value() {
     let source = r#"
         const PSY_TOTAL_USERS: usize = 4;
         const PSY_TOTAL_CONTRACTS: usize = 4;
@@ -115,12 +110,8 @@ fn non_state_struct_methods_should_work_but_currently_fails() {
         }
     "#;
 
-    // Intentionally failing regression test:
-    // desired behavior is that plain non-contract struct methods can be defined and
-    // called.
-    let output = compile(source).expect("expected compiler to support plain impl methods on non-state structs");
-    assert!(
-        output.abi.contract.methods.iter().any(|m| m.name == "use_non_state_struct_methods"),
-        "method should appear in ABI after successful compile"
-    );
+    let ctx = default_context();
+    let result = execute(source, "use_non_state_struct_methods", &ctx, &[7, 3]);
+    assert!(result.success, "failure={:?}", result.failure);
+    assert_write(&result, ctx.user_id, ctx.contract_id, 0, &[10]);
 }

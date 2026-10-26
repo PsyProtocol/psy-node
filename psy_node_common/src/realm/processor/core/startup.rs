@@ -372,7 +372,7 @@ pub(crate) mod startup_tests {
         }
 
         pub(crate) fn abort_gatherers(&self) {
-            self.guta_gatherer_handle.abort();
+            if let Some(handle) = &self.processor.guta_gatherer_join { handle.abort(); }
         }
 
         /// The db-level processor from the underlying env, for seeding
@@ -400,7 +400,7 @@ pub(crate) mod startup_tests {
         assert_eq!(state.processing_proc_checkpoint_unique_id, 0u128);
         assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
         assert_eq!(state.last_committed_checkpoint_id, 0);
-        assert_eq!(state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(state.chain_id, u64::from(TEST_CHAIN_ID));
         assert_eq!(state.realm_id_u64, crate::realm::processor::db::realm_db_test_env::TEST_REALM_ID);
 
         // processor defaults: unlimited worker wait, starting status
@@ -412,7 +412,7 @@ pub(crate) mod startup_tests {
         assert_eq!(env.processor.db.status.state(), ProcessorState::Starting);
 
         // the gatherer background task is alive until aborted
-        assert!(!env.guta_gatherer_handle.is_finished());
+        assert!(!env.processor.guta_gatherer_join.as_ref().unwrap().is_finished());
         env.abort_gatherers();
         Ok(())
     }

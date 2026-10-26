@@ -68,10 +68,13 @@ struct PsyFaucetOperatorsConfig {
     faucet_method_name: String,
     faucet_method_id: u32,
     faucet_per_claim_amount: String,
-    #[serde(alias = "sdkKeyExpectedTxCount")]
-    sd_key_expected_tx_count: u64,
+    #[serde(default)]
+    sd_key_min_tx_count: Option<u64>,
+    #[serde(default)]
+    sd_key_max_tx_count: Option<u64>,
     sd_key_allowed_contract_ids: Option<Vec<u64>>,
     sd_key_allowed_method_ids: Option<Vec<u32>>,
+    sd_key_allowed_caller_contract_ids: Option<Vec<u64>>,
     operators: Vec<PsyFaucetOperatorConfig>,
 }
 
@@ -171,6 +174,18 @@ fn parse_csv_env(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn resolve_tx_count_range(config: &PsyFaucetOperatorsConfig) -> anyhow::Result<(u64, u64)> {
+    let range = match (config.sd_key_min_tx_count, config.sd_key_max_tx_count) {
+        (Some(min), Some(max)) => (min, max),
+        (Some(min), None) => (min, min),
+        (None, Some(max)) => (1, max),
+        (None, None) => anyhow::bail!("faucet config requires sdKeyMinTxCount or sdKeyMaxTxCount"),
+    };
+    anyhow::ensure!(range.0 <= range.1, "faucet sd-key min tx count exceeds max tx count");
+    anyhow::ensure!(range.0 >= 1 && range.1 <= 64, "faucet sd-key transaction count must be within 1..=64");
+    Ok(range)
+}
+
 fn is_already_claimed_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("faucet already claimed") || lower.contains("already claimed for wi")
@@ -196,7 +211,10 @@ impl PsyFaucetService {
             !config.faucet_per_claim_amount.trim().is_empty(),
             "PSY_FAUCET_OPERATORS_JSON.faucetPerClaimAmount is empty"
         );
-        config.faucet_per_claim_amount.parse::<u64>()?;
+        anyhow::ensure!(
+            config.faucet_per_claim_amount.parse::<u64>()? >= 2,
+            "PSY_FAUCET_OPERATORS_JSON.faucetPerClaimAmount must be at least 2 for two faucet calls"
+        );
 
         let turnstile_secret = env::var("PSY_FAUCET_TURNSTILE_SECRET").ok().filter(|value| !value.trim().is_empty());
         let require_turnstile = parse_bool_env("PSY_FAUCET_REQUIRE_TURNSTILE", turnstile_secret.is_some());
@@ -225,14 +243,31 @@ impl PsyFaucetService {
             .clone()
             .unwrap_or_else(|| vec![config.faucet_contract_id]);
         let allowed_method_ids: Vec<u32> = config.sd_key_allowed_method_ids.clone().unwrap_or_else(|| vec![config.faucet_method_id]);
-        let fingerprint = wallet_session
-            .register_sd_key_circuit(&allowed_contract_ids, &allowed_method_ids, config.sd_key_expected_tx_count)
-            .await?;
+        let allowed_caller_contract_ids = config
+            .sd_key_allowed_caller_contract_ids
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("faucet config requires sdKeyAllowedCallerContractIds"))?;
+        let (min_tx_count, max_tx_count) = resolve_tx_count_range(&config)?;
+        let (function, sd_key_config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            allowed_caller_contract_ids,
+            &allowed_contract_ids,
+            &allowed_method_ids,
+            min_tx_count,
+            max_tx_count,
+        )?;
+        for call in &sd_key_config.transaction_count_policy.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("faucet SDKey requires a transaction count policy"))?.allowed_calls {
+            if call.contract_id == 0 && call.method_id == 2789897329 {
+                anyhow::ensure!(call.caller_contract_id == Some(config.faucet_contract_id),
+                    "faucet SDKey Transfer must be called by the faucet contract");
+            }
+        }
+        let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, sd_key_config).await?;
 
         let mut operators = Vec::with_capacity(config.operators.len());
         for operator in &config.operators {
             anyhow::ensure!(
-                operator.sign_type == "sd-key" || operator.sign_type == "sdk-key" || operator.sign_type == "SDKeySign",
+                operator.sign_type == "sd-key" || operator.sign_type == "SDKeySign",
                 "faucet operator {} uses unsupported signType {}; server faucet requires sd-key",
                 operator.user_id,
                 operator.sign_type
@@ -698,52 +733,12 @@ impl PsyFaucetRpcServer for PsyFaucetServerProvider {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, PoisonError};
-
     use psy_client_data::config::store_config::PsyHasher;
     use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
-    use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
+    use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
 
     use super::*;
-
-    static FAUCET_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_faucet_env() -> MutexGuard<'static, ()> {
-        FAUCET_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    const FAUCET_ENV_NAMES: &[&str] = &[
-        "PSY_FAUCET_OPERATORS_JSON",
-        "PSY_FAUCET_OPERATORS_JSON_B64",
-        "PSY_FAUCET_TURNSTILE_SECRET",
-        "PSY_FAUCET_REQUIRE_TURNSTILE",
-        "PSY_FAUCET_TURNSTILE_ACTION",
-        "PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES",
-        "PSY_FAUCET_WINDOW_CHECKPOINTS",
-    ];
-
-    struct FaucetEnvGuard(Vec<(&'static str, Option<String>)>);
-
-    impl FaucetEnvGuard {
-        fn cleared() -> Self {
-            let previous = FAUCET_ENV_NAMES.iter().map(|&name| (name, env::var(name).ok())).collect();
-            for name in FAUCET_ENV_NAMES {
-                env::remove_var(name);
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for FaucetEnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                match value {
-                    Some(value) => env::set_var(name, value),
-                    None => env::remove_var(name),
-                }
-            }
-        }
-    }
+    use crate::test_support::{lock_faucet_env, FaucetEnvGuard};
 
     fn test_network_config() -> psy_config::NetworkConfigGoldilocks {
         serde_json::from_value(serde_json::json!({
@@ -757,6 +752,7 @@ mod tests {
             "prove_proxy_url": [],
             "faucet_rpc_url": [],
             "nostr_relay_url": "ws://127.0.0.1:1",
+            "p2p": {"checkpoints_per_epoch": 1},
             "native_currency": "PSY",
             "native_currency_decimal": 18,
             "native_currency_name": "Psy",
@@ -776,7 +772,9 @@ mod tests {
             "faucetMethodName": "claim",
             "faucetMethodId": 4,
             "faucetPerClaimAmount": "500",
-            "sdKeyExpectedTxCount": 2,
+            "sdKeyMinTxCount": 2,
+            "sdKeyMaxTxCount": 2,
+            "sdKeyAllowedCallerContractIds": [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64],
             "operators": [{
                 "userId": "7",
                 "address": "address",
@@ -870,13 +868,15 @@ mod tests {
     }
 
     #[test]
-    fn operator_config_accepts_sdk_key_expected_count_alias() {
+    fn operator_config_accepts_sd_key_tx_count_range() {
         let config: PsyFaucetOperatorsConfig = serde_json::from_value(serde_json::json!({
             "faucetContractId": 3,
             "faucetMethodName": "claim",
             "faucetMethodId": 4,
             "faucetPerClaimAmount": "500",
-            "sdkKeyExpectedTxCount": 2,
+            "sdKeyMinTxCount": 2,
+            "sdKeyMaxTxCount": 2,
+            "sdKeyAllowedCallerContractIds": [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64],
             "operators": [{
                 "userId": "7",
                 "address": "address",
@@ -891,15 +891,27 @@ mod tests {
         assert_eq!(config.faucet_method_name, "claim");
         assert_eq!(config.faucet_method_id, 4);
         assert_eq!(config.faucet_per_claim_amount, "500");
-        assert_eq!(config.sd_key_expected_tx_count, 2);
+        assert_eq!(config.sd_key_min_tx_count, Some(2));
+        assert_eq!(config.sd_key_max_tx_count, Some(2));
+        assert_eq!(resolve_tx_count_range(&config).unwrap(), (2, 2));
         assert!(config.sd_key_allowed_contract_ids.is_none());
         assert!(config.sd_key_allowed_method_ids.is_none());
+        assert_eq!(config.sd_key_allowed_caller_contract_ids, Some(vec![psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64]));
         assert_eq!(config.operators.len(), 1);
         assert_eq!(config.operators[0].user_id, "7");
         assert_eq!(config.operators[0].address, "address");
         assert_eq!(config.operators[0].private_key, "key");
         assert_eq!(config.operators[0].fingerprint, "fingerprint");
         assert_eq!(config.operators[0].sign_type, "sd-key");
+        let mut range_config = config.clone();
+        range_config.sd_key_min_tx_count = Some(1);
+        range_config.sd_key_max_tx_count = Some(64);
+        assert_eq!(resolve_tx_count_range(&range_config).unwrap(), (1, 64));
+        range_config.sd_key_max_tx_count = Some(65);
+        assert!(resolve_tx_count_range(&range_config).is_err());
+        range_config.sd_key_min_tx_count = Some(0);
+        range_config.sd_key_max_tx_count = Some(64);
+        assert!(resolve_tx_count_range(&range_config).is_err());
     }
 
     #[tokio::test]
@@ -980,7 +992,8 @@ mod tests {
             "faucetMethodName": "claim",
             "faucetMethodId": 4,
             "faucetPerClaimAmount": "500",
-            "sdKeyExpectedTxCount": 2,
+            "sdKeyMinTxCount": 2,
+            "sdKeyMaxTxCount": 2,
             "operators": []
         });
         env::set_var(
@@ -1042,7 +1055,8 @@ mod tests {
         // (contract_ids, method_ids, tx_count) triple, so the shared offline
         // session can precompute what from_env will register
         let shared = crate::test_support::shared_offline_wallet_session().await;
-        let fingerprint = shared.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        let (function, sd_key_config) = psy_vm::ups::sd_key::build_allow_method_policy(&[3], &[4], 2).unwrap();
+        let fingerprint = shared.write().register_sd_key_dpn_circuit(function, sd_key_config).await.unwrap();
 
         let private_key = QHashOut::<F>::from_values(11, 12, 13, 14);
         let address = ZKPublicKeyInfo {
@@ -1242,7 +1256,8 @@ mod tests {
         // session can precompute what from_env will register for
         // contract 3 / method 4 / tx_count 2
         let shared = crate::test_support::shared_offline_wallet_session().await;
-        let fingerprint = shared.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        let (function, sd_key_config) = psy_vm::ups::sd_key::build_allow_method_policy(&[3], &[4], 2).unwrap();
+        let fingerprint = shared.write().register_sd_key_dpn_circuit(function, sd_key_config).await.unwrap();
 
         let private_key = QHashOut::<F>::from_values(11, 12, 13, 14);
         let public_key = ZKPublicKeyInfo {

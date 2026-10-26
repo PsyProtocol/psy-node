@@ -3959,8 +3959,8 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     }
     let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
     let submission = wallet.submit_end_cap(&trace, bincode::deserialize(&proof)?).await;
-    let leaf = match submission {
-        Ok(_) => end_user_leaf_hash,
+    let tx_hash = match submission {
+        Ok(tx_hash) => tx_hash,
         Err(error) => {
             if let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, &retained.history, &request_json, &staged_deposit_tree_states).await? {
                 return Ok(import_recovered(provider, config, archive, retained, session, &deposit_tree_states).await?);
@@ -3969,7 +3969,8 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         }
     };
     let start = trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64();
-    provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, leaf, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+    tracing::debug!(%tx_hash, %end_user_leaf_hash, "waiting for submitted EndCap inclusion");
+    provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, end_user_leaf_hash, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
     let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, &retained.history, &request_json, &staged_deposit_tree_states).await? else {
         anyhow::bail!("submitted EndCap has no authenticated inclusion");
     };

@@ -17,6 +17,7 @@ use plonky2::{
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::privacy::deposit_inclusion::DepositInclusionInput;
 use psy_common_circuit::{
+    builder::comparison::split_canonical_low_high_32bits,
     builder::pad_circuit::{pad_circuit_degree, CircuitBuilderPsyCommonGates},
     circuits::traits::qstandard::QStandardCircuit,
     hash::merkle::gadgets::merkle_proof::{MerkleProofGadget, OptionalMerkleProofGadget},
@@ -80,7 +81,7 @@ impl DepositInclusionGadget {
         // This proof must commit to the same leaf the receiver later claims.
         let shield_address_words: [Target; 8] = std::array::from_fn(|i| {
             let elem_idx = i / 2;
-            let (low, high) = builder.split_low_high(shield_address.elements[elem_idx], 32, 64);
+            let (low, high) = split_canonical_low_high_32bits(builder, shield_address.elements[elem_idx]);
             if i % 2 == 0 {
                 high
             } else {
@@ -89,7 +90,7 @@ impl DepositInclusionGadget {
         });
         let note_commitment_words: [Target; 8] = std::array::from_fn(|i| {
             let elem_idx = i / 2;
-            let (low, high) = builder.split_low_high(note_commitment.elements[elem_idx], 32, 64);
+            let (low, high) = split_canonical_low_high_32bits(builder, note_commitment.elements[elem_idx]);
             if i % 2 == 0 {
                 high
             } else {

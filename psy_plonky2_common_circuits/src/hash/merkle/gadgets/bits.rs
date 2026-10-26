@@ -36,7 +36,12 @@ impl QVariableHeightBitInfo {
         base >= 1
 
     }
-    pub fn get_root_parent_index(
+    /// Returns the subtree-root NODE index, i.e. `index >> height`. The low
+    /// bit is still the root's left/right direction relative to its parent;
+    /// divide by 2 to obtain the parent index. The historic name
+    /// `get_root_parent_index` was wrong for this loop shape (starts at bit
+    /// 0, keeping the direction bit).
+    pub fn get_root_index(
         &self,
     ) -> u32 {
         let mut sub_root_bit = 0u32;
@@ -102,7 +107,12 @@ impl VariableHeightBitInfo {
         BoolTarget::new_unsafe(base)
 
     }
-    pub fn get_root_parent_index<F: RichField + Extendable<D>, const D: usize>(
+    /// Returns the subtree-root NODE index, i.e. `index >> height`. The low
+    /// bit is still the root's left/right direction relative to its parent;
+    /// divide by 2 to obtain the parent index. The historic name
+    /// `get_root_parent_index` was wrong for this loop shape (starts at bit
+    /// 0, keeping the direction bit).
+    pub fn get_root_index<F: RichField + Extendable<D>, const D: usize>(
         &self,
         builder: &mut CircuitBuilder<F, D>,
     ) -> Target {

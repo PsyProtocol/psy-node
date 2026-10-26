@@ -11,7 +11,7 @@ use plonky2::{
     },
 };
 use psy_plonky2_basic_helpers::{
-    builder::comparison::CircuitBuilderComparison,
+    builder::comparison::{split_canonical_low_high_32bits, CircuitBuilderComparison},
     builder::connect::CircuitBuilderConnectHelpers,
     u32::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target},
 };
@@ -290,10 +290,10 @@ fn hash_target_to_u32x8_internal<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     hash: HashOutTarget,
 ) -> [U32Target; WORDS_PER_BYTES32] {
-    let (a_low, a_high) = builder.split_low_high(hash.elements[0], 32, 64);
-    let (b_low, b_high) = builder.split_low_high(hash.elements[1], 32, 64);
-    let (c_low, c_high) = builder.split_low_high(hash.elements[2], 32, 64);
-    let (d_low, d_high) = builder.split_low_high(hash.elements[3], 32, 64);
+    let (a_low, a_high) = split_canonical_low_high_32bits(builder, hash.elements[0]);
+    let (b_low, b_high) = split_canonical_low_high_32bits(builder, hash.elements[1]);
+    let (c_low, c_high) = split_canonical_low_high_32bits(builder, hash.elements[2]);
+    let (d_low, d_high) = split_canonical_low_high_32bits(builder, hash.elements[3]);
     [
         U32Target(a_low),
         U32Target(a_high),

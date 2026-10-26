@@ -21,7 +21,7 @@ use psy_crypto::signature::secp256k1::wallet::{hash_no_pad_compressed_public_key
 use psy_network_circuit::{gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::SignContextGadget}, ups::gadgets::ups_signature_data::PsyUserProvingSessionSignatureDataCompactGadget};
 use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureInput, MULTISIG_POLICY_CONTRACT_ID};
 
-use super::{software_defined::{compute_sig_hash, set_sig_hash_witness}, state_reader::StateReaderGadget};
+use super::{sd_key_plonky2::{compute_sig_hash, set_sig_hash_witness}, state_reader::StateReaderGadget};
 
 fn canonical_bits(builder: &mut CircuitBuilder<F, 2>, value: Target) -> Vec<BoolTarget> {
     let bits = builder.split_le(value, 64);

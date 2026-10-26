@@ -119,6 +119,8 @@ impl UPSCFCStandardStateDeltaGadget {
 
         let previous_step_tx_count = previous_step_header_gadget.current_state.tx_count;
         let previous_step_tx_hash_stack = previous_step_header_gadget.current_state.tx_hash_stack;
+        builder.connect(cfc_transaction_input_context.transaction_call_start_ctx.previous_tx_count, previous_step_tx_count);
+        builder.connect_hashes(cfc_transaction_input_context.transaction_call_start_ctx.previous_tx_stack_hash, previous_step_tx_hash_stack);
         let previous_step_user_balance = previous_step_header_gadget.current_state.user_leaf.balance;
         let previous_step_user_event_index = previous_step_header_gadget.current_state.user_leaf.event_index;
         tracing::debug!(

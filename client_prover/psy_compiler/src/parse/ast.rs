@@ -68,12 +68,13 @@ pub struct ContractDef {
     pub span: Span,
 }
 
-/// `#[contract_implementation] impl Name { methods }`
+/// An impl block for a contract or a regular struct.
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
     pub contract_name: String,
     pub methods: Vec<MethodDef>,
     pub span: Span,
+    pub is_contract_impl: bool,
 }
 
 /// `[pub] trait Name { fn method_name(&self, ...) -> ReturnType; ... }`

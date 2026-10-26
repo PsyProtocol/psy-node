@@ -276,16 +276,21 @@ impl ModuleResolver {
                     }
 
                     Item::ImplBlock(i) => {
-                        impl_count += 1;
-                        if impl_count > 1 {
-                            bail!(
-                                "Multiple #[contract_implementation] blocks found. Only one per crate is allowed. \
-                                 Found in module {:?}",
-                                prefix
-                            );
+                        if i.is_contract_impl {
+                            impl_count += 1;
+                            if impl_count > 1 {
+                                bail!(
+                                    "Multiple #[contract_implementation] blocks found. Only one per crate is allowed. \
+                                     Found in module {:?}",
+                                    prefix
+                                );
+                            }
                         }
-                        // Impl block always refers to the contract by original name
-                        merged_items.push(Item::ImplBlock(i.clone()));
+                        let mut qualified = i.clone();
+                        if !i.is_contract_impl && !prefix.is_empty() {
+                            qualified.contract_name = Self::qualify_name(prefix, &i.contract_name);
+                        }
+                        merged_items.push(Item::ImplBlock(qualified));
                     }
 
                     Item::TraitDef(t) => {

@@ -37,11 +37,11 @@ impl QEDContractLeafGadget {
         let function_tree_root = builder.add_virtual_hash();
         let code_root = builder.add_virtual_hash();
         let state_tree_height = builder.add_virtual_target();
-        let mut base = state_tree_height;
+        let mut base = builder.one();
         let zero = builder.zero();
 
-        // state tree height must be in 1..=MAX_CONTRACT_STATE_TREE_HEIGHT
-        // so we multiply (state_tree_height-1)*(state_tree_height-2*...(state_tree_height-MAX_CONTRACT_STATE_TREE_HEIGHT) and ensure the product is 0
+        // Constrain state tree height to 1..=max_contract_state_tree_height.
+        // (height - 1) * ... * (height - max) = 0.
         for i in 1..=max_contract_state_tree_height {
             let acceptable_height = builder.constant_u64(i as u64);
             let value = builder.sub(state_tree_height, acceptable_height);
@@ -129,5 +129,32 @@ impl<F: RichField> WitnessValueFor<QEDContractLeafGadget, F, true> for PQEDContr
 impl<F: RichField> WitnessValueFor<QEDContractLeafGadget, F, false> for PQEDContractLeaf<F, QHashOut<F>> {
     fn set_for_witness(&self, witness: &mut impl Witness<F>, target: &QEDContractLeafGadget) -> anyhow::Result<()> {
         target.set_witness(witness, self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::Field},
+        iop::witness::PartialWitness,
+        plonk::{circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
+    };
+
+    use super::*;
+
+    #[test]
+    fn contract_state_height_must_be_between_one_and_max() {
+        const MAX_HEIGHT: usize = 4;
+        let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(CircuitConfig::standard_recursion_config());
+        let leaf = QEDContractLeafGadget::add_virtual_to(&mut builder, MAX_HEIGHT);
+        let circuit = builder.build::<PoseidonGoldilocksConfig>();
+
+        for (height, should_prove) in [(0, false), (1, true), (4, true), (5, false)] {
+            let mut witness = PartialWitness::new();
+            let mut value = PQEDContractLeaf::<GoldilocksField, QHashOut<GoldilocksField>>::default();
+            value.state_tree_height = GoldilocksField::from_canonical_u64(height);
+            leaf.set_witness(&mut witness, &value).unwrap();
+            assert_eq!(circuit.prove(witness).is_ok(), should_prove, "height={height}");
+        }
     }
 }

@@ -58,6 +58,8 @@ fn context() -> ExecutionContext {
         checkpoint_id: 10,
         nonce: 11,
         user_public_key_hash: [0; 4],
+        transaction_log: vec![],
+        transaction_stack_hash: [0; 4],
         session_proof_tree_root: [0; 4],
     }
 }

@@ -13,6 +13,20 @@ pub fn get_plonky2_circuit_library_and_prover_for_network<C: QGenericConfig<D> +
 where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
     crate::node::config::networks::resolver::ensure_plonky2_network(network)?;
+
+    let (gcv, circuits) = build_plonky2_circuit_library_and_prover::<C, D>(network)?;
+    let published = crate::generated::cached_circuit_library::get_cached_circuit_library::<C::F>();
+    use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;
+    assert_eq!(gcv.library.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?, published.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?, "network {:?}: constructed genesis fingerprint differs from cached config; regenerate circuit library", network);
+    assert_eq!(circuits.checkpoint_root_transition.get_fingerprint(), published.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?, "network {:?}: constructed final minified transition fingerprint differs from cached config; regenerate circuit library", network);
+    Ok((gcv, circuits))
+}
+
+fn build_plonky2_circuit_library_and_prover<C: QGenericConfig<D> + 'static, const D: usize>(
+    network: PsyChainNetworkType,
+) -> anyhow::Result<(GenericCircuitVerifier<C, D>, QEDCoordinatorCircuitManager<C, D>)>
+where C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
+{
     let mut gcv = GenericCircuitVerifier::<C, D>::new();
 
     // use dummy for now
