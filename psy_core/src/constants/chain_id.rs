@@ -19,6 +19,14 @@ pub enum PsyChainNetworkType {
 }
 
 impl PsyChainNetworkType {
+    pub fn config_key(&self) -> anyhow::Result<&'static str> {
+        match self {
+            PsyChainNetworkType::LocalDevnet => Ok("localhost"),
+            PsyChainNetworkType::PsyPublicTestnet => Ok("testnet"),
+            PsyChainNetworkType::PsyMainnet => Ok("mainnet"),
+            _ => anyhow::bail!("No configuration key for network {self:?}"),
+        }
+    }
     pub fn to_u8(&self) -> u8 {
         *self as u8
     }
@@ -150,18 +158,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_network_identities_roundtrip() {
+    fn configured_network_magics_roundtrip_without_inferring_selector() {
         for network in [PsyChainNetworkType::LocalDevnet, PsyChainNetworkType::PsyPublicTestnet, PsyChainNetworkType::PsyMainnet] {
-            assert_eq!(PsyChainNetworkType::try_from_chain_id(network.get_chain_id()).unwrap(), network);
-            assert_eq!(PsyChainNetworkType::try_from(network.to_u8()).unwrap(), network);
+            let magic = network.get_chain_id();
+            assert_eq!(PsyChainNetworkType::try_from_chain_id(magic).unwrap().get_chain_id(), magic);
         }
         assert_eq!(PSY_CHAIN_ID_LOCAL_DEVNET, 1384803358401154921);
         assert!(PsyChainNetworkType::try_from_chain_id(0).is_err());
     }
 
     #[test]
+    fn shared_testnet_magic_keeps_local_devnet_priority() {
+        assert_eq!(PSY_CHAIN_ID_LOCAL_DEVNET, PSY_CHAIN_ID_PSY_PUBLIC_TESTNET);
+        assert_eq!(
+            PsyChainNetworkType::try_from_chain_id(PSY_CHAIN_ID_PSY_PUBLIC_TESTNET).unwrap(),
+            PsyChainNetworkType::LocalDevnet,
+        );
+    }
+
+    #[test]
+    fn configured_network_selectors_roundtrip_independently_of_magic() {
+        for (network, key) in [
+            (PsyChainNetworkType::LocalDevnet, "localhost"),
+            (PsyChainNetworkType::PsyPublicTestnet, "testnet"),
+            (PsyChainNetworkType::PsyMainnet, "mainnet"),
+        ] {
+            assert_eq!(network.config_key().unwrap(), key);
+            assert_eq!(PsyChainNetworkType::try_from(network.to_u8()).unwrap(), network);
+            let input = PsyNetworkTypeInput::from(network);
+            let parsed = PsyNetworkTypeInput::try_from(input.to_string().as_str()).unwrap();
+            assert_eq!(PsyChainNetworkType::from(parsed), network);
+        }
+    }
+
+    #[test]
     fn unsupported_networks_fail_closed() {
         for network in [PsyChainNetworkType::PsyTeamDevnet, PsyChainNetworkType::InternalDevnet, PsyChainNetworkType::InternalTestnet, PsyChainNetworkType::InternalPreProduction, PsyChainNetworkType::PsyPublicCanary] {
+            assert!(network.config_key().is_err());
             assert!(std::panic::catch_unwind(|| network.get_chain_id()).is_err());
         }
     }

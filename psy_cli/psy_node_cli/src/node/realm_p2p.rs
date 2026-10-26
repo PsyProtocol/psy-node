@@ -84,15 +84,6 @@ struct RealmPublicData {
     realm_user_tree_height: u8,
 }
 
-fn public_network_key(network: PsyChainNetworkType) -> anyhow::Result<&'static str> {
-    match network {
-        PsyChainNetworkType::LocalDevnet => Ok("localhost"),
-        PsyChainNetworkType::PsyPublicTestnet => Ok("sepolia"),
-        PsyChainNetworkType::PsyMainnet => Ok("ethereum"),
-        _ => anyhow::bail!("Realm P2P has no public config mapping for network {network:?}"),
-    }
-}
-
 fn validate_realm_validator_count(realm_id: u32, count: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
         (MIN_VALIDATORS_PER_REALM..=MAX_VALIDATORS_PER_REALM).contains(&count),
@@ -148,8 +139,7 @@ fn validate_public_network(network: &PublicNetworkConfig) -> anyhow::Result<()> 
 }
 
 fn load_selected_network(network: PsyChainNetworkType) -> anyhow::Result<PublicNetworkConfig> {
-    let selected_name = public_network_key(network)?;
-    let network_type = network;
+    let selected_name = network.config_key()?;
     if let Ok(environment_name) = std::env::var("PSY_NETWORK") {
         anyhow::ensure!(
             environment_name == selected_name,
@@ -160,15 +150,21 @@ fn load_selected_network(network: PsyChainNetworkType) -> anyhow::Result<PublicN
         .unwrap_or_else(|_| "psy-genesis/config.json".to_string());
     let text = std::fs::read_to_string(&path)
         .map_err(|error| anyhow::anyhow!("failed to read network config {path}: {error}"))?;
-    let config: PublicConfig = serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("failed to parse network config {path}: {error}"))?;
+    let public = read_public_network_config(&text, network)
+        .map_err(|error| anyhow::anyhow!("invalid network config {path}: {error}"))?;
+    psy_data::config::network_config::load_realm_rotation_config(network)?;
+    Ok(public)
+}
+
+fn read_public_network_config(text: &str, network: PsyChainNetworkType) -> anyhow::Result<PublicNetworkConfig> {
+    let selected_name = network.config_key()?;
+    let config: PublicConfig = serde_json::from_str(text)?;
     let network = config
         .networks
         .into_iter()
         .find_map(|(name, public)| (name == selected_name).then_some(public))
         .ok_or_else(|| anyhow::anyhow!("network config has no network named {selected_name}"))?;
     validate_public_network(&network)?;
-    psy_data::config::network_config::load_realm_rotation_config(network_type)?;
     Ok(network)
 }
 
@@ -800,11 +796,35 @@ mod tests {
     }
 
     #[test]
-    fn public_network_keys_are_explicit_and_fail_closed() {
-        assert_eq!(public_network_key(PsyChainNetworkType::LocalDevnet).unwrap(), "localhost");
-        assert_eq!(public_network_key(PsyChainNetworkType::PsyPublicTestnet).unwrap(), "sepolia");
-        assert_eq!(public_network_key(PsyChainNetworkType::PsyMainnet).unwrap(), "ethereum");
-        assert!(public_network_key(PsyChainNetworkType::InternalDevnet).is_err());
+    fn public_network_keys_are_canonical_and_fail_closed() {
+        assert_eq!(PsyChainNetworkType::LocalDevnet.config_key().unwrap(), "localhost");
+        assert_eq!(PsyChainNetworkType::PsyPublicTestnet.config_key().unwrap(), "testnet");
+        assert_eq!(PsyChainNetworkType::PsyMainnet.config_key().unwrap(), "mainnet");
+        assert!(read_public_network_config("{}", PsyChainNetworkType::InternalDevnet).is_err());
+    }
+
+    #[test]
+    fn public_testnet_config_selects_testnet_not_sepolia() {
+        let config = serde_json::json!({"networks": {
+            "testnet": {"realm_user_tree_height": 20, "realm_configs": [{"id": 0, "validators": []}]},
+            "sepolia": {"realm_user_tree_height": 19, "realm_configs": [{"id": 1, "validators": []}]}
+        }});
+        let selected = read_public_network_config(&config.to_string(), PsyChainNetworkType::PsyPublicTestnet).unwrap();
+        assert_eq!(selected.realm_user_tree_height, 20);
+        assert_eq!(selected.realm_configs[0].id, 0);
+    }
+
+    #[test]
+    fn public_network_config_rejects_legacy_keys_without_canonical_section() {
+        for (network, legacy_key) in [
+            (PsyChainNetworkType::PsyPublicTestnet, "sepolia"),
+            (PsyChainNetworkType::PsyMainnet, "ethereum"),
+        ] {
+            let config = serde_json::json!({"networks": {
+                legacy_key: {"realm_user_tree_height": 20, "realm_configs": []}
+            }});
+            assert!(read_public_network_config(&config.to_string(), network).is_err());
+        }
     }
 
     #[test]

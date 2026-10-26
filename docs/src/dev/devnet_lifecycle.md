@@ -590,6 +590,26 @@ values, then service-specific overrides (`dev/locSetupV4.ts:3921-3931,3970-3975,
 
 ### 12.1 Network and Anvil
 
+For a cloud testnet using Plonky2 and Scylla, build with `PSY_NETWORK=testnet`
+and run Node and Worker with `PSY_NETWORK=testnet`, `--network psy-public-testnet`
+and `--proving-backend plonky2-poseidon-goldilocks`. Set `PSY_CONFIG_PATH` to the
+reviewed public configuration. P2P membership, rotation and the Edge worker
+whitelist select `networks.testnet`, not `networks.sepolia` or `networks.localhost`.
+Pass the same reviewed configuration to each Edge's `--worker-whitelist-config`.
+Processors require `--genesis-data-path`; public testnet cannot fall back to the
+empty local-development Genesis.
+
+The Plonky2 resolver and Worker circuit-library constructor reject a network
+selector that disagrees with the binary's compiled stage or a set `PSY_NETWORK`.
+Local development remains supported with a localhost build and
+`--network local-devnet`. Mainnet and other selectors remain unsupported by this
+Plonky2/Scylla startup path. The existing cached circuit layout is shared by
+localhost and testnet; this does not activate the historical
+`PsyNetworkPsyPublicTestnetConstants`, regenerate circuits, or select JTMB.
+The current configuration gives localhost and testnet the same magic, so magic
+alone cannot distinguish them; the stage name is also checked. These Node
+selectors are separate from the launcher's L1/Anvil selectors below.
+
 | Variable                   | Default and validation                                  | Effect                                                                                                  | Evidence                                                                                |
 | -------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | `VITE_NETWORK`             | `localhost`; accepts `localhost`, `sepolia`, `ethereum` | Selects network metadata, deployment namespace, external RPC, and UI network.                           | `dev/locSetupV4.ts:482-487,3943-3948`                              |

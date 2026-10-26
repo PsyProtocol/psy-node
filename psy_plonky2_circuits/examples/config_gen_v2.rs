@@ -90,7 +90,13 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
     println!("end_cap_alt_verifier_data_serialized: {}", end_cap_alt_verifier_data_serialized);
     */
 
-    let end_cap_alt_verifier_data = get_end_cap_alt_verifier_data_for_network(PsyChainNetworkType::LocalDevnet)?;
+    let network = match psy_config::CURRENT_NETWORK {
+        "localhost" => PsyChainNetworkType::LocalDevnet,
+        "testnet" => PsyChainNetworkType::PsyPublicTestnet,
+        stage => anyhow::bail!("Unsupported Plonky2 cache network {stage}"),
+    };
+    psy_plonky2_circuits::node::config::networks::resolver::ensure_plonky2_network(network)?;
+    let end_cap_alt_verifier_data = get_end_cap_alt_verifier_data_for_network(network)?;
 
     let end_cap_verifier_data = end_cap_alt_verifier_data.to_verifier_data::<C, D>();
     let end_cap_fingerprint = get_circuit_fingerprint_generic_q::<D, F, C>(&end_cap_verifier_data);
@@ -120,7 +126,6 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
 
     gcv.register_circuit_triplet(ProvingJobCircuitType::UserEndCap, end_cap_verifier_triplet);
 
-    let network = psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet;
     let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
     let guta_circuits = QEDGUTACircuitManager::<C, D>::new_with_config_and_chain_domain(
         &end_cap_common_data,

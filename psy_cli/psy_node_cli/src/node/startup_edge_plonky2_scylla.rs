@@ -88,7 +88,8 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
     ) -> Self {
       */
     match config.network {
-        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
+        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet
+        | psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
@@ -128,6 +129,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 
 
 pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
+    psy_plonky2_circuits::node::config::networks::resolver::ensure_plonky2_network(config.network)?;
     let realm_sub_id = crate::node::realm_p2p::resolve_edge_sub_id(config)?;
     let config = &config.clone().with_derived_realm_sub_id(realm_sub_id);
 
@@ -174,7 +176,8 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
     ) -> Self {
       */
     match config.network {
-        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
+        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet
+        | psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);

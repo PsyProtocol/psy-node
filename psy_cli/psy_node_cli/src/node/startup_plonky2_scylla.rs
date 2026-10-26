@@ -70,7 +70,8 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
     let chain_id = config.network.get_chain_id();
 
     match config.network {
-        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
+        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet
+        | psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
@@ -355,7 +356,8 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     
      */
     match config.network {
-        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
+        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet
+        | psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);

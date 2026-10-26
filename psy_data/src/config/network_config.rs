@@ -26,12 +26,7 @@ pub trait PsyNodeCircuitFingerprintConfigProvider<Hash> {
 }
 
 pub fn load_realm_rotation_config(network: PsyChainNetworkType) -> anyhow::Result<parth_common::realm_rotation::RealmRotationConfig> {
-    let name = match network {
-        PsyChainNetworkType::LocalDevnet => "localhost",
-        PsyChainNetworkType::PsyPublicTestnet => "testnet",
-        PsyChainNetworkType::PsyMainnet => "mainnet",
-        _ => anyhow::bail!("No realm rotation configuration for network {network:?}"),
-    };
+    let name = network.config_key()?;
     if let Ok(selected) = std::env::var("PSY_NETWORK") {
         anyhow::ensure!(selected == name, "PSY_NETWORK {selected} does not match {name}");
     }
@@ -47,14 +42,24 @@ pub fn load_realm_rotation_config(network: PsyChainNetworkType) -> anyhow::Resul
             Err(error) => anyhow::bail!("Cannot read network config {path}: {error}"),
         };
         let config: serde_json::Value = serde_json::from_str(&text)?;
-        let network = &config["networks"][name];
-        let has_validators = network["realm_configs"].as_array().is_some_and(|realms|
-            realms.iter().any(|realm| realm["validators"].as_array().is_some_and(|validators| !validators.is_empty())));
-        if has_validators {
-            return realm_rotation_config_from_network(network);
+        if let Some(rotation) = read_realm_rotation_config(&config, network)? {
+            return Ok(rotation);
         }
     }
     anyhow::bail!("No injected validator set found for network {name}")
+}
+
+fn read_realm_rotation_config(
+    config: &serde_json::Value,
+    network: PsyChainNetworkType,
+) -> anyhow::Result<Option<parth_common::realm_rotation::RealmRotationConfig>> {
+    let network = &config["networks"][network.config_key()?];
+    let has_validators = network["realm_configs"].as_array().is_some_and(|realms|
+        realms.iter().any(|realm| realm["validators"].as_array().is_some_and(|validators| !validators.is_empty())));
+    if has_validators {
+        return realm_rotation_config_from_network(network).map(Some);
+    }
+    Ok(None)
 }
 
 fn realm_rotation_config_from_network(network: &serde_json::Value) -> anyhow::Result<parth_common::realm_rotation::RealmRotationConfig> {
@@ -82,8 +87,34 @@ fn realm_rotation_config_from_network(network: &serde_json::Value) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::realm_rotation_config_from_network;
+    use super::{read_realm_rotation_config, realm_rotation_config_from_network};
+    use psy_core::constants::chain_id::PsyChainNetworkType;
     use serde_json::json;
+
+    #[test]
+    fn realm_rotation_selects_testnet_not_legacy_or_localhost() {
+        let config = json!({"networks": {
+            "testnet": {"realm_configs": [{"id": 0, "validators": [{}, {}, {}]}]},
+            "localhost": {"realm_configs": [{"id": 0, "validators": [{}, {}]}]},
+            "sepolia": {"realm_configs": [{"id": 0, "validators": [{}, {}]}]}
+        }});
+        let rotation = read_realm_rotation_config(&config, PsyChainNetworkType::PsyPublicTestnet).unwrap().unwrap();
+        assert_eq!(rotation.validator_sub_ids, vec![1, 2, 3]);
+        assert_eq!(rotation.checkpoints_per_epoch, psy_config::CHECKPOINTS_PER_EPOCH);
+    }
+
+    #[test]
+    fn realm_rotation_rejects_unsupported_network_and_missing_canonical_section() {
+        let config = json!({"networks": {
+            "localhost": {"realm_configs": [{"id": 0, "validators": [{}, {}]}]},
+            "sepolia": {"realm_configs": [{"id": 0, "validators": [{}, {}]}]},
+            "ethereum": {"realm_configs": [{"id": 0, "validators": [{}, {}]}]}
+        }});
+        for network in [PsyChainNetworkType::PsyPublicTestnet, PsyChainNetworkType::PsyMainnet] {
+            assert!(read_realm_rotation_config(&config, network).unwrap().is_none());
+        }
+        assert!(read_realm_rotation_config(&config, PsyChainNetworkType::InternalDevnet).is_err());
+    }
 
     #[test]
     fn realm_rotation_config_requires_uniform_validator_counts() -> anyhow::Result<()> {
