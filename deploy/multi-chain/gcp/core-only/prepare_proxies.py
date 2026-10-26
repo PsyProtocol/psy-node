@@ -11,8 +11,12 @@ verify|check-host|install --package DIR --package-sha256 HASH
 The binary manifest is the approved build manifest: source_commit, network,
 config_sha256, local_circuits_sha256, binaries.psy_user_cli are required.
 The separately approved RPC endpoints JSON has exactly coordinator (id "0"),
-realms (ids "0", "1"), prove_proxy_url and system_prove_proxy_url. Each value is
-an array of URLs (three per coordinator/realm). Only those runtime fields change;
+realms (ids "0", "1"), prove_proxy_url, system_prove_proxy_url and placement.
+URL values are arrays (three per coordinator/realm). placement must contain both
+system and user, each with exactly host (hostname) and listen_addr (IP:port).
+Placement is covered by rpc_endpoints_sha256 in the version-2 package approval.
+Version-1 packages and endpoint maps without placement are rejected.
+Only the runtime URL fields change;
 build config, P2P and guardian commitments are retained. No network probes run.
 Reachability and real RPC behavior require separate pre-activation verification.
 MemoryHigh/Max default to 36/44 GiB system and 40/48 GiB user. Overrides may
@@ -39,6 +43,7 @@ Verify the transferred installer against the reviewed source before executing it
 import argparse
 import hashlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -52,8 +57,7 @@ from urllib.parse import urlsplit
 
 RELEASE_ID = "core-testnet-20261026"
 MAGIC = "0x1337CF514544CF69"
-PLACEMENT = {"system": ("arc99x1", "10.250.0.13:9998"),
-             "user": ("arc99x3", "10.250.0.12:9999")}
+ROLES = ("system", "user")
 MEMORY_GIB = {"system": (36, 44), "user": (40, 48)}
 VERIFIERS = {"bridge_agg": "GnarkGroth16Verifier.sol", "deposit_append": "DepositBatchVerifier.sol",
              "withdrawal_claim": "WithdrawalClaimVerifier.sol", "reward_claim": "RewardClaimVerifier.sol"}
@@ -205,6 +209,26 @@ def validate_urls(urls, count=None):
                 and parsed.path in ("", "/"), "RPC endpoint must be an HTTP origin with a port")
 
 
+def validate_placement(endpoints):
+    placement = endpoints.get("placement")
+    require(isinstance(placement, dict) and set(placement) == set(ROLES), "complete role placement required")
+    for role in ROLES:
+        target = placement[role]
+        require(isinstance(target, dict) and set(target) == {"host", "listen_addr"}, "placement schema mismatch")
+        host, listen = target["host"], target["listen_addr"]
+        require(isinstance(host, str) and 0 < len(host) <= 253 and all(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split(".")),
+            "literal hostname required")
+        require(isinstance(listen, str) and re.fullmatch(r"[0-9a-fA-F:.\[\]]+", listen),
+                "literal IP and port required")
+        address = urlsplit("//" + listen)
+        require(address.hostname and address.port is not None and 0 < address.port <= 65535,
+                "valid listen port required")
+        ip = ipaddress.ip_address(address.hostname)
+        require(not ip.is_unspecified and not ip.is_multicast, "unicast listen address required")
+    return placement
+
+
 def rpc_config(network_raw, endpoints):
     config = decode(network_raw)
     validate_public(config)
@@ -215,10 +239,11 @@ def rpc_config(network_raw, endpoints):
             "fresh coordinator configuration required")
     require([realm["id"] for realm in network["realm_configs"]] == [0, 1],
             "fresh realm configuration required")
-    require(set(endpoints) == {"coordinator", "realms", "prove_proxy_url", "system_prove_proxy_url"}
+    require(set(endpoints) == {"coordinator", "realms", "prove_proxy_url", "system_prove_proxy_url", "placement"}
             and set(endpoints["coordinator"]) == {"0"} and set(endpoints["realms"]) == {"0", "1"},
             "complete approved RPC endpoint map required")
     validate_public(endpoints)
+    validate_placement(endpoints)
     for group, field in (("coordinator", "coordinator_configs"), ("realms", "realm_configs")):
         for node in network[field]:
             urls = endpoints[group][str(node["id"])]
@@ -274,9 +299,10 @@ def memory_limits(role, high=None, maximum=None):
     return high, maximum
 
 
-def proxy_unit(role, high=None, maximum=None):
+def proxy_unit(role, endpoints, high=None, maximum=None):
     release, config, state = paths(role)
-    host, listen = PLACEMENT[role]
+    target = validate_placement(endpoints)[role]
+    host, listen = target["host"], target["listen_addr"]
     high, maximum = memory_limits(role, high, maximum)
     return ("\n".join([
         "[Unit]", "Description=Psy testnet prove proxy " + role,
@@ -364,7 +390,7 @@ def prepare_package(args):
     high, maximum = memory_limits(args.role, args.memory_high_gib, args.memory_max_gib)
     generated = {"build.json": build_raw, "network.json": network_raw, "rpc-endpoints.json": endpoints_raw,
                  "rpc.json": rpc_config(network_raw, decode(endpoints_raw)),
-                 unit_name(args.role): proxy_unit(args.role, high, maximum)}
+                 unit_name(args.role): proxy_unit(args.role, decode(endpoints_raw), high, maximum)}
     with open_file(Path(__file__).absolute()) as stream:
         generated["prepare_proxies.py"] = stream.read()
     sources = {"psy_user_cli": (args.binary, build["binaries"]["psy_user_cli"])}
@@ -388,7 +414,7 @@ def prepare_package(args):
             require(file_hash(args.verifier_dir / name)["sha256"] == sha256, "exported verifier mismatch")
             sources["verifiers/" + name] = (args.verifier_dir / name, sha256)
     require(file_hash(args.binary)["sha256"] == sources["psy_user_cli"][1], "binary hash mismatch")
-    generated["package.json"] = encode({"version": 1, "role": args.role,
+    generated["package.json"] = encode({"version": 2, "role": args.role,
         "source_commit": args.source_commit,
         "rpc_endpoints_sha256": args.rpc_endpoints_sha256,
         "memory_high_gib": high, "memory_max_gib": maximum,
@@ -414,7 +440,7 @@ def read_package(package, package_hash):
     require(set(approval) == {"version", "role", "source_commit", "binary_manifest_sha256", "setup_manifest_sha256",
                               "rpc_endpoints_sha256", "installer_sha256", "memory_high_gib", "memory_max_gib"}
             and type(approval["version"]) is int
-            and approval["version"] == 1 and approval["role"] in PLACEMENT, "package schema mismatch")
+            and approval["version"] == 2 and approval["role"] in ROLES, "package schema mismatch")
     role = approval["role"]
     require(file_hash(Path(__file__).absolute())["sha256"] == validate_hash(approval["installer_sha256"]),
             "running installer differs from approved package")
@@ -428,7 +454,8 @@ def read_package(package, package_hash):
     expected = {"package.json": digest(raw), "build.json": digest(build_raw),
                 "network.json": digest(network_raw), "rpc-endpoints.json": digest(endpoints_raw),
                 "rpc.json": digest(rpc_config(network_raw, decode(endpoints_raw))),
-                unit_name(role): digest(proxy_unit(role, approval["memory_high_gib"], approval["memory_max_gib"])),
+                unit_name(role): digest(proxy_unit(role, decode(endpoints_raw),
+                                                   approval["memory_high_gib"], approval["memory_max_gib"])),
                 "psy_user_cli": build["binaries"]["psy_user_cli"],
                 "prepare_proxies.py": validate_hash(approval["installer_sha256"])}
     if role == "system":
@@ -467,10 +494,11 @@ def command(argv):
         raise ProxyError("host command failed; no command output logged") from None
 
 
-def check_host(role):
-    require(socket.gethostname().split(".")[0] == PLACEMENT[role][0], "wrong proxy host")
+def check_host(role, endpoints):
+    placement = validate_placement(endpoints)
+    require(socket.gethostname() == placement[role]["host"], "wrong proxy host")
     require(os.uname().machine == "x86_64", "wrong proxy architecture")
-    for unit in (*OLD_UNITS, *(unit_name(role) for role in PLACEMENT)):
+    for unit in (*OLD_UNITS, *(unit_name(role) for role in ROLES)):
         output = command(["systemctl", "show", unit, "--property=LoadState,ActiveState,UnitFileState,MainPID"])
         properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
         if properties.get("LoadState") == "not-found":
@@ -481,7 +509,8 @@ def check_host(role):
     jobs = command(["systemctl", "list-jobs", "--no-legend", "--no-pager"])
     require(not any("prove-proxy" in line for line in jobs.splitlines()), "proxy systemd job queued")
     sockets = command(["ss", "-H", "-ltn"])
-    require(not any(len(fields) > 3 and fields[3].rsplit(":", 1)[-1] in ("9998", "9999")
+    ports = {str(urlsplit("//" + target["listen_addr"]).port) for target in placement.values()}
+    require(not any(len(fields) > 3 and fields[3].rsplit(":", 1)[-1] in ports
                     for fields in map(str.split, sockets.splitlines())), "proxy port occupied")
 
 
@@ -522,7 +551,9 @@ def check_destinations(role):
 def install_proxy(package, package_hash, check_only=True):
     role, expected = read_package(package, package_hash)
     require(os.geteuid() == 0, "host checks require root; install requires separate authorization")
-    check_host(role)
+    endpoints_raw = read_json_bytes(package / "rpc-endpoints.json")
+    require(digest(endpoints_raw) == expected["rpc-endpoints.json"], "RPC endpoint approval pin mismatch")
+    check_host(role, decode(endpoints_raw))
     check_destinations(role)
     if not check_only:
         release, config, state = paths(role)
@@ -555,7 +586,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="action", required=True)
     package = commands.add_parser("package")
-    package.add_argument("--role", choices=PLACEMENT, required=True)
+    package.add_argument("--role", choices=ROLES, required=True)
     package.add_argument("--source-commit", required=True)
     for name in ("binary", "binary-manifest", "network-config", "rpc-endpoints", "output"):
         package.add_argument("--" + name, type=Path, required=True)

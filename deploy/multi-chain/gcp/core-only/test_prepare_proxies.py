@@ -28,11 +28,11 @@ class ProxyPreparationTests(unittest.TestCase):
             "magic": p.MAGIC,
             "p2p": {"protocol": "retained-test-protocol"},
             "guardian_initial_member_hashes": ["public-1", "public-2", "public-3"],
-            "coordinator_configs": [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}"
+            "coordinator_configs": [{"id": 0, "rpc_url": [f"http://192.0.2.25:{port}"
                                                         for port in (15370, 15371, 15372)]}],
             "realm_configs": [{"id": i, "rpc_url": [f"http://{host}:{port}" for port in ports]}
-                              for i, host, ports in ((0, "10.148.0.36", (15380, 15381, 15382)),
-                                                     (1, "10.148.0.35", (15383, 15384, 15385)))],
+                              for i, host, ports in ((0, "192.0.2.36", (15380, 15381, 15382)),
+                                                     (1, "192.0.2.35", (15383, 15384, 15385)))],
         }}}
         self.binary = b"\x7fELF\x02\x01" + b"\x00" * 12 + b"\x3e\x00" + b"test-only binary"
         (self.root / "psy_user_cli").write_bytes(self.binary)
@@ -40,11 +40,13 @@ class ProxyPreparationTests(unittest.TestCase):
                       "config_sha256": p.digest(p.encode(self.network)),
                       "local_circuits_sha256": "1" * 64,
                       "binaries": {"psy_user_cli": p.digest(self.binary), "psy_relayer_cli": "3" * 64}}
-        self.endpoints = {"coordinator": {"0": [f"http://10.250.0.1:{port}" for port in (15370, 15371, 15372)]},
-            "realms": {str(i): [f"http://10.250.0.1:{port}" for port in ports]
+        self.endpoints = {"coordinator": {"0": [f"http://198.51.100.1:{port}" for port in (15370, 15371, 15372)]},
+            "realms": {str(i): [f"http://198.51.100.1:{port}" for port in ports]
                        for i, ports in ((0, (15380, 15381, 15382)), (1, (15383, 15384, 15385)))},
-            "prove_proxy_url": ["http://10.250.0.12:9999"],
-            "system_prove_proxy_url": ["http://10.250.0.13:9998"]}
+            "prove_proxy_url": ["http://198.51.100.12:9999"],
+            "system_prove_proxy_url": ["http://198.51.100.13:9998"],
+            "placement": {"system": {"host": "system.example", "listen_addr": "198.51.100.13:9998"},
+                          "user": {"host": "user.example", "listen_addr": "198.51.100.12:9999"}}}
         provenance = {"source_commit": SOURCE, "config_sha256": self.build["config_sha256"],
                       "local_circuits_sha256": self.build["local_circuits_sha256"]}
         self.setup = {"version": 1, "network": "testnet", "magic": p.MAGIC,
@@ -94,15 +96,15 @@ class ProxyPreparationTests(unittest.TestCase):
         self.assertFalse(report["claim_ready"])
         self.assertFalse(any("setup" in name or "keystore" in name or "verifiers" in name for name in files))
         unit = (self.args.output / p.unit_name(role)).read_text()
-        self.assertIn("ConditionHost=arc99x3", unit)
-        self.assertIn("/psy_user_cli prove-proxy --role user --listen-addr 10.250.0.12:9999", unit)
+        self.assertIn("ConditionHost=user.example", unit)
+        self.assertIn("/psy_user_cli prove-proxy --role user --listen-addr 198.51.100.12:9999", unit)
         self.assertIn("[Install]\nWantedBy=multi-user.target", unit)
         self.assertNotIn("EnvironmentFile", unit)
         self.assertNotIn("/opt/parth", unit)
         self.assertIn("MemoryHigh=40G\nMemoryMax=48G", unit)
         rpc = json.loads((self.args.output / "rpc.json").read_text())["networks"]["testnet"]
-        self.assertEqual(rpc["system_prove_proxy_url"], ["http://10.250.0.13:9998"])
-        self.assertEqual(rpc["prove_proxy_url"], ["http://10.250.0.12:9999"])
+        self.assertEqual(rpc["system_prove_proxy_url"], ["http://198.51.100.13:9998"])
+        self.assertEqual(rpc["prove_proxy_url"], ["http://198.51.100.12:9999"])
         self.assertEqual(rpc["coordinator_configs"][0]["rpc_url"], self.endpoints["coordinator"]["0"])
         for realm in rpc["realm_configs"]:
             self.assertEqual(realm["rpc_url"], self.endpoints["realms"][str(realm["id"])])
@@ -120,11 +122,11 @@ class ProxyPreparationTests(unittest.TestCase):
         self.assertEqual(role, "system")
         self.assertEqual({name for name in files if name.startswith("keystore/")},
                          {"keystore/" + name for name in p.SETUP_NAMES})
-        unit = p.proxy_unit(role).decode()
-        self.assertIn("ConditionHost=arc99x1", unit)
+        unit = p.proxy_unit(role, self.endpoints).decode()
+        self.assertIn("ConditionHost=system.example", unit)
         self.assertIn("MemoryHigh=36G\nMemoryMax=44G", unit)
         self.assertIn("StartLimitBurst=3", unit)
-        self.assertIn("--role system --listen-addr 10.250.0.13:9998", unit)
+        self.assertIn("--role system --listen-addr 198.51.100.13:9998", unit)
         self.assertIn("Environment=HOME=/opt/psy-core-prove-proxy/releases/" + p.RELEASE_ID + "-system/home", unit)
 
     def test_binary_build_and_network_mismatches_fail_before_output(self):
@@ -180,10 +182,10 @@ class ProxyPreparationTests(unittest.TestCase):
                 p.rpc_config(p.encode(self.network), endpoints)
         for field in ("prove_proxy_url", "system_prove_proxy_url"):
             endpoints = copy.deepcopy(self.endpoints)
-            endpoints[field] = "http://10.250.0.12:9999"
+            endpoints[field] = "http://198.51.100.12:9999"
             with self.assertRaises(p.ProxyError):
                 p.rpc_config(p.encode(self.network), endpoints)
-        for urls in ([], ["http://10.250.0.1:15370"] * 3, ["http://user:secret@10.250.0.1:15370"]):
+        for urls in ([], ["http://198.51.100.1:15370"] * 3, ["http://user:secret@198.51.100.1:15370"]):
             endpoints = copy.deepcopy(self.endpoints)
             endpoints["coordinator"]["0"] = urls
             with self.assertRaises(p.ProxyError):
@@ -192,6 +194,61 @@ class ProxyPreparationTests(unittest.TestCase):
         with self.assertRaises(p.ProxyError):
             p.prepare_package(self.args)
         self.assertFalse(self.args.output.exists())
+
+    def test_placement_is_complete_and_rejects_unit_injection(self):
+        for placement in (None, {}, {"user": self.endpoints["placement"]["user"]}):
+            endpoints = copy.deepcopy(self.endpoints)
+            endpoints["placement"] = placement
+            with self.assertRaises(p.ProxyError):
+                p.validate_placement(endpoints)
+        for field, value in (("host", ""), ("host", "*.example"), ("host", "%H"),
+                             ("host", "user.example\nWants=other.service"), ("host", "-user.example"),
+                             ("listen_addr", ""), ("listen_addr", "host.example:9999"),
+                             ("listen_addr", "198.51.100.12:0"), ("listen_addr", "198.51.100.12:65536"),
+                             ("listen_addr", "0.0.0.0:9999"), ("listen_addr", "[ff02::1]:9999"),
+                             ("listen_addr", "198.51.100.12:9999 --role all")):
+            endpoints = copy.deepcopy(self.endpoints)
+            endpoints["placement"]["user"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                p.validate_placement(endpoints)
+        endpoints = copy.deepcopy(self.endpoints)
+        endpoints["placement"]["user"]["listen_addr"] = "[2001:db8::12]:29999"
+        self.assertIn("--listen-addr [2001:db8::12]:29999", p.proxy_unit("user", endpoints).decode())
+
+    def test_package_version_one_and_missing_placement_are_rejected(self):
+        endpoints = self.endpoints.pop("placement")
+        self.save_inputs()
+        with self.assertRaises(p.ProxyError):
+            p.prepare_package(self.args)
+        self.assertFalse(self.args.output.exists())
+        self.endpoints["placement"] = endpoints
+        self.package()
+        path = self.args.output / "package.json"
+        approval = p.decode(path.read_bytes())
+        self.assertEqual(approval["version"], 2)
+        approval["version"] = 1
+        raw = p.encode(approval)
+        path.write_bytes(raw)
+        with self.assertRaisesRegex(p.ProxyError, "package schema mismatch"):
+            p.read_package(self.args.output, p.digest(raw))
+
+    def test_placement_changes_are_pinned_and_drive_host_port_checks(self):
+        self.endpoints["placement"]["user"] = {"host": "relocated.example", "listen_addr": "198.51.100.99:29999"}
+        report = self.package()
+        unit = (self.args.output / p.unit_name("user")).read_text()
+        self.assertIn("ConditionHost=relocated.example", unit)
+        self.assertIn("--listen-addr 198.51.100.99:29999", unit)
+        with patch.object(p.socket, "gethostname", return_value="relocated.example"), \
+                patch.object(p, "command", self.host_command):
+            p.check_host("user", self.endpoints)
+            with patch.object(p, "command", side_effect=lambda argv:
+                              "LISTEN 0 4096 [2001:db8::1]:29999 [::]:*" if argv[0] == "ss" else self.host_command(argv)):
+                with self.assertRaisesRegex(p.ProxyError, "port occupied"):
+                    p.check_host("user", self.endpoints)
+        self.endpoints["placement"]["user"]["host"] = "tampered.example"
+        (self.args.output / "rpc-endpoints.json").write_bytes(p.encode(self.endpoints))
+        with self.assertRaisesRegex(p.ProxyError, "RPC endpoint approval pin mismatch"):
+            p.read_package(self.args.output, report["package_sha256"])
 
     def test_user_rejects_every_setup_input(self):
         for field, value in (("setup_dir", self.root / "setup"), ("verifier_dir", self.root / "verifiers"),
@@ -364,19 +421,19 @@ class ProxyPreparationTests(unittest.TestCase):
         return ""
 
     def test_wrong_host_active_enabled_jobs_and_ports_rejected(self):
-        with patch.object(p.socket, "gethostname", return_value="arc99x3"), patch.object(p, "command", self.host_command):
+        with patch.object(p.socket, "gethostname", return_value="user.example"), patch.object(p, "command", self.host_command):
             with self.assertRaises(p.ProxyError):
-                p.check_host("system")
-            p.check_host("user")
+                p.check_host("system", self.endpoints)
+            p.check_host("user", self.endpoints)
             for output in ("LoadState=loaded\nActiveState=active\nUnitFileState=disabled\nMainPID=1\n",
                            "LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\nMainPID=0\n"):
                 with patch.object(p, "command", return_value=output), self.assertRaises(p.ProxyError):
-                    p.check_host("user")
+                    p.check_host("user", self.endpoints)
             for prefix, output in ((["systemctl", "list-jobs"], "1 parth-prove-proxy@system.service start waiting"),
                                    (["ss", "-H"], "LISTEN 0 4096 0.0.0.0:9998 0.0.0.0:*")):
                 with patch.object(p, "command", side_effect=lambda argv: output if argv[:2] == prefix else self.host_command(argv)):
                     with self.assertRaises(p.ProxyError):
-                        p.check_host("user")
+                        p.check_host("user", self.endpoints)
 
     def test_install_layout_modes_no_enable_start_and_preserve_old(self):
         report = self.package("system")
@@ -389,7 +446,7 @@ class ProxyPreparationTests(unittest.TestCase):
                 patch.object(p, "check_host") as host, patch.object(p, "check_destinations"), \
                 patch.object(p.os, "geteuid", return_value=0), patch.object(p, "command") as command:
             # Regenerate units for redirected test destinations; production verifies these exact bytes.
-            unit_raw = p.proxy_unit("system")
+            unit_raw = p.proxy_unit("system", self.endpoints)
             (self.args.output / p.unit_name("system")).write_bytes(unit_raw)
             real_mkdir = p.create_directory
             def mkdir(path, mode=0o755, fresh=False):
