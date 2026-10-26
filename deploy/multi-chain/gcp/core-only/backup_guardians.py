@@ -208,6 +208,7 @@ def backup(root, guardian_id, identity, helper_source):
     require(len(payload) <= MAX_MESSAGE, "custody message too large")
     remote = shlex.join(["sudo", "-n", "--", "/usr/bin/python3", "-I", "-c",
                          helper_source, "--receive", str(guardian_id)])
+    remote = shlex.join(["/usr/bin/bash", "-c", remote])
     reply = command(["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                      "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=15",
                      "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes",

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -98,7 +99,11 @@ class BackupTests(unittest.TestCase):
             self.assertIn(f"ubuntu@{host}", ssh)
             self.assertEqual(ssh[ssh.index("-J") + 1], "gcp-gateway")
             self.assertIn("StrictHostKeyChecking=yes", ssh)
-            self.assertIn("sudo -n -- /usr/bin/python3 -I -c", ssh[-1])
+            shell = shlex.split(ssh[-1])
+            self.assertEqual(shell[:2], ["/usr/bin/bash", "-c"])
+            self.assertEqual(len(shell), 3)
+            self.assertEqual(shlex.split(shell[2]), ["sudo", "-n", "--", "/usr/bin/python3",
+                                                     "-I", "-c", "# public helper", "--receive", str(guardian_id)])
             self.assertNotIn(PASSWORD.decode(), " ".join(ssh))
             self.assertNotIn(base64.b64encode(PASSWORD).decode(), " ".join(ssh))
             self.assertEqual(raw, sent)
@@ -107,6 +112,21 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(base64.b64decode(message["keystore"]),
                              (self.keys / f"guardian-{guardian_id}.keystore.json").read_bytes())
             self.assertNotIn("credential", message)
+
+    def test_explicit_shell_preserves_multiline_helper_and_stdin(self):
+        helper = "# public helper\nvalue = '''quotes: ' and \"; $HOME `id` $(id)'''\n"
+        with patch.object(backup, "command", side_effect=self.client_command):
+            backup.backup(self.source, 1, Path("/test/identity"), helper)
+        ssh, payload = self.calls[-1]
+        shell = shlex.split(ssh[-1])
+        self.assertEqual(shell[:2], ["/usr/bin/bash", "-c"])
+        self.assertEqual(len(shell), 3)
+        receiver = shlex.split(shell[2])
+        self.assertEqual(receiver, ["sudo", "-n", "--", "/usr/bin/python3", "-I", "-c",
+                                    helper, "--receive", "1"])
+        self.assertEqual(base64.b64decode(json.loads(payload)["password"]), PASSWORD)
+        self.assertNotIn(PASSWORD.decode(), ssh[-1])
+        self.assertNotIn(base64.b64encode(PASSWORD).decode(), ssh[-1])
 
     def test_receiver_reencrypts_checks_hash_and_writes_only_protected_backup(self):
         result = self.receive(self.envelope())
