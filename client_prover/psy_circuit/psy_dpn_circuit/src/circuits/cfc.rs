@@ -1,6 +1,7 @@
 use plonky2::{
+    field::extension::Extendable,
     gates::gate::GateRef,
-    hash::hash_types::HashOut,
+    hash::hash_types::{HashOut, RichField},
     iop::{
         target::Target,
         witness::{PartialWitness, WitnessWrite},
@@ -8,7 +9,7 @@ use plonky2::{
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
-        config::{AlgebraicHasher, GenericConfig},
+        config::{AlgebraicHasher, GenericConfig, Hasher},
         proof::ProofWithPublicInputs,
     },
 };
@@ -109,6 +110,12 @@ where
             minifier_chain,
         }
     }
+    /// Estimated retained prover buffers, including every minifier; not process RSS.
+    pub fn estimated_prover_bytes(&self) -> u64 {
+        prover_data_bytes(&self.circuit_data)
+            + self.minifier_chain.minifiers.iter().map(|minifier| prover_data_bytes(&minifier.circuit_data)).sum::<u64>()
+    }
+
     pub fn prove_base(&self, cfc_input: &DapenContractFunctionCircuitInput<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
@@ -163,6 +170,24 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_standard(input)
     }
+}
+
+// Boxed generators have opaque heap sizes; small indexes and common data are excluded.
+const WITNESS_GENERATOR_BYTES_ESTIMATE: u64 = 256;
+
+fn prover_data_bytes<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(data: &CircuitData<F, C, D>) -> u64 {
+    let prover = &data.prover_only;
+    let field = std::mem::size_of::<F>() as u64;
+    let batch = &prover.constants_sigmas_commitment;
+    let coefficients: u64 = batch.polynomials.iter().map(|poly| poly.coeffs.capacity() as u64).sum();
+    let leaves: u64 = batch.merkle_tree.leaves.iter().map(|leaf| leaf.capacity() as u64).sum();
+    let digests = batch.merkle_tree.digests.capacity() as u64 * std::mem::size_of::<<C::Hasher as Hasher<F>>::Hash>() as u64;
+    let sigmas: u64 = prover.sigmas.iter().map(|sigma| sigma.capacity() as u64).sum();
+    let roots: u64 = prover.fft_root_table.as_ref().map_or(0, |table| table.iter().map(|level| level.capacity() as u64).sum());
+    (coefficients + leaves + sigmas + roots + prover.subgroup.capacity() as u64) * field
+        + digests
+        + prover.representative_map.capacity() as u64 * std::mem::size_of::<usize>() as u64
+        + prover.generators.len() as u64 * WITNESS_GENERATOR_BYTES_ESTIMATE
 }
 
 #[cfg(test)]
@@ -273,6 +298,29 @@ mod ucon_leaf_prove_tests {
             definitions: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn estimated_prover_bytes_counts_minifiers_and_retained_capacity() {
+        let mut circuit = DapenContractFunctionCircuit::<C, D>::new(
+            &empty_fn_def(), CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false,
+        );
+        let base_bytes = prover_data_bytes(&circuit.circuit_data);
+        let minifier_bytes: u64 = circuit.minifier_chain.minifiers.iter()
+            .map(|minifier| prover_data_bytes(&minifier.circuit_data)).sum();
+        assert!(base_bytes > 0);
+        assert!(minifier_bytes > 0);
+        assert_eq!(circuit.estimated_prover_bytes(), base_bytes + minifier_bytes);
+
+        let before_bytes = circuit.estimated_prover_bytes();
+        let subgroup = &mut circuit.circuit_data.prover_only.subgroup;
+        let before_capacity = subgroup.capacity();
+        let before_len = subgroup.len();
+        subgroup.reserve_exact(before_capacity + 17);
+        let added_bytes = (subgroup.capacity() - before_capacity) as u64 * std::mem::size_of::<F>() as u64;
+        assert_eq!(subgroup.len(), before_len);
+        assert!(added_bytes > 0);
+        assert_eq!(circuit.estimated_prover_bytes(), before_bytes + added_bytes);
     }
 
     #[test]

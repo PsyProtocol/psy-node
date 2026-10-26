@@ -55,6 +55,21 @@ Clients pick the pool through `config.json`: wallets use `prove_proxy_url`; the 
 | `psy_resolve_contract_function_by_method_id` | `contract_id`: `u64`, `contract_code`: `ContractCodeDefinition`, `method_id`: `u32` |
 | `psy_prove_contract_call` | `contract_id`: `u64`, `fn_id`: `u32`, `input`: `DapenContractFunctionCircuitInput<F>` |
 
+### Contract prover cache budget
+
+Each UPS circuit manager bounds retained contract prover circuits by estimated bytes, including the base circuit and every minifier. The native proxy uses this cache in its `user` and `all` roles; it does not budget system-role Groth16 circuits.
+
+| Runtime | Default budget per manager | Configuration |
+|---|---|---|
+| Native | 10 GiB (`10737418240` bytes) | `PSY_CONTRACT_PROVER_CACHE_BYTES`, read when the manager is created |
+| Browser / WASM | 256 MiB (`268435456` bytes) | Fixed byte budget; the native environment override does not apply |
+
+`PSY_CONTRACT_PROVER_CACHE_BYTES` accepts decimal digits representing an unsigned 64-bit byte count, without signs, whitespace, or unit suffixes. Only an unset value uses the native default. Empty, non-Unicode, malformed (such as `512MiB`), or overflowing values cause the existing infallible `new_with_config` constructor to panic with a configuration error naming the variable, before any UPS circuits are built; they never fall back to a larger budget. The budget is read once per manager construction and remains fixed for that manager. Zero disables retention of prover circuits. A circuit larger than the budget can still be built and used, but is not retained and must be rebuilt for a later request. Production managers do not expose a runtime budget setter.
+
+The WASM default replaces the old 200-circuit count limit with a finite 256 MiB byte budget to leave headroom for compilation, proving, and the rest of the browser application. It is a conservative retention policy, not a measured browser memory guarantee; rebuilding evicted or oversized circuits trades latency for lower retained memory.
+
+The estimate is **not process RSS or a total memory limit**. It counts the capacity of major prover buffers and uses a fixed estimate for boxed witness generators. It excludes small indexes, common data, the separate function-registration cache, other circuits, allocator overhead, and temporary compilation/proving allocations. In-flight requests may retain circuit references after eviction, and concurrent builds or multiple managers can consume memory beyond one cache budget. Function registrations retain definitions and verifier data independently, so prover eviction does not itself invalidate verifier queries or prevent rebuilding.
+
 ## Signatures / minifiers
 
 | RPC method | Parameters |

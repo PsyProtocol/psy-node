@@ -54,8 +54,96 @@ use psy_vm::{
     ups::circuit_manager::{PortableQTreeRecursion, PortableQTreeRecursionCircuitsData, PortableQTreeRecursionCircuitsProve, UPSCircuitManager},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
-use quick_cache::sync::Cache;
+use quick_cache::{
+    sync::{Cache, DefaultLifecycle},
+    DefaultHashBuilder, OptionsBuilder, Weighter,
+};
 use serde::Serialize;
+
+const CONTRACT_FUNCTION_REGISTRATION_CAPACITY: usize = 10_000;
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 10 << 30;
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 256 << 20;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_contract_prover_cache_bytes(value: Option<&std::ffi::OsStr>) -> Result<u64, &'static str> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_CONTRACT_PROVER_CACHE_BYTES);
+    };
+    let value = value.to_str().ok_or("PSY_CONTRACT_PROVER_CACHE_BYTES must contain Unicode decimal digits")?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("PSY_CONTRACT_PROVER_CACHE_BYTES must contain decimal digits only (no sign, whitespace, or unit suffix)");
+    }
+    value.parse::<u64>().map_err(|_| "PSY_CONTRACT_PROVER_CACHE_BYTES exceeds the unsigned 64-bit byte range")
+}
+
+fn contract_prover_cache_bytes() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        parse_contract_prover_cache_bytes(std::env::var_os("PSY_CONTRACT_PROVER_CACHE_BYTES").as_deref())
+            .unwrap_or_else(|error| panic!("invalid contract prover cache configuration: {}", error))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        DEFAULT_CONTRACT_PROVER_CACHE_BYTES
+    }
+}
+
+#[derive(Debug)]
+pub struct ContractFunctionRegistration<C: GenericConfig<D>, const D: usize> {
+    fn_def: DPNFunctionCircuitDefinition,
+    state_tree_height: usize,
+    pub fingerprint: QHashOut<C::F>,
+    pub verifier_only: VerifierOnlyCircuitData<C, D>,
+}
+
+#[derive(Debug)]
+struct ContractProverCircuit<C: GenericConfig<D>, const D: usize>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    circuit: Arc<DapenContractFunctionCircuit<C, D>>,
+    estimated_bytes: u64,
+}
+
+impl<C: GenericConfig<D>, const D: usize> Clone for ContractProverCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn clone(&self) -> Self {
+        Self { circuit: self.circuit.clone(), estimated_bytes: self.estimated_bytes }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContractProverCircuitWeighter;
+
+impl<C: GenericConfig<D>, const D: usize> Weighter<(u64, u32), ContractProverCircuit<C, D>> for ContractProverCircuitWeighter
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn weight(&self, _key: &(u64, u32), value: &ContractProverCircuit<C, D>) -> u64 {
+        value.estimated_bytes.max(1)
+    }
+}
+
+type ContractProverCircuitCache<C, const D: usize> = Cache<(u64, u32), ContractProverCircuit<C, D>, ContractProverCircuitWeighter>;
+
+fn new_contract_prover_circuit_cache<C: GenericConfig<D>, const D: usize>(bytes: u64) -> ContractProverCircuitCache<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    // A single shard allows any circuit up to the entire byte budget to be retained.
+    let options = OptionsBuilder::new()
+        .estimated_items_capacity(64)
+        .weight_capacity(bytes)
+        .shards(1)
+        .hot_allocation(1.0)
+        .build()
+        .expect("contract prover cache options set every required field");
+    Cache::with_options(options, ContractProverCircuitWeighter, DefaultHashBuilder::default(), DefaultLifecycle::default())
+}
 
 #[derive(Debug)]
 pub struct PsyUPSStepCircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -75,8 +163,8 @@ where
     pub ups_cfc_deferred_tx_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub ups_start_register_user_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
 
-    // contract circuits, lazily cached by (contract_id, fn_id)
-    pub contract_circuits: Cache<(u64, u32), Arc<DapenContractFunctionCircuit<C, D>>>,
+    contract_function_registrations: Cache<(u64, u32), Arc<ContractFunctionRegistration<C, D>>>,
+    contract_circuits: ContractProverCircuitCache<C, D>,
     // method name index, cached by (contract_id, method_name)
     pub contract_method_ids: Cache<(u64, String), u32>,
 
@@ -97,6 +185,12 @@ where
         //coset_gate: &GateRef<C::F, D>,
         network_magic: u64,
     ) -> Self {
+        let cache_bytes = contract_prover_cache_bytes();
+        Self::new_with_config_and_cache_bytes(network_magic, cache_bytes)
+    }
+
+    fn new_with_config_and_cache_bytes(network_magic: u64, cache_bytes: u64) -> Self {
+        let contract_circuits = new_contract_prover_circuit_cache(cache_bytes);
         let ups_start = UPSStartSessionCircuit::new();
         let ups_start_register_user = UPSStartSessionRegisterUserCircuit::new();
         let ups_cfc_standard_tx = UPSCFCStandardTransactionCircuit::new();
@@ -159,7 +253,8 @@ where
             ups_cfc_standard_tx_whitelist_proof,
             ups_cfc_deferred_tx_whitelist_proof,
             ups_start_register_user_whitelist_proof,
-            contract_circuits: Cache::new(200),
+            contract_function_registrations: Cache::new(CONTRACT_FUNCTION_REGISTRATION_CAPACITY),
+            contract_circuits,
             contract_method_ids: Cache::new(1000),
             zk_signature_minifier_circuit: OnceLock::new(),
             secp_circuit: OnceLock::new(),
@@ -242,36 +337,71 @@ where
         let fn_name = dapen_fc.name.clone();
         let state_tree_height = contract_code.state_tree_height as usize;
 
-        // Fast-path: already cached and still valid (function definition and
-        // state tree height are the inputs that determine the compiled circuit).
-        if let Some(cached_circuit) = self.contract_circuits.get(&(contract_id, fn_id)) {
-            if cached_circuit.fn_def == dapen_fc
-                && cached_circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
-            {
+        let key = (contract_id, fn_id);
+        if let Some(registration) = self.contract_function_registrations.get(&key) {
+            if registration.fn_def == dapen_fc && registration.state_tree_height == state_tree_height {
+                self.contract_method_ids.insert((contract_id, fn_name), fn_id);
                 return Ok(());
             }
-            // Stale: function definition or state tree height changed.
-            self.contract_circuits.remove(&(contract_id, fn_id)); 
         }
 
-        tracing::info!("register contract {} function {}", contract_id, fn_name);
-
-        // Use get_or_insert_with for atomic check-then-insert: only one thread
-        // compiles per (contract_id, fn_id); all others block and receive the
-        // cached Arc via the guard mechanism.
-        self.contract_circuits
-            .get_or_insert_with(&(contract_id, fn_id), || {
-                Ok::<Arc<DapenContractFunctionCircuit<C, D>>, std::convert::Infallible>(Arc::new(DapenContractFunctionCircuit::<C, D>::new(
-                    &dapen_fc,
-                    state_tree_height,
-                    UPS_SESSION_PROOF_TREE_HEIGHT as usize,
-                    false,
-                )))
-            })
-            .ok();
-
+        let circuit = self.contract_prover_circuit(key, &dapen_fc, state_tree_height);
+        self.contract_function_registrations.insert(key, Arc::new(ContractFunctionRegistration {
+            fn_def: dapen_fc,
+            state_tree_height,
+            fingerprint: circuit.get_fingerprint(),
+            verifier_only: circuit.get_verifier_config_ref().clone(),
+        }));
+        let (cached_bytes, budget_bytes, cached_circuits) = self.contract_prover_cache_usage();
+        tracing::info!(contract_id, fn_name, cached_bytes, budget_bytes, cached_circuits, "registered contract function");
         self.contract_method_ids.insert((contract_id, fn_name), fn_id);
         Ok(())
+    }
+
+    fn contract_prover_circuit(
+        &self,
+        key: (u64, u32),
+        fn_def: &DPNFunctionCircuitDefinition,
+        state_tree_height: usize,
+    ) -> Arc<DapenContractFunctionCircuit<C, D>> {
+        let compile = || Arc::new(DapenContractFunctionCircuit::<C, D>::new(
+            fn_def, state_tree_height, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false,
+        ));
+        let compiled_from_inputs = |circuit: &DapenContractFunctionCircuit<C, D>| {
+            circuit.fn_def == *fn_def && circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
+        };
+        let cache = &self.contract_circuits;
+        for _ in 0..3 {
+            let cached = match cache.get_or_insert_with(&key, || {
+                let circuit = compile();
+                let estimated_bytes = circuit.estimated_prover_bytes();
+                Ok::<_, std::convert::Infallible>(ContractProverCircuit { circuit, estimated_bytes })
+            }) {
+                Ok(cached) => cached,
+                Err(never) => match never {},
+            };
+            // Both cache hits and concurrent fills must match the requested compilation inputs.
+            if compiled_from_inputs(&cached.circuit) {
+                return cached.circuit;
+            }
+            cache.remove_if(&key, |current| Arc::ptr_eq(&current.circuit, &cached.circuit));
+        }
+        compile()
+    }
+
+    pub fn contract_prover_cache_usage(&self) -> (u64, u64, usize) {
+        let cache = &self.contract_circuits;
+        (cache.weight(), cache.capacity(), cache.len())
+    }
+
+    pub fn contract_function_registration(&self, contract_id: u64, fn_id: u32) -> Option<Arc<ContractFunctionRegistration<C, D>>> {
+        self.contract_function_registrations.get(&(contract_id, fn_id))
+    }
+
+    pub fn contract_function_circuit(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<Arc<DapenContractFunctionCircuit<C, D>>> {
+        let registration = self.contract_function_registration(contract_id, fn_id)
+            .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
+        Ok(self.contract_prover_circuit((contract_id, fn_id), &registration.fn_def, registration.state_tree_height))
     }
 
     fn resolve_fn_id_by_method_name(&self, contract_code: &ContractCodeDefinition, method_name: &str) -> anyhow::Result<u32> {
@@ -396,13 +526,11 @@ where
     }
 
     async fn get_contract_method_common_data(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<(QHashOut<C::F>, VerifierOnlyCircuitData<C, D>)> {
-        let key = (contract_id, fn_id);
-        let circuit = self
-            .contract_circuits
-            .get(&key)
+        let registration = self
+            .contract_function_registration(contract_id, fn_id)
             .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
         tracing::info!("get contract {} method {} common data", contract_id, fn_id);
-        Ok((circuit.get_fingerprint(), circuit.get_verifier_config_ref().clone()))
+        Ok((registration.fingerprint, registration.verifier_only.clone()))
     }
 
     async fn prove_contract_call(
@@ -411,11 +539,7 @@ where
         fn_id: u32,
         input: &DapenContractFunctionCircuitInput<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let key = (contract_id, fn_id);
-        let fn_circuit = self
-            .contract_circuits
-            .get(&key)
-            .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
+        let fn_circuit = self.contract_function_circuit(contract_id, fn_id)?;
         fn_circuit.prove_base(&input)
     }
 
@@ -607,6 +731,253 @@ where
         Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod contract_cache_tests {
+    use super::*;
+    use plonky2::plonk::config::PoseidonGoldilocksConfig;
+    use psy_vm::dpn::contract::dapen_fc_to_cfc_code_definition;
+    use std::sync::Barrier;
+
+    type C = PoseidonGoldilocksConfig;
+    type Manager = PsyUPSStepCircuitManager<C, 2>;
+
+    fn definition() -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "cache_identity".into(),
+            method_id: 1,
+            circuit_inputs: vec![],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        }
+    }
+
+    fn register(manager: &Manager, key: (u64, u32), def: &DPNFunctionCircuitDefinition, state_tree_height: u16) {
+        let code = ContractCodeDefinition {
+            state_tree_height,
+            functions: vec![dapen_fc_to_cfc_code_definition(def)],
+        };
+        futures::executor::block_on(manager.register_contract_method_circuit(key.0, &code, key.1)).unwrap();
+    }
+
+    fn assert_circuit_inputs(circuit: &DapenContractFunctionCircuit<C, 2>, def: &DPNFunctionCircuitDefinition, height: usize) {
+        assert_eq!(&circuit.fn_def, def);
+        assert_eq!(circuit.fn_builder_gadget.state_reader.contract_state_tree_height, height);
+        assert_eq!(circuit.fn_builder_gadget.state_reader.session_proof_tree_height, UPS_SESSION_PROOF_TREE_HEIGHT as usize);
+        assert!(!circuit.fn_builder_gadget.state_reader.force_four_align);
+    }
+
+    fn replace_contract_prover_cache(manager: &mut Manager, bytes: u64) {
+        manager.contract_circuits = new_contract_prover_circuit_cache(bytes);
+    }
+
+    #[test]
+    fn contract_cache_budget_parses_default_zero_and_valid_bytes() {
+        assert_eq!(parse_contract_prover_cache_bytes(None), Ok(DEFAULT_CONTRACT_PROVER_CACHE_BYTES));
+        for (value, expected) in [
+            ("0", 0), ("1", 1), ("268435456", 256 << 20),
+            ("10737418240", 10 << 30), ("18446744073709551615", u64::MAX),
+        ] {
+            assert_eq!(parse_contract_prover_cache_bytes(Some(std::ffi::OsStr::new(value))), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn contract_cache_budget_rejects_invalid_and_overflow_values() {
+        for value in ["", "512MiB", "-1", "+1", " 512", "512 ", "1.5", "1_024", "0x100", "NaN"] {
+            assert_eq!(parse_contract_prover_cache_bytes(Some(std::ffi::OsStr::new(value))), Err(
+                "PSY_CONTRACT_PROVER_CACHE_BYTES must contain decimal digits only (no sign, whitespace, or unit suffix)"
+            ));
+        }
+        assert_eq!(parse_contract_prover_cache_bytes(Some(std::ffi::OsStr::new("18446744073709551616"))), Err(
+            "PSY_CONTRACT_PROVER_CACHE_BYTES exceeds the unsigned 64-bit byte range"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contract_cache_budget_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let value = std::ffi::OsStr::from_bytes(&[0xff]);
+        assert_eq!(parse_contract_prover_cache_bytes(Some(value)), Err(
+            "PSY_CONTRACT_PROVER_CACHE_BYTES must contain Unicode decimal digits"
+        ));
+    }
+
+    #[test]
+    fn contract_cache_zero_budget_constructor_does_not_retain_insert() {
+        let cache = new_contract_prover_circuit_cache::<C, 2>(0);
+        let circuit = Arc::new(DapenContractFunctionCircuit::<C, 2>::new(
+            &definition(), 4, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false,
+        ));
+        let estimated_bytes = circuit.estimated_prover_bytes();
+        assert!(estimated_bytes > 0);
+        let key = (42, 0);
+        cache.insert(key, ContractProverCircuit { circuit, estimated_bytes });
+        assert!(cache.get(&key).is_none());
+        assert_eq!((cache.weight(), cache.capacity(), cache.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn contract_cache_byte_bounds_and_zero_budget_rebuild() {
+        let mut manager = Manager::new_with_config_and_cache_bytes(1, 1 << 30);
+        let key = (42, 0);
+        let def = definition();
+        register(&manager, key, &def, 4);
+        let first = manager.contract_function_circuit(key.0, key.1).unwrap();
+        let bytes = first.estimated_prover_bytes();
+        let fingerprint = first.get_fingerprint();
+        let verifier = serde_json::to_value(first.get_verifier_config_ref()).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(manager.contract_prover_cache_usage(), (bytes, 1 << 30, 1));
+        assert!(Arc::ptr_eq(&first, &manager.contract_function_circuit(key.0, key.1).unwrap()));
+
+        replace_contract_prover_cache(&mut manager, 0);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        manager.contract_method_ids.remove(&(key.0, def.name.clone()));
+        register(&manager, key, &def, 4);
+        assert_eq!(manager.contract_method_ids.get(&(key.0, def.name.clone())), Some(key.1));
+        let registration = manager.contract_function_registration(key.0, key.1).unwrap();
+        assert_eq!(registration.fingerprint, fingerprint);
+        assert_eq!(serde_json::to_value(&registration.verifier_only).unwrap(), verifier);
+        let rebuilt = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt.get_fingerprint(), fingerprint);
+        assert_eq!(serde_json::to_value(rebuilt.get_verifier_config_ref()).unwrap(), verifier);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        assert!(manager.contract_function_circuit(999, 0).is_err());
+
+        replace_contract_prover_cache(&mut manager, bytes);
+        let admitted = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_eq!(manager.contract_prover_cache_usage(), (bytes, bytes, 1));
+        assert!(Arc::ptr_eq(&admitted, &manager.contract_function_circuit(key.0, key.1).unwrap()));
+        for contract_id in 43..46 {
+            let circuit = manager.contract_prover_circuit((contract_id, 0), &def, 4);
+            assert_eq!(circuit.get_fingerprint(), fingerprint);
+            let (weight, capacity, count) = manager.contract_prover_cache_usage();
+            assert_eq!((weight, capacity, count), (bytes, bytes, 1));
+        }
+        assert_eq!(first.get_fingerprint(), fingerprint);
+
+        replace_contract_prover_cache(&mut manager, bytes - 1);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, bytes - 1, 0));
+        let oversized = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_eq!(oversized.get_fingerprint(), fingerprint);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, bytes - 1, 0));
+    }
+
+    #[test]
+    fn three_circuits_respect_two_circuit_budget() {
+        let mut manager = Manager::new_with_config_and_cache_bytes(1, 1 << 30);
+        let def = definition();
+        let first_key = (42, 0);
+        let second_key = (43, 0);
+        let third_key = (44, 0);
+        let first = manager.contract_prover_circuit(first_key, &def, 4);
+        let bytes = first.estimated_prover_bytes();
+        assert!(bytes > 0);
+        let budget = 2 * bytes;
+        replace_contract_prover_cache(&mut manager, budget);
+        manager.contract_circuits.insert(first_key, ContractProverCircuit { circuit: first.clone(), estimated_bytes: bytes });
+        let second = manager.contract_prover_circuit(second_key, &def, 4);
+        assert_eq!(second.estimated_prover_bytes(), bytes);
+        assert_eq!(manager.contract_prover_cache_usage(), (budget, budget, 2));
+        {
+            let cache = &manager.contract_circuits;
+            assert!(Arc::ptr_eq(&first, &cache.get(&first_key).unwrap().circuit));
+            assert!(Arc::ptr_eq(&second, &cache.get(&second_key).unwrap().circuit));
+        }
+
+        let third = manager.contract_prover_circuit(third_key, &def, 4);
+        assert_eq!(third.estimated_prover_bytes(), bytes);
+        assert_eq!(manager.contract_prover_cache_usage(), (budget, budget, 2));
+        let cache = &manager.contract_circuits;
+        let mut retained_count = 0;
+        for (key, circuit) in [(first_key, &first), (second_key, &second), (third_key, &third)] {
+            assert_circuit_inputs(circuit, &def, 4);
+            assert_eq!(circuit.get_fingerprint(), first.get_fingerprint());
+            assert_eq!(circuit.get_verifier_config_ref(), first.get_verifier_config_ref());
+            if let Some(cached) = cache.get(&key) {
+                assert!(Arc::ptr_eq(circuit, &cached.circuit));
+                retained_count += 1;
+            }
+        }
+        assert_eq!(retained_count, 2);
+    }
+
+    #[test]
+    fn contract_cache_coalesces_concurrent_misses() {
+        let mut manager = Manager::new_with_config_and_cache_bytes(1, 0);
+        let key = (42, 0);
+        register(&manager, key, &definition(), 4);
+        replace_contract_prover_cache(&mut manager, 1 << 30);
+        let barrier = Barrier::new(4);
+        let circuits = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                barrier.wait();
+                manager.contract_function_circuit(key.0, key.1).unwrap()
+            })).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        for circuit in &circuits {
+            assert!(Arc::ptr_eq(&circuits[0], circuit));
+            assert_circuit_inputs(circuit, &definition(), 4);
+        }
+        assert_eq!(manager.contract_prover_cache_usage(), (circuits[0].estimated_prover_bytes(), 1 << 30, 1));
+    }
+
+    #[test]
+    fn contract_cache_rejects_stale_and_concurrent_compilation_inputs() {
+        let manager = Manager::new_with_config_and_cache_bytes(1, 1 << 30);
+        let key = (42, 0);
+        let def = definition();
+        register(&manager, key, &def, 4);
+        let first = manager.contract_function_circuit(key.0, key.1).unwrap();
+        let mut changed = def.clone();
+        changed.method_id = 2;
+        changed.name = "changed_cache_identity".into();
+        let changed_circuit = manager.contract_prover_circuit(key, &changed, 4);
+        assert_circuit_inputs(&changed_circuit, &changed, 4);
+        assert!(!Arc::ptr_eq(&first, &changed_circuit));
+        let changed_height = manager.contract_prover_circuit(key, &def, 5);
+        assert_circuit_inputs(&changed_height, &def, 5);
+        let restored = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_eq!(restored.get_fingerprint(), first.get_fingerprint());
+        assert_eq!(restored.get_verifier_config_ref(), first.get_verifier_config_ref());
+
+        let barrier = Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|index| {
+                let requested = if index % 2 == 0 { &def } else { &changed };
+                let barrier = &barrier;
+                let manager = &manager;
+                scope.spawn(move || {
+                    let height = 4 + index / 2;
+                    barrier.wait();
+                    for _ in 0..3 {
+                        let circuit = manager.contract_prover_circuit(key, requested, height);
+                        assert_circuit_inputs(&circuit, requested, height);
+                    }
+                    register(manager, key, requested, height as u16);
+                })
+            }).collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let registered = manager.contract_function_registration(key.0, key.1).unwrap();
+        let circuit = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_circuit_inputs(&circuit, &registered.fn_def, registered.state_tree_height);
+        assert_eq!(registered.fingerprint, circuit.get_fingerprint());
+        assert_eq!(&registered.verifier_only, circuit.get_verifier_config_ref());
+    }
+
+}
+
 #[cfg(test)]
 mod eth_personal_tests {
     use plonky2::{
