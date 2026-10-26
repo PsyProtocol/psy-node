@@ -1107,6 +1107,7 @@ impl<
 pub(crate) mod tests {
     use super::*;
     use crate::coordinator::processor::db::PsyCoordinatorDatabaseProcessor;
+    use crate::coordinator::processor::startup::startup_tests::{genesis_validator, validator_signing_key};
     use crate::test_common::{
         create_test_unified_db, FakeEphemeralQueuePublisher, FakeEphemeralQueueSubscriber,
         FakeWorkerQueuePublisher, FakeWorkerQueueSubscriber, TestNetworkConfig,
@@ -1120,10 +1121,15 @@ pub(crate) mod tests {
         utils::QPGenRandom,
         PHash, PF,
     };
-    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_core::{constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, job::job_id::QProvingJobDataID};
     use psy_data::{
         config::network_config::PsyNodeCircuitFingerprintConfig,
         genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+        guta::realm_finalize::{
+            finalize_output_from_witness, finalize_reward_root63, protocol_encode_finalize_output,
+            realm_finalize_guta_chain_domain, RealmFinalizeGUTAInput,
+        },
+        p2p::{bitmap_set, encode_proposal_body, proposal_from_parts, vote_message, ProtocolEncode},
         v1::qdata::{
             checkpoint::PQEDCheckpointLeafStats,
             contract::{
@@ -1136,13 +1142,13 @@ pub(crate) mod tests {
         file::memory_fs::SimpleMockMemoryFileSystem,
         genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
         psy_core_db::traits::full::{
-            PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreDatabaseContractObjectStoreReader,
+            PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreDatabaseContractObjectStoreReader,
             PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreRewardsTagTreeStoreWriter,
             PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
         },
         psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseWriter,
         psy_temp_db::{
-            QTempDBGutaInFlightStore, QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
+            GatheringGeneration, QTempDBGutaInFlightStore, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
         },
         store::traits::proof_store::QParthProofStoreReader,
     };
@@ -1200,6 +1206,7 @@ pub(crate) mod tests {
         PsyGenesisBlockSetupData {
             contracts: vec![contract],
             users: vec![],
+            validators: vec![genesis_validator()],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: PHash::from_values(4, 0, 0, 0),
             withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
@@ -1217,6 +1224,7 @@ pub(crate) mod tests {
         pub(crate) contract_queue: Arc<FakeEphemeralQueuePublisher>,
         pub(crate) work_queue: Arc<FakeWorkerQueueSubscriber>,
         pub(crate) temp_db: Arc<InMemoryTempStore>,
+        _worker_whitelist_config: tempfile::NamedTempFile,
     }
 
     impl EdgeTestEnv {
@@ -1229,6 +1237,14 @@ pub(crate) mod tests {
             let register_queue = Arc::new(FakeEphemeralQueuePublisher::new());
             let contract_queue = Arc::new(FakeEphemeralQueuePublisher::new());
             let work_queue = Arc::new(FakeWorkerQueueSubscriber::new());
+            let worker_whitelist_config = tempfile::NamedTempFile::new()?;
+            serde_json::to_writer(worker_whitelist_config.as_file(), &serde_json::json!({
+                "networks": {"localhost": {"whitelist": {"enabled": false, "secp256k1": []}}}
+            }))?;
+            let worker_whitelist = WhiteListCache::new(
+                worker_whitelist_config.path(),
+                psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet,
+            )?;
             let handler = CoordinatorEdgeHandler::new(
                 Arc::clone(&db),
                 tag_tree,
@@ -1239,6 +1255,8 @@ pub(crate) mod tests {
                 Arc::clone(&contract_queue),
                 Arc::clone(&work_queue),
                 QRealmIdentifier::new(1, 2),
+                worker_whitelist,
+                PSY_CHAIN_ID_LOCAL_DEVNET,
                 Arc::new(crate::test_common::TestZKVerifier {}),
                 zh(25),
                 PHash::from_values(7, 0, 0, 0),
@@ -1283,8 +1301,12 @@ pub(crate) mod tests {
             // seed both counters so handler reads behave like production.
             let rid = QRealmIdentifier::new(1, 2);
             temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
-            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
-            Ok(Self { handler, db, guta_queue, register_queue, contract_queue, work_queue, temp_db })
+            temp_db.set_gathering_generation(&rid, GatheringGeneration {
+                checkpoint_id: 0,
+                unique_pending_id: 0,
+                proc_checkpoint_unique_id: 0,
+            }).await?;
+            Ok(Self { handler, db, guta_queue, register_queue, contract_queue, work_queue, temp_db, _worker_whitelist_config: worker_whitelist_config })
         }
 
         /// Commits genesis through a real database processor sharing the same
@@ -1301,7 +1323,7 @@ pub(crate) mod tests {
                 GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<
                     parth_core::pgoldilocks::PoseidonHasher,
                     N,
-                >(&genesis_data, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
+                >(&genesis_data, PSY_CHAIN_ID_LOCAL_DEVNET, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
             let mut processor = TestProcessor::new_init(
                 Arc::clone(&self.db),
                 Arc::clone(&self.db),
@@ -1409,7 +1431,6 @@ pub(crate) mod tests {
         let handler = &env.handler;
 
         assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
-        assert_eq!(handler.get_current_gathering_unique_pending_id_internal().await?, (0, 0));
         // no pending-id mapping exists on a fresh database
         assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, None);
         // genesis commit records pending id 0 -> checkpoint 0
@@ -1654,7 +1675,7 @@ pub(crate) mod tests {
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64,
         );
         input.header.header.state_transition.node_index = PF::from_u64_value(0);
-        input.job_type_u32 = psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange as u32;
+        input.job_type_u32 = psy_core::job::job_id::ProvingJobCircuitType::RealmFinalizeGUTA as u32;
         input
     }
 
@@ -1666,42 +1687,33 @@ pub(crate) mod tests {
         // wrong node level
         let mut bad_level = guta_input();
         bad_level.header.header.state_transition.node_level = PF::from_u64_value(5);
-        let err = handler.submit_guta_internal(bad_level, vec![]).await.expect_err("wrong level must fail");
+        let err = handler.submit_guta_internal(bad_level, vec![], None, None).await.expect_err("wrong level must fail");
         assert!(err.to_string().contains("invalid realm level"), "unexpected error: {err}");
 
         // realm id beyond the coordinator tree capacity
         let mut bad_realm = guta_input();
         bad_realm.header.header.state_transition.node_index =
             PF::from_u64_value((1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT) + 1);
-        let err = handler.submit_guta_internal(bad_realm, vec![]).await.expect_err("invalid realm id must fail");
+        let err = handler.submit_guta_internal(bad_realm, vec![], None, None).await.expect_err("invalid realm id must fail");
         assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
 
         // unknown circuit type
         let mut bad_type = guta_input();
         bad_type.job_type_u32 = 999_999;
-        assert!(handler.submit_guta_internal(bad_type, vec![]).await.is_err());
+        assert!(handler.submit_guta_internal(bad_type, vec![], None, None).await.is_err());
 
         // stale realm root
         let mut stale = guta_input();
         stale.header.header.state_transition.old_node_value = PHash::from_values(123, 0, 0, 0);
-        let err = handler.submit_guta_internal(stale, vec![]).await.expect_err("stale root must fail");
+        let err = handler.submit_guta_internal(stale, vec![], None, None).await.expect_err("stale root must fail");
         assert!(err.to_string().contains("stale GUTA update rejected"), "unexpected error: {err}");
 
         // double submission for the same realm + pending id
-        let mut input = guta_input();
-        let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
-            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-            index: 0,
-        };
-        let current_root = env
-            .db
-            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key)
-            .await?;
-        input.header.header.state_transition.old_node_value = current_root.value;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
         env.temp_db
             .set_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 0, 0, 1)
             .await?;
-        let err = handler.submit_guta_internal(input, vec![]).await.expect_err("double submit must fail");
+        let err = handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await.expect_err("double submit must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
         Ok(())
     }
@@ -1715,7 +1727,7 @@ pub(crate) mod tests {
             PF::from_u64_value(1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT);
 
         let err = handler
-            .submit_guta_internal(input, vec![])
+            .submit_guta_internal(input, vec![], None, None)
             .await
             .expect_err("realm id equal to tree capacity must fail");
         assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
@@ -1727,18 +1739,8 @@ pub(crate) mod tests {
         let env = EdgeTestEnv::create().await?;
         let handler = &env.handler;
 
-        let mut input = guta_input();
-        let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
-            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-            index: 0,
-        };
-        let current_root = env
-            .db
-            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key)
-            .await?;
-        input.header.header.state_transition.old_node_value = current_root.value;
-
-        handler.submit_guta_internal(input, vec![]).await?;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
+        handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         // the queue item was published and the proof stored for the derived job id
         assert_eq!(env.guta_queue.published_count(), 1);
@@ -1746,21 +1748,23 @@ pub(crate) mod tests {
             0,
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
             0,
-            psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange,
+            psy_core::job::job_id::ProvingJobCircuitType::RealmFinalizeGUTA,
         )?;
         assert!(env.temp_db.contains_proof_for_job_id(job_id, 0).await?);
 
         // a second submission for the same realm is rejected; the in-flight guard answers before
         // the per-batch status guard (which `submit_guta_rejects_invalid_headers` covers)
         let mut second = guta_input();
-        second.header.header.state_transition.old_node_value = current_root.value;
-        let err = handler.submit_guta_internal(second, vec![]).await.expect_err("double submit must fail");
+        second.header.header.state_transition.old_node_value = input.header.header.state_transition.old_node_value;
+        let err = handler.submit_guta_internal(second, vec![], None, None).await.expect_err("double submit must fail");
         assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
         Ok(())
     }
 
-    /// A GUTA update for realm 0 whose old root is the committed root, so the stale check passes.
-    async fn submittable_guta_input(env: &EdgeTestEnv) -> anyhow::Result<GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>> {
+    /// Commits the proof base and signs a circuit-63 proposal with its authenticated validator.
+    /// ZK proofs still use TestZKVerifier; certificate admission uses real BLS verification.
+    async fn submittable_guta_input(env: &EdgeTestEnv) -> anyhow::Result<(GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>, Vec<u8>, Vec<u8>)> {
+        env.commit_genesis().await?;
         let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
             level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
             index: 0,
@@ -1768,14 +1772,53 @@ pub(crate) mod tests {
         let current_root = env.db.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key).await?;
         let mut input = guta_input();
         input.header.header.state_transition.old_node_value = current_root.value;
-        Ok(input)
+        input.header.header.checkpoint_tree_root = env.db.checkpoint_tree_get_root_hash(0).await?;
+        input.header.header.total_aggregation_proofs_generated = PF::from_u64_value(1);
+        let mut witness = RealmFinalizeGUTAInput::<PF, PHash>::qp_rand_gen();
+        witness.root_guta_header = input.header.header;
+        witness.checkpoint_id = PF::from_u64_value(0);
+        witness.checkpoint_leaf.global_state_roots = env.db.get_checkpoint_global_state_roots(0).await?;
+        witness.realm_sub_id = 1;
+        witness.validator_user_id = PF::from_u64_value(genesis_validator().validator_user_id);
+        let output = finalize_output_from_witness::<PF, PHash, parth_core::pgoldilocks::PoseidonHasher>(
+            &witness,
+            realm_finalize_guta_chain_domain::<PF, PHash, parth_core::pgoldilocks::PoseidonHasher>(PSY_CHAIN_ID_LOCAL_DEVNET),
+            input.header.new_tag_tree_node_value,
+        );
+        let worker_tag = PHash::from_values(6, 0, 0, 0);
+        input.header.header = output.final_guta_header;
+        input.header.new_tag_tree_node_value = finalize_reward_root63::<PF, PHash, parth_core::pgoldilocks::PoseidonHasher>(&output, &worker_tag);
+        let output_bytes = protocol_encode_finalize_output(&output)?;
+        let body = encode_proposal_body(&output_bytes, &[], &[], &worker_tag.into_owned_32bytes())?;
+        let proposal = proposal_from_parts(
+            PSY_CHAIN_ID_LOCAL_DEVNET, 0, 0, 1,
+            output.validator_tree_root.into_owned_32bytes(),
+            sha256(&output_bytes), sha256(&[]), sha256(&[]), sha256(&body),
+        );
+        let mut signer_bitmap = [0; 32];
+        bitmap_set(&mut signer_bitmap, 1);
+        let certificate = Certificate {
+            chain_id: proposal.chain_id,
+            realm_id: proposal.realm_id,
+            validator_tree_root: proposal.validator_tree_root,
+            proposal_id: proposal.proposal_id,
+            signer_bitmap,
+            aggregated_signature: validator_signing_key().sign_vote(&vote_message(
+                proposal.chain_id, proposal.realm_id, &proposal.validator_tree_root, &proposal.proposal_id,
+            )),
+        };
+        Ok((input, proposal.protocol_encode_to_vec(), certificate.protocol_encode_to_vec()))
     }
 
     /// Moves the coordinator to a new gathering batch and committed checkpoint, so the
     /// per-batch submitted-status guard of an earlier submission no longer applies.
     async fn advance_coordinator(env: &EdgeTestEnv, gathering_pending_id: u64, committed_checkpoint_id: u64) -> anyhow::Result<()> {
         env.temp_db
-            .set_gathering_unique_pending_ids(&QRealmIdentifier::new(1, 2), gathering_pending_id, gathering_pending_id as u128)
+            .set_gathering_generation(&QRealmIdentifier::new(1, 2), GatheringGeneration {
+                checkpoint_id: committed_checkpoint_id,
+                unique_pending_id: gathering_pending_id,
+                proc_checkpoint_unique_id: gathering_pending_id as u128,
+            })
             .await?;
         env.db.set_latest_checkpoint_id(committed_checkpoint_id).await?;
         Ok(())
@@ -1784,9 +1827,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_records_the_accepted_update_as_in_flight() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
 
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         let (record, _) = env
             .temp_db
@@ -1802,14 +1845,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_rejects_a_second_copy_while_the_first_may_be_in_flight() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal.clone()), Some(certificate.clone())).await?;
 
         // two checkpoints later the first copy may still be in the batch that commits next
         advance_coordinator(&env, 1, 2).await?;
         let err = env
             .handler
-            .submit_guta_internal(input, vec![])
+            .submit_guta_internal(input, vec![], Some(proposal), Some(certificate))
             .await
             .expect_err("a second copy inside the window must be rejected");
 
@@ -1829,11 +1872,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_accepts_a_copy_once_the_first_cannot_be_live() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal.clone()), Some(certificate.clone())).await?;
 
         advance_coordinator(&env, 1, 3).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         assert_eq!(env.guta_queue.published_count(), 2);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
@@ -1851,8 +1894,8 @@ pub(crate) mod tests {
         };
         assert!(env.temp_db.claim_guta_in_flight(&QRealmIdentifier::new(1, 2), 0, None, &earlier).await?);
 
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        let (input, proposal, certificate) = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         assert_eq!(env.guta_queue.published_count(), 1);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();

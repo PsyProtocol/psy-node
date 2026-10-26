@@ -17,7 +17,7 @@ pub type RecTree = SimpleMemoryMerkleRecorderStore<Hasher, Hash>;
 mod tests {
     use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
     use parth_core::{
-        crypto::hash::traits::{MerkleZeroHasher, ZeroableHash},
+        crypto::hash::traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
         felt::{FromPrimitiveValuesFelt, ToU64Value},
         protocol::core_types::QNetworkTreeConstants,
         utils::QPGenRandom,
@@ -27,7 +27,7 @@ mod tests {
     use psy_io::tokio::TokioLikeFileSystem;
     use psy_node_core::{
         file::memory_fs::SimpleMockMemoryFileSystem,
-        psy_temp_db::QTempDBProofWitnessReader,
+        psy_temp_db::{QTempDBProofWitnessReader, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter},
     };
     use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
@@ -63,10 +63,15 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("expected a gatherer output for a single user"))?;
 
         let job_levels = &result.job_ids;
-        assert_eq!(job_levels.len(), 1);
+        assert_eq!(job_levels.len(), 2);
         assert_eq!(job_levels[0].len(), 1);
+        assert_eq!(job_levels[1].len(), 1);
         let root_job = &job_levels[0][0];
         assert_eq!(root_job.job_id.circuit_type, ProvingJobCircuitType::GUTASingleEndCap);
+        let finalizer_job = &job_levels[1][0];
+        assert_eq!(finalizer_job.job_id.circuit_type, ProvingJobCircuitType::RealmFinalizeGUTA);
+        assert_eq!(finalizer_job.metadata.dependencies, vec![root_job.job_id.clone()]);
+        assert_eq!(result.db_output.guta_header.job_id, finalizer_job.job_id);
 
         // the single dependency is the user's end cap job
         let end_cap_job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
@@ -78,57 +83,63 @@ mod tests {
         basic_validate_job_results_singlet_case(&[end_cap_job_id.clone()], job_levels)?;
 
         assert_eq!(result.db_output.total_users_updated, 1);
-        assert_eq!(result.db_output.total_proofs_generated, 1);
+        assert_eq!(result.db_output.total_proofs_generated, 2);
         assert_ne!(result.db_output.old_realm_root, result.db_output.new_realm_root);
 
-        // the stored witness round trips and its realm sub-tree transition verifies
-        let witness_bytes = chain_state
-            .temp_db
-            .get_tdb_proof_witness_bytes(&chain_state.realm_identifier, chain_state.unique_pending_id, root_job.job_id.clone())
-            .await?;
-        let job_info = RGPJobInfo::new_from_metadata_and_raw_witness(root_job, &witness_bytes)?;
+        // Validate both stored witnesses, including finalizer membership and continuity.
+        let mut job_infos = Vec::new();
+        for level in job_levels {
+            let mut infos = Vec::new();
+            for job in level {
+                let witness_bytes = chain_state.temp_db.get_tdb_proof_witness_bytes(
+                    &chain_state.realm_identifier, chain_state.unique_pending_id, job.job_id.clone(),
+                ).await?;
+                infos.push(RGPJobInfo::new_from_metadata_and_raw_witness(job, &witness_bytes)?);
+            }
+            job_infos.push(infos);
+        }
+        assert_eq!(job_infos.iter().map(Vec::len).sum::<usize>(), 2);
         let validator = RGPTestResultValidator::new(
             chain_state.guta_circuit_whitelist,
             result.db_output.clone(),
-            vec![vec![job_info]],
+            job_infos,
             vec![end_cap_job_id],
         )?;
-        let _ = validator;
+        validator.run_full_tests()?;
         Ok(())
     }
 
     #[tokio::test]
     async fn future_checkpoint_end_caps_are_deferred_and_processed_later() -> anyhow::Result<()> {
         let (mut chain_state, user_a, user_b) = test_chain_with_two_users_and_one_contract().await?;
-        chain_state.unique_pending_id += 1;
-        let unique_pending_id = chain_state.unique_pending_id;
-        // both users update against checkpoint 1 while the realm planner is still at checkpoint 0
-        chain_state.checkpoint_id += 1;
-        let item_a = chain_state.run_ups_for_user(user_a, &one_contract_update()).await?;
-        let item_b = chain_state.run_ups_for_user(user_b, &one_contract_update()).await?;
-
+        let unique_pending_id = chain_state.unique_pending_id + 1;
         let realm_tree_height = N::REALM_GLOBAL_USER_TREE_HEIGHT;
-        let mut realm_tree = RecTree::new(realm_tree_height);
+        let mut realm_tree = chain_state.first_realm_global_user_tree.clone();
         let backup_file_system = SimpleMockMemoryFileSystem::new();
         let backup_file_path = "backups/future_end_caps_test".to_string();
         let mut backup_file = backup_file_system.file_like_fs_create(&backup_file_path).await?;
 
         let start_realm_root = realm_tree.get_root();
-        let new_planner = |checkpoint_root: Hash, checkpoint_id: u64| {
-            RealmGUTAPlanner::<F, Hash>::new(
-                chain_state.chain_id,
-                chain_state.realm_identifier,
-                checkpoint_root,
-                checkpoint_id,
-                unique_pending_id,
-                start_realm_root,
-                realm_tree_height,
-                N::GLOBAL_USER_TREE_HEIGHT,
-                chain_state.guta_circuit_whitelist,
-            )
-        };
+        let mut planner = chain_state.configure_validator_proofs(RealmGUTAPlanner::<F, Hash>::new(
+            chain_state.chain_id,
+            chain_state.realm_identifier,
+            chain_state.checkpoint_tree_root,
+            chain_state.checkpoint_id,
+            unique_pending_id,
+            start_realm_root,
+            realm_tree_height,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            chain_state.guta_circuit_whitelist,
+        ))?;
 
-        let mut planner = new_planner(chain_state.checkpoint_tree_root, 0);
+        // Create an authenticated checkpoint 1 while retaining the checkpoint-0 planner.
+        assert!(chain_state.process_checkpoint(&[], &[], false).await?.is_none());
+        assert_eq!(chain_state.checkpoint_id, 1);
+        assert_eq!(chain_state.unique_pending_id, unique_pending_id);
+        assert_eq!(chain_state.first_realm_global_user_tree.get_root(), start_realm_root);
+        let item_a = chain_state.run_ups_for_user(user_a, &one_contract_update()).await?;
+        let item_b = chain_state.run_ups_for_user(user_b, &one_contract_update()).await?;
+
         let added_a = planner
             .add_end_cap_job(
                 &chain_state.checkpoint_tree,
@@ -164,11 +175,20 @@ mod tests {
             .await?;
         assert_eq!(still_deferred, 0);
         assert_eq!(planner.future_pending_end_cap_jobs.len(), 2);
+        assert_eq!(realm_tree.get_root(), start_realm_root);
 
         // once the realm advances to checkpoint 1 the deferred jobs are processed and paired
-        chain_state.checkpoint_tree.append_leaf(1, Hash::qp_rand_gen())?;
-        let checkpoint_1_root = chain_state.checkpoint_tree.get_root();
-        let mut advanced_planner = new_planner(checkpoint_1_root, 1);
+        let mut advanced_planner = chain_state.configure_validator_proofs(RealmGUTAPlanner::<F, Hash>::new(
+            chain_state.chain_id,
+            chain_state.realm_identifier,
+            chain_state.checkpoint_tree_root,
+            chain_state.checkpoint_id,
+            unique_pending_id,
+            start_realm_root,
+            realm_tree_height,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            chain_state.guta_circuit_whitelist,
+        ))?;
         let processed = advanced_planner
             .add_future_end_cap_jobs(
                 &chain_state.checkpoint_tree,
@@ -192,24 +212,38 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("expected a planner output for the processed future end caps"))?;
         assert_eq!(result.db_output.total_users_updated, 2);
-        assert_eq!(result.db_output.total_proofs_generated, 1);
-        assert_eq!(result.job_ids.len(), 1);
+        assert_eq!(result.db_output.total_proofs_generated, 2);
+        assert_eq!(result.job_ids.len(), 2);
+        assert_eq!(result.job_ids[0].len(), 1);
+        assert_eq!(result.job_ids[1].len(), 1);
         let root_job = &result.job_ids[0][0];
         assert_eq!(root_job.job_id.circuit_type, ProvingJobCircuitType::GUTATwoEndCap);
         assert_eq!(root_job.metadata.dependencies, vec![item_a.job_id.clone(), item_b.job_id.clone()]);
+        let finalizer_job = &result.job_ids[1][0];
+        assert_eq!(finalizer_job.job_id.circuit_type, ProvingJobCircuitType::RealmFinalizeGUTA);
+        assert_eq!(finalizer_job.metadata.dependencies, vec![root_job.job_id.clone()]);
+        assert_eq!(result.db_output.guta_header.job_id, finalizer_job.job_id);
+        basic_validate_job_results_singlet_case(&[item_a.job_id.clone(), item_b.job_id.clone()], &result.job_ids)?;
 
-        // the two-end-cap witness round trips through the temp db
-        let witness_bytes = chain_state
-            .temp_db
-            .get_tdb_proof_witness_bytes(&chain_state.realm_identifier, unique_pending_id, root_job.job_id.clone())
-            .await?;
-        let job_info = RGPJobInfo::new_from_metadata_and_raw_witness(root_job, &witness_bytes)?;
-        RGPTestResultValidator::new(
+        let mut job_infos = Vec::new();
+        for level in &result.job_ids {
+            let mut infos = Vec::new();
+            for job in level {
+                let witness_bytes = chain_state.temp_db.get_tdb_proof_witness_bytes(
+                    &chain_state.realm_identifier, unique_pending_id, job.job_id.clone(),
+                ).await?;
+                infos.push(RGPJobInfo::new_from_metadata_and_raw_witness(job, &witness_bytes)?);
+            }
+            job_infos.push(infos);
+        }
+        assert_eq!(job_infos.iter().map(Vec::len).sum::<usize>(), 2);
+        let validator = RGPTestResultValidator::new(
             chain_state.guta_circuit_whitelist,
             result.db_output.clone(),
-            vec![vec![job_info]],
+            job_infos,
             vec![item_a.job_id.clone(), item_b.job_id.clone()],
         )?;
+        validator.run_full_tests()?;
         Ok(())
     }
 
@@ -240,6 +274,11 @@ mod tests {
         let mut future_b = item_a.clone();
         future_b.new_user_leaf.user_id = F::from_u64_value(user_b);
         future_b.new_user_leaf.last_checkpoint_id = F::from_u64_value(planner.current_checkpoint_id + 1);
+        future_b.new_user_leaf_hash = future_b.new_user_leaf.qfhash::<Hasher>();
+        assert!(chain_state.temp_db.get_contract_updates_for_user(
+            &chain_state.realm_identifier, chain_state.unique_pending_id, user_b,
+        ).await?.is_none());
+        let start_root = realm_tree.get_root();
         let added = planner
             .add_end_cap_job(
                 &chain_state.checkpoint_tree,
@@ -256,6 +295,9 @@ mod tests {
             "a future end cap without contract updates must be dropped, not queued"
         );
         assert_eq!(planner.total_end_caps_processed, 0);
+        assert!(planner.end_cap_straggler.is_none());
+        assert!(planner.user_leaf_updates_ffs.is_empty());
+        assert_eq!(realm_tree.get_root(), start_root);
         Ok(())
     }
 
@@ -283,9 +325,29 @@ mod tests {
         let min_user_id = planner.realm_user_min_id;
         let max_user_id = planner.realm_user_max_id;
 
+        // A malformed preimage is rejected before any queue-item processing.
+        let start_root = realm_tree.get_root();
+        let mut malformed = item_a.clone();
+        malformed.new_user_leaf.user_id = F::from_u64_value(user_b);
+        assert_ne!(malformed.new_user_leaf.qfhash::<Hasher>(), malformed.new_user_leaf_hash);
+        let error = planner.add_end_cap_job(
+            &chain_state.checkpoint_tree,
+            &mut realm_tree,
+            &mut backup_file,
+            chain_state.temp_db.clone(),
+            &malformed.psy_ser_to_bytes_vec()?,
+            malformed,
+        ).await.expect_err("a mismatched new user preimage must fail");
+        assert!(error.to_string().contains("EndCap new user preimage hash mismatch"), "{error:#}");
+        assert_eq!(realm_tree.get_root(), start_root);
+        assert_eq!(planner.total_end_caps_processed, 0);
+        assert!(planner.end_cap_straggler.is_none());
+        assert!(planner.user_leaf_updates_ffs.is_empty());
+
         // out-of-bounds user id: skipped before any tree access
         let mut out_of_bounds = item_a.clone();
         out_of_bounds.new_user_leaf.user_id = F::from_u64_value(max_user_id + 1);
+        out_of_bounds.new_user_leaf_hash = out_of_bounds.new_user_leaf.qfhash::<Hasher>();
         let added = planner
             .add_end_cap_job(
                 &chain_state.checkpoint_tree,
@@ -298,6 +360,7 @@ mod tests {
             .await?;
         assert_eq!(added, 0);
         assert_eq!(planner.total_end_caps_processed, 0);
+        assert_eq!(realm_tree.get_root(), start_root);
 
         // stale old leaf hash against a non-zero tree leaf: skipped without any mutation
         realm_tree.set_leaf(user_a - min_user_id, Hash::from_values(9, 9, 9, 9));
@@ -321,7 +384,11 @@ mod tests {
         // contract updates for user b cause a skip
         let mut for_user_b = item_a.clone();
         for_user_b.new_user_leaf.user_id = F::from_u64_value(user_b);
+        for_user_b.new_user_leaf_hash = for_user_b.new_user_leaf.qfhash::<Hasher>();
         for_user_b.old_user_leaf_hash = Hash::from_values(5, 6, 7, 8);
+        assert!(chain_state.temp_db.get_contract_updates_for_user(
+            &chain_state.realm_identifier, chain_state.unique_pending_id, user_b,
+        ).await?.is_none());
         let added = planner
             .add_end_cap_job(
                 &chain_state.checkpoint_tree,
@@ -339,7 +406,9 @@ mod tests {
         // a consistent item without contract updates is skipped too
         let mut no_updates = item_a.clone();
         no_updates.new_user_leaf.user_id = F::from_u64_value(user_b);
-        no_updates.old_user_leaf_hash = Hash::get_zero_value();
+        no_updates.new_user_leaf_hash = no_updates.new_user_leaf.qfhash::<Hasher>();
+        no_updates.old_user_leaf_hash = realm_tree.get_leaf_value(user_b - min_user_id);
+        let root_before_missing_updates = realm_tree.get_root();
         let added = planner
             .add_end_cap_job(
                 &chain_state.checkpoint_tree,
@@ -351,6 +420,10 @@ mod tests {
             )
             .await?;
         assert_eq!(added, 0);
+        assert_eq!(realm_tree.get_root(), root_before_missing_updates);
+        assert_eq!(planner.total_end_caps_processed, 0);
+        assert!(planner.end_cap_straggler.is_none());
+        assert!(planner.user_leaf_updates_ffs.is_empty());
 
         // the valid item for user a still processes after its tree leaf is restored
         realm_tree.set_leaf(user_a - min_user_id, Hash::get_zero_value());

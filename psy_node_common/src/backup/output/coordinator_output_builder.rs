@@ -957,6 +957,10 @@ mod output_builder_tests {
             output.new_base.checkpoint_leaf.global_state_roots.withdrawal_tree_root,
             last_committed.checkpoint_state_roots.withdrawal_tree_root
         );
+        assert_eq!(
+            output.new_base.checkpoint_leaf.global_state_roots.validator_tree_root,
+            last_committed.checkpoint_state_roots.validator_tree_root
+        );
 
         // leaf stats: job counts, reward commitments, seed and block time
         assert_eq!(output.new_base.checkpoint_leaf.stats.block_time, PF::from_u64_value(block_time));
@@ -1011,6 +1015,10 @@ mod output_builder_tests {
         assert_eq!(output.update_contract_function_tree_nodes_ffs, vec![4, 5, 11, 12]);
         assert_eq!(output.new_contract_leaves_ffs, vec![1, 2, 3, 9, 10]);
         assert_eq!(output.new_base.block_state.next_contract_id, 22);
+        assert_eq!(
+            output.new_base.checkpoint_leaf.global_state_roots.validator_tree_root,
+            last_committed.checkpoint_state_roots.validator_tree_root
+        );
     }
 
     #[test]
@@ -1234,32 +1242,33 @@ mod output_builder_tests {
     }
 
     /// Builds a checkpoint tree whose leaf at index 0 matches the old leaf
-    /// derived from `stats` and the gatherer start roots, exactly like the
+    /// derived from committed state and the gatherer start roots, exactly like the
     /// witness's own consistency check computes it.
-    fn consistent_tree_and_stats() -> (PsyDashMemoryAppendOnlyMerkleStore<PoseidonHasher, PHash>, PQEDCheckpointLeafStats<PF, PHash>, PHash) {
-        let stats = PQEDCheckpointLeafStats::<PF, PHash>::qp_rand_gen();
+    fn consistent_tree_and_last_committed() -> (PsyDashMemoryAppendOnlyMerkleStore<PoseidonHasher, PHash>, CoordinatorProcessorLastCommittedState<PF, PHash>, PHash) {
+        let mut last_committed = sample_last_committed(PQEDCheckpointLeafStats::qp_rand_gen());
         let old_state_roots = PQEDCheckpointGlobalStateRoots::<PHash> {
             contract_tree_root: zh(5),
             deposit_tree_root: PoseidonHasher::get_zero_hash(TODO_DEPOSIT_TREE_HEIGHT as usize),
             user_tree_root: zh(1),
             withdrawal_tree_root: PoseidonHasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: zh(3),
+            validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
         };
+        last_committed.checkpoint_state_roots = old_state_roots;
         let old_leaf = PQEDCheckpointLeaf::<PF, PHash> {
             global_chain_root: old_state_roots.qfhash::<PoseidonHasher>(),
-            stats: stats.clone(),
+            stats: last_committed.checkpoint_leaf_stats.clone(),
         };
         let old_leaf_hash = old_leaf.qfhash::<PoseidonHasher>();
 
         let tree = PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(32);
         tree.append_leaf(0, old_leaf_hash).unwrap();
-        (tree, stats, old_leaf_hash)
+        (tree, last_committed, old_leaf_hash)
     }
 
     #[test]
     fn checkpoint_witness_accepts_a_consistent_tree_and_rejects_a_stale_one() {
-        let (tree, stats, old_leaf_hash) = consistent_tree_and_stats();
-        let last_committed = sample_last_committed(stats.clone());
+        let (tree, last_committed, old_leaf_hash) = consistent_tree_and_last_committed();
         let fingerprint_config = sample_fingerprint_config();
         let builder = make_builder(false);
 
@@ -1287,10 +1296,12 @@ mod output_builder_tests {
         assert_eq!(witness.checkpoint_state_transition_circuit_fingerprint, zh(25));
         assert_eq!(witness.partial.block_time, PF::from_u64_value(999));
         assert_eq!(witness.partial.final_random_seed_contribution, zh(51));
-        assert_eq!(witness.partial.old_stats.random_seed, stats.random_seed);
+        assert_eq!(witness.partial.old_stats.random_seed, last_committed.checkpoint_leaf_stats.random_seed);
+        assert_eq!(witness.partial.validator_tree_root, last_committed.checkpoint_state_roots.validator_tree_root);
 
         // a stale tree (leaf built from different stats) must be rejected
-        let stale_last_committed = sample_last_committed(PQEDCheckpointLeafStats::qp_rand_gen());
+        let mut stale_last_committed = sample_last_committed(PQEDCheckpointLeafStats::qp_rand_gen());
+        stale_last_committed.checkpoint_state_roots = last_committed.checkpoint_state_roots;
         let err = builder
             .get_checkpoint_state_transition_witness(0, 1, &tree, &stale_last_committed, &fingerprint_config, zh(50), zh(60), 999)
             .unwrap_err();
@@ -1299,8 +1310,7 @@ mod output_builder_tests {
 
     #[test]
     fn checkpoint_transition_job_metadata_and_sibling_capture() {
-        let (tree, stats, _old_leaf_hash) = consistent_tree_and_stats();
-        let last_committed = sample_last_committed(stats);
+        let (tree, last_committed, _old_leaf_hash) = consistent_tree_and_last_committed();
         let fingerprint_config = sample_fingerprint_config();
         let mut builder = make_builder(false);
 

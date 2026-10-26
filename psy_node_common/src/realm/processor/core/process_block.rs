@@ -1004,6 +1004,8 @@ where
 
 #[cfg(test)]
 mod process_block_tests {
+    use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
+    use psy_node_core::psy_core_db::traits::full::{PsyNodeCoreDatabaseUserStoreReader, PsyNodeGlobalUserTreeDatabaseReader};
     use parth_core::{
         crypto::hash::{merkle_proof::compute_root_merkle_proof_generic, traits::QFieldHashable},
         pgoldilocks::PoseidonHasher,
@@ -1018,7 +1020,7 @@ mod process_block_tests {
 
     use crate::realm::processor::{
         core::startup::startup_tests::RealmProcessorTestEnv,
-        db::realm_db_test_env::{zh, N},
+        db::realm_db_test_env::{build_realm_genesis, checkpoint_tree_root_for_leaves, zh, N},
     };
 
     type TestJobs = Vec<Vec<PsyProvingJobMetadataWithJobId<parth_core::PHash, QProvingJobDataID>>>;
@@ -1207,7 +1209,9 @@ mod process_block_tests {
             1,
             &checkpoint_siblings,
         );
-        env.db_env.seed_checkpoint_one(update, realm_root_unchanged);
+        env.db_env.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+        env.db_env.coordinator.seed_realm_sync_info(update);
+        env.db_env.coordinator.set_latest_checkpoint_id(1);
 
         // the stale check must be recognized, fast-forwarded and re-verified
         env.processor.sync_and_verify().await?;
@@ -1221,13 +1225,22 @@ mod process_block_tests {
     }
 
     #[tokio::test]
-    async fn sync_and_verify_fast_forwards_changed_realm_root() -> anyhow::Result<()> {
+    async fn sync_and_verify_rejects_changed_realm_root_without_verified_proposal() -> anyhow::Result<()> {
         let mut env = RealmProcessorTestEnv::create().await?;
         let old_realm_root = env.db_env.local_realm_root().await?;
+        let changed_user_id = psy_core::user_id::get_user_id_from_user_registration_id(
+            1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT,
+        );
+        let old_user_leaf = env.db_env.db.get_user_leaf(0, changed_user_id).await?;
 
-        // This checkpoint comes from a separately built, internally consistent
-        // genesis state, so its realm root and top-tree proof belong together.
-        let update = env.db_env.make_checkpoint_one_update();
+        let mut changed_data = env.db_env.genesis_data.clone();
+        changed_data.users[1].balance += 1;
+        let mut update = build_realm_genesis(&changed_data)?.coordinator_update;
+        update.checkpoint_sync_info.checkpoint_id = 1;
+        update.checkpoint_sync_info.block_state.checkpoint_id = 1;
+        update.checkpoint_sync_info.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&[
+            env.db_env.genesis_leaf_hash(), update.checkpoint_sync_info.checkpoint_leaf_hash,
+        ]);
         let new_realm_root = update.merkle_proof_to_realm_root.value;
         assert_ne!(new_realm_root, old_realm_root);
         assert_eq!(
@@ -1236,12 +1249,23 @@ mod process_block_tests {
         );
         env.db_env.seed_checkpoint_one(update, new_realm_root);
 
-        // Fast-forward must persist the changed realm node before the second
-        // consistency check reads it back from the global-user-tree store.
-        env.processor.sync_and_verify().await?;
-
-        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
-        assert_eq!(env.processor.db.state.last_committed_realm_end_root, new_realm_root);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), env.processor.sync_and_verify())
+            .await.expect("missing proposal must fail without an unbounded retry").unwrap_err();
+        assert!(error.to_string().contains("no stored proposal for included realm transition"), "unexpected error: {error}");
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db_env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_realm_end_root, old_realm_root);
+        let committed_checkpoint = env.db_env.db.get_latest_checkpoint_id().await?;
+        assert_eq!(env.db_env.db.global_user_tree_get_node(committed_checkpoint, env.processor.db.realm_root_node).await?, old_realm_root);
+        assert_eq!(env.db_env.db.get_user_leaf(committed_checkpoint, changed_user_id).await?, old_user_leaf);
+        assert_eq!(env.db_env.db.get_user_leaf(1, changed_user_id).await?, old_user_leaf);
+        assert_eq!(env.db_env.db.get_unique_pending_id_for_checkpoint_id(1).await?, None);
+        let committed_tree = crate::backup::realm::load_realm_memory_trees_from_db::<N, _>(
+            &env.db_env.db, committed_checkpoint, env.processor.db.state.realm_id_u64,
+        ).await?;
+        assert_eq!(committed_tree.global_user_tree.get_root(), old_realm_root);
+        // Authenticated checkpoint-1 top metadata can exist before its Realm FFS is available.
+        assert_eq!(env.db_env.db.global_user_tree_get_node(1, env.processor.db.realm_root_node).await?, new_realm_root);
         assert_eq!(env.processor.db.get_realm_root_from_db().await?, new_realm_root);
         env.abort_gatherers();
         Ok(())
@@ -1262,7 +1286,7 @@ mod process_block_tests {
             Ok(_) => anyhow::bail!("a realm root mismatch at the same checkpoint must fail"),
         };
         assert!(
-            error.contains("Realm Root mismatch"),
+            error.contains("requires Realm state updates before metadata sync"),
             "unexpected error: {error}"
         );
         env.abort_gatherers();

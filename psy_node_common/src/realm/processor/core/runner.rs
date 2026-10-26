@@ -287,6 +287,7 @@ mod tests {
 #[cfg(test)]
 mod runner_tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
 
     use crate::{
         realm::processor::core::{
@@ -329,11 +330,12 @@ mod runner_tests {
 
     #[tokio::test]
     async fn loop_marks_running_and_shuts_down_gracefully() -> anyhow::Result<()> {
+        tokio::task::LocalSet::new().run_until(async {
         let env = RealmProcessorTestEnv::create().await?;
         let status = env.processor.db.status.clone();
         wait_for_slot_away_from_processing_window().await;
 
-        let handle = tokio::spawn(run_realm_processor_loop(env.processor));
+        let handle = tokio::task::spawn_local(run_realm_processor_loop(env.processor));
         assert!(
             poll_until(5_000, || status.state() == ProcessorState::Running).await,
             "loop must mark itself running at startup"
@@ -346,45 +348,58 @@ mod runner_tests {
         result?;
         assert_eq!(status.state(), ProcessorState::Stopped);
         Ok(())
+        }).await
     }
 
     #[tokio::test]
-    async fn loop_parks_in_error_state_when_process_block_fails() -> anyhow::Result<()> {
+    async fn loop_reenters_catchup_after_process_block_failure_without_committing() -> anyhow::Result<()> {
+        tokio::task::LocalSet::new().run_until(async {
         let mut env = RealmProcessorTestEnv::create().await?;
-        // make every block attempt bail immediately: past genesis the unique
-        // ids must be differentiated, and equal ids mark corrupt state. The
-        // sync path itself stays healthy (it consults the store and the
-        // backup manager, not these in-memory ids), so the failure is
-        // attributable to process_block alone.
-        env.processor.db.state.last_committed_checkpoint_id = 1;
+        let gathering_proc_id = env.processor.db.state.gathering_proc_checkpoint_unique_id;
+        assert!(poll_until(5_000, || {
+            env.db_env.guta_queue.ensured_consumers.lock().unwrap().iter()
+                .filter(|(id, _)| *id == gathering_proc_id).count() >= 2
+        }).await, "initial gatherer must finish bootstrap");
+        let update = env.db_env.make_checkpoint_one_update();
+        let old_root = env.db_env.genesis_realm_root();
+        env.db_env.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+        env.db_env.coordinator.seed_realm_sync_info(update.clone());
+        env.db_env.coordinator.set_latest_checkpoint_id(1);
+        env.processor.db.sync_to_coordinator_set_checkpoint_id().await?;
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 1);
         env.processor.db.state.processing_proc_checkpoint_unique_id =
             env.processor.db.state.gathering_proc_checkpoint_unique_id;
         env.processor.db.state.processing_unique_pending_id = env.processor.db.state.gathering_unique_pending_id;
+        env.processor.sync_and_verify().await?;
+        let error = env.processor.process_block().await.unwrap_err();
+        assert!(error.to_string().contains("Unique IDs not differentiated outside of genesis"), "unexpected error: {error}");
         let status = env.processor.db.status.clone();
+        let original_gatherer = env.guta_gatherer_handle.clone();
+        let consumers_before = env.db_env.guta_queue.ensured_consumer_count();
 
-        let handle = tokio::spawn(run_realm_processor_loop(env.processor));
+        let handle = tokio::task::spawn_local(run_realm_processor_loop(env.processor));
         assert!(poll_until(5_000, || status.state() == ProcessorState::Running).await);
 
-        // a processing slot arrives at most 3s apart; the block attempt fails
-        // and the loop must park in Error until manually restarted
         assert!(
-            poll_until(20_000, || status.state() == ProcessorState::Error).await,
-            "a failed process_block must park the loop in the Error state"
+            poll_until(10_000, || original_gatherer.is_finished()
+                && env.db_env.guta_queue.ensured_consumer_count() > consumers_before).await,
+            "block failure must abort the old gatherer and bootstrap a replacement"
         );
-        let error = status.error().unwrap_or_default().to_string();
-        assert!(
-            error.contains("realm process_block failed at slot"),
-            "unexpected recorded error: {error}"
-        );
-
-        // the parked loop stays alive: begin_shutdown cannot clear Error, so
-        // it must still be running
+        assert_eq!(status.state(), ProcessorState::Running);
+        assert!(status.error().is_none());
+        assert!(!handle.is_finished());
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db_env.db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db_env.db.get_unique_pending_id_for_checkpoint_id(1).await?, None);
+        assert_eq!(env.db_env.local_realm_root().await?, old_root);
+        assert_eq!(*env.db_env.proof_queue.published_count.lock().unwrap(), 0);
         status.begin_shutdown();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!handle.is_finished(), "an errored loop must keep running until aborted");
-        assert_eq!(status.state(), ProcessorState::Error);
-        handle.abort();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await.expect("loop must shut down after catch-up")??;
+        assert_eq!(status.state(), ProcessorState::Stopped);
         Ok(())
+        }).await
     }
 
     #[tokio::test]
@@ -395,10 +410,10 @@ mod runner_tests {
         // a crashed gatherer surfaces as an error from the joined runner
         env.guta_gatherer_handle.abort();
 
-        let RealmProcessorTestEnv { processor, guta_gatherer_handle, .. } = env;
+        let RealmProcessorTestEnv { processor, db_env, .. } = env;
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_realm_processor(processor, guta_gatherer_handle),
+            run_realm_processor(processor),
         )
         .await
         .expect("runner must return once the gatherer join fails");
@@ -408,6 +423,7 @@ mod runner_tests {
         // join error tore everything down; tell it to stop before dropping the
         // runtime
         status.begin_shutdown();
+        drop(db_env);
         Ok(())
     }
 }

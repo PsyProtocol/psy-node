@@ -2265,6 +2265,7 @@ pub(crate) mod tests {
         psy_core_db::traits::full::{
             PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeCheckpointTreeDatabaseReader,
             PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
+            PsyNodeGlobalUserTreeDatabaseWriter,
         },
         psy_temp_db::{
             QTempDBJobStatsStore, QTempDBPendingIdWriter, QTempDBSubmitStatusWriter,
@@ -2419,6 +2420,7 @@ pub(crate) mod tests {
         pub(crate) temp_db: Arc<InMemoryTempStore>,
         pub(crate) user_update_queue: Arc<FakeEphemeralQueuePublisher>,
         pub(crate) work_queue: Arc<FakeWorkerQueueSubscriber>,
+        _worker_whitelist_config: tempfile::NamedTempFile,
     }
 
     impl<N> RealmEdgeTestEnv<N>
@@ -2432,6 +2434,14 @@ pub(crate) mod tests {
             let proof_store = Arc::clone(&temp_db);
             let user_update_queue = Arc::new(FakeEphemeralQueuePublisher::new());
             let work_queue = Arc::new(FakeWorkerQueueSubscriber::new());
+            let worker_whitelist_config = tempfile::NamedTempFile::new()?;
+            serde_json::to_writer(worker_whitelist_config.as_file(), &serde_json::json!({
+                "networks": {"localhost": {"whitelist": {"enabled": false, "secp256k1": []}}}
+            }))?;
+            let worker_whitelist = WhiteListCache::new(
+                worker_whitelist_config.path(),
+                psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet,
+            )?;
             let handler = RealmEdgeHandler::new(
                 Arc::clone(&db),
                 tag_tree_rewards_store,
@@ -2440,7 +2450,8 @@ pub(crate) mod tests {
                 Arc::clone(&user_update_queue),
                 Arc::clone(&work_queue),
                 test_realm_identifier(),
-                TEST_CHAIN_ID,
+                worker_whitelist,
+                TEST_CHAIN_ID as u64,
                 TEST_NODE_ID,
                 proof_verifier,
             );
@@ -2448,8 +2459,12 @@ pub(crate) mod tests {
             // counters so handler reads behave like production (ids at 0).
             let rid = test_realm_identifier();
             temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
-            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
-            Ok(Self { handler, db, temp_db, user_update_queue, work_queue })
+            temp_db.set_gathering_generation(&rid, GatheringGeneration {
+                checkpoint_id: 0,
+                unique_pending_id: 0,
+                proc_checkpoint_unique_id: 0,
+            }).await?;
+            Ok(Self { handler, db, temp_db, user_update_queue, work_queue, _worker_whitelist_config: worker_whitelist_config })
         }
     }
 
@@ -2711,6 +2726,7 @@ pub(crate) mod tests {
                 contract_id: 1,
                 slot_updates: vec![RealmSlotUpdate { slot: 5, old_value: 0, new_value: 7 }],
             }],
+            accepted_user_leaf_hash: Some([1, 2, 3, 4]),
         };
         env.temp_db
             .set_user_end_cap_slot_updates(
@@ -2745,7 +2761,7 @@ pub(crate) mod tests {
         let mut mismatch = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         mismatch.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
         let err = handler
-            .handle_user_end_cap_proof_submission(mismatch, vec![])
+            .handle_user_end_cap_proof_submission(mismatch, vec![], None)
             .await
             .expect_err("checkpoint mismatch must fail");
         assert!(
@@ -2756,7 +2772,7 @@ pub(crate) mod tests {
         // user from another realm
         let foreign = gen_end_cap_input(OTHER_REALM_USER_ID, checkpoint_root);
         let err = handler
-            .handle_user_end_cap_proof_submission(foreign, vec![])
+            .handle_user_end_cap_proof_submission(foreign, vec![], None)
             .await
             .expect_err("user outside the realm must fail");
         assert!(err.to_string().contains("does not belong to this realm"), "unexpected error: {err}");
@@ -2765,7 +2781,7 @@ pub(crate) mod tests {
         let mut empty = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         empty.contract_state_updates = vec![];
         let err = handler
-            .handle_user_end_cap_proof_submission(empty, vec![])
+            .handle_user_end_cap_proof_submission(empty, vec![], None)
             .await
             .expect_err("empty updates must fail");
         assert!(err.to_string().contains("contract_state_updates cannot be empty"), "unexpected error: {err}");
@@ -2775,7 +2791,7 @@ pub(crate) mod tests {
         future.core.checkpoint_id = PF::from_u64_value(1);
         future.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
         let err = handler
-            .handle_user_end_cap_proof_submission(future, vec![])
+            .handle_user_end_cap_proof_submission(future, vec![], None)
             .await
             .expect_err("future checkpoint must fail");
         assert!(err.to_string().contains("but current checkpoint is"), "unexpected error: {err}");
@@ -2784,7 +2800,7 @@ pub(crate) mod tests {
         let mut bad_start = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         bad_start.core.state_transition.start_user_leaf_hash = PHash::from_values(4242, 0, 0, 0);
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_start, vec![])
+            .handle_user_end_cap_proof_submission(bad_start, vec![], None)
             .await
             .expect_err("wrong start hash must fail");
         assert!(err.to_string().contains("Invalid start_user_leaf_hash"), "unexpected error: {err}");
@@ -2797,7 +2813,7 @@ pub(crate) mod tests {
             .into_owned_32bytes()
             .to_vec();
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_root, proof_bytes)
+            .handle_user_end_cap_proof_submission(bad_root, proof_bytes, None)
             .await
             .expect_err("wrong checkpoint tree root must fail");
         assert!(
@@ -2808,7 +2824,7 @@ pub(crate) mod tests {
         // proof bytes that decode to a different public-inputs hash
         let (input, _) = valid_end_cap_submission(&env).await?;
         let err = handler
-            .handle_user_end_cap_proof_submission(input, PHash::get_zero_value().into_owned_32bytes().to_vec())
+            .handle_user_end_cap_proof_submission(input, PHash::get_zero_value().into_owned_32bytes().to_vec(), None)
             .await
             .expect_err("mismatched public inputs hash must fail");
         assert!(err.to_string().contains("Public inputs hash mismatch"), "unexpected error: {err}");
@@ -2822,7 +2838,7 @@ pub(crate) mod tests {
             .into_owned_32bytes()
             .to_vec();
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_leaf, proof_bytes)
+            .handle_user_end_cap_proof_submission(bad_leaf, proof_bytes, None)
             .await
             .expect_err("inconsistent new user leaf must fail");
         assert!(err.to_string().contains("invalid new_user_leaf"), "unexpected error: {err}");
@@ -2844,7 +2860,7 @@ pub(crate) mod tests {
             .await?;
         let stale = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         let err = handler
-            .handle_user_end_cap_proof_submission(stale, vec![])
+            .handle_user_end_cap_proof_submission(stale, vec![], None)
             .await
             .expect_err("stale user checkpoint must fail");
         assert!(err.to_string().contains("but user's last checkpoint is 5"), "unexpected error: {err}");
@@ -2859,7 +2875,7 @@ pub(crate) mod tests {
         let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
         let new_user_leaf = input.core.new_user_leaf.clone();
 
-        handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone()).await?;
+        handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone(), None).await?;
 
         // the end-cap queue item was published under the live proc id
         assert_eq!(env.user_update_queue.published_count(), 1);
@@ -2899,7 +2915,7 @@ pub(crate) mod tests {
         // a second submission for the same user is rejected by the status guard
         let (second, second_proof) = valid_end_cap_submission(&env).await?;
         let err = handler
-            .handle_user_end_cap_proof_submission(second, second_proof)
+            .handle_user_end_cap_proof_submission(second, second_proof, None)
             .await
             .expect_err("double submission must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
@@ -3231,6 +3247,19 @@ pub(crate) mod tests {
         let root = RealmEdgeRpcServer::get_latest_checkpoint_tree_root(handler).await?;
         assert_eq!(root, RealmEdgeRpcServer::get_checkpoint_tree_root(handler, 0).await?);
         assert_eq!(root, zh(N::CHECKPOINT_TREE_HEIGHT_USIZE));
+        let err = RealmEdgeRpcServer::get_user_tree_root(handler, 0)
+            .await
+            .expect_err("an absent checkpoint spine must not fall back to a sparse root");
+        assert!(err.to_string().contains("User tree proof not found"), "unexpected error: {err}");
+        let top_proof = MerkleProofCore {
+            root: zh(N::GLOBAL_USER_TREE_HEIGHT_USIZE),
+            value: zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize),
+            index: TEST_REALM_ID,
+            siblings: (N::REALM_GLOBAL_USER_TREE_HEIGHT..N::GLOBAL_USER_TREE_HEIGHT)
+                .map(|height| zh(height as usize))
+                .collect(),
+        };
+        env.db.global_user_tree_set_top_tree_merkle_proof(0, &top_proof).await?;
         let user_root = RealmEdgeRpcServer::get_user_tree_root(handler, 0).await?;
         assert_eq!(user_root, zh(N::GLOBAL_USER_TREE_HEIGHT_USIZE));
         assert_eq!(
@@ -3244,11 +3273,11 @@ pub(crate) mod tests {
             .expect_err("empty user id list must fail");
         assert!(err.to_string().contains("user_ids cannot be empty"), "unexpected error: {err}");
 
-        // the top rewards-tree proof for a checkpoint that has none must fail
+        // A fresh database has no checkpoint-to-pending mapping for rewards proofs.
         let err = RealmEdgeRpcServer::get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(handler, 0)
             .await
-            .expect_err("missing rewards tree proof must fail");
-        assert!(err.to_string().contains("Rewards tree proof not found"), "unexpected error: {err}");
+            .expect_err("missing rewards pending mapping must fail");
+        assert_eq!(err.message(), "Rewards tree proof unavailable: no pending mapping for checkpoint_id 0");
 
         // IMT endpoints report missing leaves and keys
         let err = RealmEdgeRpcServer::get_imt_leaf_preimage(handler, 0, REALM_USER_ID, 0, 0)

@@ -979,7 +979,7 @@ mod tests {
     }
 
     /// Builder for the tree runner: rejects the poison marker item so the
-    /// restart-cycle branch is exercised.
+    /// fail-closed update path is exercised.
     struct RecordingTreeBuilder {
         created_with_unique_id: u128,
         signals: std::sync::Arc<BuilderSignals>,
@@ -1056,16 +1056,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tree_gatherer_runner_restarts_cycle_after_update_error() -> anyhow::Result<()> {
-        // the poison item makes the first update fail; the runner must drop the
-        // cycle, rebuild, and still answer the next trigger
+    async fn tree_gatherer_runner_stops_after_update_error() -> anyhow::Result<()> {
+        // An update error must reach the owner without rebuilding a cycle or
+        // presenting partially processed input as a successful finalization.
         let signals = std::sync::Arc::new(BuilderSignals::default());
         let subscriber = std::sync::Arc::new(FakeEphemeralSubscriber::with_items(
             31,
             vec![vec![9], vec![0xFF], vec![8]],
         ));
         let tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(32);
-        let (mut gatherer, join_handle) =
+        let (mut gatherer, mut join_handle) =
             super::EphemeralQueueGathererWithTree::<7, QueueItem, (u128, Vec<Vec<u8>>)>::new::<
                 FakeEphemeralSubscriber,
                 std::sync::Arc<BuilderSignals>,
@@ -1074,23 +1074,25 @@ mod tests {
                 RecordingTreeBuilder,
             >(std::sync::Arc::clone(&subscriber), std::sync::Arc::clone(&signals), base_queue_key(31), tree);
 
-        // wait for the poisoned cycle to crash and the replacement builder to
-        // spin up before triggering, so the outcome does not depend on which
-        // select branch wins the race
-        signals.wait_for_creations(2).await?;
-        let (created_with, items) = gatherer.finalize_gathering_and_update_queue_key(32).await?;
-        assert_eq!(created_with, 31);
-        // [9] was accepted before the poison item killed the cycle; the poison
-        // itself and the trailing [8] were dropped with the failed batch
-        assert_eq!(items, vec![vec![9]]);
+        // Join before sending a trigger so the failure occurs during normal
+        // intake, not in the pre-finalize drain branch.
+        let result = match tokio::time::timeout(Duration::from_secs(10), &mut join_handle).await {
+            Ok(result) => result?,
+            Err(_) => {
+                join_handle.abort();
+                let _ = join_handle.await;
+                anyhow::bail!("tree gatherer did not stop after the update error");
+            }
+        };
+        let error = result.expect_err("the owner must receive the update failure");
+        assert_eq!(error.to_string(), "poison item rejected by test builder");
+        assert_eq!(signals.creations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(signals.log_items(), vec![vec![9]]);
+        assert!(subscriber.deleted_consumers.lock().unwrap().is_empty());
 
-        // wait until the runner has finished the post-handover cleanup of the
-        // poisoned unique_id before requesting the stop, so the shutdown flag
-        // cannot land mid-branch and skip the stop trigger
-        subscriber.wait_for_deleted_consumers(vec![31]).await;
-
-        gatherer.stop_gracefully().await?;
-        join_handle.await??;
+        let error = gatherer.finalize_gathering_and_update_queue_key(32).await
+            .expect_err("a failed owner cannot return partial output");
+        assert_eq!(error.downcast_ref::<GathererChannelClosed>().unwrap().0, 7);
         Ok(())
     }
 

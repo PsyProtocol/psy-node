@@ -330,15 +330,17 @@ pub(crate) mod startup_tests {
     pub(crate) struct RealmProcessorTestEnv {
         pub db_env: RealmDbTestEnv,
         pub processor: TestProcessor,
-        pub guta_gatherer_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        pub guta_gatherer_handle: tokio::task::AbortHandle,
     }
 
     impl RealmProcessorTestEnv {
         /// Builds the processor over the environment's stores with the
         /// coordinator sitting consistently at the genesis checkpoint.
         pub(crate) async fn create_over_db_env(db_env: RealmDbTestEnv) -> anyhow::Result<Self> {
-            db_env.coordinator.seed_realm_root(0, db_env.genesis.prepared_updates.new_realm_root);
-            let (processor, guta_gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+            let expected_root = db_env.genesis_realm_root();
+            assert_eq!(db_env.local_realm_root().await?, expected_root);
+            db_env.coordinator.seed_realm_root(0, expected_root);
+            let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
                 TEST_CHAIN_ID,
                 &db_env.genesis_data,
                 Arc::clone(&db_env.file_system),
@@ -353,13 +355,15 @@ pub(crate) mod startup_tests {
                 test_realm_identifier(),
                 fingerprint_config(),
                 Arc::clone(&db_env.coordinator),
+                Arc::clone(&db_env.proof_verifier),
+                Arc::clone(&db_env.proposal_backup),
+                None,
             )
             .await?;
-            // the genesis commit writes the realm-root node into the store;
-            // make the coordinator's checkpoint-0 view agree with the
-            // committed node value so sync_and_verify sees a consistent head
-            // out of the box
-            db_env.coordinator.seed_realm_root(0, db_env.local_realm_root().await?);
+            let guta_gatherer_handle = processor.guta_gatherer_join.as_ref().expect("gatherer owner").abort_handle();
+            let tree = crate::realm::processor::db::realm_db_test_env::load_global_user_tree(&db_env).await?;
+            assert_eq!(tree.get_root(), expected_root);
+            assert_eq!(processor.db.state.last_committed_realm_end_root, expected_root);
             Ok(Self { db_env, processor, guta_gatherer_handle })
         }
 
@@ -425,7 +429,7 @@ pub(crate) mod startup_tests {
 
         // restart with the same database, checkpoint-tree backup file and
         // coordinator, as a real process restart would
-        let (second_processor, second_gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+        let second_processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
             TEST_CHAIN_ID,
             &genesis_data,
             file_system,
@@ -440,9 +444,12 @@ pub(crate) mod startup_tests {
             test_realm_identifier(),
             fingerprint_config(),
             coordinator,
+            Arc::clone(&first.db_env.proof_verifier),
+            Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(first.db_env.proposal_backup_dir.path()).await?),
+            None,
         )
         .await?;
-        second_gatherer_handle.abort();
+        second_processor.guta_gatherer_join.as_ref().expect("gatherer owner").abort();
 
         // still exactly the genesis checkpoint, with the original pending-id
         // mapping intact (a re-commit would have rewritten checkpoint state)

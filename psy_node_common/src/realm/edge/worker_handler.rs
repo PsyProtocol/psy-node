@@ -747,7 +747,7 @@ mod tests {
         psy_core_db::traits::full::PsyNodeCoreDatabaseUserStoreWriter,
         psy_temp_db::{
             QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore,
-            QTempDBPendingIdWriter, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader,
+            QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader,
             QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter,
             QTempDBWorkerReputationWriter,
         },
@@ -875,7 +875,6 @@ mod tests {
 
         // fresh pending counters read back at zero
         assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
-        assert_eq!(handler.get_current_gathering_unique_pending_id_internal().await?, (0, 0));
 
         assert!(!handler.has_job_id_already_been_submitted(0, job_id).await?);
         // the dedicated status probe always reports not-submitted

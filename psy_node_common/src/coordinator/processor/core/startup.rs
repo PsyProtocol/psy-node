@@ -247,10 +247,11 @@ pub(crate) mod startup_tests {
     use parth_core::{
         crypto::hash::traits::MerkleZeroHasher, node::realm_identifier::QRealmIdentifier, utils::QPGenRandom, PHash, PF,
     };
-    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_core::{constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET, job::job_id::QProvingJobDataID};
     use psy_data::{
         config::network_config::PsyNodeCircuitFingerprintConfig,
-        genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+        genesis::genesis_block_setup::{GenesisValidator, PsyGenesisBlockSetupData},
+        p2p::{BlsSecretKey, NodeId},
         v1::qdata::{
             checkpoint::PQEDCheckpointLeafStats,
             contract::{ContractCodeDefinition, PQBCDeployContract},
@@ -316,9 +317,25 @@ pub(crate) mod startup_tests {
         PsyGenesisBlockSetupData {
             contracts: vec![contract],
             users: vec![],
+            validators: vec![genesis_validator()],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: zh(psy_core::constants::protocol::TODO_DEPOSIT_TREE_HEIGHT as usize),
             withdrawal_tree_root: zh(psy_core::constants::protocol::TODO_WITHDRAWAL_TREE_HEIGHT as usize),
+        }
+    }
+
+    pub(crate) fn validator_signing_key() -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[11; 32]).expect("test validator BLS key")
+    }
+
+    pub(crate) fn genesis_validator() -> GenesisValidator {
+        let keypair = libp2p_identity::Keypair::ed25519_from_bytes([11; 32])
+            .expect("test validator Ed25519 key");
+        GenesisValidator {
+            realm_id: 0,
+            validator_user_id: 1,
+            node_id: *NodeId::from_keypair(&keypair).expect("test validator NodeId").as_raw(),
+            bls_public_key: validator_signing_key().public_key().to_bytes(),
         }
     }
 
@@ -364,6 +381,7 @@ pub(crate) mod startup_tests {
             let proof_work_queue = Arc::new(FakeWorkerQueue::new());
             let (processor, guta_gatherer_handle, register_gatherer_handle, deploy_gatherer_handle) =
                 create_coordinator_processor::<N, _, _, _, _, _, _, _, _, _>(
+                    PSY_CHAIN_ID_LOCAL_DEVNET,
                     genesis_data,
                     Arc::clone(&file_system),
                     "coord_test_deploy_backups".to_string(),

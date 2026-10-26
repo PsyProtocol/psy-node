@@ -417,9 +417,10 @@ mod commit_tests {
         assert_eq!(env.proof_queue.ensured_consumers.lock().unwrap().len(), 2);
 
         // temp db mirrors the rotated ids
-        let gathering = env.temp_db.get_gathering_unique_pending_ids(&rid).await?;
-        assert_eq!(gathering.0, 1);
-        assert_eq!(gathering.1, env.processor.state.gathering_proc_checkpoint_unique_id);
+        let gathering = env.temp_db.get_gathering_generation(&rid).await?;
+        assert_eq!(gathering.checkpoint_id, env.processor.state.gathering_checkpoint_id);
+        assert_eq!(gathering.unique_pending_id, 1);
+        assert_eq!(gathering.proc_checkpoint_unique_id, env.processor.state.gathering_proc_checkpoint_unique_id);
         let processing = env.temp_db.get_unique_pending_ids(&rid).await?;
         assert_eq!(processing, (0, 0u128));
 
@@ -449,17 +450,17 @@ mod commit_tests {
 
         let err = match env
             .processor
-            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![], false)
+            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![])
             .await
         {
             Err(err) => err,
             Ok(_) => panic!("tampered checkpoint tree root must fail the commit"),
         };
-        assert!(err.to_string().contains("Inconsistent checkpoint tree root"), "unexpected error: {err}");
+        assert!(err.to_string().contains("membership root does not match trusted C after-root"), "unexpected error: {err}");
 
         // the checkpoint marker must NOT advance on a failed commit
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
-        // the pending-id mapping written up-front still points 0 -> 0
+        // The constructor's genesis mapping is unchanged by rejection.
         assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(0).await?, Some(0));
         Ok(())
     }
@@ -474,33 +475,30 @@ mod commit_tests {
         assert_eq!(env.db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
         assert_eq!(env.db.get_l2_block_state(0).await?, update.checkpoint_sync_info.block_state);
 
-        // core state committed the processing snapshot. Note: neither the
-        // state's committed root nor the per-checkpoint tree root stored in
-        // the db equals the coordinator's canonical checkpoint_tree_root —
-        // the canonical root is only recorded via the root -> checkpoint id
-        // mapping, asserted below
+        // Genesis persists the authenticated checkpoint after-root.
         let state = &env.processor.state;
         assert_eq!(state.last_committed_checkpoint_id, 0);
-        assert_ne!(state.last_committed_checkpoint_root, update.checkpoint_sync_info.checkpoint_tree_root);
+        assert_eq!(state.last_committed_checkpoint_root, update.checkpoint_sync_info.checkpoint_tree_root);
         assert_eq!(
             env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
             Some(0)
         );
-        assert_eq!(state.last_committed_realm_end_root, env.genesis.prepared_updates.new_realm_root);
+        assert_eq!(state.last_committed_realm_end_root, env.genesis_realm_root());
+        assert_eq!(env.local_realm_root().await?, env.genesis_realm_root());
         assert_eq!(state.last_committed_unique_pending_id, 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn commit_state_skips_root_check_when_flag_set_at_checkpoint_one() -> anyhow::Result<()> {
+    async fn commit_state_requires_authenticated_root_at_checkpoint_one() -> anyhow::Result<()> {
         let mut env = RealmDbTestEnv::create().await?;
         env.commit_genesis().await?;
         let local_root = env.seed_consistent_coordinator_head().await?;
 
-        // a checkpoint-1 update whose checkpoint-tree root does NOT match a
-        // local append: with skip_checkpoint_root_check = true the commit must
-        // still succeed (the backup manager was synced from the coordinator)
+        // A seeded membership must reject a different advertised after-root.
         let mut update = env.make_checkpoint_one_update();
+        let authenticated_root = update.checkpoint_sync_info.checkpoint_tree_root;
+        env.seed_checkpoint_one(update.clone(), local_root);
         update.checkpoint_sync_info.checkpoint_tree_root = zh(77);
 
         let proc_id: QCoreProcCheckpointUniqueId = 7;
@@ -524,8 +522,17 @@ mod commit_tests {
             update_user_leaves_ffs: vec![],
             update_contract_state_imt_leaves_ffs: vec![],
         };
+        let err = env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await.unwrap_err();
+        assert!(err.to_string().contains("membership root does not match trusted C after-root"), "unexpected error: {err}");
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(1).await?, None);
+        assert_eq!(env.db.get_unique_pending_id_for_checkpoint_id(1).await?, None);
+
+        update.checkpoint_sync_info.checkpoint_tree_root = authenticated_root;
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
             .await?;
 
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
@@ -541,7 +548,7 @@ mod commit_tests {
         assert_eq!(state.last_committed_checkpoint_id, 1);
         assert_eq!(state.last_committed_unique_pending_id, 1);
         assert_eq!(state.last_committed_proc_checkpoint_unique_id, proc_id);
-        assert_eq!(state.last_committed_checkpoint_root, zh(77));
+        assert_eq!(state.last_committed_checkpoint_root, authenticated_root);
         Ok(())
     }
 
@@ -552,6 +559,7 @@ mod commit_tests {
         let local_root = env.seed_consistent_coordinator_head().await?;
 
         let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update.clone(), local_root);
         env.processor.state.processing_checkpoint_id = 1;
         env.processor.state.processing_checkpoint_root = update.checkpoint_sync_info.checkpoint_tree_root;
         env.processor.state.processing_realm_start_root = local_root;
@@ -573,7 +581,7 @@ mod commit_tests {
             update_contract_state_imt_leaves_ffs: vec![],
         };
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
             .await?;
         // the previous checkpoint's proofs (pending id 0) were dropped; the
         // commit itself still reports checkpoint 1 fully persisted

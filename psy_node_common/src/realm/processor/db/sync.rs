@@ -848,15 +848,17 @@ mod sync_tests {
     }
 
     #[tokio::test]
-    async fn sync_to_coordinator_bails_on_fresh_database_without_metadata() -> anyhow::Result<()> {
+    async fn sync_to_coordinator_rejects_unapplied_realm_root_without_advancing_marker() -> anyhow::Result<()> {
         let mut env = RealmDbTestEnv::create().await?;
+        assert_eq!(env.db.get_l2_block_state(0).await?, env.genesis.coordinator_update.checkpoint_sync_info.block_state);
 
         let err = match env.processor.sync_to_coordinator_set_checkpoint_id().await {
             Err(err) => err,
-            Ok(_) => panic!("syncing a database without any checkpoint metadata must fail"),
+            Ok(_) => panic!("metadata sync must not replace unapplied Realm state"),
         };
-        assert!(err.to_string().contains("No complete checkpoint metadata"), "unexpected error: {err}");
+        assert!(err.to_string().contains("requires Realm state updates before metadata sync"), "unexpected error: {err}");
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.processor.state.last_committed_realm_end_root, env.genesis_realm_root());
         Ok(())
     }
 
@@ -890,8 +892,11 @@ mod sync_tests {
         env.seed_consistent_coordinator_head().await?;
 
         let update = env.make_checkpoint_one_update();
-        let root_at_one = zh(71);
-        env.seed_checkpoint_one(update.clone(), root_at_one);
+        let root_at_one = env.genesis_realm_root();
+        assert_eq!(update.merkle_proof_to_realm_root.value, root_at_one);
+        env.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+        env.coordinator.seed_realm_sync_info(update.clone());
+        env.coordinator.set_latest_checkpoint_id(1);
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
 
         env.processor.sync_to_coordinator_set_checkpoint_id().await?;

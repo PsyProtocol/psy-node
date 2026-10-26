@@ -122,9 +122,9 @@ mod create_tests {
     async fn create_realm_processor_initializes_database_and_gatherer() -> anyhow::Result<()> {
         let env = RealmDbTestEnv::create().await?;
         // the coordinator reports the genesis realm root for our realm
-        env.coordinator.seed_realm_root(0, env.genesis.prepared_updates.new_realm_root);
+        env.coordinator.seed_realm_root(0, env.genesis_realm_root());
 
-        let (processor, gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+        let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
             TEST_CHAIN_ID,
             &env.genesis_data,
             Arc::clone(&env.file_system),
@@ -139,6 +139,9 @@ mod create_tests {
             test_realm_identifier(),
             fingerprint_config(),
             Arc::clone(&env.coordinator),
+            Arc::clone(&env.proof_verifier),
+            Arc::clone(&env.proposal_backup),
+            None,
         )
         .await?;
 
@@ -148,6 +151,7 @@ mod create_tests {
 
         // unique ids rotated past genesis and were published to the wrapper
         let state = &processor.db.state;
+        assert_eq!(state.last_committed_realm_end_root, env.genesis_realm_root());
         assert_eq!(state.gathering_unique_pending_id, 1);
         assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
         assert_eq!(state.chain_id, TEST_CHAIN_ID);
@@ -157,6 +161,7 @@ mod create_tests {
         assert_eq!(shared.gathering_unique_pending_id, 1);
 
         // the gatherer background task is alive until aborted
+        let gatherer_handle = processor.guta_gatherer_join.as_ref().expect("gatherer owner");
         assert!(!gatherer_handle.is_finished());
         gatherer_handle.abort();
 
@@ -167,15 +172,17 @@ mod create_tests {
 
     #[tokio::test]
     async fn create_realm_processor_and_run_starts_and_is_abortable() -> anyhow::Result<()> {
+        tokio::task::LocalSet::new().run_until(async {
         let env = RealmDbTestEnv::create().await?;
-        env.coordinator.seed_realm_root(0, env.genesis.prepared_updates.new_realm_root);
+        let expected_realm_root = env.genesis_realm_root();
+        env.coordinator.seed_realm_root(0, expected_realm_root);
         let genesis_data = env.genesis_data.clone();
 
         let observe_db = Arc::clone(&env.db);
         let observe_guta_queue = Arc::clone(&env.guta_queue);
         let observe_coordinator = Arc::clone(&env.coordinator);
-        let run_handle = tokio::spawn(async move {
-            create_realm_processor_and_run::<N, _, _, _, _, _, _, _, _>(
+        let run_handle = tokio::task::spawn_local(async move {
+            let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
                 TEST_CHAIN_ID,
                 &genesis_data,
                 Arc::clone(&env.file_system),
@@ -190,8 +197,14 @@ mod create_tests {
                 test_realm_identifier(),
                 fingerprint_config(),
                 Arc::clone(&env.coordinator),
+                Arc::clone(&env.proof_verifier),
+                Arc::clone(&env.proposal_backup),
+                None,
             )
-            .await
+            .await?;
+            let result = crate::realm::processor::core::runner::run_realm_processor(processor).await;
+            drop(env);
+            result
         });
 
         // construction commits genesis (writing the pending-id-0 mapping) and
@@ -204,6 +217,7 @@ mod create_tests {
             {
                 break;
             }
+            assert!(!run_handle.is_finished(), "processor task exited before startup completed");
             assert!(std::time::Instant::now() < deadline, "and_run never constructed the processor");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -219,12 +233,15 @@ mod create_tests {
                 },
             )
             .await?;
+        assert_eq!(committed_realm_root, expected_realm_root);
         observe_coordinator.seed_realm_root(0, committed_realm_root);
 
         // the run loop is now driving the processor; the task must not have
         // exited (it only returns on shutdown or a fatal join error)
         assert!(!run_handle.is_finished());
         run_handle.abort();
+        assert!(run_handle.await.unwrap_err().is_cancelled());
         Ok(())
+        }).await
     }
 }
