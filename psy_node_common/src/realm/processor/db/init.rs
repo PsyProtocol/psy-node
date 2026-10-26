@@ -1960,6 +1960,195 @@ mod init_tests {
     use super::realm_db_test_env::*;
 
     #[tokio::test]
+    async fn mapped_backup_recovery_restores_finalizer_fee_and_durable_root() -> anyhow::Result<()> {
+        use parth_core::{
+            crypto::hash::{tag_tree::TagTreeMerkleProof, traits::QFieldHashable},
+            data::hash::fast_node_serializer::QMerkleStoreFastZeroNodeSerializer,
+            felt::{FromPrimitiveValuesFelt, ToU64Value},
+            pgoldilocks::PoseidonHasher,
+            PF,
+        };
+        use psy_data::{
+            guta::realm_finalize::VALIDATOR_TREE_HEIGHT,
+            prepared_block::realm::PsyRealmCoordinatorUpdate,
+            v1::qdata::{
+                checkpoint::{PQEDCheckpointLeaf, QEDL2BlockState},
+                checkpoint_sync::PQEDCheckpointSyncInfoCompact,
+            },
+        };
+        use psy_node_core::psy_core_db::traits::full::{
+            PsyNodeCoreDatabaseUserStoreReader, PsyNodeGlobalUserTreeDatabaseReader,
+        };
+        use psy_node_store_memory::temp_store::InMemoryTempStore;
+        use crate::{
+            realm::processor::{
+                gatherers::realm_end_cap_gatherer::{
+                    gatherer_builder_tests::gather_two_user_backup,
+                    get_new_realm_end_cap_gatherer_backup_file_path,
+                },
+                proposal_backup::ProposalBackup,
+            },
+            test_common::{FakeEphemeralQueueSubscriber, FakeWorkerQueue, TestZKVerifier},
+        };
+
+        let fixture = gather_two_user_backup().await?;
+        let chain = &fixture.chain_state;
+        let db = &chain.db;
+        let checkpoint_id = chain.checkpoint_id + 1;
+        let pending_id = chain.unique_pending_id;
+        let proc_id = chain.unique_cord_proc_id;
+        let validator_id = fixture.validator_leaf_before.user_id.to_u64_value();
+        assert_eq!(chain.checkpoint_id, 0);
+        assert!(pending_id > 0);
+        assert!(fixture.da_fees_collected > 0);
+        assert_eq!(fixture.prebatch_tree.get_root(), fixture.old_realm_root);
+        assert_ne!(fixture.old_realm_root, fixture.new_realm_root);
+        assert_eq!(db.get_user_leaf(0, validator_id).await?, fixture.validator_leaf_before);
+        assert_eq!(
+            fixture.validator_leaf_after.balance.to_u64_value(),
+            fixture.validator_leaf_before.balance.to_u64_value().checked_add(fixture.da_fees_collected).unwrap()
+        );
+
+        let mut block_state = QEDL2BlockState::get_genesis_value();
+        block_state.next_user_id = chain.next_user_registration_id;
+        block_state.next_contract_id = chain.next_contract_id;
+        let initial_update = PsyRealmCoordinatorUpdate {
+            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
+                checkpoint_id: 0,
+                coordinator_id: 0,
+                coordinator_sub_id: 0,
+                coordinator_unique_pending_id: 0,
+                block_state,
+                state_roots: chain.finalizer_state_roots,
+                checkpoint_leaf: chain.finalizer_checkpoint_leaf,
+                checkpoint_leaf_hash: chain.finalizer_checkpoint_leaf.qfhash::<PoseidonHasher>(),
+                checkpoint_tree_root: chain.checkpoint_tree_root,
+            },
+            merkle_proof_to_realm_root: chain.coordinator_global_user_tree.get_e_leaf(chain.realm_id_u64),
+            reward_tree_top_proof: TagTreeMerkleProof::new_empty(),
+        };
+        assert_eq!(initial_update.merkle_proof_to_realm_root.value, fixture.old_realm_root);
+        let mut validator_tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(VALIDATOR_TREE_HEIGHT as u8);
+        validator_tree.set_leaf_no_proof(
+            chain.validator_preimage.tree_index()?,
+            PHash::from_owned_32bytes(chain.validator_preimage.leaf_hash()?),
+        );
+        assert_eq!(validator_tree.get_root(), initial_update.checkpoint_sync_info.state_roots.validator_tree_root);
+        // User state is already persisted by the gatherer fixture; bootstrap only its checkpoint records.
+        let genesis = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate {
+            prepared_updates: PsyPreparedRealmBlockStateUpdates {
+                realm_id: chain.realm_id_u64,
+                realm_sub_id: chain.realm_sub_id_u64,
+                unique_pending_id: 0,
+                proc_checkpoint_unique_id: 0,
+                old_realm_root: fixture.old_realm_root,
+                new_realm_root: fixture.old_realm_root,
+                update_global_user_tree_nodes_ffs: vec![],
+                update_user_contract_tree_nodes_ffs: vec![],
+                update_contract_state_tree_nodes_ffs: vec![],
+                update_user_leaves_ffs: vec![],
+                update_contract_state_imt_leaves_ffs: vec![],
+            },
+            coordinator_update: initial_update.clone(),
+            update_validator_tree_nodes_ffs: QMerkleStoreFastZeroNodeSerializer::serialize_zero_id_hash_map_to_vec(validator_tree.get_changes()),
+            new_validator_leaf_preimages: vec![chain.validator_preimage.clone()],
+        };
+        let coordinator = Arc::new(FakeRealmCoordinatorClient::new());
+        coordinator.push_checkpoint_leaf(initial_update.checkpoint_sync_info.checkpoint_leaf_hash);
+        coordinator.seed_realm_sync_info(initial_update.clone());
+        coordinator.seed_realm_root(0, fixture.old_realm_root);
+        let temp_db = Arc::new(InMemoryTempStore::new("mapped_fee_recovery".to_string(), chain.realm_id_u64, chain.realm_sub_id_u64));
+        let mut processor = PsyRealmDatabaseProcessor::<N, _, _, _, _, _, _, _, _>::new_init(
+            Arc::clone(db), Arc::clone(db), Arc::clone(&temp_db), temp_db,
+            Arc::new(FakeEphemeralQueueSubscriber::new()), Arc::new(FakeWorkerQueue::new()),
+            Arc::clone(&coordinator), chain.chain_id, chain.realm_identifier, fingerprint_config(),
+            Arc::new(TestZKVerifier {}), Arc::clone(&fixture.file_system),
+            "mapped_fee_checkpoint_tree.backup".to_string(), &genesis,
+        ).await?;
+        processor.ensure_genesis_applied(genesis).await?;
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
+
+        let mut coordinator_tree = chain.coordinator_global_user_tree.clone();
+        coordinator_tree.set_e_leaf(chain.realm_id_u64, fixture.new_realm_root);
+        let mut update = initial_update;
+        let sync = &mut update.checkpoint_sync_info;
+        sync.checkpoint_id = checkpoint_id;
+        sync.coordinator_unique_pending_id = 1;
+        sync.block_state.checkpoint_id = checkpoint_id;
+        sync.state_roots.user_tree_root = coordinator_tree.get_root();
+        let mut stats = sync.checkpoint_leaf.stats;
+        stats.da_fees_collected = PF::from_u64_value(fixture.da_fees_collected);
+        sync.checkpoint_leaf = PQEDCheckpointLeaf { global_chain_root: sync.state_roots.qfhash::<PoseidonHasher>(), stats };
+        sync.checkpoint_leaf_hash = sync.checkpoint_leaf.qfhash::<PoseidonHasher>();
+        sync.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&[
+            chain.finalizer_checkpoint_leaf.qfhash::<PoseidonHasher>(), sync.checkpoint_leaf_hash,
+        ]);
+        update.merkle_proof_to_realm_root = coordinator_tree.get_e_leaf(chain.realm_id_u64);
+        coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+        coordinator.seed_realm_sync_info(update.clone());
+        coordinator.seed_realm_root(checkpoint_id, fixture.new_realm_root);
+        coordinator.set_latest_checkpoint_id(checkpoint_id);
+        let membership = coordinator.rc_get_checkpoint_tree_merkle_proof(checkpoint_id).await?;
+        update.checkpoint_sync_info.ensure_valid::<PoseidonHasher>(&membership.siblings)?;
+        assert!(membership.verify::<PoseidonHasher>());
+        assert_eq!(membership.root, update.checkpoint_sync_info.checkpoint_tree_root);
+
+        // Model a crash after both pending mappings were written but before FFS and the durable marker.
+        db.set_unique_pending_id_checkpoint_id_mapping(pending_id, checkpoint_id).await?;
+        db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, pending_id, &proc_id).await?;
+        assert_eq!(db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::NeedsRecovery);
+        let proposal_dir = tempfile::tempdir()?;
+        let proposal_backup = ProposalBackup::open(proposal_dir.path()).await?;
+        let backup_directory = std::path::Path::new(&fixture.backup_path).parent().unwrap().to_str().unwrap();
+        let mapped_path = get_new_realm_end_cap_gatherer_backup_file_path(
+            backup_directory, chain.realm_id_u64, chain.realm_sub_id_u64, pending_id,
+        );
+        assert_eq!(mapped_path, std::path::PathBuf::from(&fixture.backup_path));
+        let mut tree = fixture.prebatch_tree.clone();
+
+        // Missing mapped bytes must fail directly, not enter pending scans or proposal retry loops.
+        let (backup_path, backup_bytes) = fixture.file_system.files.remove(&fixture.backup_path).expect("finalized backup exists");
+        let missing = tokio::time::timeout(Duration::from_secs(5), processor.ensure_backup_restored_if_necessary(
+            fixture.file_system.as_ref(), backup_directory, &mut tree, &proposal_backup, None,
+        )).await.expect("mapped recovery must not fall back when its backup is missing").unwrap_err();
+        assert_eq!(missing.downcast_ref::<std::io::Error>().expect("missing backup IO error").kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(tree.get_root(), fixture.old_realm_root);
+        assert_eq!(db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        assert_eq!(db.get_user_leaf(checkpoint_id, validator_id).await?, fixture.validator_leaf_before);
+        assert_eq!(db.global_user_tree_get_node(0, processor.realm_root_node).await?, fixture.old_realm_root);
+        assert_eq!(db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?, Some((pending_id, proc_id)));
+        fixture.file_system.files.insert(backup_path, backup_bytes);
+
+        tokio::time::timeout(Duration::from_secs(5), processor.ensure_backup_restored_if_necessary(
+            fixture.file_system.as_ref(), backup_directory, &mut tree, &proposal_backup, None,
+        )).await.expect("mapped recovery must finish without proposal fallback")?;
+        assert_eq!(tree.get_root(), fixture.new_realm_root);
+        assert_eq!(db.get_latest_checkpoint_id().await?, checkpoint_id);
+        assert_eq!(db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(db.get_user_leaf(checkpoint_id, validator_id).await?, fixture.validator_leaf_after);
+        assert_eq!(db.get_user_leaf(0, validator_id).await?, fixture.validator_leaf_before);
+        for user_id in [fixture.user_a, fixture.user_b] {
+            assert_eq!(db.get_user_leaf(checkpoint_id, user_id).await?, chain.users[&user_id].user_leaf);
+        }
+        let restored = crate::backup::realm::load_realm_memory_trees_from_db::<N, _>(
+            db, checkpoint_id, chain.realm_id_u64,
+        ).await?;
+        assert_eq!(restored.global_user_tree.get_root(), fixture.new_realm_root);
+        assert_eq!(processor.get_realm_root_from_db().await?, fixture.new_realm_root);
+        assert_eq!(processor.state.last_committed_checkpoint_id, checkpoint_id);
+        assert_eq!(processor.state.last_committed_realm_end_root, fixture.new_realm_root);
+        assert_eq!(processor.state.last_committed_unique_pending_id, pending_id);
+        assert_eq!(processor.state.last_committed_proc_checkpoint_unique_id, proc_id);
+        assert_eq!(db.get_checkpoint_id_for_unique_pending_id(pending_id).await?, Some(checkpoint_id));
+        assert_eq!(db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?, Some((pending_id, proc_id)));
+        assert_eq!(db.checkpoint_tree_get_root_hash(checkpoint_id).await?, membership.root);
+        assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn new_init_on_fresh_database_reports_needs_genesis() -> anyhow::Result<()> {
         let env = RealmDbTestEnv::create().await?;
         let processor = &env.processor;

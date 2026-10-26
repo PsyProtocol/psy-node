@@ -20,7 +20,7 @@ use parth_core::{
     QCoreProcCheckpointUniqueId, QJobIdBase,
 };
 
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{
         header::GlobalUserTreeAggregatorHeader,
@@ -60,6 +60,8 @@ use crate::{
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52; // 'RGE1' in little-endian u32
+// RGE2 adds a pre-footer effect: tag 0 for empty batches, or tag 1 + pre/post-fee user leaves.
+pub const REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32: u32 = 0x32_45_47_52;
 
 
 /// Typed failure raised when a realm end-cap backup's declared start global
@@ -96,8 +98,7 @@ pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     ))
 }
 
-/// Reads only the authenticated-format end root from a backup header without
-/// mutating the in-memory tree.
+/// Discovery hint only; replay and checkpoint/proposal binding must authenticate the root before commit.
 pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: QDBHashBase>(
     file_system: &FileSystem,
     path: &str,
@@ -114,9 +115,8 @@ pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: Q
     file.read_exact(&mut header).await?;
     let magic = u32::from_le_bytes(header[..4].try_into().expect("4-byte magic"));
     anyhow::ensure!(
-        magic == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
-        "Realm backup magic mismatch: expected {:x}, got {:x}",
-        REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+        magic == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 || magic == REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32,
+        "Realm backup magic mismatch: expected RGE1 or RGE2, got {:x}",
         magic
     );
     Ok(Hash::from_owned_32bytes(header[36..68].try_into().expect("end root")))
@@ -124,7 +124,7 @@ pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: Q
 
 
 pub fn read_realm_end_cap_gatherer_backup_bytes<
-    Hasher: MerkleZeroHasher<Hash>,
+    Hasher: FieldQHasher<F, Hash>,
     Hash: QDBHashBase + QFHashBase<F>,
     F: QFelt64,
 >(
@@ -135,6 +135,36 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
     coordinator_global_user_tree_height: u8,
     insert_old_leaves: bool,
 ) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<F, Hash>> {
+    let snapshot = tree.snapshot();
+    let result = apply_realm_end_cap_gatherer_backup_bytes::<Hasher, Hash, F>(
+        backup, tree, realm_id_u64, realm_global_user_tree_height, coordinator_global_user_tree_height,
+    );
+    if result.is_err() || insert_old_leaves {
+        // Old-leaf reads validate forward replay, then restore the prebatch tree and prior changes.
+        tree.revert_to(snapshot);
+    }
+    result.map(|mut output| {
+        if insert_old_leaves {
+            output.update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
+                tree.get_changes(),
+                SimpleMerkleNodeKey { level: coordinator_global_user_tree_height, index: realm_id_u64 },
+            );
+        }
+        output
+    })
+}
+
+fn apply_realm_end_cap_gatherer_backup_bytes<
+    Hasher: FieldQHasher<F, Hash>,
+    Hash: QDBHashBase + QFHashBase<F>,
+    F: QFelt64,
+>(
+    backup: &[u8],
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    realm_id_u64: u64,
+    realm_global_user_tree_height: u8,
+    coordinator_global_user_tree_height: u8,
+) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<F, Hash>> {
     const HEADER_LEN: usize = 4 + 32 + 32 + 8;
     anyhow::ensure!(
         backup.len() >= HEADER_LEN,
@@ -143,9 +173,8 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
     );
     let magic_u32 = u32::from_le_bytes(backup[0..4].try_into().expect("4-byte magic"));
     anyhow::ensure!(
-        magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
-        "Realm proposal backup magic mismatch: expected {:x}, got {:x}",
-        REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+        magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 || magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32,
+        "Realm proposal backup magic mismatch: expected RGE1 or RGE2, got {:x}",
         magic_u32
     );
     let start_global_user_tree_root = Hash::from_owned_32bytes(backup[4..36].try_into().expect("start root"));
@@ -164,8 +193,13 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
     let mut update_user_contract_tree_nodes_ffs = Vec::new();
     let mut update_contract_state_tree_nodes_ffs = Vec::new();
     let mut update_contract_state_imt_leaves_ffs = Vec::new();
-    let min_user_id = realm_id_u64 << (realm_global_user_tree_height as u64);
-    let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
+    let mut user_leaf_offsets = std::collections::HashMap::new();
+    let mut da_fees_collected = 0u64;
+    anyhow::ensure!(realm_global_user_tree_height < 64 && tree.get_height() == realm_global_user_tree_height,
+        "Realm backup tree height mismatch");
+    let realm_size = 1u64 << realm_global_user_tree_height;
+    let min_user_id = realm_id_u64.checked_mul(realm_size).context("Realm backup user range overflow")?;
+    let max_user_id = min_user_id.checked_add(realm_size - 1).context("Realm backup user range overflow")?;
     let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
 
     for _ in 0..expected_end_caps_processed {
@@ -192,6 +226,9 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
         }
         let mut stats_bytes = [0u8; 40];
         Read::read_exact(&mut cursor, &mut stats_bytes)?;
+        let stats = GUTAStats::<F>::psy_ser_from_slice(&stats_bytes)?;
+        da_fees_collected = da_fees_collected.checked_add(stats.da_fees_collected.to_u64_value())
+            .context("Realm backup DA fee total overflow")?;
         let mut events_len_bytes = [0u8; 4];
         Read::read_exact(&mut cursor, &mut events_len_bytes)?;
         let events_len = usize::try_from(u32::from_le_bytes(events_len_bytes))?;
@@ -248,14 +285,14 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
             true,
         )?;
         update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
-        user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
+        anyhow::ensure!(tree.get_leaf_value(user_id - min_user_id) == old_user_leaf_hash,
+            "Realm backup EndCap old leaf mismatch for user {}", user_id);
+        anyhow::ensure!(user_leaf_node.qfhash::<Hasher>() == new_user_leaf_hash,
+            "Realm backup EndCap new leaf preimage mismatch for user {}", user_id);
+        write_realm_backup_user_leaf(&mut update_user_leaves_ffs, &mut user_leaf_offsets, &user_leaf_node)?;
         update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
         update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
-        if insert_old_leaves {
-            tree.set_leaf(user_id - min_user_id, old_user_leaf_hash);
-        } else {
-            tree.set_leaf(user_id - min_user_id, new_user_leaf_hash);
-        }
+        tree.set_leaf(user_id - min_user_id, new_user_leaf_hash);
         actual_end_caps_processed += 1;
     }
     if actual_end_caps_processed != expected_end_caps_processed as usize {
@@ -265,6 +302,17 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
             actual_end_caps_processed
         );
     }
+    let finalizer_effect = if magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32 {
+        let mut tag = [0u8; 1];
+        Read::read_exact(&mut cursor, &mut tag).context("Realm backup missing finalizer effect")?;
+        match tag[0] {
+            0 => None,
+            1 => Some((PQEDUserLeaf::<F, Hash>::pio_read_from_io(&mut cursor)?, PQEDUserLeaf::<F, Hash>::pio_read_from_io(&mut cursor)?)),
+            tag => anyhow::bail!("Realm backup invalid finalizer effect tag {}", tag),
+        }
+    } else {
+        None
+    };
     let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
     let remaining_backup_bytes = remaining_backup_bytes(&cursor)?;
     anyhow::ensure!(
@@ -276,6 +324,47 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
     let mut header_bytes = vec![0u8; footer_size];
     Read::read_exact(&mut cursor, &mut header_bytes)?;
     let guta_header = read_guta_header_with_job_id_from_backup_bytes::<F, Hash>(&header_bytes)?;
+    let is_finalizer = guta_header.job_id.circuit_type == ProvingJobCircuitType::RealmFinalizeGUTA;
+    anyhow::ensure!(magic_u32 != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 || !is_finalizer,
+        "RGE1 finalizer backup is missing the validator fee effect; cannot recover safely");
+    anyhow::ensure!(guta_header.header.stats.da_fees_collected.to_u64_value() == da_fees_collected,
+        "Realm backup DA fee total does not match GUTA footer");
+    if let Some((old_leaf, new_leaf)) = finalizer_effect {
+        anyhow::ensure!(is_finalizer && actual_end_caps_processed > 0,
+            "Realm backup finalizer effect requires a nonempty circuit-63 batch");
+        anyhow::ensure!(guta_header.job_id == QProvingJobDataID::realm_finalize_guta(guta_header.job_id.goal_id, u32::try_from(realm_id_u64)?),
+            "Realm backup finalizer job identity mismatch");
+        let user_id = old_leaf.user_id.to_u64_value();
+        anyhow::ensure!(user_id >= min_user_id && user_id <= max_user_id, "Realm backup finalizer user outside realm");
+        anyhow::ensure!(tree.get_leaf_value(user_id - min_user_id) == old_leaf.qfhash::<Hasher>(),
+            "Realm backup finalizer old leaf preimage mismatch");
+        let balance = old_leaf.balance.to_u64_value().checked_add(da_fees_collected)
+            .filter(|balance| *balance < (1u64 << 60)).context("Realm backup finalizer balance overflow")?;
+        let mut expected_leaf = old_leaf;
+        expected_leaf.balance = F::from_u64_value(balance);
+        if da_fees_collected != 0 {
+            expected_leaf.last_checkpoint_id = F::from_u64_value(guta_header.job_id.goal_id);
+        }
+        anyhow::ensure!(new_leaf == expected_leaf, "Realm backup finalizer fee leaf mismatch");
+        tree.set_leaf(user_id - min_user_id, new_leaf.qfhash::<Hasher>());
+        write_realm_backup_user_leaf(&mut update_user_leaves_ffs, &mut user_leaf_offsets, &new_leaf)?;
+    } else if magic_u32 == REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32 {
+        anyhow::ensure!(actual_end_caps_processed == 0 && !is_finalizer, "Realm backup missing finalizer effect for nonempty batch");
+    }
+    anyhow::ensure!(tree.get_root() == expected_end_global_user_tree_root,
+        "Realm backup reconstructed end root does not match advertised end root");
+    if actual_end_caps_processed == 0 {
+        anyhow::ensure!(guta_header.job_id == QProvingJobDataID::new_invalid_job_id()
+            && guta_header.header.state_transition.old_node_value == Hash::get_zero_value()
+            && guta_header.header.state_transition.new_node_value == Hash::get_zero_value(),
+            "Realm backup empty batch has a nonempty GUTA footer");
+    } else {
+        anyhow::ensure!(guta_header.header.state_transition.old_node_value == start_global_user_tree_root
+            && guta_header.header.state_transition.new_node_value == tree.get_root()
+            && guta_header.header.state_transition.node_index.to_u64_value() == realm_id_u64
+            && guta_header.header.state_transition.node_level.to_u64_value() == coordinator_global_user_tree_height as u64,
+            "Realm backup GUTA footer transition mismatch");
+    }
     let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
         tree.get_changes(),
         SimpleMerkleNodeKey {
@@ -295,6 +384,22 @@ pub fn read_realm_end_cap_gatherer_backup_bytes<
         total_users_updated: actual_end_caps_processed as u64,
         guta_header,
     })
+}
+
+fn write_realm_backup_user_leaf<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>>(
+    bytes: &mut Vec<u8>,
+    offsets: &mut std::collections::HashMap<u64, usize>,
+    leaf: &PQEDUserLeaf<F, Hash>,
+) -> anyhow::Result<()> {
+    let serialized = leaf.psy_ser_to_bytes_vec()?;
+    anyhow::ensure!(serialized.len() == PSY_OBJECT_FFS_SIZE_USER_LEAF, "Realm backup user leaf FFS size mismatch");
+    let offset = *offsets.entry(leaf.user_id.to_u64_value()).or_insert(bytes.len());
+    if offset == bytes.len() {
+        bytes.extend_from_slice(&serialized);
+    } else {
+        bytes[offset..offset + PSY_OBJECT_FFS_SIZE_USER_LEAF].copy_from_slice(&serialized);
+    }
+    Ok(())
 }
 
 fn remaining_backup_bytes(cursor: &Cursor<&[u8]>) -> anyhow::Result<usize> {
@@ -337,7 +442,7 @@ fn check_qblob_size(declared_total_size: u64, remaining_payload_bytes: usize, se
 
 
 pub async fn read_realm_end_cap_gatherer_backup_file<
-    Hasher: MerkleZeroHasher<Hash>,
+    Hasher: FieldQHasher<F, Hash>,
     Hash: QDBHashBase + QFHashBase<F>,
     F: QFelt64,
     FileSystem: TokioLikeFileSystem,
@@ -883,7 +988,7 @@ impl<
         // prior cycle at the same pending id are cut here.
         let mut new_realm_end_cap_gatherer_file = config.file_system.file_like_fs_create(&backup_path).await?;
         new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
-        new_realm_end_cap_gatherer_file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32).await?;
+        new_realm_end_cap_gatherer_file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32).await?;
         new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
         new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
         new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
@@ -1117,12 +1222,20 @@ impl<
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
         let total_end_caps_processed = self.guta_planner.total_end_caps_processed;
+        let validator_leaf_before_fee = self.guta_planner.current_validator_user_leaf.clone()
+            .context("missing validator leaf before finalizer backup effect")?;
         let result = self
             .guta_planner
             .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
             .await
             .context("GUTA updates gatherer planner finalize failed")?;
         if let Some(result) = result {
+            let validator_leaf_after_fee = self.guta_planner.current_validator_user_leaf.as_ref()
+                .context("missing validator leaf after finalizer backup effect")?;
+            let mut finalizer_effect = vec![1u8];
+            validator_leaf_before_fee.pio_write_to_io(&mut finalizer_effect)?;
+            validator_leaf_after_fee.pio_write_to_io(&mut finalizer_effect)?;
+            self.new_realm_end_cap_gatherer_file.write_all(&finalizer_effect).await?;
             self.new_realm_end_cap_gatherer_file
                 .write_all(&result.db_output.guta_header.psy_ser_to_bytes_vec()?)
                 .await?;
@@ -1174,6 +1287,7 @@ impl<
                 total_aggregation_proofs_generated: N::F::ZERO_VALUE,
             },
         };
+        self.new_realm_end_cap_gatherer_file.write_all(&[0u8]).await?;
         self.new_realm_end_cap_gatherer_file
             .write_all(&guta_header.psy_ser_into_bytes_vec()?)
             .await?;
@@ -1335,8 +1449,8 @@ mod backup_file_tests {
         }
 
         let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        if magic != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
-            anyhow::bail!("bad magic: expected {:x}, got {:x}", REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32, magic);
+        if magic != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 && magic != super::REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32 {
+            anyhow::bail!("bad magic: expected RGE1 or RGE2, got {:x}", magic);
         }
 
         let expected_end_caps = u64::from_le_bytes(data[68..76].try_into().unwrap());
@@ -1369,7 +1483,15 @@ mod backup_file_tests {
                 .map_err(|e| anyhow::anyhow!("IMT blob parse failed for queue_item #{}: {}", actual_end_caps, e))?;
         }
 
-        if HEADER_SIZE + offset + FOOTER_SIZE > file_len {
+        if magic == super::REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32 {
+            let tag = *body.get(offset).ok_or_else(|| anyhow::anyhow!("missing finalizer effect"))?;
+            offset += match tag {
+                0 => 1,
+                1 => 1 + 2 * USER_LEAF_SIZE,
+                _ => anyhow::bail!("invalid finalizer effect tag {}", tag),
+            };
+        }
+        if HEADER_SIZE + offset + FOOTER_SIZE != file_len {
             anyhow::bail!(
                 "file too small for footer after {} end-cap records: file_len={}, footer_offset={}",
                 expected_end_caps,
@@ -1465,6 +1587,7 @@ mod backup_file_tests {
         };
         use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
         use psy_serialize::PsyIOReadWrite;
+        use parth_core::crypto::hash::traits::QFieldHashable;
 
         use super::super::{
             read_realm_end_cap_gatherer_backup_file, write_guta_header_with_job_id_backup_bytes, QBlobDataType, QBlobMerkleNodeTreeType,
@@ -1491,25 +1614,30 @@ mod backup_file_tests {
             let path = "realm_end_cap_reader_test.backup";
             let mut tree = SimpleMemoryMerkleRecorderStore::<ReaderHasher, ReaderHash>::new(READER_REALM_GLOBAL_USER_TREE_HEIGHT);
             let start_root = tree.get_root();
+            let mut expected_tree = tree.clone();
+            for record in records {
+                expected_tree.set_leaf(5, ReaderHash::from_owned_32bytes(record[64..96].try_into().unwrap()));
+            }
+            let end_root = expected_tree.get_root();
             let declared_start_root = declared_start_root_override.unwrap_or(start_root);
             let mut data = Vec::new();
             data.extend_from_slice(&REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
             data.extend_from_slice(&declared_start_root.into_owned_32bytes());
-            data.extend_from_slice(&start_root.into_owned_32bytes());
+            data.extend_from_slice(&end_root.into_owned_32bytes());
             data.extend_from_slice(&(records.len() as u64).to_le_bytes());
             for record in records {
                 data.extend_from_slice(record);
             }
             let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<ReaderF, ReaderHash> {
-                job_id: QProvingJobDataID::new_invalid_job_id(),
+                job_id: QProvingJobDataID::guta_single_end_cap_witness(1, 0, 0, 0),
                 header: GlobalUserTreeAggregatorHeader {
                     guta_circuit_whitelist: ReaderHash::get_zero_value(),
                     checkpoint_tree_root: ReaderHash::get_zero_value(),
                     state_transition: SubTreeNodeStateTransition {
-                        old_node_value: ReaderHash::get_zero_value(),
-                        new_node_value: ReaderHash::get_zero_value(),
+                        old_node_value: start_root,
+                        new_node_value: end_root,
                         node_index: ReaderF::ZERO_VALUE,
-                        node_level: ReaderF::ZERO_VALUE,
+                        node_level: ReaderF::from_owned_u64(READER_COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64),
                     },
                     stats: GUTAStats::<ReaderF>::get_zero_value(),
                     total_aggregation_proofs_generated: ReaderF::ZERO_VALUE,
@@ -1534,14 +1662,14 @@ mod backup_file_tests {
             let mut record = Vec::new();
             record.extend_from_slice(&[0u8; JOB_ID_SIZE]);
             record.extend_from_slice(&1u64.to_le_bytes());
-            record.extend_from_slice(&[3u8; HASH_SIZE]);
-            record.extend_from_slice(&[4u8; HASH_SIZE]);
-            PQEDUserLeaf::<ReaderF, ReaderHash>::new_user_default(
+            record.extend_from_slice(&ReaderHash::get_zero_value().into_owned_32bytes());
+            let leaf = PQEDUserLeaf::<ReaderF, ReaderHash>::new_user_default(
                 ReaderF::from_owned_u64(5),
                 ReaderHash::from_owned_32bytes([7u8; 32]),
                 ReaderHash::get_zero_value(),
-            )
-            .pio_write_to_io(&mut record)?;
+            );
+            record.extend_from_slice(&leaf.qfhash::<ReaderHasher>().into_owned_32bytes());
+            leaf.pio_write_to_io(&mut record)?;
             record.extend_from_slice(&[0u8; GUTA_STATS_SIZE]);
             record.extend_from_slice(&0u32.to_le_bytes());
             record.extend_from_slice(&node_blob(32u32, QBlobDataType::GenericSingleIdMerkleNodeBatch, QBlobMerkleNodeTreeType::UserContractTree)?);
@@ -1786,21 +1914,26 @@ mod guta_header_backup_tests {
 }
 
 #[cfg(test)]
-mod gatherer_builder_tests {
+pub(crate) mod gatherer_builder_tests {
     use std::sync::{Arc, RwLock};
 
     use parth_common::memory_stores::{
         mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
     };
     use parth_core::{
-        felt::FromPrimitiveValuesFelt,
+        crypto::hash::traits::QFieldHashable,
+        felt::{FromPrimitiveValuesFelt, ToU64Value},
         pgoldilocks::PoseidonHasher,
-        protocol::core_types::QNetworkTreeConstants,
+        protocol::core_types::{Q256BitHash, QNetworkTreeConstants},
         utils::QPGenRandom,
         PHash, PF,
     };
     use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-    use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId, node::realm_processor::RealmProcessorCoreState};
+    use psy_data::{
+        guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
+        node::realm_processor::RealmProcessorCoreState,
+        v1::qdata::{ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF, user::PQEDUserLeaf},
+    };
     use psy_io::tokio::TokioLikeFileSystem;
     use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
     use psy_node_store_memory::temp_store::InMemoryTempStore;
@@ -1819,23 +1952,30 @@ mod gatherer_builder_tests {
     type Hash = PHash;
     type RecTree = SimpleMemoryMerkleRecorderStore<PoseidonHasher, PHash>;
 
-    struct GatherFixture {
-        file_system: Arc<SimpleMockMemoryFileSystem>,
-        backup_path: String,
-        realm_id_u64: u64,
-        user_a: u64,
-        user_b: u64,
-        old_hash_a: Hash,
-        old_hash_b: Hash,
-        root_job_id: QProvingJobDataID,
-        old_realm_root: Hash,
-        new_realm_root: Hash,
+    pub(crate) struct GatherFixture {
+        pub(crate) file_system: Arc<SimpleMockMemoryFileSystem>,
+        pub(crate) backup_path: String,
+        pub(crate) realm_id_u64: u64,
+        pub(crate) user_a: u64,
+        pub(crate) user_b: u64,
+        pub(crate) old_hash_a: Hash,
+        pub(crate) old_hash_b: Hash,
+        pub(crate) root_job_id: QProvingJobDataID,
+        pub(crate) old_realm_root: Hash,
+        pub(crate) new_realm_root: Hash,
+        pub(crate) prebatch_tree: RecTree,
+        pub(crate) validator_leaf_before: PQEDUserLeaf<PF, Hash>,
+        pub(crate) validator_leaf_after: PQEDUserLeaf<PF, Hash>,
+        pub(crate) da_fees_collected: u64,
+        pub(crate) update_user_leaves_ffs: Vec<u8>,
+        pub(crate) update_global_user_tree_nodes_ffs: Vec<u8>,
+        pub(crate) chain_state: RGPTestChainState,
     }
 
     /// Runs the full RealmGUTAEndCapGatherer lifecycle (create -> two queue
     /// items -> finalize) over the in-memory realm planner test env and returns
     /// everything needed to inspect the committed backup file.
-    async fn gather_two_user_backup() -> anyhow::Result<GatherFixture> {
+    pub(crate) async fn gather_two_user_backup() -> anyhow::Result<GatherFixture> {
         let mut chain_state = RGPTestChainState::create_for_tests().await?;
         let user_a = chain_state.register_new_random_user().await?;
         let user_b = chain_state.register_new_random_user().await?;
@@ -1850,7 +1990,28 @@ mod gatherer_builder_tests {
         let item_a = chain_state.run_ups_for_user(user_a, &updates()).await?;
         let item_b = chain_state.run_ups_for_user(user_b, &updates()).await?;
 
-        let mut realm_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let mut realm_tree = chain_state.first_realm_global_user_tree.clone();
+        realm_tree.commit_changes();
+        let prebatch_tree = realm_tree.clone();
+        use psy_node_core::psy_core_db::traits::full::{
+            PsyNodeCoreDatabaseUserStoreWriter, PsyNodeGlobalUserTreeDatabaseWriter,
+            PsyNodeValidatorTreeDatabaseWriter, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointTreeDatabaseWriter,
+        };
+        use parth_core::crypto::hash::traits::QFieldHashable;
+        let db = &chain_state.db;
+        let validator = &chain_state.finalizer_user;
+        db.set_user_leaf(0, &validator.user_leaf).await?;
+        db.global_user_tree_set_leaf_hash(0, validator.user_id, validator.user_leaf.qfhash::<PoseidonHasher>()).await?;
+        db.global_user_tree_set_top_tree_merkle_proof(0, &chain_state.coordinator_global_user_tree.get_e_leaf(chain_state.realm_id_u64)).await?;
+        let validator_index = (chain_state.realm_id_u64 << 8) | chain_state.realm_sub_id_u64;
+        let validator_hash = psy_data::guta::realm_finalize::realm_validator_leaf_hash::<PF, Hash, PoseidonHasher>(
+            validator.user_id, chain_state.validator_node_limbs, chain_state.validator_bls_limbs,
+        );
+        db.validator_tree_set_leaf_hash(0, validator_index, validator_hash).await?;
+        db.validator_tree_set_leaf_preimage(0, validator_index, &chain_state.validator_preimage).await?;
+        db.set_checkpoint_global_state_roots(0, &chain_state.finalizer_state_roots).await?;
+        db.set_checkpoint_leaf_data(0, &chain_state.finalizer_checkpoint_leaf).await?;
+        db.checkpoint_tree_set_leaf_hash(0, chain_state.finalizer_checkpoint_leaf.qfhash::<PoseidonHasher>()).await?;
         let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
         let status = Arc::new(RwLock::new(RealmProcessorCoreState::new_basic(
             chain_state.chain_id,
@@ -1891,13 +2052,31 @@ mod gatherer_builder_tests {
             .await?;
         let output = gatherer.finalize_with_tree(&mut realm_tree).await?;
 
-        // both users were paired into a single GUTATwoEndCap root job
-        assert_eq!(output.job_ids.len(), 1);
+        assert_eq!(output.job_ids.len(), 2);
         assert_eq!(output.job_ids[0].len(), 1);
         assert_eq!(output.job_ids[0][0].job_id.circuit_type, ProvingJobCircuitType::GUTATwoEndCap);
+        assert_eq!(output.job_ids[1].len(), 1);
+        assert_eq!(output.job_ids[1][0].job_id.circuit_type, ProvingJobCircuitType::RealmFinalizeGUTA);
         assert_eq!(output.db_output.total_users_updated, 2);
-        assert_eq!(output.db_output.total_proofs_generated, 1);
+        assert_eq!(output.db_output.total_proofs_generated, 2);
         assert!(!output.db_output.is_noop());
+        let da_fees_collected = output.db_output.guta_header.header.stats.da_fees_collected.to_u64_value();
+        assert!(da_fees_collected > 0, "the backup regression must exercise a nonzero validator fee");
+        let mut validator_leaf_after = chain_state.finalizer_user.user_leaf.clone();
+        validator_leaf_after.balance += PF::from_u64_value(da_fees_collected);
+        validator_leaf_after.last_checkpoint_id = PF::from_u64_value(chain_state.checkpoint_id);
+        let validator_index = chain_state.finalizer_user.user_id - (chain_state.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        assert_eq!(realm_tree.get_leaf_value(validator_index), validator_leaf_after.qfhash::<PoseidonHasher>());
+        assert_eq!(realm_tree.get_root(), output.db_output.new_realm_root);
+        let live_leaves = output.db_output.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF);
+        assert!(live_leaves.remainder().is_empty());
+        let live_validator_leaves = live_leaves
+            .map(PQEDUserLeaf::<PF, Hash>::psy_ser_from_slice)
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|leaf| leaf.user_id == validator_leaf_after.user_id)
+            .collect::<Vec<_>>();
+        assert_eq!(live_validator_leaves, vec![validator_leaf_after.clone()]);
 
         let backup_path = get_new_realm_end_cap_gatherer_backup_file_path(
             "backups",
@@ -1917,9 +2096,16 @@ mod gatherer_builder_tests {
             user_b,
             old_hash_a: item_a.old_user_leaf_hash,
             old_hash_b: item_b.old_user_leaf_hash,
-            root_job_id: output.job_ids[0][0].job_id.clone(),
+            root_job_id: output.job_ids[1][0].job_id.clone(),
             old_realm_root: output.db_output.old_realm_root,
             new_realm_root: output.db_output.new_realm_root,
+            prebatch_tree,
+            validator_leaf_before: chain_state.finalizer_user.user_leaf.clone(),
+            validator_leaf_after,
+            da_fees_collected,
+            update_user_leaves_ffs: output.db_output.update_user_leaves_ffs,
+            update_global_user_tree_nodes_ffs: output.db_output.update_global_user_tree_nodes_ffs,
+            chain_state,
         })
     }
 
@@ -1933,7 +2119,7 @@ mod gatherer_builder_tests {
         assert_eq!(end_root, fixture.new_realm_root);
 
         // a full restore with new leaves reproduces the gatherer output
-        let mut restored_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let mut restored_tree = fixture.prebatch_tree.clone();
         let restored = read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
             fixture.file_system.as_ref(),
             &fixture.backup_path,
@@ -1948,15 +2134,24 @@ mod gatherer_builder_tests {
         assert_eq!(restored.total_proofs_generated, 0);
         assert_eq!(restored.old_realm_root, fixture.old_realm_root);
         assert_eq!(restored.new_realm_root, fixture.new_realm_root);
-        assert_eq!(restored_tree.get_root(), fixture.new_realm_root);
+        assert_eq!(restored_tree.get_root(), fixture.new_realm_root, "backup replay must apply the finalizer fee, not only advertise its root");
         assert_eq!(restored.guta_header.job_id, fixture.root_job_id);
         assert!(!restored.update_user_leaves_ffs.is_empty());
         assert!(!restored.update_user_contract_tree_nodes_ffs.is_empty());
         assert!(!restored.update_contract_state_tree_nodes_ffs.is_empty());
         assert!(!restored.update_global_user_tree_nodes_ffs.is_empty());
+        assert_eq!(restored.update_user_leaves_ffs, fixture.update_user_leaves_ffs);
+        let sorted_nodes = |bytes: &[u8]| {
+            let chunks = bytes.chunks_exact(super::QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
+            assert!(chunks.remainder().is_empty());
+            let mut nodes = chunks.map(|node| node.to_vec()).collect::<Vec<_>>();
+            nodes.sort_unstable();
+            nodes
+        };
+        assert_eq!(sorted_nodes(&restored.update_global_user_tree_nodes_ffs), sorted_nodes(&fixture.update_global_user_tree_nodes_ffs));
 
         // restoring with insert_old_leaves rebuilds the pre-update tree state
-        let mut old_tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let mut old_tree = fixture.prebatch_tree.clone();
         read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
             fixture.file_system.as_ref(),
             &fixture.backup_path,
@@ -1970,6 +2165,174 @@ mod gatherer_builder_tests {
         let min_user_id = fixture.realm_id_u64 << (N::REALM_GLOBAL_USER_TREE_HEIGHT as u64);
         assert_eq!(old_tree.get_leaf_value(fixture.user_a - min_user_id), fixture.old_hash_a);
         assert_eq!(old_tree.get_leaf_value(fixture.user_b - min_user_id), fixture.old_hash_b);
+        assert_eq!(old_tree.get_root(), fixture.old_realm_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_backup_replays_validator_fee_leaf_ffs() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+        let mut tree = fixture.prebatch_tree.clone();
+        let restored = read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
+            fixture.file_system.as_ref(),
+            &fixture.backup_path,
+            &mut tree,
+            fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            false,
+        ).await?;
+        assert_eq!(restored.guta_header.header.stats.da_fees_collected.to_u64_value(), fixture.da_fees_collected);
+        let leaves = restored.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF);
+        assert!(leaves.remainder().is_empty());
+        let validator_leaves = leaves
+            .map(PQEDUserLeaf::<PF, Hash>::psy_ser_from_slice)
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|leaf| leaf.user_id == fixture.validator_leaf_before.user_id)
+            .collect::<Vec<_>>();
+        assert_eq!(validator_leaves.len(), 1, "backup replay must emit the finalizer validator leaf exactly once");
+        assert_eq!(validator_leaves[0].balance.to_u64_value(), fixture.validator_leaf_before.balance.to_u64_value() + fixture.da_fees_collected);
+        assert_eq!(validator_leaves[0], fixture.validator_leaf_after);
+        assert_eq!(restored.update_user_leaves_ffs, fixture.update_user_leaves_ffs);
+        Ok(())
+    }
+
+    fn assert_backup_rejected_without_tree_changes(fixture: &GatherFixture, bytes: &[u8], expected_error: &str) {
+        // An uncommitted validator seed checks preservation of the caller's journal and root on failure.
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        for (index, hash) in fixture.prebatch_tree.get_leaves_slow_all() {
+            tree.set_leaf(index, hash);
+        }
+        assert_eq!(tree.get_root(), fixture.old_realm_root);
+        let changes = tree.get_changes().clone();
+        for insert_old_leaves in [false, true] {
+            let error = match super::read_realm_end_cap_gatherer_backup_bytes::<PoseidonHasher, Hash, PF>(
+                bytes, &mut tree, fixture.realm_id_u64,
+                N::REALM_GLOBAL_USER_TREE_HEIGHT, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, insert_old_leaves,
+            ) {
+                Ok(_) => panic!("corrupted backup must fail: {expected_error}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(expected_error), "expected {expected_error}, got {error:#}");
+            assert_eq!(tree.get_root(), fixture.old_realm_root);
+            assert_eq!(tree.get_changes(), &changes);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalizer_backup_rejects_tampering_without_tree_changes() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+        let raw = fixture.file_system.files.get(&fixture.backup_path).unwrap().value().clone();
+        let footer_start = raw.len() - GlobalUserTreeAggregatorHeaderWithJobId::<PF, Hash>::FIXED_SIZE;
+        let effect_start = footer_start - 1 - 2 * PSY_OBJECT_FFS_SIZE_USER_LEAF;
+        assert_eq!(&raw[..4], &super::REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32.to_le_bytes());
+        assert_eq!(raw[effect_start], 1);
+
+        let mut bad = raw.clone();
+        bad[effect_start] = 2;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "invalid finalizer effect tag");
+        let mut bad = raw.clone();
+        let mut old_leaf = fixture.validator_leaf_before.clone();
+        old_leaf.balance += PF::from_u64_value(1);
+        bad[effect_start + 1..effect_start + 1 + PSY_OBJECT_FFS_SIZE_USER_LEAF].copy_from_slice(&old_leaf.psy_ser_to_bytes_vec()?);
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "finalizer old leaf preimage mismatch");
+        for change_nonce in [false, true] {
+            let mut bad = raw.clone();
+            let mut new_leaf = fixture.validator_leaf_after.clone();
+            if change_nonce {
+                new_leaf.nonce += PF::from_u64_value(1);
+            } else {
+                new_leaf.balance += PF::from_u64_value(1);
+            }
+            bad[effect_start + 1 + PSY_OBJECT_FFS_SIZE_USER_LEAF..footer_start].copy_from_slice(&new_leaf.psy_ser_to_bytes_vec()?);
+            assert_backup_rejected_without_tree_changes(&fixture, &bad, "finalizer fee leaf mismatch");
+        }
+        let mut bad = raw.clone();
+        bad[36] ^= 1;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "reconstructed end root");
+        let mut bad = raw.clone();
+        bad[footer_start + 96] ^= 1;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "GUTA footer transition mismatch");
+        let mut bad = raw.clone();
+        bad[footer_start + 152] ^= 1;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "DA fee total");
+        let mut bad = raw.clone();
+        bad[76 + 32] ^= 1;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "EndCap old leaf mismatch");
+        let mut bad = raw.clone();
+        bad[76 + 64] ^= 1;
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "EndCap new leaf preimage mismatch");
+        let mut bad = raw[..effect_start].to_vec();
+        bad.push(0);
+        bad.extend_from_slice(&raw[footer_start..]);
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "missing finalizer effect for nonempty batch");
+        let mut bad = raw.clone();
+        bad.push(0);
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "footer size mismatch");
+        assert_backup_rejected_without_tree_changes(&fixture, &raw[..raw.len() - 1], "footer size mismatch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rge1_backup_accepts_complete_replay_and_rejects_missing_finalizer() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+        let raw = fixture.file_system.files.get(&fixture.backup_path).unwrap().value().clone();
+        let footer_start = raw.len() - GlobalUserTreeAggregatorHeaderWithJobId::<PF, Hash>::FIXED_SIZE;
+        let effect_start = footer_start - 1 - 2 * PSY_OBJECT_FFS_SIZE_USER_LEAF;
+        let mut legacy = raw[..effect_start].to_vec();
+        legacy[..4].copy_from_slice(&super::REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        legacy.extend_from_slice(&raw[footer_start..]);
+        assert_backup_rejected_without_tree_changes(&fixture, &legacy, "RGE1 finalizer backup is missing");
+
+        // A pre-finalizer RGE1 backup contains just the two EndCap effects.
+        let mut expected_tree = fixture.prebatch_tree.clone();
+        for bytes in fixture.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF) {
+            let leaf = PQEDUserLeaf::<PF, Hash>::psy_ser_from_slice(bytes)?;
+            if leaf.user_id != fixture.validator_leaf_before.user_id {
+                expected_tree.set_leaf(leaf.user_id.to_u64_value() - (fixture.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT), leaf.qfhash::<PoseidonHasher>());
+            }
+        }
+        let mut header = super::read_guta_header_with_job_id_from_backup_bytes::<PF, Hash>(&raw[footer_start..])?;
+        header.job_id = QProvingJobDataID::guta_two_end_cap_witness(0, fixture.realm_id_u64 as u32, 0);
+        header.header.state_transition.new_node_value = expected_tree.get_root();
+        header.header.total_aggregation_proofs_generated = PF::from_u64_value(1);
+        legacy.truncate(effect_start);
+        legacy[36..68].copy_from_slice(&expected_tree.get_root().into_owned_32bytes());
+        legacy.extend_from_slice(&super::write_guta_header_with_job_id_backup_bytes(&header)?);
+        let mut tree = fixture.prebatch_tree.clone();
+        let restored = super::read_realm_end_cap_gatherer_backup_bytes::<PoseidonHasher, Hash, PF>(
+            &legacy, &mut tree, fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, false,
+        )?;
+        assert_eq!(tree.get_root(), expected_tree.get_root());
+        assert_eq!(restored.new_realm_root, expected_tree.get_root());
+        assert_eq!(restored.update_user_leaves_ffs.len(), 2 * PSY_OBJECT_FFS_SIZE_USER_LEAF);
+        let mut bad = legacy;
+        bad[36..68].copy_from_slice(&fixture.new_realm_root.into_owned_32bytes());
+        assert_backup_rejected_without_tree_changes(&fixture, &bad, "reconstructed end root");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalizer_backup_old_leaf_read_preserves_validator_and_journal() -> anyhow::Result<()> {
+        let fixture = gather_two_user_backup().await?;
+        let raw = fixture.file_system.files.get(&fixture.backup_path).unwrap().value().clone();
+        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        for (index, hash) in fixture.prebatch_tree.get_leaves_slow_all() {
+            tree.set_leaf(index, hash);
+        }
+        let changes = tree.get_changes().clone();
+        let restored = super::read_realm_end_cap_gatherer_backup_bytes::<PoseidonHasher, Hash, PF>(
+            &raw, &mut tree, fixture.realm_id_u64,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, true,
+        )?;
+        assert_eq!(tree.get_root(), fixture.old_realm_root);
+        assert_eq!(tree.get_changes(), &changes);
+        let index = fixture.validator_leaf_before.user_id.to_u64_value() - (fixture.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        assert_eq!(tree.get_leaf_value(index), fixture.validator_leaf_before.qfhash::<PoseidonHasher>());
+        assert_eq!(restored.update_user_leaves_ffs, fixture.update_user_leaves_ffs);
+        assert_eq!(restored.new_realm_root, fixture.new_realm_root);
         Ok(())
     }
 
@@ -1988,8 +2351,8 @@ mod gatherer_builder_tests {
             Err(e) => e,
             Ok(_) => anyhow::bail!("bad magic must fail the end root reader"),
         };
-        assert!(err.to_string().contains("magic number mismatch"), "unexpected error: {err}");
-        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        assert!(err.to_string().contains("magic mismatch"), "unexpected error: {err}");
+        let mut tree = fixture.prebatch_tree.clone();
         let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
             fixture.file_system.as_ref(),
             &bad_magic_path,
@@ -2004,12 +2367,12 @@ mod gatherer_builder_tests {
             Err(e) => e,
             Ok(_) => anyhow::bail!("bad magic must fail the full reader"),
         };
-        assert!(err.to_string().contains("magic number mismatch"), "unexpected error: {err}");
+        assert!(err.to_string().contains("magic mismatch"), "unexpected error: {err}");
 
         // a file shorter than the fixed header is rejected
         let too_small_path = "backups/too_small.backup".to_string();
         fixture.file_system.files.insert(too_small_path.clone(), vec![0u8; 16]);
-        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let mut tree = fixture.prebatch_tree.clone();
         let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
             fixture.file_system.as_ref(),
             &too_small_path,
@@ -2052,7 +2415,7 @@ mod gatherer_builder_tests {
             .file_system
             .files
             .insert(truncated_path.clone(), raw[..raw.len() - footer_size].to_vec());
-        let mut tree = RecTree::new(N::REALM_GLOBAL_USER_TREE_HEIGHT);
+        let mut tree = fixture.prebatch_tree.clone();
         let err = match read_realm_end_cap_gatherer_backup_file::<PoseidonHasher, Hash, PF, _>(
             fixture.file_system.as_ref(),
             &truncated_path,
@@ -2067,7 +2430,7 @@ mod gatherer_builder_tests {
             Err(e) => e,
             Ok(_) => anyhow::bail!("truncated footer must fail"),
         };
-        assert!(err.to_string().contains("missing GUTA footer"), "unexpected error: {err}");
+        assert!(err.to_string().contains("footer size mismatch"), "unexpected error: {err}");
 
         // a path that was never written simply fails to open
         assert!(

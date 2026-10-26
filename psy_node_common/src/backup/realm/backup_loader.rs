@@ -87,13 +87,13 @@ mod tests {
         protocol::core_types::{QNetworkTreeConstants, Q256BitHash},
         PHash, PF,
     };
-    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
     use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId, node::realm_processor::RealmProcessorCoreState};
     use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
-    use psy_serialize::PsyCanonicalSerializeMetadata;
+    use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
 
     use crate::realm::processor::gatherers::realm_end_cap_gatherer::{
         get_new_realm_end_cap_gatherer_backup_file_path,
+        RealmGUTAEndCapGathererOutputDatabase,
         REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
     };
     use crate::test_common::TestNetworkConfig;
@@ -131,18 +131,8 @@ mod tests {
     /// GUTA footer in the on-disk layout parsed by
     /// `read_guta_header_with_job_id_from_backup_bytes`.
     fn footer_bytes() -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::FIXED_SIZE);
-        for i in 70..74u64 {
-            bytes.extend_from_slice(&h(i).into_owned_32bytes());
-        }
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // node_index
-        bytes.extend_from_slice(&2u64.to_le_bytes()); // node_level
-        for i in 3..8u64 {
-            bytes.extend_from_slice(&i.to_le_bytes()); // stats
-        }
-        bytes.extend_from_slice(&11u64.to_le_bytes()); // total aggregation proofs
-        let job_id = QProvingJobDataID::new_proof_job_id(9, 1, ProvingJobCircuitType::GUTATwoEndCap, 0, 0);
-        bytes.extend_from_slice(&job_id.to_fixed_bytes());
+        let bytes = RealmGUTAEndCapGathererOutputDatabase::<PF, Hash>::get_empty(zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize))
+            .guta_header.psy_ser_to_bytes_vec().expect("empty GUTA footer must serialize");
         assert_eq!(bytes.len(), GlobalUserTreeAggregatorHeaderWithJobId::<PF, PHash>::FIXED_SIZE);
         bytes
     }
@@ -171,7 +161,8 @@ mod tests {
     async fn regenerates_realm_output_from_an_empty_end_cap_backup() -> anyhow::Result<()> {
         let fs = Fs::new();
         let state = realm_state();
-        fs.files.insert(backup_path(17), end_cap_backup_bytes(zh(20), h(80)));
+        let root = zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize);
+        fs.files.insert(backup_path(17), end_cap_backup_bytes(root, root));
 
         let mut tree = fresh_tree();
         let updates =
@@ -183,7 +174,7 @@ mod tests {
         assert_eq!(updates.unique_pending_id, state.processing_unique_pending_id);
         assert_eq!(updates.proc_checkpoint_unique_id, state.processing_proc_checkpoint_unique_id);
         assert_eq!(updates.old_realm_root, zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize));
-        assert_eq!(updates.new_realm_root, h(80));
+        assert_eq!(updates.new_realm_root, root);
         // zero end caps: no node updates are emitted
         assert!(updates.update_global_user_tree_nodes_ffs.is_empty());
         assert!(updates.update_user_contract_tree_nodes_ffs.is_empty());
@@ -200,12 +191,15 @@ mod tests {
         let fs = Fs::new();
         let state = realm_state();
         // only the backup for pending id 88 exists
-        fs.files.insert(backup_path(88), end_cap_backup_bytes(zh(20), h(81)));
+        let root = zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize);
+        fs.files.insert(backup_path(88), end_cap_backup_bytes(root, root));
 
         let mut tree = fresh_tree();
         let updates = generate_realm_output_from_backups::<N, Fs>(&fs, "guta", &state, Some(88), &mut tree).await?;
         assert_eq!(updates.unique_pending_id, 88);
-        assert_eq!(updates.new_realm_root, h(81));
+        assert_eq!(updates.old_realm_root, root);
+        assert_eq!(updates.new_realm_root, root);
+        assert_eq!(tree.get_root(), root);
 
         // restoring without the matching file for the state's pending id fails
         let err = generate_realm_output_from_backups::<N, Fs>(&fs, "guta", &state, None, &mut tree)
@@ -232,12 +226,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fails_when_empty_backup_advertises_an_unreconstructed_end_root() -> anyhow::Result<()> {
+        let fs = Fs::new();
+        let state = realm_state();
+        let mut tree = fresh_tree();
+        let root = tree.get_root();
+        fs.files.insert(backup_path(17), end_cap_backup_bytes(root, h(80)));
+
+        let err = generate_realm_output_from_backups::<N, Fs>(&fs, "guta", &state, None, &mut tree)
+            .await.err().expect("an empty backup cannot change the realm root");
+        assert!(err.to_string().contains("reconstructed end root"), "unexpected error: {err}");
+        assert_eq!(tree.get_root(), root);
+        assert!(tree.get_changes().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fails_on_bad_magic_and_truncated_files() -> anyhow::Result<()> {
         let fs = Fs::new();
         let state = realm_state();
 
         // wrong magic
-        let mut bad_magic = end_cap_backup_bytes(zh(20), h(80));
+        let root = zh(N::REALM_GLOBAL_USER_TREE_HEIGHT as usize);
+        let mut bad_magic = end_cap_backup_bytes(root, root);
         bad_magic[0] ^= 0xFF;
         fs.files.insert(backup_path(17), bad_magic);
         let mut tree = fresh_tree();

@@ -103,6 +103,26 @@ FastForward remains the follower path for applying an included proposal; it is s
 
 The tree runner does not retain raw cycle items for replay. FastForward applies the included updates before constructing a replacement builder; speculative inputs are not replayed. Items fetched from the retired queue after finalize are discarded with a warning. Future-checkpoint EndCaps remain owned by `future_pending_end_cap_jobs`; the lossy raw-input policy does not authorize dropping confirmed FFS.
 
+### 3.2 Validator fee recovery
+
+New EndCap backups use `RGE2`. They retain the RGE1 header and EndCap records,
+then add the finalizer effect before the GUTA footer: tag 0 for an empty batch,
+or tag 1 followed by the validator account's pre-fee and post-fee user leaves.
+The effect is written before the existing backup flush/sync boundary.
+
+Recovery replays the EndCaps, checks their leaf preimages, then applies the
+validator DA-fee credit and includes its final leaf in the recovered FFS. It
+checks the fee total, finalizer job identity, footer transition, and reconstructed
+end root. The caller must still authenticate that root against the included
+Coordinator transition before committing. Failed decoding restores the caller's
+tree journal; an old-leaf read validates the forward transition but restores the
+prebatch tree.
+
+Complete legacy RGE1 backups remain readable. An RGE1 circuit-63 finalizer
+backup lacks the fee effect and is rejected rather than treated as successful
+recovery. Old binaries do not understand RGE2; do not roll back a validator to
+an RGE1-only binary while relying on new backups for recovery.
+
 ## 4. Coordinator gatherers
 
 **Register user.** Deserialize 64 bytes (fingerprint + param), set the next leaf in `user_registration_tree`, append FFS public-key bytes, increment `next_user_id`.
