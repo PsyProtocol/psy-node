@@ -1284,7 +1284,7 @@ mod event_candidate_identity_tests {
     #[test]
     fn append_event_owned_by_the_bridge_user_decodes() {
         let candidate = decode_event(u64::from(WITHDRAWAL_CONTRACT), APPEND_METHODS[0], BRIDGE_USER_ID, 5, Hash4::ZERO, &felt_words(&append_words())).unwrap().expect("append candidate");
-        match candidate.kind {
+        match candidate {
             CandidateKind::Append { chain, index, .. } => assert_eq!((chain, index), (1, 0)),
             CandidateKind::Burn { .. } => panic!("append event decoded as burn"),
         }
@@ -1324,6 +1324,6 @@ mod preimage_canonicality_tests {
     #[test]
     fn canonical_node_hash_round_trips_through_both_domains() {
         let hash = words_to_hash(&[7, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-        assert_eq!(hash4(node_hash(hash)).unwrap(), hash);
+        assert_eq!(hash4(node_hash(hash).unwrap()).unwrap(), hash);
     }
 }
