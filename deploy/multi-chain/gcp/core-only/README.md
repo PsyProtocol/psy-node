@@ -271,3 +271,64 @@ Keep wallet, Faucet, Services/indexers and Bridge exposure disabled until their
 matching artifacts are ready. The subsequent L1/Bridge rollout is a **fresh
 deployment**: old contract addresses and old Groth16 setup are not inputs to it.
 Guardian signing keys remain reusable and are not regenerated for that rollout.
+
+### Fresh Bridge Placement And Startup Order (2026-10-26)
+
+The operator selected separate offsite proof roles for this new chain:
+
+| Host | Role | Candidate private listener |
+| --- | --- | --- |
+| `<system-host>` | System only, one CPU instance | `<system-private-ip>:9998` |
+| `<user-host>` | User only, one CPU instance | `<user-private-ip>:9999` |
+
+These are the intended backend listeners, not an assertion that routing or
+services have already been enabled. Do not provision the previously proposed
+cloud System host, start User on the System host, or inherit old `parth-*`
+service drop-ins. Do not alter the self-hosted L1 clients on the System host.
+Existing WireGuard ingress must be inspected before any routing change; the
+System host is not the assumed balancer. Resolve these role placeholders from
+the operator's private deployment inventory.
+
+Start with a pinned testnet Relayer/User CLI build and an isolated new Groth16
+setup root. Generate and verify the bridge aggregation, deposit append,
+withdrawal claim and reward claim cohorts, then export their matching Solidity
+verifiers. System loads all four cohorts; User does not need these setup files.
+Neither an old setup manifest nor a successful binary build establishes
+compatibility with the new circuits.
+
+Before L1 deployment, run the parser/negative-control tests and the four-cohort
+EVM checker from the repository root:
+
+```sh
+node --test deploy/multi-chain/gcp/core-only/test_verify_bridge_setup.cjs
+node deploy/multi-chain/gcp/core-only/verify_bridge_setup.cjs "<contracts-dir>" "<setup-dir>"
+```
+
+Use the prepared contracts checkout with its locked dependencies installed and
+its Hardhat network configured without forking. The checker compiles contracts
+and deploys only to its in-process Hardhat network (chain ID 31337). Each exported
+Solidity file in the setup root must byte-match `src/` in that checkout. Retain
+one generator log per cohort as `<cohort>.log`, with the successful native
+verification marker and exactly one `proofString` record from that same run.
+Require exit code zero and all four cohort results: the real proof succeeds,
+and both the changed input and changed proof revert with `ProofInvalid`.
+`verifyProof` succeeds without a return value; it is not a boolean API. Preserve
+the checker output and matching setup/verifier hashes. Parser tests alone do
+not satisfy this gate; offline acceptance does not approve deployment or mark
+services as running.
+
+Deploy fresh L1 contracts on Sepolia, BSC Testnet and Base Sepolia **before
+starting normal Relayer operation**. Preserve each chain's deployment document,
+deployment receipts, chain ID/index, roles and verifier hashes. Do not reuse
+old Bridge addresses or reset the already running L2. After deployment, wire
+the exact documents into Guardians, Envio, Services and Relayer. Validate the
+proof services and retained Guardian identities, then enable indexing/Services
+and finally Relayer. Require real checkpoint settlement and bridge-flow
+acceptance before calling the bridge ready.
+
+The `write-relayer-config.sh` private-key model is not a valid Guardian
+configuration. The new daemon needs `guardian_root`, the correct RPC config,
+a configured `system_prove_proxy_url`, and fresh Services/Envio data. Guardian
+startup uses the retained Genesis membership; do not register/bootstrap a
+second policy or regenerate signing keys. The whole fresh-deployment runner
+must not be rerun after core startup, because its initial steps stop/reset data.
