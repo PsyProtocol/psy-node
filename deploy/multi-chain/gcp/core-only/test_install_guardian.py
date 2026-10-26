@@ -54,7 +54,7 @@ class InstallTests(unittest.TestCase):
         canonical = self.input("canonical.json", self.canonical)
         build = {"source_commit": installer.RUNTIME_SOURCE, "network": "testnet",
                  "config_sha256": canonical["sha256"], "binaries": {"psy_relayer_cli": installer.digest(binary)}}
-        self.spec = {"version": 2, "guardian_id": 1, "hostname": "guardian.example", "address": ADDRESS,
+        self.spec = {"version": 3, "guardian_id": 1, "hostname": "guardian.example", "address": ADDRESS,
                      "guardian_history": copy.deepcopy(self.history),
                      "proof_origins": {field: copy.deepcopy(self.rpc["networks"]["testnet"][field])
                                        for field in ("prove_proxy_url", "system_prove_proxy_url")},
@@ -143,7 +143,7 @@ class InstallTests(unittest.TestCase):
         self.spec["version"] = 1
         with self.assertRaisesRegex(ValueError, "version"):
             installer.load_plan(self.spec_path, self.save())
-        self.spec["version"] = 2
+        self.spec["version"] = 3
         del self.spec["guardian_history"]
         with self.assertRaisesRegex(ValueError, "fields"):
             installer.load_plan(self.spec_path, self.save())
@@ -306,7 +306,7 @@ class InstallTests(unittest.TestCase):
             self.assertIn(f"/guardian-{guardian_id}/psy-guardian-{guardian_id}-password.cred", text)
             self.assertIn(f"ReadWritePaths={installer.STATES}/guardian-{guardian_id}/db\n", text)
             self.assertIn("ProtectSystem=strict", text)
-            self.assertNotIn("WantedBy=", text)
+            self.assertIn("WantedBy=multi-user.target", text)
             self.assertNotIn("KEYSTORE_PASSWORD=", text)
 
     def test_install_uses_frozen_bytes_and_copies_only_assigned_key(self):
@@ -322,6 +322,8 @@ class InstallTests(unittest.TestCase):
             Path(self.spec["binary"]["path"]).write_bytes(b"changed-after-validation")
             return account, self.key
 
+        old_unit = installer.UNITS / "psy-guardian-1.service"
+        old_unit.write_bytes(b"retained old unit")
         with patch.object(installer, "host_checks", side_effect=checked), \
                 patch.object(installer.os, "fchown"), patch.object(installer, "command") as command:
             result = installer.run("install", self.spec_path, self.save(), apply=True)
@@ -335,6 +337,8 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((keys / "guardian-1.keystore.json").stat().st_mode), 0o600)
         self.assertFalse(result["started"] or result["enabled"])
+        self.assertEqual(old_unit.read_bytes(), b"retained old unit")
+        self.assertEqual((installer.UNITS / "psy-guardian-r2-1.service").read_bytes(), installer.unit(self.spec))
 
     def test_atomic_write_refuses_existing_target_and_cleans_owned_temporary(self):
         target = self.root / "existing"
@@ -370,6 +374,8 @@ class InstallTests(unittest.TestCase):
             if argv[0] == "systemctl":
                 if argv[1] == "--version":
                     return "systemd 252"
+                if argv[1] == "show" and argv[2] == "psy-guardian-1.service" and state["show"] == "LoadState=not-found\n":
+                    return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return state["show" if argv[1] == "show" else "jobs"]
             return outputs[argv[0]]
 
@@ -420,6 +426,73 @@ class InstallTests(unittest.TestCase):
         host.assert_called_once()
         write.assert_not_called()
         command.assert_not_called()
+
+    def test_r2_rejects_old_schema_and_uses_fresh_state(self):
+        self.spec["version"] = 2
+        with self.assertRaisesRegex(ValueError, "version"):
+            installer.load_plan(self.spec_path, self.save())
+        self.assertTrue(str(installer.RELEASES).endswith("-r2"))
+        self.assertTrue(str(installer.STATES).endswith("-r2"))
+
+    def test_retained_unit_must_be_loaded_inactive_disabled_without_jobs(self):
+        names = ("old.service", "new.service")
+        good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
+        for output in ("LoadState=not-found\n", good.replace("disabled", "enabled"),
+                       good.replace("disabled", "masked"), good.replace("disabled", "static"),
+                       good.replace("inactive", "active"), good.replace("MainPID=0", "MainPID=42"),
+                       good.replace("LoadState=loaded", "LoadState=error")):
+            with self.subTest(output=output), patch.object(installer, "command", return_value=output):
+                with self.assertRaises(ValueError):
+                    installer.inactive_units(names, {"old.service"})
+        def command(argv):
+            if argv[1] == "show":
+                return good if argv[2] == "old.service" else "LoadState=not-found\n"
+            return ""
+        with patch.object(installer, "command", side_effect=command):
+            installer.inactive_units(names, {"old.service"})
+        for name in names:
+            with patch.object(installer, "command", side_effect=[good, "LoadState=not-found\n", f"1 {name} start waiting"]):
+                with self.assertRaisesRegex(ValueError, "job queued"):
+                    installer.inactive_units(names, {"old.service"})
+
+    def test_static_guardian_requires_listed_scope_and_no_enablement(self):
+        name = "psy-guardian-1.service"
+        good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=static\n"
+        with patch.object(installer, "command", side_effect=[good, ""]), \
+                patch.object(installer, "static_guardian_unlinked") as check:
+            installer.inactive_units([name], {name}, {name})
+            check.assert_called_once_with(name)
+        with patch.object(installer, "command", return_value=good), \
+                patch.object(installer, "static_guardian_unlinked") as check:
+            with self.assertRaises(ValueError):
+                installer.inactive_units([name], {name})
+            check.assert_not_called()
+        with self.assertRaises(ValueError):
+            installer.static_guardian_unlinked("psy-core-relayer.service")
+        unit_root = self.root / "units"
+        unit_root.mkdir()
+        (unit_root / name).write_bytes(b"[Service]\nExecStart=/bin/true\n")
+        wanted = unit_root / "multi-user.target.wants"
+        wanted.mkdir()
+        details = f"FragmentPath={unit_root / name}\nDropInPaths=\nNames={name}\n"
+        def command(argv):
+            return details if argv[0] == "systemctl" else str(unit_root)
+        with patch.object(installer, "UNITS", unit_root), patch.object(installer, "command", side_effect=command):
+            installer.static_guardian_unlinked(name)
+            for link in (wanted / name, unit_root / "alias.service"):
+                link.symlink_to(unit_root / name)
+                with self.assertRaisesRegex(ValueError, "enablement or alias"):
+                    installer.static_guardian_unlinked(name)
+                link.unlink()
+            for changed in (details.replace("DropInPaths=", "DropInPaths=/unapproved.conf"),
+                            details.replace(f"Names={name}", f"Names={name} alias.service"),
+                            details.replace(f"FragmentPath={unit_root / name}", "FragmentPath=/wrong.service")):
+                with patch.object(installer, "command", return_value=changed), self.assertRaises(ValueError):
+                    installer.static_guardian_unlinked(name)
+        with patch.object(installer, "command", side_effect=[good, f"1 {name} start waiting"]), \
+                patch.object(installer, "static_guardian_unlinked"):
+            with self.assertRaisesRegex(ValueError, "job queued"):
+                installer.inactive_units([name], {name}, {name})
 
 
 class WrapperTests(unittest.TestCase):

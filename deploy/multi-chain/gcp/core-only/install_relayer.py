@@ -6,7 +6,7 @@ before executing the shared checked filesystem helpers.
 Commands: plan|check-host|install --spec <absolute-json> --spec-sha256 <sha256>.
 Only install accepts and requires --apply. An empty l1_documents permits plan only.
 
-Requires Python 3.11+. Operator JSON fields: version=2, hostname, address,
+Requires Python 3.11+. Operator JSON fields: version=3, hostname, address,
 guardian_history={listen_address, rpc_url}, service_user=psy-core-relayer,
 memory_high_gib, memory_max_gib, keystore_owner, build, binary, canonical_config,
 rpc_config, daemon_config, wrapper, l1_keystore, password_credential, l1_documents.
@@ -30,6 +30,8 @@ existing history cannot be changed. Genesis commitments and build bytes stay fix
 The encrypted credential must be made on this host with the helper's fixed name.
 Before activation, verify /usr/bin/python3 and its resolved executable are
 root-owned, executable and not group/other-writable on the target host.
+R2 uses a new unit/release/state and copies the existing encrypted credential.
+The old psy-core-relayer.service must exist, be inactive with PID zero and disabled.
 """
 
 import argparse
@@ -57,16 +59,16 @@ try:
     _helper_bytes = _helper.read_bytes()
 except OSError:
     raise SystemExit("Reviewed install_guardian.py sibling required") from None
-if hashlib.sha256(_helper_bytes).hexdigest() != "74e5d9da7d6b4aaca0cc4d2da1dc1881c1f98aec6e9380e0e9bc086f64ba6c78":
+if hashlib.sha256(_helper_bytes).hexdigest() != "21e71a5ec1c48c7b8ce32ae4f85c6c4cbf046fbae94e45f392603221133d283c":
     raise SystemExit("Reviewed install_guardian.py sibling hash mismatch")
 g = types.ModuleType("guardian_install_files")
 g.__file__ = str(_helper)
 exec(compile(_helper_bytes, str(_helper), "exec"), g.__dict__)
-RELEASE = Path("/opt/psy-core-relayer/releases/core-testnet-20261026")
-STATE = Path("/var/lib/psy-core-relayer/core-testnet-20261026")
-CREDENTIALS = Path("/etc/psy-core-relayer/core-testnet-20261026")
+RELEASE = Path("/opt/psy-core-relayer/releases/core-testnet-20261026-r2")
+STATE = Path("/var/lib/psy-core-relayer/core-testnet-20261026-r2")
+CREDENTIALS = Path("/etc/psy-core-relayer/core-testnet-20261026-r2")
 UNITS = Path("/etc/systemd/system")
-UNIT = "psy-core-relayer.service"
+UNIT = "psy-core-relayer-r2.service"
 USER = "psy-core-relayer"
 PASSWORD_ENV = "PSY_CORE_RELAYER_L1_PASSWORD"
 CREDENTIAL = "psy-core-relayer-l1-password"
@@ -199,7 +201,7 @@ def load_plan(spec_path, spec_hash):
     g.require(set(spec) == {"version", "hostname", "address", "guardian_history", "service_user", "memory_high_gib", "memory_max_gib",
         "keystore_owner", "build", "binary", "canonical_config", "rpc_config", "daemon_config", "wrapper",
         "l1_keystore", "password_credential", "l1_documents"}, "operator spec fields mismatch")
-    integer(spec["version"], 2, 2)
+    integer(spec["version"], 3, 3)
     g.require(isinstance(spec["hostname"], str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", spec["hostname"]), "invalid hostname")
     g.private_ip(spec["address"])
     g.require(spec["service_user"] == USER, "dedicated non-root service account required")
@@ -295,14 +297,8 @@ def host_checks(spec, port):
     account = pwd.getpwnam(USER)
     g.require(account.pw_uid > 0 and account.pw_gid > 0 and grp.getgrnam(USER).gr_gid == account.pw_gid, "dedicated non-root user/group required")
     g.require(int(g.command(["systemctl", "--version"]).split()[1]) >= 250, "systemd 250+ required")
-    for name in (UNIT, "parth-bridge-relayer.service", "parth-relayer.service"):
-        values = dict(line.split("=", 1) for line in g.command([
-            "systemctl", "show", name, "--property=LoadState,ActiveState,UnitFileState,MainPID"]).splitlines() if "=" in line)
-        g.require(values.get("LoadState") == "not-found" or (values.get("ActiveState") == "inactive"
-                  and values.get("MainPID") == "0" and values.get("UnitFileState") in ("disabled", "masked")), "Relayer unit active or enabled")
-    jobs = g.command(["systemctl", "list-jobs", "--no-legend", "--no-pager"])
-    g.require(not any(len(row) > 1 and row[1] in (UNIT, "parth-bridge-relayer.service", "parth-relayer.service")
-                      for row in map(str.split, jobs.splitlines())), "Relayer job queued")
+    g.inactive_units((UNIT, "psy-core-relayer.service", "parth-bridge-relayer.service", "parth-relayer.service"),
+                     {"psy-core-relayer.service"})
     g.require(not any(len(row) > 3 and row[3].rsplit(":", 1)[-1] == str(port)
                       for row in map(str.split, g.command(["ss", "-H", "-ltn"]).splitlines())), "history port occupied")
     for path in (RELEASE, STATE, CREDENTIALS):
@@ -314,7 +310,7 @@ def host_checks(spec, port):
     paths = g.command(["systemd-analyze", "unit-paths"]).splitlines()
     g.require(str(UNITS) in paths, "unit search paths invalid")
     for root in paths:
-        for name in (UNIT, "psy-core-.service", "psy-.service", "service"):
+        for name in (UNIT, "psy-core-relayer-.service", "psy-core-.service", "psy-.service", "service"):
             g.require(not any(os.path.lexists(g.path_value(root) / (name + suffix)) for suffix in ("", ".d")), "existing unit or inherited drop-in")
     for parent in (UNITS, *UNITS.parents):
         g.trusted_directory(parent)

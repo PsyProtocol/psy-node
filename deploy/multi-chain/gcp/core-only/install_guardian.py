@@ -7,7 +7,7 @@ it never enables/starts/stops services, generates keys, migrates DBs or uses SSH
 Failures after writes retain the partial destination for operator inspection.
 
 The operator-owned private JSON has exactly these fields:
-version: 2; guardian_id: 1..3; hostname; address (private IPv4);
+version: 3; guardian_id: 1..3; hostname; address (private IPv4);
 guardian_history: {listen_address, rpc_url}, explicitly approved private HTTP origin;
 proof_origins: {prove_proxy_url: [origins], system_prove_proxy_url: [origins]};
 service_user: psy-guardian-N (must already exist, non-root);
@@ -31,6 +31,10 @@ Pending documents permit plan only. Real RPC/proof/membership acceptance and
 any service activation remain separate operator gates, even after installation.
 Before activation, confirm /usr/bin/python3 and its resolved executable are
 root-owned, executable and not group/other-writable on the target host.
+R2 uses new units/releases/state; retained units and custody are never changed.
+The assigned old Guardian must exist and be inactive with PID zero. A disabled
+unit is accepted; a static old Guardian additionally needs no aliases, drop-ins,
+enablement symlinks or queued jobs. This exception never applies to r2/Relayer.
 """
 
 import argparse
@@ -49,13 +53,13 @@ import subprocess
 from urllib.parse import urlsplit
 
 
-RUNTIME_SOURCE = "da6391549e44d49c07e856eaeb5d0b8d7902ef17"
+RUNTIME_SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 KEY_SOURCE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-BUILD_HASH = "c480d96f72a26be0269f777453153d46bb5d20e9f29edaf15580716152fa6d5b"
+BUILD_HASH = "da174adeccef81c312e1f2eb1e6a136b53fb8a68f6e9f5b39510c6c1305133bf"
 MAGIC = "0x1337CF514544CF69"
 CUSTODY = Path("/var/lib/psy-guardian-custody")
-RELEASES = Path("/opt/psy-guardian/releases/core-testnet-20261026")
-STATES = Path("/var/lib/psy-guardian/core-testnet-20261026")
+RELEASES = Path("/opt/psy-guardian/releases/core-testnet-20261026-r2")
+STATES = Path("/var/lib/psy-guardian/core-testnet-20261026-r2")
 UNITS = Path("/etc/systemd/system")
 CHAINS = {"sepolia": (0, 11155111), "bscTestnet": (1, 97), "baseSepolia": (2, 84532)}
 
@@ -258,7 +262,7 @@ def load_plan(spec_path, spec_hash):
                           "build", "binary", "canonical_config", "rpc_config", "wrapper", "l1_documents"},
             "operator spec fields mismatch")
     guardian_id = spec["guardian_id"]
-    require(type(spec["version"]) is int and spec["version"] == 2
+    require(type(spec["version"]) is int and spec["version"] == 3
             and type(guardian_id) is int and guardian_id in (1, 2, 3), "invalid version or Guardian ID")
     require(isinstance(spec["hostname"], str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", spec["hostname"]),
             "invalid hostname")
@@ -304,7 +308,7 @@ def unit(spec):
         "CapabilityBoundingSet=", "RestrictSUIDSGID=true", "LimitCORE=0", "LimitNOFILE=65536",
         f"MemoryHigh={spec['memory_high_gib']}G", f"MemoryMax={spec['memory_max_gib']}G",
         "Restart=on-failure", "RestartSec=15", "TimeoutStopSec=300",
-        "StandardOutput=journal", "StandardError=journal", "",
+        "StandardOutput=journal", "StandardError=journal", "", "[Install]", "WantedBy=multi-user.target", "",
     ])).encode()
 
 
@@ -326,6 +330,48 @@ def trusted_directory(path, private=False):
         os.close(fd)
 
 
+def static_guardian_unlinked(name):
+    require(re.fullmatch(r"psy-guardian-[123]\.service", name), "static exception is old Guardian only")
+    values = dict(line.split("=", 1) for line in command([
+        "systemctl", "show", name, "--property=FragmentPath,DropInPaths,Names"]).splitlines() if "=" in line)
+    require(values.get("FragmentPath") == str(UNITS / name) and values.get("DropInPaths") == ""
+            and values.get("Names", "").split() == [name], "static Guardian fragment, drop-in or alias mismatch")
+    paths = command(["systemd-analyze", "unit-paths"]).splitlines()
+    require(str(UNITS) in paths, "unit search paths invalid")
+    def failed(_):
+        raise ValueError("cannot inspect unit enablement paths")
+    for root in paths:
+        path = path_value(root)
+        if not os.path.lexists(path):
+            continue
+        require(path.is_dir(), "unit search root is not a directory")
+        for parent, directories, files in os.walk(path, followlinks=False, onerror=failed):
+            for entry in directories + files:
+                link = Path(parent) / entry
+                if not link.is_symlink():
+                    continue
+                require(not (entry.endswith((".wants", ".requires", ".upholds")) and link.is_dir()),
+                        "symlinked enablement directory requires operator inspection")
+                require(link.resolve().name != name and entry != name, "static Guardian enablement or alias symlink")
+
+
+def inactive_units(names, required, static_guardians=()):
+    for name in names:
+        output = command(["systemctl", "show", name,
+                          "--property=LoadState,ActiveState,UnitFileState,MainPID"])
+        values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        static = values.get("UnitFileState") == "static" and name in static_guardians
+        require((name not in required and values.get("LoadState") == "not-found") or
+                (values.get("LoadState") == "loaded" and values.get("ActiveState") == "inactive"
+                 and values.get("MainPID") == "0" and (values.get("UnitFileState") == "disabled" or static)),
+                "unit active or enabled, missing retained unit, or not strictly disabled")
+        if static:
+            static_guardian_unlinked(name)
+    jobs = command(["systemctl", "list-jobs", "--no-legend", "--no-pager"])
+    require(not any(len(row) > 1 and row[1] in names for row in map(str.split, jobs.splitlines())),
+            "unit job queued")
+
+
 def host_checks(spec, network, port):
     require(os.geteuid() == 0, "host checks require root")
     require(socket.gethostname() == spec["hostname"] and os.uname().machine == "x86_64", "wrong host")
@@ -336,14 +382,9 @@ def host_checks(spec, network, port):
             and grp.getgrnam(spec["service_user"]).gr_gid == account.pw_gid,
             "dedicated non-root account/group required")
     require(int(command(["systemctl", "--version"]).split()[1]) >= 250, "systemd 250+ required")
-    for guardian_id in (1, 2, 3):
-        output = command(["systemctl", "show", f"psy-guardian-{guardian_id}.service",
-                          "--property=LoadState,ActiveState,UnitFileState,MainPID"])
-        values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-        require(values.get("LoadState") == "not-found" or
-                (values.get("ActiveState") == "inactive" and values.get("MainPID") == "0"
-                 and values.get("UnitFileState") in ("disabled", "masked")), "Guardian unit active or enabled")
-    require("guardian" not in command(["systemctl", "list-jobs", "--no-legend", "--no-pager"]).lower(), "Guardian job queued")
+    inactive_units([f"psy-guardian-{generation}{i}.service" for generation in ("", "r2-") for i in (1, 2, 3)],
+                   {f"psy-guardian-{spec['guardian_id']}.service"},
+                   {f"psy-guardian-{i}.service" for i in (1, 2, 3)})
     require(not any(len(row) > 3 and row[3].rsplit(":", 1)[-1] == str(port)
                     for row in map(str.split, command(["ss", "-H", "-ltn"]).splitlines())), "Guardian port occupied")
     guardian_id = spec["guardian_id"]
@@ -373,7 +414,8 @@ def host_checks(spec, network, port):
     unit_paths = command(["systemd-analyze", "unit-paths"]).splitlines()
     require(str(UNITS) in unit_paths, "unit search paths invalid")
     for root in unit_paths:
-        for unit_name in (f"psy-guardian-{guardian_id}.service", "psy-guardian-.service", "psy-.service", "service"):
+        for unit_name in (f"psy-guardian-r2-{guardian_id}.service", "psy-guardian-r2-.service",
+                          "psy-guardian-.service", "psy-.service", "service"):
             for suffix in ("", ".d"):
                 require(not os.path.lexists(path_value(root) / (unit_name + suffix)), "existing unit or inherited drop-in")
     for parent in (UNITS, *UNITS.parents):
@@ -442,7 +484,7 @@ def run(mode, spec_path, spec_hash, apply=False):
                       (0o755 if name == "psy_relayer_cli" else 0o644))
             write(release / f"home/.psy/keystore/guardian-{spec['guardian_id']}.keystore.json", key,
                   uid=account.pw_uid, gid=account.pw_gid)
-            write(UNITS / f"psy-guardian-{spec['guardian_id']}.service", unit(spec), mode=0o644)
+            write(UNITS / f"psy-guardian-r2-{spec['guardian_id']}.service", unit(spec), mode=0o644)
             command(["systemctl", "daemon-reload"])
     return {"guardian_id": spec["guardian_id"], "mode": mode, "runtime_source": RUNTIME_SOURCE,
             "key_source": KEY_SOURCE, "l1_documents_pending": pending, "started": False,

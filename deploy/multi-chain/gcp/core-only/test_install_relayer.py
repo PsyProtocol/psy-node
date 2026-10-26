@@ -59,7 +59,7 @@ class InstallTests(unittest.TestCase):
         binary = b"\x7fELF\x02\x01" + b"\0" * 12 + b"\x3e\x00" + b"synthetic"
         build = {"source_commit": installer.g.RUNTIME_SOURCE, "network": "testnet",
                  "config_sha256": canonical["sha256"], "binaries": {"psy_relayer_cli": installer.g.digest(binary)}}
-        self.spec = {"version": 2, "hostname": "relayer.example", "address": ADDRESS,
+        self.spec = {"version": 3, "hostname": "relayer.example", "address": ADDRESS,
                      "guardian_history": copy.deepcopy(self.network["guardian_history"]),
                      "service_user": installer.USER, "memory_high_gib": 4, "memory_max_gib": 6,
                      "keystore_owner": "custodian", "build": self.input("build.json", build),
@@ -226,7 +226,7 @@ class InstallTests(unittest.TestCase):
         self.spec["version"] = 1
         with self.assertRaises(ValueError):
             installer.load_plan(self.spec_path, self.save())
-        self.spec["version"] = 2
+        self.spec["version"] = 3
         del self.spec["guardian_history"]
         with self.assertRaises(ValueError):
             installer.load_plan(self.spec_path, self.save())
@@ -323,6 +323,8 @@ class InstallTests(unittest.TestCase):
             Path(self.spec["binary"]["path"]).write_bytes(b"changed-after-plan")
             return account, key, credential
 
+        old_unit = installer.UNITS / "psy-core-relayer.service"
+        old_unit.write_bytes(b"retained old Relayer unit")
         with patch.object(installer, "host_checks", side_effect=checked), patch.object(installer.g.os, "fchown"), \
                 patch.object(installer.g, "command") as command:
             result = installer.run("install", self.spec_path, self.save(), True)
@@ -336,6 +338,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertFalse((installer.STATE / "db/relayer.redb").exists())
         self.assertFalse(result["started"] or result["enabled"])
+        self.assertEqual(old_unit.read_bytes(), b"retained old Relayer unit")
         with patch.object(installer.g.os, "fchown"), self.assertRaises(FileExistsError):
             installer.g.write(installer.UNITS / installer.UNIT, b"replacement")
 
@@ -360,6 +363,8 @@ class InstallTests(unittest.TestCase):
             if argv == ["systemctl", "--version"]:
                 return "systemd 255"
             if argv[:2] == ["systemctl", "show"]:
+                if argv[2] == "psy-core-relayer.service":
+                    return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return "LoadState=not-found\n"
             if argv[:2] == ["systemctl", "list-jobs"]:
                 return ""
@@ -407,6 +412,8 @@ class InstallTests(unittest.TestCase):
             if argv == ["systemctl", "--version"]:
                 return "systemd 255"
             if argv[:2] == ["systemctl", "show"]:
+                if argv[2] == "psy-core-relayer.service" and host_state["unit"].strip() == "LoadState=not-found":
+                    return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return host_state["unit"]
             if argv[:2] == ["systemctl", "list-jobs"]:
                 return host_state["jobs"]
@@ -425,7 +432,7 @@ class InstallTests(unittest.TestCase):
             self.root.chmod(0o755)
             actual, actual_key, actual_credential = installer.host_checks(self.spec, 9700)
             self.assertEqual((actual, actual_key, actual_credential), (service, key, credential))
-            for active, enabled in (("active", "disabled"), ("inactive", "enabled")):
+            for active, enabled in (("active", "disabled"), ("inactive", "enabled"), ("inactive", "masked"), ("inactive", "static")):
                 host_state["unit"] = f"LoadState=loaded\nActiveState={active}\nUnitFileState={enabled}\nMainPID=0\n"
                 with self.assertRaisesRegex(ValueError, "unit active or enabled"):
                     installer.host_checks(self.spec, 9700)
