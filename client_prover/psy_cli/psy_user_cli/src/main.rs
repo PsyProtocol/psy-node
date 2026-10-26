@@ -3,6 +3,11 @@ mod error;
 mod result;
 mod subcommand;
 
+// Avoid glibc arena retention across short-lived native proving threads.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(not(target_arch = "wasm32"))]
 use shadow_rs::shadow;
 
