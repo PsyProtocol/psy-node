@@ -32,15 +32,24 @@ class WorkerPreparationTests(unittest.TestCase):
             "whitelist": {"enabled": True, "secp256k1": list(set(workers.PUBLIC_KEYS.values()))}}}})
         self.stack.enter_context(patch.object(workers, "WORKER_SHA256", workers.digest(self.binary)))
         self.stack.enter_context(patch.object(workers, "CONFIG_SHA256", workers.digest(self.config)))
-        self.build = {"source_commit": workers.SOURCE, "network": "testnet", "cli_network": "psy-public-testnet",
-                      "backend": "plonky2-poseidon-goldilocks", "config_sha256": workers.CONFIG_SHA256,
+        self.build = {"source_commit": workers.SOURCE, "network": "testnet", "network_magic": "0x1337CF514544CF69",
+                      "config_sha256": workers.CONFIG_SHA256,
                       "binaries": {"psy_worker_cli": workers.WORKER_SHA256}}
+        build_hash = workers.digest(workers.encode(self.build))
+        self.stack.enter_context(patch.object(workers, "BUILD_SHA256", build_hash, create=True))
+        self.attestation = dict(self.build, schema_version=1, kind="packaging-build-attestation",
+                                build_manifest_sha256=build_hash, cli_network="psy-public-testnet",
+                                backend="plonky2-poseidon-goldilocks")
+        self.attestation_path = self.root / "attestation.json"
+        self.attestation_path.write_bytes(workers.encode(self.attestation))
+        self.stack.enter_context(patch.object(workers, "ATTESTATION_SHA256",
+                                             workers.digest(workers.encode(self.attestation)), create=True))
         (self.release / "psy_worker_cli").write_bytes(self.binary)
         (self.release / "manifest.json").write_bytes(workers.encode(self.build))
         self.network.write_bytes(self.config)
 
     def prepare(self):
-        return workers.prepare_package(self.release, self.network, self.topology, self.package)
+        return workers.prepare_package(self.release, self.network, self.topology, self.package, self.attestation_path)
 
     def map_host(self):
         for name in ("RELEASE", "CONFIG", "STATE", "UNITS"):
@@ -67,6 +76,9 @@ class WorkerPreparationTests(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertFalse(result["contains_credentials"])
         files = workers.read_package(self.package)
+        self.assertEqual(files["build.json"], workers.encode(self.build))
+        self.assertEqual(files["attestation.json"], workers.encode(self.attestation))
+        self.assertNotIn("cli_network", workers.decode(files["build.json"]))
         for role in workers.THREADS:
             config = workers.decode(files[role + ".json"])
             self.assertNotIn("private_key", config)
@@ -82,6 +94,7 @@ class WorkerPreparationTests(unittest.TestCase):
             unit = files[workers.unit_name(role)].decode()
             self.assertIn("[Install]\nWantedBy=multi-user.target", unit)
             self.assertIn("--batch-size 1", unit)
+            self.assertIn("--network psy-public-testnet --proving-backend plonky2-poseidon-goldilocks", unit)
             self.assertIn("--url-rotation-strategy round-robin", unit)
             self.assertIn("RAYON_NUM_THREADS=" + str(workers.THREADS[role]), unit)
             self.assertNotIn("--private-key", unit)
@@ -109,7 +122,25 @@ class WorkerPreparationTests(unittest.TestCase):
         changed = self.root / "topology.json"
         changed.write_bytes(self.topology_bytes + b"\n")
         with self.assertRaises(workers.WorkerError):
-            workers.prepare_package(self.release, self.network, changed, self.package)
+            workers.prepare_package(self.release, self.network, changed, self.package, self.attestation_path)
+
+    def test_attestation_pin_and_original_manifest_binding_fail_closed(self):
+        original = self.attestation_path.read_bytes()
+        self.attestation_path.write_bytes(original + b"\n")
+        with self.assertRaises(workers.WorkerError):
+            self.prepare()
+        self.assertFalse(self.package.exists())
+        for field, value in (("source_commit", "a" * 40), ("config_sha256", "b" * 64),
+                             ("network", "localhost"), ("network_magic", "0x1"),
+                             ("binaries", {}), ("build_manifest_sha256", "c" * 64),
+                             ("cli_network", "local-devnet"), ("backend", "jtmb-poseidon-goldilocks"),
+                             ("schema_version", True), ("kind", "untrusted")):
+            raw = workers.encode(dict(self.attestation, **{field: value}))
+            self.attestation_path.write_bytes(raw)
+            with self.subTest(field=field), patch.object(workers, "ATTESTATION_SHA256", workers.digest(raw)):
+                with self.assertRaises(workers.WorkerError):
+                    self.prepare()
+                self.assertFalse(self.package.exists())
 
     def test_package_refuses_overwrite(self):
         self.prepare()

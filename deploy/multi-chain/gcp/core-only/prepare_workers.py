@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare a secret-free worker package; check/install on its host without starting.
 
-package --release-dir DIR --network-config FILE --output NEW_DIR
+package --release-dir DIR --network-config FILE --build-attestation FILE --output NEW_DIR
 check-host --package DIR             (sudo; read-only)
 install --package DIR                (sudo; separately authorized; never starts)
 
@@ -28,6 +28,8 @@ RELEASE_ID = "core-testnet-20261026-r2"
 WORKER_SHA256 = "db160bf77e00fecc92907cc9eaf0bba371853d1c6d6c9f8589238853fbd96f45"
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
 TOPOLOGY_SHA256 = "89a9c4cfaa43d6537427c23c34ac2919291a582926f4841aa6926a419dc65473"
+BUILD_SHA256 = "da174adeccef81c312e1f2eb1e6a136b53fb8a68f6e9f5b39510c6c1305133bf"
+ATTESTATION_SHA256 = "232bc48d7a9978a7d6c8a3b9845cca3858069b3e662ef6c4ad3faef99c6789f6"
 RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
 STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID
@@ -157,10 +159,21 @@ def payloads(inputs):
     require(digest(inputs["psy_worker_cli"]) == WORKER_SHA256, "worker binary hash mismatch")
     require(digest(inputs["network.json"]) == CONFIG_SHA256, "compiled network config hash mismatch")
     require(digest(inputs["topology.json"]) == TOPOLOGY_SHA256, "reviewed topology hash mismatch")
+    require(digest(inputs["build.json"]) == BUILD_SHA256, "original build manifest hash mismatch")
+    require(digest(inputs["attestation.json"]) == ATTESTATION_SHA256, "build attestation hash mismatch")
     build = decode(inputs["build.json"])
+    attestation = decode(inputs["attestation.json"])
+    require(type(attestation["schema_version"]) is int and attestation["schema_version"] == 1
+            and attestation["kind"] == "packaging-build-attestation"
+            and attestation["build_manifest_sha256"] == BUILD_SHA256,
+            "attestation does not bind original build manifest")
+    require(all(attestation[field] == build[field] for field in
+                ("source_commit", "config_sha256", "network", "network_magic", "binaries")),
+            "attestation differs from original build manifest")
     require(build["source_commit"] == SOURCE and build["network"] == "testnet"
-            and build["cli_network"] == "psy-public-testnet"
-            and build["backend"] == "plonky2-poseidon-goldilocks"
+            and build["network_magic"] == "0x1337CF514544CF69"
+            and attestation["cli_network"] == "psy-public-testnet"
+            and attestation["backend"] == "plonky2-poseidon-goldilocks"
             and build["config_sha256"] == CONFIG_SHA256
             and build["binaries"]["psy_worker_cli"] == WORKER_SHA256, "build provenance mismatch")
     topology = decode(inputs["topology.json"])
@@ -200,10 +213,11 @@ def write_new(path, raw, mode, uid, gid):
         os.close(parent)
 
 
-def prepare_package(release_dir, network_config, topology, output):
+def prepare_package(release_dir, network_config, topology, output, build_attestation):
     inputs = {name: read_file(path)[0] for name, path in {
         "psy_worker_cli": release_dir / "psy_worker_cli", "build.json": release_dir / "manifest.json",
         "network.json": network_config, "topology.json": topology,
+        "attestation.json": build_attestation,
     }.items()}
     files = payloads(inputs)
     files["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]
@@ -226,7 +240,7 @@ def read_package(package):
     finally:
         os.close(fd)
     inputs = {}
-    for name in ("psy_worker_cli", "build.json", "network.json", "topology.json"):
+    for name in ("psy_worker_cli", "build.json", "network.json", "topology.json", "attestation.json"):
         inputs[name] = read_file(package / name)[0]
     expected = payloads(inputs)
     expected["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]
@@ -287,6 +301,7 @@ def install_paths(files, keys, user):
         RELEASE / "psy_worker_cli": (files["psy_worker_cli"], 0o755, ROOT_UID, ROOT_GID),
         CONFIG / "network.json": (files["network.json"], 0o640, ROOT_UID, gid),
         CONFIG / "build.json": (files["build.json"], 0o640, ROOT_UID, gid),
+        CONFIG / "attestation.json": (files["attestation.json"], 0o640, ROOT_UID, gid),
         CONFIG / "topology.json": (files["topology.json"], 0o640, ROOT_UID, gid),
     }
     directories = {RELEASE: (0o755, ROOT_UID, ROOT_GID), CONFIG: (0o750, ROOT_UID, gid),
@@ -377,6 +392,7 @@ def main(argv=None):
     prepare = commands.add_parser("package")
     prepare.add_argument("--release-dir", type=Path, required=True)
     prepare.add_argument("--network-config", type=Path, required=True)
+    prepare.add_argument("--build-attestation", type=Path, required=True)
     prepare.add_argument("--topology", type=Path, default=HERE / "topology.json")
     prepare.add_argument("--output", type=Path, required=True)
     for name in ("check-host", "install"):
@@ -385,7 +401,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == "package":
-            report = prepare_package(args.release_dir, args.network_config, args.topology, args.output)
+            report = prepare_package(args.release_dir, args.network_config, args.topology, args.output,
+                                     args.build_attestation)
         else:
             report = install_workers(args.package, args.action == "check-host")
     except WorkerError as error:
