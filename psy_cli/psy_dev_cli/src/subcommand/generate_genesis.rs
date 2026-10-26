@@ -101,6 +101,9 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "faucet-operator-count", default_value_t = 10)]
     pub faucet_operator_count: usize,
 
+    #[arg(long, help = "Generate validator and faucet private keys from OS entropy; required outside localhost")]
+    pub random_private_keys: bool,
+
     #[arg(long = "sd-key-fingerprint", default_value = DEFAULT_SD_KEY_FINGERPRINT)]
     pub sd_key_fingerprint: String,
 
@@ -152,6 +155,32 @@ pub struct GenerateGenesisDataArgs {
 
 pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
     generate_local_devnet_genesis(&args)
+}
+
+fn ensure_private_key_mode(network: &str, random_private_keys: bool) -> anyhow::Result<()> {
+    ensure!(network == "localhost" || random_private_keys,
+        "network {network} requires --random-private-keys; deterministic Genesis private keys are localhost-only");
+    Ok(())
+}
+
+fn ensure_faucet_output(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
+    ensure!(!args.random_private_keys || args.skip_faucet_operators || args.faucet_operators_out.is_some(),
+        "--random-private-keys requires --skip-faucet-operators or an explicit --faucet-operators-out");
+    Ok(())
+}
+
+fn random_private_key(rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> anyhow::Result<Hash> {
+    for _ in 0..128 {
+        let mut bytes = [0u8; 32];
+        rng.try_fill_bytes(&mut bytes).context("OS entropy unavailable for Genesis private keys")?;
+        let limbs: [u64; 4] = std::array::from_fn(|index| {
+            u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
+        });
+        if limbs.iter().all(|limb| *limb < F::ORDER) && limbs != [0; 4] {
+            return Ok(Hash::from_values(limbs[0], limbs[1], limbs[2], limbs[3]));
+        }
+    }
+    anyhow::bail!("OS entropy did not produce a nonzero canonical Genesis private key")
 }
 
 fn deterministic_private_key(slot: u64) -> QHashOut<F> {
@@ -411,6 +440,7 @@ fn compact_user(
 fn genesis_users(
     args: &GenerateGenesisDataArgs,
     relayer: PsyCompactUserDefinition<Hash>,
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
 ) -> anyhow::Result<(Vec<PsyCompactUserDefinition<Hash>>, Vec<Option<Hash>>)> {
     let validator_slots = parse_validator_slots(&args.validator_slots)?;
     let zk_fingerprint = zk_fingerprint(args)?;
@@ -450,7 +480,8 @@ fn genesis_users(
             "validator slot registration {} does not match dense cursor {next_registration}",
             slot.registration_id
         );
-        let private_key = deterministic_private_key(slot.registration_id);
+        let private_key = if args.random_private_keys { random_private_key(rng)? } else { deterministic_private_key(slot.registration_id) };
+        ensure!(!private_keys.contains(&Some(private_key)), "duplicate Genesis private key");
         private_keys.push(Some(private_key));
         users.push(compact_user(zk_fingerprint, private_key, args.initial_fee_balance));
         let user_id = user_id_for(args, slot.registration_id);
@@ -469,7 +500,8 @@ fn genesis_users(
 
     for i in 0..args.faucet_operator_count {
         let slot = special_zk_user_count + i;
-        let private_key = deterministic_private_key(slot as u64);
+        let private_key = if args.random_private_keys { random_private_key(rng)? } else { deterministic_private_key(slot as u64) };
+        ensure!(!private_keys.contains(&Some(private_key)), "duplicate Genesis private key");
         private_keys.push(Some(private_key));
         users.push(compact_user(sd_key_fingerprint, private_key, args.initial_fee_balance));
     }
@@ -477,6 +509,8 @@ fn genesis_users(
 }
 
 fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
+    ensure_private_key_mode(psy_config::CURRENT_NETWORK, args.random_private_keys)?;
+    ensure_faucet_output(args)?;
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
@@ -491,7 +525,7 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
     validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
     let relayer = initialized_multisig_user(&account, args.initial_fee_balance)?;
-    let (users, private_keys) = genesis_users(args, relayer)?;
+    let (users, private_keys) = genesis_users(args, relayer, &mut rand::rngs::OsRng)?;
     let special_zk_user_count = users.len() - args.faucet_operator_count;
 
     let genesis_data = PsyGenesisBlockSetupData {
@@ -533,16 +567,19 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let private_keys_body = serde_json::to_vec_pretty(&private_keys)?;
     let faucet_body = faucet_operators_path.as_ref().map(|_| faucet_operators_body(args, &private_keys, special_zk_user_count, sd_key_fingerprint)).transpose()?;
 
-    write_exclusive(&genesis_path, &genesis_body)?;
-    write_owned_regular(&private_keys_path, &private_keys_body)?;
-    if let (Some(path), Some(body)) = (faucet_operators_path.as_ref(), faucet_body.as_ref()) { write_owned_regular(path, body)?; }
+    save_genesis_outputs(
+        args.random_private_keys,
+        (&genesis_path, &genesis_body),
+        (&private_keys_path, &private_keys_body),
+        faucet_operators_path.as_deref().zip(faucet_body.as_deref()),
+    )?;
     let faucet_operators_written = faucet_operators_path;
 
     tracing::info!(
         genesis = %genesis_path.display(),
         private_keys = %private_keys_path.display(),
         faucet_operators = ?faucet_operators_written.as_ref().map(|p| p.display().to_string()),
-        "wrote local-devnet genesis artifacts"
+        "wrote genesis artifacts"
     );
     Ok(())
 }
@@ -562,23 +599,79 @@ fn faucet_operators_body(args: &GenerateGenesisDataArgs, private_keys: &[Option<
     serde_json::to_vec_pretty(&FaucetOperatorsJson { faucet_contract_id: args.faucet_contract_id, faucet_method_name: args.faucet_method_name.clone(), faucet_method_id: args.faucet_method_id, faucet_per_claim_amount: args.faucet_per_claim_amount.clone(), sd_key_expected_tx_count: args.sd_key_expected_tx_count, sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(), sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(), operators }).context("serializing faucet operators")
 }
 
-/// Creates `path` and writes it. An existing path, including a symlink, is refused.
-fn write_exclusive(path: &Path, body: &[u8]) -> anyhow::Result<()> {
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, io::{AsRawFd, FromRawFd}};
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+fn save_genesis_outputs(random_private_keys: bool, genesis: (&Path, &[u8]), private_keys: (&Path, &[u8]), faucet: Option<(&Path, &[u8])>) -> anyhow::Result<()> {
+    let mut outputs = vec![private_keys];
+    outputs.extend(faucet);
+    outputs.push(genesis);
+    let cwd = std::env::current_dir()?;
+    let mut paths = Vec::<PathBuf>::new();
+    for (path, _) in &outputs {
+        ensure!(!path.components().any(|component| component == std::path::Component::ParentDir),
+            "Genesis output paths must not contain parent components");
+        let absolute = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+        let normalized: PathBuf = absolute.components().collect();
+        ensure!(!paths.iter().any(|other| normalized.starts_with(other) || other.starts_with(&normalized)),
+            "Genesis output paths must be distinct and must not contain another output");
+        if random_private_keys || *path == genesis.0 {
+            preflight_new_destination(path)?;
+        } else {
+            preflight_owned_regular_destination(path)?;
+        }
+        paths.push(normalized);
+    }
+    // Publish Genesis last: a failed secret write must never expose a usable new network snapshot.
+    for (path, body) in outputs {
+        if random_private_keys || path == genesis.0 {
+            write_exclusive(path, body)?;
+        } else {
+            write_owned_regular(path, body)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_missing_at(directory: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+    let name = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), metadata.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    ensure!(result != 0, "refusing to overwrite existing Genesis output {}", path.display());
+    let error = std::io::Error::last_os_error();
+    ensure!(error.raw_os_error() == Some(libc::ENOENT), "checking {} failed: {error}", path.display());
+    Ok(())
+}
+
+fn preflight_new_destination(path: &Path) -> anyhow::Result<()> {
     let name = path.file_name().context("output path has no file name")?;
-    std::fs::create_dir_all(parent)?;
-    let directory = std::fs::File::open(parent).with_context(|| format!("opening {}", parent.display()))?;
-    let c_name = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
-    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), c_name.as_ptr(), flags, 0o600) };
-    ensure!(fd >= 0, "creating {} failed: {}", path.display(), std::io::Error::last_os_error());
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
-    ensure!(metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o600,
-        "{} must be a single regular file owned by this user in mode 0600", path.display());
-    std::io::Write::write_all(&mut file, body).with_context(|| format!("writing {}", path.display()))?;
-    file.sync_all().with_context(|| format!("syncing {}", path.display()))
+    if let Some(directory) = open_usable_parent(output_parent(path))? {
+        require_missing_at(&directory, name, path)?;
+    }
+    Ok(())
+}
+
+fn create_output_parent(parent: &Path) -> anyhow::Result<std::fs::File> {
+    use std::{path::Component, os::unix::{ffi::OsStrExt, io::AsRawFd}};
+    let mut directory = std::fs::File::open(if parent.is_absolute() { "/" } else { "." })?;
+    for component in parent.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => anyhow::bail!("output parent must not contain parent components"),
+        };
+        directory = match open_nofollow_directory_at(&directory, name)? {
+            Some(child) => child,
+            None => {
+                let name_c = std::ffi::CString::new(name.as_bytes()).context("output parent contains NUL")?;
+                if unsafe { libc::mkdirat(directory.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    ensure!(error.raw_os_error() == Some(libc::EEXIST), "creating output directory failed: {error}");
+                }
+                directory.sync_all()?;
+                open_nofollow_directory_at(&directory, name)?.context("output directory disappeared")?
+            }
+        };
+    }
+    Ok(directory)
 }
 
 fn default_private_keys_path(repo_root: &Path) -> PathBuf {
@@ -601,7 +694,7 @@ fn output_parent(path: &Path) -> &Path {
 
 /// Metadata-only acceptance of one secret output. A missing file is a first
 /// generation. A missing parent is allowed because `write_owned_regular`
-/// creates just that parent with `create_dir_all`; an existing component must
+/// creates it through directory descriptors; an existing component must
 /// already be a real directory opened with `O_NOFOLLOW`. An existing file must
 /// be one regular link owned by this user in mode 0600. File bytes are not read.
 fn preflight_owned_regular_destination(path: &Path) -> anyhow::Result<()> {
@@ -665,29 +758,42 @@ fn require_owned_regular_at(directory: &std::fs::File, name: &std::ffi::OsStr, p
     Ok(())
 }
 
-/// Publishes `path` atomically through a no-follow parent descriptor. Calls
-/// `preflight_owned_regular_destination` before `create_dir_all`, then checks
-/// the same metadata again once that parent exists. A missing destination is
-/// created by the exclusive temp-and-renameat publish. A failed write leaves
-/// the existing file intact and no temporary survives.
 fn write_owned_regular(path: &Path, body: &[u8]) -> anyhow::Result<()> {
-    use std::os::unix::{ffi::OsStrExt, io::{AsRawFd, FromRawFd}};
-    preflight_owned_regular_destination(path)?;
+    write_genesis_file(path, body, true)
+}
+
+fn write_exclusive(path: &Path, body: &[u8]) -> anyhow::Result<()> {
+    write_genesis_file(path, body, false)
+}
+
+fn write_genesis_file(path: &Path, body: &[u8], replace_owned: bool) -> anyhow::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, io::{AsRawFd, FromRawFd}};
+    if replace_owned { preflight_owned_regular_destination(path)?; } else { preflight_new_destination(path)?; }
     let parent = output_parent(path);
     let name = path.file_name().context("output path has no file name")?;
-    std::fs::create_dir_all(parent)?;
-    let directory = open_usable_parent(parent)?.with_context(|| format!("opening {}", parent.display()))?;
-    require_owned_regular_at(&directory, name, path)?;
+    let directory = create_output_parent(parent)?;
+    if replace_owned { require_owned_regular_at(&directory, name, path)?; } else { require_missing_at(&directory, name, path)?; }
     let destination = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
     let temporary = std::ffi::CString::new(format!(".{}.tmp", name.to_string_lossy())).context("temporary name contains NUL")?;
     let created = unsafe { libc::openat(directory.as_raw_fd(), temporary.as_ptr(), libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600) };
     ensure!(created >= 0, "reserving a temporary for {} failed: {}", path.display(), std::io::Error::last_os_error());
     let mut file = unsafe { std::fs::File::from_raw_fd(created) };
     let publish = (|| {
+        let metadata = file.metadata()?;
+        ensure!(metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o600,
+            "Genesis temporary output must be an owned single regular file in mode 0600");
         std::io::Write::write_all(&mut file, body)?;
         file.sync_all()?;
-        ensure!(unsafe { libc::renameat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), destination.as_ptr()) } == 0,
-            "publishing {} failed: {}", path.display(), std::io::Error::last_os_error());
+        if replace_owned {
+            require_owned_regular_at(&directory, name, path)?;
+            ensure!(unsafe { libc::renameat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), destination.as_ptr()) } == 0,
+                "replacing {} failed: {}", path.display(), std::io::Error::last_os_error());
+        } else {
+            ensure!(unsafe { libc::linkat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), destination.as_ptr(), 0) } == 0,
+                "publishing {} failed: {}", path.display(), std::io::Error::last_os_error());
+            ensure!(unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } == 0,
+                "removing Genesis temporary output failed: {}", std::io::Error::last_os_error());
+        }
         Ok(directory.sync_all()?)
     })();
     if publish.is_err() { unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) }; }
@@ -697,6 +803,102 @@ fn write_owned_regular(path: &Path, body: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::MetadataExt;
+
+    struct KeyBytesRng(std::collections::VecDeque<[u64; 4]>);
+
+    impl rand::CryptoRng for KeyBytesRng {}
+
+    impl rand::RngCore for KeyBytesRng {
+        fn next_u32(&mut self) -> u32 { panic!("key generation must use fallible bytes") }
+        fn next_u64(&mut self) -> u64 { panic!("key generation must use fallible bytes") }
+        fn fill_bytes(&mut self, _: &mut [u8]) { panic!("key generation must propagate entropy failures") }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            assert_eq!(dest.len(), 32);
+            let limbs = self.0.pop_front().ok_or_else(|| rand::Error::new(
+                std::io::Error::new(std::io::ErrorKind::Other, "fixture entropy exhausted"),
+            ))?;
+            for (chunk, limb) in dest.chunks_exact_mut(8).zip(limbs) { chunk.copy_from_slice(&limb.to_le_bytes()); }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn public_network_requires_random_private_keys() {
+        let default = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        assert!(!default.random_private_keys);
+        assert!(ensure_private_key_mode("localhost", default.random_private_keys).is_ok());
+        for network in ["testnet", "mainnet", "unknown", ""] {
+            assert!(ensure_private_key_mode(network, default.random_private_keys).unwrap_err().to_string().contains("--random-private-keys"));
+        }
+        let random = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--random-private-keys"]).unwrap();
+        assert!(random.random_private_keys);
+        for network in ["localhost", "testnet", "mainnet"] {
+            assert!(ensure_private_key_mode(network, random.random_private_keys).is_ok());
+        }
+        if psy_config::CURRENT_NETWORK != "localhost" {
+            assert!(generate_local_devnet_genesis(&default).unwrap_err().to_string().contains("--random-private-keys"));
+        }
+    }
+
+    #[test]
+    fn random_faucet_output_requires_explicit_destination_or_skip() {
+        let deterministic = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        assert!(ensure_faucet_output(&deterministic).is_ok());
+        let mut random = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--random-private-keys"]).unwrap();
+        assert!(ensure_faucet_output(&random).unwrap_err().to_string().contains("--faucet-operators-out"));
+        random.skip_faucet_operators = true;
+        assert!(ensure_faucet_output(&random).is_ok());
+        random.skip_faucet_operators = false;
+        random.faucet_operators_out = Some(PathBuf::from("explicit-faucet.json"));
+        assert!(ensure_faucet_output(&random).is_ok());
+    }
+
+    #[test]
+    fn random_private_keys_reject_noncanonical_zero_and_failed_entropy() {
+        let mut rng = KeyBytesRng([[0; 4], [F::ORDER, 1, 2, 3], [1, 2, 3, F::ORDER - 1]].into());
+        assert_eq!(random_private_key(&mut rng).unwrap(), Hash::from_values(1, 2, 3, F::ORDER - 1));
+        assert!(random_private_key(&mut rng).unwrap_err().to_string().contains("OS entropy unavailable"));
+        let mut zero_rng = KeyBytesRng(vec![[0; 4]; 128].into());
+        assert!(random_private_key(&mut zero_rng).unwrap_err().to_string().contains("nonzero canonical"));
+    }
+
+    fn relayer_fixture() -> PsyCompactUserDefinition<Hash> {
+        let account = account_fixture();
+        PsyCompactUserDefinition {
+            public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account.public_key_param().unwrap().0) },
+            balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
+        }
+    }
+
+    #[test]
+    fn random_genesis_keys_keep_registration_and_faucet_bindings() {
+        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--random-private-keys"]).unwrap();
+        let mut rng = KeyBytesRng((1..=14).map(|index| [index, 11, 12, 13]).collect());
+        let (users, keys) = genesis_users(&args, relayer_fixture(), &mut rng).unwrap();
+        assert_eq!(keys.len(), 15);
+        assert_eq!(users.len(), keys.len());
+        assert!(keys[2].is_none());
+        assert!(rng.0.is_empty());
+        for (registration, key) in keys.iter().enumerate().filter_map(|(index, key)| key.map(|key| (index, key))) {
+            assert_eq!(users[registration].public_key_info.public_key_param, get_public_key_param::<F, PoseidonHash>(key));
+            assert_ne!(key, deterministic_private_key(registration as u64));
+            assert!(!keys[..registration].contains(&Some(key)));
+        }
+        let faucet: serde_json::Value = serde_json::from_slice(&faucet_operators_body(
+            &args, &keys, 5, parse_qhash(&args.sd_key_fingerprint).unwrap(),
+        ).unwrap()).unwrap();
+        let operators = faucet["operators"].as_array().unwrap();
+        assert_eq!(operators.len(), 10);
+        for (index, operator) in operators.iter().enumerate() {
+            assert_eq!(operator["privateKey"], keys[index + 5].unwrap().to_string());
+            assert_eq!(operator["userId"], user_id_for(&args, (index + 5) as u64).to_string());
+            assert_eq!(operator["address"], users[index + 5].public_key_info.to_hash::<PoseidonHasher>().to_string());
+        }
+        let mut duplicate = KeyBytesRng([[1, 2, 3, 4]; 2].into());
+        assert!(genesis_users(&args, relayer_fixture(), &mut duplicate).unwrap_err().to_string().contains("duplicate Genesis private key"));
+        assert!(genesis_users(&args, relayer_fixture(), &mut rng).unwrap_err().to_string().contains("OS entropy unavailable"));
+    }
+
     #[test]
     fn policy_abi_requires_exact_visible_four_slot_storage() {
         let abi = serde_json::json!({"schema_version":"2.0.0","contract":{"state":[
@@ -798,12 +1000,7 @@ mod tests {
     #[test]
     fn dense_export_keeps_validator_and_faucet_indices_without_relayer_secret() {
         let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
-        let account = account_fixture();
-        let relayer = PsyCompactUserDefinition {
-            public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account.public_key_param().unwrap().0) },
-            balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
-        };
-        let (users, keys) = genesis_users(&args, relayer).unwrap();
+        let (users, keys) = genesis_users(&args, relayer_fixture(), &mut KeyBytesRng(Default::default())).unwrap();
         assert_eq!(keys.len(), users.len());
         assert_eq!(keys.len(), 15);
         assert!(keys[2].is_none());
@@ -1001,7 +1198,7 @@ mod tests {
         network.as_object_mut().unwrap().remove("guardian_initial_member_hashes");
         write_canonical_network(&root, &network);
         let args = GenerateGenesisDataArgs::try_parse_from([
-            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+            "generate-genesis-data", "--random-private-keys", "--skip-faucet-operators", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
         let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
         assert!(error.contains(&format!("networks.{}.guardian_initial_member_hashes", psy_config::CURRENT_NETWORK)));
@@ -1020,7 +1217,7 @@ mod tests {
         std::fs::write(root.join("psy-genesis/config.json"),
             r#"{"networks":{"localhost":{},"localhost":{}}}"#).unwrap();
         let args = GenerateGenesisDataArgs::try_parse_from([
-            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+            "generate-genesis-data", "--random-private-keys", "--skip-faucet-operators", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
         let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
         assert!(error.contains("not duplicate-free JSON"));
@@ -1042,7 +1239,7 @@ mod tests {
         let config = format!(r#"{{"defaultNetwork":"{network_name}","networks":{{"{network_name}":{duped}}}}}"#);
         std::fs::write(root.join("psy-genesis/config.json"), config).unwrap();
         let args = GenerateGenesisDataArgs::try_parse_from([
-            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+            "generate-genesis-data", "--random-private-keys", "--skip-faucet-operators", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
         assert!(generate_local_devnet_genesis(&args).is_err());
         assert!(!root.join("genesis.json").exists());
@@ -1082,6 +1279,116 @@ mod tests {
     }
 
     #[test]
+    fn localhost_regeneration_replaces_owned_secrets_but_not_genesis() {
+        let root = std::env::temp_dir().join(format!("psy-genesis-local-reset-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let genesis = root.join("genesis.json");
+        let keys = root.join("private_keys.json");
+        let faucet = root.join("faucetOperators.json");
+        write_owned_regular(&keys, b"old keys").unwrap();
+        write_owned_regular(&faucet, b"old faucet").unwrap();
+        let old_keys = std::fs::File::open(&keys).unwrap();
+        let old_faucet = std::fs::File::open(&faucet).unwrap();
+        save_genesis_outputs(false, (&genesis, b"genesis"), (&keys, b"new keys"), Some((&faucet, b"new faucet"))).unwrap();
+        assert_ne!(old_keys.metadata().unwrap().ino(), std::fs::metadata(&keys).unwrap().ino());
+        assert_ne!(old_faucet.metadata().unwrap().ino(), std::fs::metadata(&faucet).unwrap().ino());
+        assert!(save_genesis_outputs(false, (&genesis, b"other genesis"), (&keys, b"other keys"), Some((&faucet, b"other faucet"))).is_err());
+        for (path, body) in [(&genesis, b"genesis".as_slice()), (&keys, b"new keys".as_slice()), (&faucet, b"new faucet".as_slice())] {
+            assert_eq!(std::fs::read(path).unwrap(), body);
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_components_fail_before_any_genesis_output_write() {
+        let root = std::env::temp_dir().join(format!("psy-genesis-parent-preflight-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let genesis = root.join("genesis.json");
+        let keys = root.join("private_keys.json");
+        let faucet = root.join("missing/../faucet.json");
+        for random_private_keys in [false, true] {
+            assert!(save_genesis_outputs(random_private_keys, (&genesis, b"genesis"), (&keys, b"keys"), Some((&faucet, b"faucet"))).is_err());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn genesis_outputs_reject_existing_files_aliases_and_symlink_parents() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("psy-genesis-exclusive-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let genesis = root.join("genesis.json");
+        let keys = root.join("private_keys.json");
+        let faucet = root.join("faucetOperators.json");
+        for existing in [&genesis, &keys, &faucet] {
+            write_owned_regular(existing, b"retained").unwrap();
+            assert!(save_genesis_outputs(true, (&genesis, b"new genesis"), (&keys, b"new keys"), Some((&faucet, b"new faucet"))).is_err());
+            assert_eq!(std::fs::read(existing).unwrap(), b"retained");
+            for absent in [&genesis, &keys, &faucet].into_iter().filter(|path| path != &existing) {
+                assert!(!absent.exists());
+            }
+            std::fs::remove_file(existing).unwrap();
+        }
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&genesis, b"keys"), None).is_err());
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&root.join("./genesis.json"), b"keys"), None).is_err());
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&genesis.join("keys"), b"keys"), None).is_err());
+        assert!(!genesis.exists());
+        let real_parent = root.join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = root.join("linked");
+        symlink(&real_parent, &linked_parent).unwrap();
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&keys, b"keys"), Some((&linked_parent.join("faucet.json"), b"faucet"))).is_err());
+        assert!(!keys.exists());
+        assert!(!genesis.exists());
+        assert_eq!(std::fs::read_dir(&real_parent).unwrap().count(), 0);
+        let dangling = root.join("dangling.json");
+        symlink(root.join("absent.json"), &dangling).unwrap();
+        assert!(write_owned_regular(&dangling, b"must not follow").is_err());
+        assert!(!root.join("absent.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn genesis_is_published_only_after_all_secret_outputs_succeed() {
+        let root = std::env::temp_dir().join(format!("psy-genesis-last-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let genesis = root.join("genesis.json");
+        let keys = root.join("private_keys.json");
+        let faucet = root.join("faucetOperators.json");
+        let blocked = root.join(".faucetOperators.json.tmp");
+        std::fs::write(&blocked, b"another writer").unwrap();
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&keys, b"keys"), Some((&faucet, b"faucet"))).is_err());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"another writer");
+        assert_eq!(std::fs::read(&keys).unwrap(), b"keys");
+        assert!(!faucet.exists());
+        assert!(!genesis.exists());
+        assert!(!root.join(".private_keys.json.tmp").exists());
+        std::fs::remove_file(&blocked).unwrap();
+        assert!(save_genesis_outputs(true, (&genesis, b"genesis"), (&keys, b"replacement"), Some((&faucet, b"faucet"))).is_err());
+        assert_eq!(std::fs::read(&keys).unwrap(), b"keys");
+        assert!(!genesis.exists());
+        let fresh = root.join("fresh");
+        let new_genesis = fresh.join("genesis.json");
+        let new_keys = fresh.join("private_keys.json");
+        let new_faucet = fresh.join("faucetOperators.json");
+        save_genesis_outputs(true, (&new_genesis, b"genesis"), (&new_keys, b"keys"), Some((&new_faucet, b"faucet"))).unwrap();
+        for (path, body) in [(&new_genesis, b"genesis".as_slice()), (&new_keys, b"keys".as_slice()), (&new_faucet, b"faucet".as_slice())] {
+            assert_eq!(std::fs::read(path).unwrap(), body);
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+        }
+        assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn first_publish_creates_missing_outputs_and_failed_replace_preserves() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("psy-owned-regular-{}", rand::random::<u64>()));
@@ -1091,7 +1398,7 @@ mod tests {
         let metadata = std::fs::metadata(&private_keys).unwrap();
         assert!(metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600);
         assert_eq!(std::fs::read(&private_keys).unwrap(), b"first body");
-        write_owned_regular(&private_keys, b"second body").expect("existing owned destination is replaced");
+        write_owned_regular(&private_keys, b"second body").unwrap();
         assert_eq!(std::fs::read(&private_keys).unwrap(), b"second body");
         let faucet = root.join("faucetOperators.json");
         std::fs::write(&faucet, b"retained").unwrap();
