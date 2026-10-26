@@ -1379,11 +1379,17 @@ pub(crate) mod tests {
             data_index: 0,
         };
         let canonical = env.db.checkpoint_tree_get_merkle_proof(0, 0).await?;
+        let append_slot = env.db.checkpoint_tree_get_merkle_proof(0, 1).await?;
+        assert_eq!(append_slot.index, 1);
+        assert_eq!(append_slot.root, canonical.root);
+        assert_eq!(append_slot.value, zh(0));
         let genesis_transition = env.db.get_verifiable_checkpoint_state_transition_and_zkp(0).await?;
         let mut witness = QCQEDCheckpointStateTransitionInput::<PF, PHash>::qp_rand_gen();
-        witness.append_checkpoint_tree_proof.index = 1;
-        witness.append_checkpoint_tree_proof.old_root = canonical.root;
-        witness.append_checkpoint_tree_proof.old_value = canonical.value;
+        witness.append_checkpoint_tree_proof.index = append_slot.index;
+        witness.append_checkpoint_tree_proof.old_root = append_slot.root;
+        witness.append_checkpoint_tree_proof.old_value = append_slot.value;
+        witness.append_checkpoint_tree_proof.siblings = append_slot.siblings;
+        witness.update_with_new_reward_tree_root::<parth_core::pgoldilocks::PoseidonHasher>(zh(40));
         witness.previous_checkpoint_proof = canonical.clone();
         witness.genesis_checkpoint_state_transition_hash =
             genesis_transition.info.state_transition.genesis_checkpoint_state_transition_hash;
@@ -1395,7 +1401,7 @@ pub(crate) mod tests {
         for corrupt in 0..3 {
             let mut bad_witness = witness.clone();
             match corrupt {
-                0 => bad_witness.append_checkpoint_tree_proof.old_value = zh(41),
+                0 => bad_witness.previous_checkpoint_proof.value = zh(41),
                 1 => bad_witness.append_checkpoint_tree_proof.old_root = zh(42),
                 _ => bad_witness.previous_chain_hash = zh(43),
             }
