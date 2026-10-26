@@ -7,7 +7,9 @@ it never enables/starts/stops services, generates keys, migrates DBs or uses SSH
 Failures after writes retain the partial destination for operator inspection.
 
 The operator-owned private JSON has exactly these fields:
-version: 1; guardian_id: 1..3; hostname; address (private IPv4);
+version: 2; guardian_id: 1..3; hostname; address (private IPv4);
+guardian_history: {listen_address, rpc_url}, explicitly approved private HTTP origin;
+proof_origins: {prove_proxy_url: [origins], system_prove_proxy_url: [origins]};
 service_user: psy-guardian-N (must already exist, non-root);
 memory_high_gib; memory_max_gib; custody_keystore_sha256;
 build, binary, canonical_config, rpc_config, wrapper: each {path, sha256};
@@ -18,7 +20,12 @@ Spec must be mode 0600, owned by the invoking UID; pin its bytes out of band.
 Transfer reviewed installer/wrapper and public artifacts separately; NEVER package
 keys or credentials. The installed wrapper must match the reviewed sibling file.
 Canonical config is the build-pinned testnet config; rpc_config may change ONLY
-coordinator/realm RPC URLs and user/system proof URLs to approved private origins.
+coordinator/realm RPC URLs to private origins and proof URLs to proof_origins.
+USER proof and L1 document origins require private IPv4 HTTPS or IPv4 loopback
+HTTP. SYSTEM proof origins may also use private IPv4 HTTP. No other loopback
+exception is permitted; every proof URL must match the explicit operator spec.
+An absent/null canonical guardian_history must be filled from the explicit spec;
+an existing history must match exactly. Canonical/build bytes remain unchanged.
 L1 documents must be real fresh deployment outputs, not proposed addresses.
 Pending documents permit plan only. Real RPC/proof/membership acceptance and
 any service activation remain separate operator gates, even after installation.
@@ -147,6 +154,17 @@ def origins(urls, private=True):
             require(url.port is not None, "private endpoint port required")
 
 
+def guardian_origins(urls):
+    origins(urls, private=False)
+    for value in urls:
+        url = urlsplit(value)
+        address = ipaddress.IPv4Address(url.hostname)
+        if url.scheme == "http":
+            require(address.is_loopback, "Guardian proof/L1 HTTP must use loopback")
+        else:
+            private_ip(str(address))
+
+
 def validate_rpc(canonical, rpc, spec):
     require(canonical["defaultNetwork"] == "testnet" and rpc["defaultNetwork"] == "testnet",
             "testnet selection required")
@@ -160,9 +178,33 @@ def validate_rpc(canonical, rpc, spec):
         for index, row in enumerate(network[field]):
             origins(row["rpc_url"])
             target[field][index]["rpc_url"] = base[field][index]["rpc_url"]
-    for field in ("prove_proxy_url", "system_prove_proxy_url"):
-        origins(network[field])
+    proof_fields = ("prove_proxy_url", "system_prove_proxy_url")
+    approved = spec["proof_origins"]
+    require(isinstance(approved, dict) and set(approved) == set(proof_fields), "explicit proof origins required")
+    for field in proof_fields:
+        require(network[field] == approved[field], "proof origins differ from operator approval")
+        origins(network[field], private=False)
+        for value in network[field]:
+            if field == "prove_proxy_url":
+                guardian_origins([value])
+            elif not ipaddress.IPv4Address(urlsplit(value).hostname).is_loopback:
+                origins([value])
         target[field] = base[field]
+    history = network.get("guardian_history")
+    require(isinstance(history, dict) and set(history) == {"listen_address", "rpc_url"}
+            and history == spec["guardian_history"], "history must match explicit operator approval")
+    listen = urlsplit("//" + history["listen_address"])
+    require(listen.hostname and listen.port and not listen.path and not listen.username
+            and not listen.password and not listen.query and not listen.fragment, "invalid history listen address")
+    private_ip(listen.hostname)
+    origins([history["rpc_url"]])
+    require(history["rpc_url"] == "http://" + history["listen_address"], "history HTTP origin differs from listen address")
+    require(base.get("guardian_history") is None or base["guardian_history"] == history,
+            "existing canonical history cannot change")
+    if "guardian_history" in base:
+        target["guardian_history"] = base["guardian_history"]
+    else:
+        del target["guardian_history"]
     require(restored == canonical, "non-URL config change rejected")
     guardians = network["guardian_configs"]
     require(sorted(row["id"] for row in guardians) == [1, 2, 3], "three Guardian IDs required")
@@ -194,7 +236,7 @@ def l1_files(documents):
         require(type(chain["l1ChainIndex"]) is int and chain["l1ChainIndex"] == index
                 and str(chain["l1ChainId"]) == str(chain_id) and str(doc["chainId"]) == str(chain_id),
                 "L1 testnet identity mismatch")
-        origins([chain["defaultRpcUrl"]], private=False)
+        guardian_origins([chain["defaultRpcUrl"]])
         bridge = doc["core"]["Bridge"]
         require(isinstance(bridge, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", bridge)
                 and int(bridge, 16) != 0 and proxy["address"].lower() == bridge.lower()
@@ -211,12 +253,12 @@ def load_plan(spec_path, spec_hash):
     raw = read(path_value(str(spec_path)), private=True)
     require(digest(raw) == pin(spec_hash), "operator spec hash mismatch")
     spec = decode(raw)
-    require(set(spec) == {"version", "guardian_id", "hostname", "address", "service_user",
+    require(set(spec) == {"version", "guardian_id", "hostname", "address", "guardian_history", "proof_origins", "service_user",
                           "memory_high_gib", "memory_max_gib", "custody_keystore_sha256",
                           "build", "binary", "canonical_config", "rpc_config", "wrapper", "l1_documents"},
             "operator spec fields mismatch")
     guardian_id = spec["guardian_id"]
-    require(type(spec["version"]) is int and spec["version"] == 1
+    require(type(spec["version"]) is int and spec["version"] == 2
             and type(guardian_id) is int and guardian_id in (1, 2, 3), "invalid version or Guardian ID")
     require(isinstance(spec["hostname"], str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", spec["hostname"]),
             "invalid hostname")

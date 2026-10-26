@@ -1,10 +1,12 @@
 import copy
+import errno
 import importlib.util
 import ipaddress
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -35,7 +37,6 @@ class InstallTests(unittest.TestCase):
         self.network = {"magic": installer.MAGIC, "membership": ["unchanged"],
                         "guardian_initial_member_hashes": [f"{i:064x}" for i in (1, 2, 3)],
                         "guardian_configs": [{"id": i, "listen_address": f"{ADDRESS}:{9700+i}"} for i in (1, 2, 3)],
-                        "guardian_history": {"listen_address": f"{ADDRESS}:9700"},
                         "coordinator_configs": [{"id": 0, "rpc_url": ["http://old.example:1"]}],
                         "realm_configs": [{"id": i, "rpc_url": ["http://old.example:2"]} for i in (0, 1)],
                         "prove_proxy_url": ["http://old.example:3"], "system_prove_proxy_url": ["http://old.example:4"]}
@@ -44,14 +45,19 @@ class InstallTests(unittest.TestCase):
         for field in ("coordinator_configs", "realm_configs"):
             for row in self.rpc["networks"]["testnet"][field]:
                 row["rpc_url"] = [f"http://{ADDRESS}:15370"]
-        self.rpc["networks"]["testnet"]["prove_proxy_url"] = [f"http://{PROXY}:19999"]
+        self.rpc["networks"]["testnet"]["prove_proxy_url"] = [f"https://{PROXY}:19999"]
         self.rpc["networks"]["testnet"]["system_prove_proxy_url"] = [f"http://{PROXY}:19998"]
+        self.history = {"listen_address": f"{PROXY}:9700", "rpc_url": f"http://{PROXY}:9700"}
+        self.rpc["networks"]["testnet"]["guardian_history"] = copy.deepcopy(self.history)
         self.key = b'{"version":3,"crypto":{"ciphertext":"synthetic-only"}}'
         binary = b"\x7fELF\x02\x01" + b"\0" * 12 + b"\x3e\x00" + b"synthetic"
         canonical = self.input("canonical.json", self.canonical)
         build = {"source_commit": installer.RUNTIME_SOURCE, "network": "testnet",
                  "config_sha256": canonical["sha256"], "binaries": {"psy_relayer_cli": installer.digest(binary)}}
-        self.spec = {"version": 1, "guardian_id": 1, "hostname": "guardian.example", "address": ADDRESS,
+        self.spec = {"version": 2, "guardian_id": 1, "hostname": "guardian.example", "address": ADDRESS,
+                     "guardian_history": copy.deepcopy(self.history),
+                     "proof_origins": {field: copy.deepcopy(self.rpc["networks"]["testnet"][field])
+                                       for field in ("prove_proxy_url", "system_prove_proxy_url")},
                      "service_user": "psy-guardian-1", "memory_high_gib": 4, "memory_max_gib": 6,
                      "custody_keystore_sha256": installer.digest(self.key), "build": self.input("build.json", build),
                      "binary": self.input("binary", binary), "canonical_config": canonical,
@@ -76,7 +82,7 @@ class InstallTests(unittest.TestCase):
             bridge = "0x" + f"{index+1:040x}"
             summary = {"network": name, "chainId": str(chain_id), "core": {"Bridge": bridge},
                        "protocol": {"chain": {"l1ChainIndex": index, "l1ChainId": chain_id,
-                                               "defaultRpcUrl": "https://rpc.example"}}}
+                                               "defaultRpcUrl": f"https://{PROXY}:8545"}}}
             receipt = {"address": bridge, "receipt": {"blockNumber": 123}}
             self.spec["l1_documents"][name] = {"summary": self.input(name + ".json", summary),
                                               "receipt": self.input(name + "-receipt.json", receipt)}
@@ -119,6 +125,68 @@ class InstallTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 installer.load_plan(self.spec_path, self.save())
 
+    def test_history_is_explicit_without_mutating_canonical(self):
+        original = Path(self.spec["canonical_config"]["path"]).read_bytes()
+        _, files, network, _ = installer.load_plan(self.spec_path, self.save())
+        self.assertEqual(network["guardian_history"], self.history)
+        self.assertEqual(files["canonical.json"], original)
+        self.assertEqual(Path(self.spec["canonical_config"]["path"]).read_bytes(), original)
+        self.assertNotIn("guardian_history", self.canonical["networks"]["testnet"])
+        for history in (None, self.history):
+            canonical = copy.deepcopy(self.canonical)
+            canonical["networks"]["testnet"]["guardian_history"] = copy.deepcopy(history)
+            frozen = copy.deepcopy(canonical)
+            installer.validate_rpc(canonical, self.rpc, self.spec)
+            self.assertEqual(canonical, frozen)
+
+    def test_missing_history_and_old_spec_are_rejected(self):
+        self.spec["version"] = 1
+        with self.assertRaisesRegex(ValueError, "version"):
+            installer.load_plan(self.spec_path, self.save())
+        self.spec["version"] = 2
+        del self.spec["guardian_history"]
+        with self.assertRaisesRegex(ValueError, "fields"):
+            installer.load_plan(self.spec_path, self.save())
+        self.spec["guardian_history"] = self.history
+        for value in (None, {}, {"listen_address": self.history["listen_address"]}):
+            rpc = copy.deepcopy(self.rpc)
+            rpc["networks"]["testnet"]["guardian_history"] = value
+            with self.assertRaisesRegex(ValueError, "history"):
+                installer.validate_rpc(self.canonical, rpc, self.spec)
+
+    def test_history_must_match_approval_and_existing_canonical(self):
+        changed = {"listen_address": f"{PROXY}:9701", "rpc_url": f"http://{PROXY}:9701"}
+        rpc = copy.deepcopy(self.rpc)
+        rpc["networks"]["testnet"]["guardian_history"] = changed
+        with self.assertRaisesRegex(ValueError, "approval"):
+            installer.validate_rpc(self.canonical, rpc, self.spec)
+        canonical = copy.deepcopy(self.canonical)
+        canonical["networks"]["testnet"]["guardian_history"] = changed
+        with self.assertRaisesRegex(ValueError, "canonical history"):
+            installer.validate_rpc(canonical, self.rpc, self.spec)
+        rpc = copy.deepcopy(self.rpc)
+        rpc["networks"]["testnet"]["guardian_initial_member_hashes"][0] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "non-URL"):
+            installer.validate_rpc(self.canonical, rpc, self.spec)
+
+    def test_history_origin_is_private_http_and_matches_listen(self):
+        variants = [
+            {"listen_address": f"{PROXY}:0", "rpc_url": f"http://{PROXY}:0"},
+            {"listen_address": "127.0.0.1:9700", "rpc_url": "http://127.0.0.1:9700"},
+            {"listen_address": "history.example:9700", "rpc_url": "http://history.example:9700"},
+            {"listen_address": f"{PROXY}:9700/path", "rpc_url": f"http://{PROXY}:9700/path"},
+            {"listen_address": f"user@{PROXY}:9700", "rpc_url": f"http://user@{PROXY}:9700"},
+            {**self.history, "rpc_url": f"https://{PROXY}:9700"},
+            {**self.history, "rpc_url": f"http://{PROXY}:9701"},
+            {**self.history, "rpc_url": f"http://{PROXY}:9700?token=x"},
+        ]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                rpc, spec = copy.deepcopy(self.rpc), copy.deepcopy(self.spec)
+                rpc["networks"]["testnet"]["guardian_history"] = value
+                spec["guardian_history"] = value
+                installer.validate_rpc(self.canonical, rpc, spec)
+
     def test_host_bind_and_private_proof_urls_required(self):
         for value in ("http://rpc.example:9999", f"http://user:pass@{PROXY}:9999", f"http://{PROXY}:9999/?token=x"):
             with self.assertRaises(ValueError):
@@ -126,6 +194,57 @@ class InstallTests(unittest.TestCase):
         self.spec["address"] = PROXY
         with self.assertRaisesRegex(ValueError, "bind mismatch"):
             installer.load_plan(self.spec_path, self.save())
+
+    def test_explicit_loopback_proof_origins_and_private_edges(self):
+        for field, port in (("prove_proxy_url", 19999), ("system_prove_proxy_url", 19998)):
+            values = [f"http://127.0.0.1:{port}"]
+            self.rpc["networks"]["testnet"][field] = values
+            self.spec["proof_origins"][field] = values
+        self.spec["rpc_config"] = self.input("rpc.json", self.rpc)
+        installer.load_plan(self.spec_path, self.save())
+        for field in ("coordinator_configs", "realm_configs"):
+            rpc = copy.deepcopy(self.rpc)
+            rpc["networks"]["testnet"][field][0]["rpc_url"] = ["http://127.0.0.1:15370"]
+            with self.assertRaisesRegex(ValueError, "private IPv4"):
+                installer.validate_rpc(self.canonical, rpc, self.spec)
+
+    def test_proof_loopback_requires_exact_explicit_approval(self):
+        rpc = copy.deepcopy(self.rpc)
+        rpc["networks"]["testnet"]["prove_proxy_url"] = ["http://127.0.0.1:19999"]
+        with self.assertRaisesRegex(ValueError, "operator approval"):
+            installer.validate_rpc(self.canonical, rpc, self.spec)
+        self.spec["proof_origins"] = {}
+        with self.assertRaisesRegex(ValueError, "explicit proof"):
+            installer.validate_rpc(self.canonical, rpc, self.spec)
+        del self.spec["proof_origins"]
+        with self.assertRaisesRegex(ValueError, "fields"):
+            installer.load_plan(self.spec_path, self.save())
+
+    def test_user_proof_rejects_native_incompatible_or_public_transport(self):
+        values = [f"http://{PROXY}:9999", "https://rpc.example:9999", "http://127.0.0.1:0",
+                  "http://127.0.0.1:65536", "http://[::1]:9999", "https://8.8.8.8:9999",
+                  "http://user:pass@127.0.0.1:9999", "http://127.0.0.1:9999?token=x"]
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                rpc, spec = copy.deepcopy(self.rpc), copy.deepcopy(self.spec)
+                rpc["networks"]["testnet"]["prove_proxy_url"] = [value]
+                spec["proof_origins"]["prove_proxy_url"] = [value]
+                installer.validate_rpc(self.canonical, rpc, spec)
+
+    def test_l1_document_transport_matches_native_guardian_boundary(self):
+        self.documents()
+        field = self.spec["l1_documents"]["sepolia"]
+        document = json.loads(Path(field["summary"]["path"]).read_bytes())
+        for value, valid in (("http://127.0.0.1:18545", True), (f"https://{PROXY}:18545", True),
+                             (f"http://{PROXY}:18545", False), ("https://rpc.example", False)):
+            document["protocol"]["chain"]["defaultRpcUrl"] = value
+            field["summary"] = self.input("sepolia.json", document)
+            with self.subTest(value=value):
+                if valid:
+                    self.assertEqual(len(installer.l1_files(self.spec["l1_documents"])), 6)
+                else:
+                    with self.assertRaises(ValueError):
+                        installer.l1_files(self.spec["l1_documents"])
 
     def test_artifact_tampering_and_wrapper_substitution_fail(self):
         original = self.spec["wrapper"]
@@ -308,14 +427,86 @@ class WrapperTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(self.root.chmod, 0o700)
 
     def credential(self, guardian_id, value):
+        self.root.chmod(0o700)
         path = self.root / f"psy-guardian-{guardian_id}-password"
         if path.exists():
             path.chmod(0o600)
         path.write_bytes(value)
         path.chmod(0o400)
+        self.root.chmod(0o500)
         return path
+
+    @staticmethod
+    def acl(permission, uid=999):
+        return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in (
+            (1, permission, 0xffffffff), (2, permission, uid), (4, 0, 0xffffffff),
+            (16, permission, 0xffffffff), (32, 0, 0xffffffff)))
+
+    def test_systemd_root_acl_file_and_directory_launch(self):
+        self.credential(1, b"synthetic-only")
+        real_fstat = os.fstat
+
+        def metadata(fd):
+            directory = stat.S_ISDIR(real_fstat(fd).st_mode)
+            return SimpleNamespace(st_uid=0, st_gid=0,
+                                   st_mode=(stat.S_IFDIR | 0o550) if directory else (stat.S_IFREG | 0o440))
+
+        def acl(fd, name):
+            self.assertEqual(name, "system.posix_acl_access")
+            return self.acl(5 if stat.S_ISDIR(real_fstat(fd).st_mode) else 4)
+
+        with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(self.root)}, clear=True), \
+                patch.object(wrapper.resource, "setrlimit"), patch.object(wrapper.os, "geteuid", return_value=999), \
+                patch.object(wrapper.os, "fstat", side_effect=metadata), \
+                patch.object(wrapper.os, "getxattr", side_effect=acl), \
+                patch.object(wrapper.os, "execve") as execute:
+            wrapper.launch(1)
+        self.assertEqual(execute.call_args.args[2]["GUARDIAN_1_KEYSTORE_PASSWORD"], "synthetic-only")
+
+    def test_root_acl_rejects_nonexact_metadata_and_permissions(self):
+        for directory in (False, True):
+            permission = 5 if directory else 4
+            mode = (stat.S_IFDIR if directory else stat.S_IFREG) | (0o550 if directory else 0o440)
+            expected = self.acl(permission)
+            altered_acls = [None, b"", expected[:-1], expected + b"\0", self.acl(permission, 998),
+                            struct.pack("<I", 3) + expected[4:],
+                            expected + struct.pack("<HHI", 8, permission, 988)]
+            for offset, value in ((6, permission | 2), (14, permission | 2),
+                                  (22, permission), (30, permission | 2), (38, permission)):
+                altered = bytearray(expected)
+                struct.pack_into("<H", altered, offset, value)
+                altered_acls.append(bytes(altered))
+            cases = [(0, 0, mode, acl) for acl in altered_acls]
+            cases.extend((uid, gid, changed, expected) for uid, gid, changed in (
+                (998, 0, mode), (0, 988, mode), (0, 0, mode | 0o200),
+                (0, 0, mode | 0o020), (0, 0, mode | 0o004), (0, 0, mode | 0o4000),
+                (0, 0, stat.S_IFLNK | 0o550)))
+            for uid, gid, changed, acl in cases:
+                with self.subTest(directory=directory, uid=uid, gid=gid, mode=changed, acl=acl), \
+                        patch.object(wrapper.os, "geteuid", return_value=999), \
+                        patch.object(wrapper.os, "fstat", return_value=SimpleNamespace(
+                            st_uid=uid, st_gid=gid, st_mode=changed)), \
+                        patch.object(wrapper.os, "getxattr", return_value=acl):
+                    with self.assertRaises(ValueError):
+                        wrapper.check_credential_access(123, directory=directory)
+
+    def test_uid_owned_readonly_credentials_and_xattr_errors(self):
+        for directory in (False, True):
+            mode = (stat.S_IFDIR | 0o500) if directory else (stat.S_IFREG | 0o400)
+            with patch.object(wrapper.os, "geteuid", return_value=999), \
+                    patch.object(wrapper.os, "fstat", return_value=SimpleNamespace(st_uid=999, st_gid=988, st_mode=mode)):
+                for error in (errno.ENODATA, errno.EOPNOTSUPP):
+                    with patch.object(wrapper.os, "getxattr", side_effect=OSError(error, "synthetic")):
+                        wrapper.check_credential_access(123, directory=directory)
+                with patch.object(wrapper.os, "getxattr", side_effect=OSError(errno.EACCES, "synthetic")):
+                    with self.assertRaises(OSError):
+                        wrapper.check_credential_access(123, directory=directory)
+                with patch.object(wrapper.os, "getxattr", return_value=self.acl(5 if directory else 4)):
+                    with self.assertRaises(ValueError):
+                        wrapper.check_credential_access(123, directory=directory)
 
     def test_only_selected_password_in_exec_environment_not_argv(self):
         for guardian_id in (1, 2, 3):
@@ -350,8 +541,12 @@ class WrapperTests(unittest.TestCase):
             path.chmod(0o644)
             with self.assertRaises(ValueError):
                 wrapper.launch(1)
+            self.root.chmod(0o700)
             path.unlink()
-            path.symlink_to(self.credential(2, b"other"))
+            other = self.credential(2, b"other")
+            self.root.chmod(0o700)
+            path.symlink_to(other)
+            self.root.chmod(0o500)
             with self.assertRaises(OSError):
                 wrapper.launch(1)
             execute.assert_not_called()

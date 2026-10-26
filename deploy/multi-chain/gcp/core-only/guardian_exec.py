@@ -1,11 +1,41 @@
 #!/usr/bin/env python3
 """Unit-only credential adapter; no password arguments, files or diagnostics."""
 
+import errno
 import os
 from pathlib import Path
 import resource
 import stat
+import struct
 import sys
+
+
+def check_credential_access(fd, *, directory=False):
+    info = os.fstat(fd)
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    permission = 5 if directory else 4
+    uid = os.geteuid()
+    if not kind(info.st_mode):
+        raise ValueError("unsafe credential type")
+    try:
+        acl = os.getxattr(fd, "system.posix_acl_access")
+    except OSError as exc:
+        if exc.errno not in (errno.ENODATA, errno.EOPNOTSUPP):
+            raise
+        acl = None
+    if info.st_uid == uid and stat.S_IMODE(info.st_mode) == permission << 6 and acl is None:
+        return
+    # systemd 255 grants the service UID access through a named-user ACL.
+    undefined = 0xffffffff
+    expected = struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, perm, identifier)
+        for tag, perm, identifier in (
+            (1, permission, undefined), (2, permission, uid), (4, 0, undefined),
+            (16, permission, undefined), (32, 0, undefined)))
+    if (uid == 0 or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != (permission << 6 | permission << 3)
+            or acl != expected):
+        raise ValueError("unsafe credential access")
 
 
 def launch(guardian_id):
@@ -16,13 +46,12 @@ def launch(guardian_id):
     directory = os.open(os.environ["CREDENTIALS_DIRECTORY"],
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        check_credential_access(directory, directory=True)
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     finally:
         os.close(directory)
     with os.fdopen(fd, "rb") as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise ValueError("unsafe credential")
+        check_credential_access(source.fileno())
         password = source.read(4097)
     if not 1 <= len(password) <= 4096 or any(c in password for c in (b"\0", b"\r", b"\n")):
         raise ValueError("invalid credential")
