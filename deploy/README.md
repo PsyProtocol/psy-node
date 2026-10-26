@@ -32,8 +32,11 @@ The current preparation entry is [core-only](multi-chain/gcp/core-only/README.md
 testnet / Plonky2, two Realms with three validators each, mandatory worker
 whitelist, private database endpoints and 100 Faucet operators. Its planner
 deliberately reports `deployment_ready=false`; branch publication is not rollout
-approval or evidence that services have started. The testnet startup patch is
-still a separately identified local candidate, not part of the functional SHA.
+approval or evidence that services have started. The canonical testnet startup
+fix is now integrated from `testnet-dev` commit
+`0cb10be58405c75c6aa019bcd686858dc99b4a41`. The core-only release manifest remains
+unfinalized until the Genesis generator and three-validator circuit checks are
+complete; its null runtime pin must not be interpreted as rollout readiness.
 
 Older profiles below are retained for provenance and reusable helpers. Their
 source pins, reset commands, account layouts and network selectors are NOT the
