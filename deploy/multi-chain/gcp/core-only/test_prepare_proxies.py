@@ -68,6 +68,7 @@ class ProxyPreparationTests(unittest.TestCase):
             network_config=self.root / "network.json", output=self.root / "package",
             rpc_endpoints=self.root / "rpc-endpoints.json", rpc_endpoints_sha256=None,
             memory_high_gib=None, memory_max_gib=None,
+            setup_build_manifest=None, setup_build_manifest_sha256=None,
             setup_dir=None, verifier_dir=None, setup_manifest=None, setup_manifest_sha256=None)
         self.save_inputs()
 
@@ -115,6 +116,60 @@ class ProxyPreparationTests(unittest.TestCase):
         self.assertFalse(report["rpc_reachability_verified"])
         self.assertFalse(report["memory_fit_verified"])
         self.assertEqual(stat.S_IMODE(self.args.output.stat().st_mode), 0o700)
+
+    def retained_setup_inputs(self):
+        old = copy.deepcopy(self.build)
+        old["source_commit"] = "d" * 40
+        old["binaries"] = {"psy_user_cli": "4" * 64, "psy_relayer_cli": "5" * 64}
+        for name in ("cached_circuit_library_sha256", "cached_common_data_sha256", "genesis_contracts_sha256"):
+            self.build[name] = old[name] = "6" * 64
+        for role, binary in (("consumer", "psy_user_cli"), ("generator", "psy_relayer_cli")):
+            self.setup[role]["source_commit"] = old["source_commit"]
+            self.setup[role]["binary_sha256"] = old["binaries"][binary]
+        self.args.setup_build_manifest = self.root / "old-build.json"
+        self.args.setup_build_manifest.write_bytes(p.encode(old))
+        self.args.setup_build_manifest_sha256 = p.digest(p.encode(old))
+        return old
+
+    def test_retained_setup_keeps_original_generator_and_consumer(self):
+        old = self.retained_setup_inputs()
+        original_setup = p.encode(self.setup)
+        report = self.package("system")
+        _, files = p.read_package(self.args.output, report["package_sha256"])
+        self.assertEqual((self.args.output / "setup.json").read_bytes(), original_setup)
+        self.assertEqual(files["setup-build.json"], p.digest(p.encode(old)))
+        (self.args.output / "setup-build.json").write_bytes(p.encode(self.build))
+        with self.assertRaisesRegex(p.ProxyError, "original setup build pin mismatch"):
+            p.read_package(self.args.output, report["package_sha256"])
+        for field in ("config_sha256", "local_circuits_sha256", "cached_circuit_library_sha256",
+                      "cached_common_data_sha256", "genesis_contracts_sha256"):
+            wrong = copy.deepcopy(self.build)
+            wrong[field] = "a" * 64
+            with self.subTest(field=field), self.assertRaises(p.ProxyError):
+                p.validate_retained_setup(self.setup, wrong, old)
+
+    def test_user_rejects_retained_setup_inputs(self):
+        self.args.setup_build_manifest = self.root / "old-build.json"
+        self.args.setup_build_manifest_sha256 = "a" * 64
+        with self.assertRaises(p.ProxyError):
+            self.package("user")
+
+    def test_retained_setup_requires_file_and_pin_together(self):
+        for path, pin in ((self.root / "old-build.json", None), (None, "a" * 64)):
+            self.args.setup_build_manifest, self.args.setup_build_manifest_sha256 = path, pin
+            with self.assertRaisesRegex(p.ProxyError, "file and hash together"):
+                self.package("system")
+            self.assertFalse(self.args.output.exists())
+
+    def test_user_package_rejects_setup_build_pin(self):
+        self.package("user")
+        path = self.args.output / "package.json"
+        approval = p.decode(path.read_bytes())
+        approval["setup_build_manifest_sha256"] = "a" * 64
+        raw = p.encode(approval)
+        path.write_bytes(raw)
+        with self.assertRaisesRegex(p.ProxyError, "user role forbids setup"):
+            p.read_package(self.args.output, p.digest(raw))
 
     def test_system_package_has_exactly_four_cohorts(self):
         report = self.package("system")
@@ -216,7 +271,7 @@ class ProxyPreparationTests(unittest.TestCase):
         endpoints["placement"]["user"]["listen_addr"] = "[2001:db8::12]:29999"
         self.assertIn("--listen-addr [2001:db8::12]:29999", p.proxy_unit("user", endpoints).decode())
 
-    def test_package_version_one_and_missing_placement_are_rejected(self):
+    def test_older_package_versions_and_missing_placement_are_rejected(self):
         endpoints = self.endpoints.pop("placement")
         self.save_inputs()
         with self.assertRaises(p.ProxyError):
@@ -226,12 +281,13 @@ class ProxyPreparationTests(unittest.TestCase):
         self.package()
         path = self.args.output / "package.json"
         approval = p.decode(path.read_bytes())
-        self.assertEqual(approval["version"], 2)
-        approval["version"] = 1
-        raw = p.encode(approval)
-        path.write_bytes(raw)
-        with self.assertRaisesRegex(p.ProxyError, "package schema mismatch"):
-            p.read_package(self.args.output, p.digest(raw))
+        self.assertEqual(approval["version"], 3)
+        for version in (1, 2):
+            approval["version"] = version
+            raw = p.encode(approval)
+            path.write_bytes(raw)
+            with self.subTest(version=version), self.assertRaisesRegex(p.ProxyError, "package schema mismatch"):
+                p.read_package(self.args.output, p.digest(raw))
 
     def test_placement_changes_are_pinned_and_drive_host_port_checks(self):
         self.endpoints["placement"]["user"] = {"host": "relocated.example", "listen_addr": "198.51.100.99:29999"}
@@ -240,7 +296,7 @@ class ProxyPreparationTests(unittest.TestCase):
         self.assertIn("ConditionHost=relocated.example", unit)
         self.assertIn("--listen-addr 198.51.100.99:29999", unit)
         with patch.object(p.socket, "gethostname", return_value="relocated.example"), \
-                patch.object(p, "command", self.host_command):
+                patch.object(p, "command", self.host_command), patch.object(p, "verify_previous_installation"):
             p.check_host("user", self.endpoints)
             with patch.object(p, "command", side_effect=lambda argv:
                               "LISTEN 0 4096 [2001:db8::1]:29999 [::]:*" if argv[0] == "ss" else self.host_command(argv)):
@@ -418,14 +474,22 @@ class ProxyPreparationTests(unittest.TestCase):
 
     def host_command(self, argv):
         if argv[:2] == ["systemctl", "show"]:
-            return "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\nMainPID=0\n"
+            return ("LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\nMainPID=0\n"
+                    + "FragmentPath=" + str(p.UNITS / argv[2]) + "\nDropInPaths=\n")
         return ""
 
     def test_wrong_host_active_enabled_jobs_and_ports_rejected(self):
-        with patch.object(p.socket, "gethostname", return_value="user.example"), patch.object(p, "command", self.host_command):
+        with patch.object(p.socket, "gethostname", return_value="user.example"), \
+                patch.object(p, "command", self.host_command), patch.object(p, "verify_previous_installation"):
             with self.assertRaises(p.ProxyError):
                 p.check_host("system", self.endpoints)
             p.check_host("user", self.endpoints)
+            for before, after in (("LoadState=loaded", "LoadState=not-found"),
+                                  ("FragmentPath=" + str(p.UNITS), "FragmentPath=/other"),
+                                  ("DropInPaths=", "DropInPaths=/override.conf")):
+                with patch.object(p, "command", side_effect=lambda argv:
+                                  self.host_command(argv).replace(before, after)), self.assertRaises(p.ProxyError):
+                    p.check_host("user", self.endpoints)
             for output in ("LoadState=loaded\nActiveState=active\nUnitFileState=disabled\nMainPID=1\n",
                            "LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\nMainPID=0\n"):
                 with patch.object(p, "command", return_value=output), self.assertRaises(p.ProxyError):
@@ -436,7 +500,65 @@ class ProxyPreparationTests(unittest.TestCase):
                     with self.assertRaises(p.ProxyError):
                         p.check_host("user", self.endpoints)
 
+    def test_previous_installation_failure_blocks_host_check_and_install(self):
+        report = self.package("user")
+        with patch.object(p.socket, "gethostname", return_value="user.example"), \
+                patch.object(p, "command", self.host_command), \
+                patch.object(p.os, "geteuid", return_value=0), \
+                patch.object(p, "verify_previous_installation", side_effect=p.ProxyError("previous changed")) as previous, \
+                patch.object(p, "create_directory") as create, patch.object(p, "write_new") as write:
+            with self.assertRaisesRegex(p.ProxyError, "previous changed"):
+                p.check_host("user", self.endpoints)
+            previous.assert_called_once_with("user")
+            with self.assertRaisesRegex(p.ProxyError, "previous changed"):
+                p.install_proxy(self.args.output, report["package_sha256"], check_only=False)
+            create.assert_not_called()
+            write.assert_not_called()
+
+    def test_previous_installation_rejects_changed_files_and_modes(self):
+        release_root, config_root, units = (self.root / name for name in ("release", "config", "units"))
+        release = release_root / (p.PREVIOUS_RELEASE_ID + "-system")
+        config = config_root / release.name
+        unit = units / "psy-core-prove-proxy-system.service"
+        files = {release / "psy_user_cli": self.binary, release / "build.json": p.encode(self.build),
+                 release / "setup.json": p.encode(self.setup), config / "network.json": p.encode(self.network),
+                 config / "rpc.json": b"{}\n", unit: b"test-only unit\n"}
+        hashes = {path.name: p.digest(raw) for path, raw in files.items()}
+        hashes["system"] = p.digest(files[unit])
+        for name in p.SETUP_NAMES:
+            files[release / "home/.psy/keystore" / name] = (self.root / "setup" / name).read_bytes()
+        for name in p.VERIFIERS.values():
+            files[release / "verifiers" / name] = (self.root / "verifiers" / name).read_bytes()
+        for path, raw in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            path.chmod(0o755 if path.name == "psy_user_cli" else 0o644)
+        real_fstat = os.fstat
+        owner = 0
+        def root_stat(fd):
+            info = real_fstat(fd)
+            return SimpleNamespace(st_uid=owner, st_mode=info.st_mode, st_nlink=info.st_nlink)
+        with patch.multiple(p, RELEASE_ROOT=release_root, CONFIG_ROOT=config_root, UNITS=units,
+                            PREVIOUS_HASHES=hashes), patch.object(p.os, "fstat", side_effect=root_stat):
+            p.verify_previous_installation("system")
+            for path, raw in files.items():
+                path.write_bytes(raw + b"changed")
+                with self.subTest(path=path.name), self.assertRaises(p.ProxyError):
+                    p.verify_previous_installation("system")
+                path.write_bytes(raw)
+            for path in (unit, release / "psy_user_cli", release / "build.json", release / "setup.json",
+                         config / "network.json", config / "rpc.json"):
+                mode = stat.S_IMODE(path.stat().st_mode)
+                path.chmod(0o666)
+                with self.subTest(path=path.name), self.assertRaisesRegex(p.ProxyError, "owner/mode"):
+                    p.verify_previous_installation("system")
+                path.chmod(mode)
+            owner = 1000
+            with self.assertRaisesRegex(p.ProxyError, "owner/mode"):
+                p.verify_previous_installation("system")
+
     def test_install_layout_modes_no_enable_start_and_preserve_old(self):
+        original_build = self.retained_setup_inputs()
         report = self.package("system")
         old = self.root / "old-backup"
         old.write_bytes(b"old setup and state remain unchanged")
@@ -464,6 +586,8 @@ class ProxyPreparationTests(unittest.TestCase):
             self.assertFalse(state.exists())
             self.assertIn("StateDirectory=psy-core-prove-proxy/" + state.name, unit_raw.decode())
             self.assertEqual((config / "network.json").read_bytes(), p.encode(self.network))
+            self.assertEqual((release / "setup-build.json").read_bytes(), p.encode(original_build))
+            self.assertEqual((release / "setup.json").read_bytes(), p.encode(self.setup))
             for name in p.SETUP_NAMES:
                 target = release / "home/.psy/keystore" / name
                 self.assertEqual(p.file_hash(target), self.setup["files"][name])
