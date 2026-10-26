@@ -724,7 +724,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             .next_backup_checkpoint_id
             .checked_sub(1)
             .map(|checkpoint_id| checkpoint_id / CHECKPOINTS_PER_BUCKET);
-        self.active_bucket = None;
         let start_bucket = start_checkpoint_id / CHECKPOINTS_PER_BUCKET;
         let start_record_index = start_checkpoint_id % CHECKPOINTS_PER_BUCKET;
         let start_bucket_path = self.bucket_file_path(start_bucket);
@@ -733,16 +732,37 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             .file_like_exists(&start_bucket_path)
             .await
             .map_err(|error| anyhow::anyhow!("Failed to inspect checkpoint bucket {} at {} during hard reset: {}", start_bucket, start_bucket_path, error))?;
+        let retained_len = start_record_index
+            .checked_mul(CHECKPOINT_BACKUP_ITEM_SIZE as u64)
+            .and_then(|len| len.checked_add(CHECKPOINT_BACKUP_MAGIC_LEN as u64))
+            .ok_or_else(|| anyhow::anyhow!("Checkpoint bucket {} truncate length overflow during hard reset", start_bucket))?;
+        // Reset cannot supply missing records: validate the prefix before changing handles, files, or tree.
+        if start_record_index > 0 {
+            anyhow::ensure!(start_bucket_exists,
+                "Cannot reset at checkpoint {}: missing checkpoint bucket prefix at {}", start_checkpoint_id, start_bucket_path);
+            let mut prefix_file = self.file_system.file_like_fs_open(&start_bucket_path).await?;
+            let actual_len = prefix_file.file_like_metadata().await?.len();
+            anyhow::ensure!(actual_len >= retained_len,
+                "Cannot reset at checkpoint {}: checkpoint bucket prefix at {} has {} bytes, needs {}",
+                start_checkpoint_id, start_bucket_path, actual_len, retained_len);
+            anyhow::ensure!(prefix_file.read_u64_le().await? == CHECKPOINT_BACKUP_MAGIC_U64_LE,
+                "Cannot reset: checkpoint bucket prefix at {} has invalid magic", start_bucket_path);
+            for expected_checkpoint_id in start_checkpoint_id - start_record_index..start_checkpoint_id {
+                let stored_checkpoint_id = prefix_file.read_u64_le().await?;
+                let mut stored_hash = [0u8; 32];
+                prefix_file.read_exact(&mut stored_hash).await?;
+                anyhow::ensure!(stored_checkpoint_id == expected_checkpoint_id && Hash::from_ref_32bytes(&stored_hash) != Hasher::get_zero_hash(0),
+                    "Cannot reset: checkpoint bucket prefix at {} has missing or invalid checkpoint {}",
+                    start_bucket_path, expected_checkpoint_id);
+            }
+        }
+        self.active_bucket = None;
         if start_bucket_exists {
             let mut start_bucket_file = self
                 .file_system
                 .file_like_fs_create(&start_bucket_path)
                 .await
                 .map_err(|error| anyhow::anyhow!("Failed to open checkpoint bucket {} at {} during hard reset: {}", start_bucket, start_bucket_path, error))?;
-            let retained_len = start_record_index
-                .checked_mul(CHECKPOINT_BACKUP_ITEM_SIZE as u64)
-                .and_then(|len| len.checked_add(CHECKPOINT_BACKUP_MAGIC_LEN as u64))
-                .ok_or_else(|| anyhow::anyhow!("Checkpoint bucket {} truncate length overflow during hard reset", start_bucket))?;
             start_bucket_file.file_like_set_len(retained_len).await.map_err(|error| {
                 anyhow::anyhow!("Failed to truncate checkpoint bucket {} at {} during hard reset: {}", start_bucket, start_bucket_path, error)
             })?;
@@ -926,10 +946,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             self.next_backup_checkpoint_id
         );
 
+        if self.next_backup_checkpoint_id < required_history_start {
+            // Forward gaps require DB records; reuse the root-validated ring and bucket installation.
+            return self.rebuild_from_database_at_checkpoint(checkpoint_tree_reader, last_committed_checkpoint_id).await;
+        }
         let needs_reset =
             (self.next_backup_checkpoint_id == 0 && self.min_backed_up_checkpoint_id == 0) ||
             (self.min_backed_up_checkpoint_id > required_history_start) ||
-            (self.next_backup_checkpoint_id < required_history_start) ||
             (last_committed_checkpoint_id > self.next_backup_checkpoint_id + self.max_checkpoints_to_keep * 2);
 
         if needs_reset {
@@ -2084,10 +2107,14 @@ mod tests {
         let fs = Arc::new(ChainFs::new());
         let db = create_test_unified_db().await?;
         let mut manager = chain_manager(&fs, &db, CHAIN_PATH, 10).await?;
-        for (i, value) in chain_leaves(3).iter().enumerate() {
+        for (i, value) in chain_leaves(7).iter().enumerate() {
             manager.append_checkpoint_leaf_hash(i as u64, *value).await?;
         }
+        let bucket_path = manager.bucket_file_path(0);
+        let bucket_before = fs.files.get(&bucket_path).expect("bucket must exist").value().clone();
+        let retained_len = CHECKPOINT_BACKUP_MAGIC_LEN + 5 * CHECKPOINT_BACKUP_ITEM_SIZE;
 
+        // Rewind within existing history; resetting must not invent a prefix.
         manager.hard_reset_and_truncate(5).await?;
         assert_eq!(manager.min_backed_up_checkpoint_id, 5);
         assert_eq!(manager.next_backup_checkpoint_id, 5);
@@ -2096,12 +2123,151 @@ mod tests {
         // the file was truncated back to just the magic header
         let bytes = fs.files.get(CHAIN_PATH).expect("backup file must exist").value().clone();
         assert_eq!(bytes, CHECKPOINT_BACKUP_MAGIC_BYTES.to_vec());
+        let bucket = fs.files.get(&bucket_path).expect("retained bucket must exist").value().clone();
+        assert_eq!(bucket, bucket_before[..retained_len]);
 
         // appending continues from the reset id
         manager.append_checkpoint_leaf_hash(5, chain_leaf(5)).await?;
         assert_eq!(manager.next_backup_checkpoint_id, 6);
         assert_eq!(manager.get_current_checkpoint_id_head(), 5);
         assert_eq!(manager.checkpoint_tree.get_leaf_value(5), chain_leaf(5));
+        let bucket = fs.files.get(&bucket_path).expect("appended bucket must exist").value().clone();
+        assert_eq!(bucket.len(), retained_len + CHECKPOINT_BACKUP_ITEM_SIZE);
+        assert_eq!(&bucket[..retained_len], &bucket_before[..retained_len]);
+        assert_eq!(u64::from_le_bytes(bucket[retained_len..retained_len + 8].try_into().unwrap()), 5);
+        assert_eq!(&bucket[retained_len + 8..], &chain_leaf(5).into_owned_32bytes());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hard_reset_rejects_missing_bucket_prefix_without_mutating_state() -> anyhow::Result<()> {
+        let fs = Arc::new(ChainFs::new());
+        let db = create_test_unified_db().await?;
+        let mut manager = chain_manager(&fs, &db, CHAIN_PATH, 10).await?;
+        for (checkpoint_id, hash) in chain_leaves(3).into_iter().enumerate() {
+            manager.append_checkpoint_leaf_hash(checkpoint_id as u64, hash).await?;
+        }
+        let bucket_path = manager.bucket_file_path(0);
+        let bucket_before = fs.files.get(&bucket_path).unwrap().value().clone();
+        let ring_before = fs.files.get(CHAIN_PATH).unwrap().value().clone();
+        let root_before = manager.get_current_checkpoint_tree_root_head();
+        let active_bucket_before = manager.active_bucket.as_ref().map(|(index, _)| *index);
+
+        // There is no source for checkpoints 3 and 4 in a source-free reset.
+        manager.hard_reset_and_truncate(5).await
+            .expect_err("reset must reject the missing bucket prefix before zero-extending it");
+
+        assert_eq!(fs.files.get(&bucket_path).unwrap().value(), &bucket_before);
+        assert_eq!(fs.files.get(CHAIN_PATH).unwrap().value(), &ring_before);
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), root_before);
+        assert_eq!(manager.active_bucket.as_ref().map(|(index, _)| *index), active_bucket_before);
+        manager.append_checkpoint_leaf_hash(3, chain_leaf(3)).await?;
+        assert_eq!(manager.next_backup_checkpoint_id, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_repairs_forward_reset_bucket_prefix() -> anyhow::Result<()> {
+        let fs = Arc::new(ChainFs::new());
+        let db = create_test_unified_db().await?;
+        let values = chain_leaves(15);
+        seed_db_leaves(&db, &values).await?;
+        let mut manager = chain_manager(&fs, &db, CHAIN_PATH, 10).await?;
+        for (checkpoint_id, hash) in values.iter().take(3).enumerate() {
+            manager.append_checkpoint_leaf_hash(checkpoint_id as u64, *hash).await?;
+        }
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+
+        // C=14 with capacity ten starts at C=5, beyond the local head; the DB must supply the prefix.
+        manager.sync_from_database(&db, 4, 14).await?;
+        assert_eq!(manager.min_backed_up_checkpoint_id, 5);
+        assert_eq!(manager.next_backup_checkpoint_id, 15);
+        let expected_root = db.checkpoint_tree_get_root_hash(14).await?;
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), expected_root);
+        let expected_records = values.iter().enumerate().map(|(id, hash)| (id as u64, *hash)).collect::<Vec<_>>();
+        let bucket_path = manager.bucket_file_path(0);
+        assert_eq!(fs.files.get(&bucket_path).unwrap().value(), &file_bytes(&expected_records));
+        for checkpoint_id in 5..=14 {
+            assert_eq!(manager.checkpoint_tree.get_leaf_value(checkpoint_id), values[checkpoint_id as usize]);
+        }
+
+        drop(manager);
+        let reloaded = CheckpointTreeBackupManager::<ChainHasher, ChainHash, ChainFs>::new_from_file_path(
+            Arc::clone(&fs), 10, CHAIN_HEIGHT, &db, CHAIN_PATH, false,
+        ).await?;
+        assert_eq!(reloaded.min_backed_up_checkpoint_id, 5);
+        assert_eq!(reloaded.next_backup_checkpoint_id, 15);
+        assert_eq!(reloaded.get_current_checkpoint_tree_root_head(), expected_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hard_reset_rejects_invalid_bucket_prefix_without_mutating_state() -> anyhow::Result<()> {
+        for corruption in ["missing", "magic", "id", "hash"] {
+            let fs = Arc::new(ChainFs::new());
+            let db = create_test_unified_db().await?;
+            let mut manager = chain_manager(&fs, &db, CHAIN_PATH, 10).await?;
+            for (id, hash) in chain_leaves(7).into_iter().enumerate() {
+                manager.append_checkpoint_leaf_hash(id as u64, hash).await?;
+            }
+            let bucket_path = manager.bucket_file_path(0);
+            let mut bucket = fs.files.get(&bucket_path).unwrap().value().clone();
+            match corruption {
+                "missing" => { fs.files.remove(&bucket_path); }
+                "magic" => { bucket[0] ^= 1; fs.files.insert(bucket_path.clone(), bucket); }
+                "id" => {
+                    bucket[CHECKPOINT_BACKUP_MAGIC_LEN + CHECKPOINT_BACKUP_ITEM_SIZE] ^= 1;
+                    fs.files.insert(bucket_path.clone(), bucket);
+                }
+                "hash" => {
+                    bucket[CHECKPOINT_BACKUP_MAGIC_LEN + 8..CHECKPOINT_BACKUP_MAGIC_LEN + CHECKPOINT_BACKUP_ITEM_SIZE].fill(0);
+                    fs.files.insert(bucket_path.clone(), bucket);
+                }
+                _ => unreachable!(),
+            }
+            let bucket_before = fs.files.get(&bucket_path).map(|bytes| bytes.value().clone());
+            let ring_before = fs.files.get(CHAIN_PATH).unwrap().value().clone();
+            let root_before = manager.get_current_checkpoint_tree_root_head();
+            let active_before = manager.active_bucket.as_ref().map(|(index, _)| *index);
+            let error = manager.hard_reset_and_truncate(5).await.expect_err("invalid prefix must fail before reset");
+            assert!(error.to_string().contains("prefix"), "{corruption}: {error}");
+            assert_eq!(fs.files.get(&bucket_path).map(|bytes| bytes.value().clone()), bucket_before);
+            assert_eq!(fs.files.get(CHAIN_PATH).unwrap().value(), &ring_before);
+            assert_eq!(manager.get_current_checkpoint_tree_root_head(), root_before);
+            assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+            assert_eq!(manager.next_backup_checkpoint_id, 7);
+            assert_eq!(manager.active_bucket.as_ref().map(|(index, _)| *index), active_before);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_from_database_rejects_forward_reset_source_gap_without_mutating_state() -> anyhow::Result<()> {
+        let fs = Arc::new(ChainFs::new());
+        let db = create_test_unified_db().await?;
+        let mut values = chain_leaves(15);
+        values[3] = zh(0);
+        seed_db_leaves(&db, &values).await?;
+        let mut manager = chain_manager(&fs, &db, CHAIN_PATH, 10).await?;
+        for (id, hash) in values.iter().take(3).enumerate() {
+            manager.append_checkpoint_leaf_hash(id as u64, *hash).await?;
+        }
+        let bucket_path = manager.bucket_file_path(0);
+        let bucket_before = fs.files.get(&bucket_path).unwrap().value().clone();
+        let ring_before = fs.files.get(CHAIN_PATH).unwrap().value().clone();
+        let root_before = manager.get_current_checkpoint_tree_root_head();
+        let active_before = manager.active_bucket.as_ref().map(|(index, _)| *index);
+
+        let error = manager.sync_from_database(&db, 4, 14).await.expect_err("missing DB prefix cannot be fabricated");
+        assert!(error.to_string().contains("missing or zero"), "unexpected error: {error}");
+        assert_eq!(fs.files.get(&bucket_path).unwrap().value(), &bucket_before);
+        assert_eq!(fs.files.get(CHAIN_PATH).unwrap().value(), &ring_before);
+        assert_eq!(manager.get_current_checkpoint_tree_root_head(), root_before);
+        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
+        assert_eq!(manager.next_backup_checkpoint_id, 3);
+        assert_eq!(manager.active_bucket.as_ref().map(|(index, _)| *index), active_before);
         Ok(())
     }
 
