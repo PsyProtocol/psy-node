@@ -25,9 +25,9 @@ import sys
 HERE = Path(__file__).resolve().parent
 SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 RELEASE_ID = "core-testnet-20261026-r2"
-WORKER_SHA256 = None
+WORKER_SHA256 = "db160bf77e00fecc92907cc9eaf0bba371853d1c6d6c9f8589238853fbd96f45"
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-TOPOLOGY_SHA256 = None
+TOPOLOGY_SHA256 = "89a9c4cfaa43d6537427c23c34ac2919291a582926f4841aa6926a419dc65473"
 RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
 STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID

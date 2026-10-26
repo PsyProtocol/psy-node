@@ -46,7 +46,7 @@ from urllib.parse import urlsplit
 SOURCE_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 # No r1 binary or Genesis may be accepted under the r2 release label.
 PINNED_SHA256 = {
-    "bin/psy_node_cli": None,
+    "bin/psy_node_cli": "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb",
     "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
     "genesis.json": None,
 }

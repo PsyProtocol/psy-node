@@ -45,14 +45,17 @@ class RestartReleaseTests(unittest.TestCase):
         self.assertEqual(proxies.unit_name("user"), "psy-core-prove-proxy-r2-user.service")
         self.assertIn("psy-core-prove-proxy-user.service", proxies.OLD_UNITS)
 
-    def test_unfrozen_binary_and_genesis_pins_cannot_reuse_r1(self):
-        # Remain closed until the build and Genesis owners supply reviewed hashes.
-        self.assertIsNone(packages.NODE_SHA256)
+    def test_frozen_build_pins_and_pending_genesis_cannot_reuse_r1(self):
+        self.assertEqual(packages.NODE_SHA256,
+                         "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb")
+        self.assertEqual(install.PINNED_SHA256["bin/psy_node_cli"], packages.NODE_SHA256)
+        # Remain closed until the Genesis owner supplies the reviewed candidate.
         self.assertIsNone(packages.GENESIS_SHA256)
-        self.assertIsNone(install.PINNED_SHA256["bin/psy_node_cli"])
         self.assertIsNone(install.PINNED_SHA256["genesis.json"])
-        self.assertIsNone(workers.WORKER_SHA256)
-        self.assertIsNone(workers.TOPOLOGY_SHA256)
+        self.assertEqual(workers.WORKER_SHA256,
+                         "db160bf77e00fecc92907cc9eaf0bba371853d1c6d6c9f8589238853fbd96f45")
+        self.assertEqual(workers.TOPOLOGY_SHA256,
+                         "89a9c4cfaa43d6537427c23c34ac2919291a582926f4841aa6926a419dc65473")
 
 
 if __name__ == "__main__":

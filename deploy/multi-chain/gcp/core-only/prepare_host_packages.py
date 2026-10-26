@@ -15,9 +15,9 @@ import plan
 
 
 HERE = Path(__file__).resolve().parent
-# Deliberately closed until the r2 build and identity-preserving Genesis are reviewed.
-NODE_SHA256 = None
+NODE_SHA256 = "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb"
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
+# Deliberately closed until the identity-preserving r2 Genesis is reviewed.
 GENESIS_SHA256 = None
 
 
