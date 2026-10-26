@@ -3,6 +3,15 @@ mod error;
 mod result;
 mod subcommand;
 
+// glibc malloc gives every new thread the next arena in rotation and never
+// releases free heaps in the middle of an arena. The prove proxy runs each proof
+// on a short-lived tokio blocking thread, so every deposit proof stranded ~2.5 GiB
+// of free heaps in a different arena until the host ran out of memory. jemalloc
+// purges freed pages back to the OS on its own.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(not(target_arch = "wasm32"))]
 use shadow_rs::shadow;
 

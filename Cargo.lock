@@ -7772,6 +7772,7 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "thiserror 2.0.17",
+ "tikv-jemallocator",
  "tiny-keccak",
  "tokio",
  "tokio-tungstenite 0.24.0",
