@@ -95,9 +95,9 @@ pub const ETH_PERSONAL_SECP256K1_FINGERPRINT_U64: [u64; 4] =
 /// `0x1337CF514544CF69` (localhost and testnet). The circuit bakes
 /// `PSY_NETWORK_MAGIC` into its sighash constraints, so the mainnet magic
 /// `0x1337CF514544C069` is a different circuit and is not recorded here.
-/// 084655fe935380d64be6ca7257f1a042038d52201007d309439c7b4a2b4a25ea
+/// a8e0dc9f01f1f20f0bf8e92644a346e8876b8cbb48aaaed8d91813ea17ea53bb
 pub const STAGE_CF69_MULTISIG_FINGERPRINT_U64: [u64; 4] =
-    [4871904455392110058, 255951051491365641, 5469281389938581570, 596258552554946774];
+    [15643275201815925691, 9758047753634229976, 862695679211030248, 12168968768645624335];
 
 /// Multisig signature-circuit fingerprint for the magic this binary was built
 /// with. Unlike the ZK and secp getters this is fallible: only the measured
