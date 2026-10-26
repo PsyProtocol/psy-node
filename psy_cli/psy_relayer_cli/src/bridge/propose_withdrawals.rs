@@ -271,7 +271,7 @@ async fn fetch_bridge_withdrawals(
     destination_chain_index: Option<u64>,
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
     let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
-    let limit: u32 = 10_000;
+    let limit: u32 = 1_000;
     let mut offset: u64 = initial_event_offset;
 
     loop {
@@ -315,18 +315,21 @@ async fn fetch_bridge_withdrawals(
         }
 
         let data = resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))?;
-        let page_len = data.withdrawals.len() as u64;
+        let total = u64::try_from(data.total)
+            .map_err(|_| anyhow::anyhow!("psy-services returned negative withdrawal total {}", data.total))?;
+        let page_len = u64::try_from(data.withdrawals.len())?;
+        let next_offset = offset.checked_add(page_len)
+            .ok_or_else(|| anyhow::anyhow!("withdrawal offset overflow at {} with {} returned rows", offset, page_len))?;
+        anyhow::ensure!(
+            page_len != 0 || offset >= total,
+            "psy-services returned an empty withdrawal page at offset {} before total {}",
+            offset, total,
+        );
         all_withdrawals.extend(data.withdrawals);
-
-        // psy-services caps pages below the requested limit (handler max is
-        // 1,000), so a short page does NOT mean the stream is exhausted — only
-        // the reported total is authoritative. Keep paging until the filtered
-        // total is fully collected (or an empty page makes further progress
-        // impossible).
-        if page_len == 0 || all_withdrawals.len() as i64 >= data.total {
+        if next_offset >= total {
             break;
         }
-        offset += page_len;
+        offset = next_offset;
     }
 
     Ok(all_withdrawals)
@@ -762,6 +765,126 @@ pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn withdrawal_page(event_ids: &[i64], total: i64) -> serde_json::Value {
+        let withdrawals: Vec<_> = event_ids.iter().map(|event_id| serde_json::json!({
+            "event_id": event_id,
+            "checkpoint_id": 10,
+            "user_id": 1,
+            "sender_user_id": 1,
+            "contract_id": 2,
+            "destination_chain_index": 2,
+            "token_address_limbs": [0, 0, 0, 0, 0, 0, 0, 0],
+            "amount_limbs": [1, 0, 0, 0, 0, 0, 0, 0],
+            "recipient_limbs": [1, 0, 0, 0, 0, 0, 0, 0],
+            "nonce_limbs": [0, 0, 0, 0, 0, 0, 0, 0],
+            "leaf_hash": UNKNOWN_WITHDRAWAL_TREE_ROOT,
+        })).collect();
+        serde_json::json!({"success": true, "data": {"withdrawals": withdrawals, "total": total}})
+    }
+
+    async fn fetch_withdrawal_pages(
+        initial_offset: u64,
+        destination_chain_index: Option<u64>,
+        pages: Vec<(u64, serde_json::Value)>,
+    ) -> anyhow::Result<anyhow::Result<Vec<BridgeWithdrawalEntry>>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build()?;
+        let server = async move {
+            for (offset, body) in pages {
+                let (socket, _) = listener.accept().await?;
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await?;
+                let request = reqwest::Url::parse(&format!("http://localhost{}", line.split_whitespace().nth(1)
+                    .ok_or_else(|| anyhow::anyhow!("missing request target"))?))?;
+                assert_eq!(request.path(), "/api/v1/bridge/withdrawals");
+                let mut expected = vec![("limit".to_string(), "1000".to_string()), ("offset".to_string(), offset.to_string())];
+                if let Some(chain_index) = destination_chain_index {
+                    expected.push(("destination_chain_index".to_string(), chain_index.to_string()));
+                }
+                assert_eq!(request.query_pairs().into_owned().collect::<Vec<_>>(), expected);
+                loop {
+                    line.clear();
+                    anyhow::ensure!(socket.read_line(&mut line).await? > 0, "incomplete request headers");
+                    if line == "\r\n" { break; }
+                }
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket.get_mut().write_all(response.as_bytes()).await?;
+            }
+            // Closing the listener makes any request beyond the reported total fail.
+            drop(listener);
+            Ok::<_, anyhow::Error>(())
+        };
+        let (result, served) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), fetch_bridge_withdrawals(&http, &url, initial_offset, destination_chain_index)),
+            tokio::time::timeout(Duration::from_secs(5), server),
+        );
+        served??;
+        Ok(result?)
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_nonzero_cursor_stops_at_total() -> anyhow::Result<()> {
+        let withdrawals = fetch_withdrawal_pages(42, Some(2), vec![(42, withdrawal_page(&[90, 95], 44))]).await??;
+        assert_eq!(withdrawals.iter().map(|row| row.event_id).collect::<Vec<_>>(), vec![90, 95]);
+        assert!(withdrawals.iter().all(|row| row.destination_chain_index == 2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_short_pages_advance_by_returned_rows() -> anyhow::Result<()> {
+        let withdrawals = fetch_withdrawal_pages(42, Some(2), vec![
+            (42, withdrawal_page(&[90, 95], 47)),
+            (44, withdrawal_page(&[99], 47)),
+            (45, withdrawal_page(&[101, 108], 47)),
+        ]).await??;
+        assert_eq!(withdrawals.iter().map(|row| row.event_id).collect::<Vec<_>>(), vec![90, 95, 99, 101, 108]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_empty_page_before_total_fails() -> anyhow::Result<()> {
+        let error = fetch_withdrawal_pages(42, Some(2), vec![
+            (42, withdrawal_page(&[90, 95], 45)),
+            (44, withdrawal_page(&[], 45)),
+        ]).await?.expect_err("an incomplete indexed prefix must not be returned");
+        assert_eq!(error.to_string(), "psy-services returned an empty withdrawal page at offset 44 before total 45");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_empty_page_at_total_succeeds() -> anyhow::Result<()> {
+        for offset in [0, 42] {
+            let withdrawals = fetch_withdrawal_pages(offset, None, vec![(offset, withdrawal_page(&[], offset as i64))]).await??;
+            assert!(withdrawals.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_negative_total_fails() -> anyhow::Result<()> {
+        let error = fetch_withdrawal_pages(0, Some(2), vec![(0, withdrawal_page(&[], -1))])
+            .await?.expect_err("a negative total must not be accepted");
+        assert_eq!(error.to_string(), "psy-services returned negative withdrawal total -1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_offset_overflow_fails() -> anyhow::Result<()> {
+        let error = fetch_withdrawal_pages(u64::MAX, Some(2), vec![(u64::MAX, withdrawal_page(&[90], i64::MAX))])
+            .await?.expect_err("an overflowing offset must not wrap or saturate");
+        assert_eq!(error.to_string(), format!("withdrawal offset overflow at {} with 1 returned rows", u64::MAX));
+        Ok(())
+    }
 
     fn u32x8_be_to_hex(words: [u32; 8]) -> String {
         let mut bytes = [0u8; 32];
