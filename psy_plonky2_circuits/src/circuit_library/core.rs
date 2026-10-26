@@ -12,7 +12,7 @@ pub fn get_plonky2_circuit_library_and_prover_for_network<C: QGenericConfig<D> +
 ) -> anyhow::Result<(GenericCircuitVerifier<C, D>, QEDCoordinatorCircuitManager<C, D>)> 
 where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
-
+    crate::node::config::networks::resolver::ensure_plonky2_network(network)?;
     let mut gcv = GenericCircuitVerifier::<C, D>::new();
 
     // use dummy for now

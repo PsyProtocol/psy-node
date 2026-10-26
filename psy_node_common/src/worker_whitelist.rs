@@ -35,7 +35,7 @@ impl WhiteList {
     fn from_json(json: &str, network: PsyChainNetworkType) -> anyhow::Result<Self> {
         let config: ConfigFile = serde_json::from_str(json)
             .map_err(|error| anyhow::anyhow!("failed to parse worker whitelist config JSON: {error}"))?;
-        let config_key = config_key_for_network(network)?;
+        let config_key = network.config_key()?;
         let network_entry = config.networks.get(config_key).ok_or_else(|| {
             anyhow::anyhow!(
                 "worker whitelist config has no network entry for {network:?} (config key \"{config_key}\")"
@@ -140,21 +140,6 @@ impl Drop for Inner {
     }
 }
 
-fn config_key_for_network(network: PsyChainNetworkType) -> anyhow::Result<&'static str> {
-    match network {
-        PsyChainNetworkType::LocalDevnet => Ok("localhost"),
-        PsyChainNetworkType::PsyPublicTestnet => Ok("sepolia"),
-        PsyChainNetworkType::PsyMainnet => Ok("ethereum"),
-        PsyChainNetworkType::PsyTeamDevnet
-        | PsyChainNetworkType::InternalDevnet
-        | PsyChainNetworkType::InternalTestnet
-        | PsyChainNetworkType::InternalPreProduction
-        | PsyChainNetworkType::PsyPublicCanary => {
-            anyhow::bail!("worker whitelist config has no explicit mapping for network {network:?}")
-        }
-    }
-}
-
 fn parse_compressed_key(value: &str) -> anyhow::Result<[u8; 33]> {
     let trimmed = value.trim();
     let hex_value = trimmed
@@ -233,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_only_explicitly_supported_networks() {
+    fn maps_only_supported_network_config_keys() {
         let expectations = [
             (PsyChainNetworkType::LocalDevnet, Some("localhost")),
             (PsyChainNetworkType::PsyTeamDevnet, None),
@@ -241,16 +226,50 @@ mod tests {
             (PsyChainNetworkType::InternalTestnet, None),
             (PsyChainNetworkType::InternalPreProduction, None),
             (PsyChainNetworkType::PsyPublicCanary, None),
-            (PsyChainNetworkType::PsyPublicTestnet, Some("sepolia")),
-            (PsyChainNetworkType::PsyMainnet, Some("ethereum")),
+            (PsyChainNetworkType::PsyPublicTestnet, Some("testnet")),
+            (PsyChainNetworkType::PsyMainnet, Some("mainnet")),
         ];
 
         for (network, expected) in expectations {
             match expected {
-                Some(config_key) => assert_eq!(config_key_for_network(network).unwrap(), config_key),
-                None => assert!(config_key_for_network(network).is_err(), "{network:?} must fail closed"),
+                Some(config_key) => assert_eq!(network.config_key().unwrap(), config_key),
+                None => assert!(network.config_key().is_err(), "{network:?} must fail closed"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn testnet_policy_enforces_membership_without_legacy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = key_from_seed(1);
+        let non_member = key_from_seed(2);
+        let mut config = config_with_policy("testnet", true, &[member]);
+        config["networks"]["localhost"] = config_with_policy("localhost", false, &[])["networks"]["localhost"].clone();
+        config["networks"]["sepolia"] = config_with_policy("sepolia", false, &[])["networks"]["sepolia"].clone();
+        let path = write_config(&dir, config);
+        let cache = WhiteListCache::new(path, PsyChainNetworkType::PsyPublicTestnet).unwrap();
+        cache.ensure_allowed(&member).unwrap();
+        assert!(cache.ensure_allowed(&non_member).is_err());
+    }
+
+    #[test]
+    fn missing_testnet_policy_section_fails_closed() {
+        for config_key in ["localhost", "sepolia"] {
+            let config = config_with_policy(config_key, false, &[]);
+            assert!(WhiteList::from_json(&config.to_string(), PsyChainNetworkType::PsyPublicTestnet).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn testnet_reload_missing_section_retains_enforced_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let member = key_from_seed(1);
+        let path = write_config(&dir, config_with_policy("testnet", true, &[member]));
+        let cache = WhiteListCache::new(&path, PsyChainNetworkType::PsyPublicTestnet).unwrap();
+        fs::write(&path, config_with_policy("sepolia", false, &[]).to_string()).unwrap();
+        assert!(cache.reload_once().is_err());
+        cache.ensure_allowed(&member).unwrap();
+        assert!(cache.ensure_allowed(&key_from_seed(2)).is_err());
     }
 
     #[tokio::test]
@@ -280,7 +299,7 @@ mod tests {
         let error = WhiteListCache::new(path, PsyChainNetworkType::PsyTeamDevnet)
             .err()
             .expect("unsupported network must fail closed");
-        assert!(error.to_string().contains("no explicit mapping"));
+        assert!(error.to_string().contains("No configuration key"));
     }
 
     #[tokio::test]
