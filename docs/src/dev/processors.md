@@ -106,7 +106,7 @@ Part-1 and CST reward layouts are in [Reward Tree Circuit Layouts](reward-tree-c
 
 Entry: `realm/processor/core/process_block.rs:422`.
 
-1. Sanity check, then `get_results_from_gatherers` (`:175`): `set_new_unique_ids(Option<N::QHash>)` at `realm/processor/db/commit.rs:154` rotates ids; it does not publish a gathering generation. Then finalize the EndCap gatherer.
+1. Sanity check, then `get_results_from_gatherers`: `set_new_unique_ids(Option<N::QHash>)` in `realm/processor/db/commit.rs` creates the next consumers, rotates ids, and publishes the gathering generation. Then finalize the EndCap gatherer.
 2. If there is no root job, synchronize metadata only through `last_committed_checkpoint_id` and return without mutating `processing_realm_end_root` (`:447-467`). This is not an early return before gatherer results.
 3. If P2P rotation is enabled and the finalized proof base does not schedule this sub-ID for `T = base + 1`, fail closed without syncing after the gatherer tree commit.
 4. Record `processing_realm_end_root`, publish GUTA jobs, and retrieve the root proof.

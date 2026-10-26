@@ -60,7 +60,7 @@ type N = PsyRGPNetworkConfig;
 /// Generates a deterministic valid Ed25519 NodeId and BLS public key from
 /// fixed seeds, advancing the seeds only until the SHA-256 digests reduce
 /// to canonical Goldilocks limbs (as realm_validator_leaf_hash requires).
-fn validator_key_fixture(node_seed: u64, bls_seed: u64) -> (NodeId, [u64; 4], BlsPublicKey, [u64; 4]) {
+pub(crate) fn validator_key_fixture(node_seed: u64, bls_seed: u64) -> (NodeId, [u64; 4], BlsPublicKey, [u64; 4]) {
     use libp2p_identity::Keypair;
     for attempt in 0..10_000u64 {
         let mut ed_seed = [0u8; 32];

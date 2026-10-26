@@ -71,17 +71,18 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::worker_whitelist::WhiteListCache;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+const MAX_END_CAP_RESTAGES: usize = 3;
 
 fn ensure_end_cap_generation_unchanged(
     stored: GatheringGeneration,
     gathering: GatheringGeneration,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        stored == gathering,
-        "EndCap gathering generation changed during storage/delivery: stored {:?}, current {:?}; delivery is not confirmed",
-        stored,
-        gathering,
-    );
+    if stored != gathering {
+        return Err(EndCapSubmitError::Busy(format!(
+            "EndCap gathering generation changed during storage/delivery: stored {:?}, current {:?}; delivery is not confirmed; check the user leaf before retrying",
+            stored, gathering,
+        )).into());
+    }
     Ok(())
 }
 
@@ -89,7 +90,7 @@ async fn with_end_cap_gathering_generation<Read, ReadFuture, Submit, SubmitFutur
     generation: GatheringGeneration,
     mut read_generation: Read,
     submit: Submit,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Option<GatheringGeneration>>
 where
     Read: FnMut() -> ReadFuture,
     ReadFuture: Future<Output = anyhow::Result<GatheringGeneration>>,
@@ -98,8 +99,18 @@ where
 {
     ensure_end_cap_generation_unchanged(generation, read_generation().await?)?;
     submit(generation).await?;
-    // A stale ephemeral publish may succeed after its gatherer has retired.
-    ensure_end_cap_generation_unchanged(generation, read_generation().await?)
+    let gathering = read_generation().await?;
+    if gathering == generation {
+        return Ok(None);
+    }
+    // Handoff may change the batch, but never the checkpoint that authorized routing.
+    if gathering.checkpoint_id != generation.checkpoint_id
+        || gathering.unique_pending_id == generation.unique_pending_id
+        || gathering.proc_checkpoint_unique_id == generation.proc_checkpoint_unique_id
+    {
+        ensure_end_cap_generation_unchanged(generation, gathering)?;
+    }
+    Ok(Some(gathering))
 }
 
 fn end_cap_generation_target(generation: GatheringGeneration) -> anyhow::Result<u64> {
@@ -946,24 +957,43 @@ impl<
         }).await??;
         timer.lap_micros("verify_zk_proof");
 
-        // Verification may span rotations; never persist into a generation other
-        // than the one whose scheduled proposer admitted this EndCap.
-        with_end_cap_gathering_generation(
-            generation,
-            || self.temp_db.get_gathering_generation(&self.realm_identifier),
-            |generation| async move {
-                self.store_end_cap_for_processing(
+        // Verification must finish in the generation whose scheduled proposer admitted this EndCap.
+        let submission_token = rand::random::<u64>();
+        let mut generation = generation;
+        let mut restages = 0;
+        loop {
+            let next_generation = with_end_cap_gathering_generation(
+                generation,
+                || self.temp_db.get_gathering_generation(&self.realm_identifier),
+                |generation| self.store_end_cap_for_processing(
                     timer,
-                    user_end_cap_input,
-                    proof_bytes,
+                    &user_end_cap_input,
+                    &proof_bytes,
                     user_id,
                     old_leaf_hash,
                     generation,
-                )
-                .await
-            },
-        )
-        .await
+                    submission_token,
+                ),
+            ).await?;
+            let Some(next_generation) = next_generation else {
+                timer.lap_group("handle_user_end_cap_proof_submission total");
+                return Ok(());
+            };
+            if restages == MAX_END_CAP_RESTAGES {
+                return Err(EndCapSubmitError::Busy(format!(
+                    "gathering batch rotated too many times while publishing EndCap for user_id {}; delivery is not confirmed, a copy may still be included; check the user leaf before retrying",
+                    user_id,
+                )).into());
+            }
+            restages += 1;
+            tracing::warn!(
+                user_id,
+                from_unique_pending_id = generation.unique_pending_id,
+                to_unique_pending_id = next_generation.unique_pending_id,
+                "Gathering batch rotated after EndCap publication; restaging at the admitted checkpoint"
+            );
+            generation = next_generation;
+        }
     }
 
     async fn forward_end_cap_to_scheduled_proposer(
@@ -1011,6 +1041,9 @@ impl<
                         unique_pending_id,
                     })
                 }
+                EndCapRejectReason::Busy => anyhow::Error::new(EndCapSubmitError::Busy(format!(
+                    "EndCap forward to proposer {proposer} is busy; delivery is not confirmed, a copy may still be included; check the user leaf before retrying"
+                ))),
                 reason => anyhow::anyhow!(
                     "EndCap forward rejected by proposer {proposer} (reason {reason:?})"
                 ),
@@ -1025,21 +1058,21 @@ impl<
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn store_end_cap_for_processing(
         &self,
         timer: &mut DebugTimer,
-        user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
-        proof_bytes: Vec<u8>,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        proof_bytes: &[u8],
         user_id: u64,
         old_leaf_hash: N::QHash,
         generation: GatheringGeneration,
+        submission_token: u64,
     ) -> anyhow::Result<()> {
         let GatheringGeneration { unique_pending_id, proc_checkpoint_unique_id: proc_checkpoint_id, .. } = generation;
         let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
             user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id,
         )?;
-        // Only fills the QBlob context checkpoint placeholder (not a real checkpoint).
-        let submission_token = rand::random::<u64>();
         let context = QBlobWriterContextMetadataHeader::new_at_now(
             self.chain_id,
             self.node_id,
@@ -1050,7 +1083,7 @@ impl<
             user_id,
         );
         let contract_update_data_for_user =
-            validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, &user_end_cap_input)?;
+            validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, user_end_cap_input)?;
         if !self
             .temp_db
             .put_submitted_status_if_absent(
@@ -1069,14 +1102,14 @@ impl<
         timer.lap_micros("put_submitted_status_if_absent");
 
         self.proof_store
-            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
+            .put_proof_bytes_for_job_id(job_id, unique_pending_id, proof_bytes)
             .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
 
         let slot_updates_payload = match self.build_user_end_cap_slot_updates(
             unique_pending_id,
             user_id,
-            &user_end_cap_input,
+            user_end_cap_input,
         ) {
             Ok(payload) => Some(payload),
             Err(err) => {
@@ -1148,7 +1181,7 @@ impl<
             new_user_leaf_hash,
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
-            events: user_end_cap_input.events,
+            events: user_end_cap_input.events.clone(),
         };
 
         self.user_update_queue.ensure_consumer(
@@ -1168,8 +1201,6 @@ impl<
             .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
             .await?;
         timer.lap_micros("publish_ephemeral_queue_item_owned");
-        timer.lap_group("handle_user_end_cap_proof_submission total");
-
         Ok(())
     }
 
@@ -1266,7 +1297,12 @@ impl<
     }
 
     async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: Vec<u8>) -> QRpcResult<String> {
-        res(self.handle_user_end_cap_proof_submission(user_ec_input, proof, None).await)?;
+        self.handle_user_end_cap_proof_submission(user_ec_input, proof, None)
+            .await
+            .map_err(|err| match EndCapSubmitError::from_error_chain(&err) {
+                Some(busy @ EndCapSubmitError::Busy(_)) => RpcError::EndCapSubmit(busy),
+                _ => RpcError::Anyhow(err),
+            })?;
         Ok("ok".to_string())
     }
 
@@ -1713,15 +1749,21 @@ mod mainnet_tests {
     async fn end_cap_rotation_between_verification_and_store_rejects_before_writes() {
         use std::cell::Cell;
         let admitted = generation();
-        let rotated = GatheringGeneration { checkpoint_id: 25, ..admitted };
-        let wrote = Cell::new(false);
-        let result = with_end_cap_gathering_generation(
-            admitted,
-            || std::future::ready(Ok(rotated)),
-            |_| async { wrote.set(true); Ok(()) },
-        ).await;
-        assert!(result.is_err());
-        assert!(!wrote.get());
+        for rotated in [
+            GatheringGeneration { checkpoint_id: 25, ..admitted },
+            GatheringGeneration { unique_pending_id: 43, ..admitted },
+            GatheringGeneration { proc_checkpoint_unique_id: 103, ..admitted },
+            GatheringGeneration { unique_pending_id: 43, proc_checkpoint_unique_id: 103, ..admitted },
+        ] {
+            let wrote = Cell::new(false);
+            let result = with_end_cap_gathering_generation(
+                admitted,
+                || std::future::ready(Ok(rotated)),
+                |_| async { wrote.set(true); Ok(()) },
+            ).await;
+            assert!(result.is_err());
+            assert!(!wrote.get());
+        }
     }
 
     #[tokio::test]
@@ -2269,7 +2311,7 @@ pub(crate) mod tests {
         },
         psy_temp_db::{
             QTempDBJobStatsStore, QTempDBPendingIdWriter, QTempDBSubmitStatusWriter,
-            QTempDBUserEndCapSlotUpdatesWriter,
+            QTempDBSubmitStatusReader, QTempDBUserContractUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter,
         },
         store::traits::proof_store::QParthProofStoreReader,
     };
@@ -2919,6 +2961,295 @@ pub(crate) mod tests {
             .await
             .expect_err("double submission must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_is_republished_when_the_batch_rotates_after_publish() -> anyhow::Result<()> {
+        for forwarded_target in [None, Some(1)] {
+            let env = end_cap_env().await?;
+            seed_contract_heights(&env).await?;
+            let temp_db = Arc::clone(&env.temp_db);
+            env.user_update_queue.set_after_publish_hook(Box::new(move |proc_id| {
+                if proc_id == 0 {
+                    set_end_cap_gathering_generation(&temp_db, 0, 1, 11);
+                }
+            }));
+            let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+
+            env.handler.handle_user_end_cap_proof_submission(input.clone(), proof_bytes.clone(), forwarded_target).await?;
+
+            assert_eq!(env.user_update_queue.published_count(), 2);
+            let first = assert_end_cap_staged_in(&env, 0, 0, &proof_bytes).await?;
+            let next = assert_end_cap_staged_in(&env, 1, 11, &proof_bytes).await?;
+            assert_eq!(first.submission_nonce, next.submission_nonce);
+            assert_eq!(first.old_user_leaf_hash, next.old_user_leaf_hash);
+            assert_eq!(next.new_user_leaf_hash, input.core.new_user_leaf.qfhash::<PoseidonHasher>());
+            assert_eq!(first.events, next.events);
+        }
+        Ok(())
+    }
+
+    fn set_end_cap_gathering_generation(temp_db: &InMemoryTempStore, checkpoint_id: u64, unique_pending_id: u64, proc_id: u128) {
+        futures::executor::block_on(temp_db.set_gathering_generation(
+            &test_realm_identifier(),
+            GatheringGeneration { checkpoint_id, unique_pending_id, proc_checkpoint_unique_id: proc_id },
+        )).expect("set gathering generation");
+    }
+
+    #[tokio::test]
+    async fn p2p_forwarded_end_cap_restages_only_on_the_scheduled_edge() -> anyhow::Result<()> {
+        use crate::guta_planner::realm_guta_planner_tests::test_env::validator_key_fixture;
+        use psy_node_core::psy_core_db::traits::full::{PsyNodeValidatorTreeDatabaseReader, PsyNodeValidatorTreeDatabaseWriter};
+        use psy_data::p2p::ValidatorLeafPreimage;
+        let mut env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let mut edges = HashMap::new();
+        for sub_id in 1..=3u16 {
+            let (node_id, _, bls_key, _) = validator_key_fixture(10_000 * sub_id as u64, 20_000 * sub_id as u64);
+            let preimage = ValidatorLeafPreimage {
+                chain_id: env.handler.chain_id,
+                realm_id: TEST_REALM_ID as u32,
+                realm_sub_id: sub_id,
+                validator_user_id: (TEST_REALM_ID << N::REALM_GLOBAL_USER_TREE_HEIGHT) + sub_id as u64,
+                node_id: *node_id.as_raw(),
+                bls_public_key: bls_key.to_bytes(),
+            };
+            let index = preimage.tree_index()?;
+            env.db.validator_tree_set_leaf_hash(0, index, PHash::from_owned_32bytes(preimage.leaf_hash()?)).await?;
+            env.db.validator_tree_set_leaf_preimage(0, index, &preimage).await?;
+            edges.insert(sub_id, node_id);
+        }
+        assert_eq!(edges.values().collect::<HashSet<_>>().len(), 3);
+        env.db.set_checkpoint_global_state_roots(0, &psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots {
+            validator_tree_root: env.db.validator_tree_get_root_hash(0).await?,
+            user_tree_root: PHash::get_zero_value(),
+            contract_tree_root: PHash::get_zero_value(),
+            deposit_tree_root: PHash::get_zero_value(),
+            withdrawal_tree_root: PHash::get_zero_value(),
+            user_registration_tree_root: PHash::get_zero_value(),
+        }).await?;
+        let checkpoint_leaf = psy_data::v1::qdata::checkpoint::PQEDCheckpointLeaf {
+            global_chain_root: PHash::get_zero_value(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        env.db.set_checkpoint_leaf_data(0, &checkpoint_leaf).await?;
+        let seed = checkpoint_leaf.stats.random_seed.to_4_felts().map(|felt| felt.to_u64_value());
+        let rotation = RealmRotationConfig { checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH, validator_sub_ids: vec![1, 2, 3] };
+        let proposer = rotation.proposer_sub_id(TEST_REALM_ID as u32, 1, seed)?.unwrap();
+        let other = (1..=3u16).find(|sub_id| *sub_id != proposer).unwrap();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        env.handler.set_realm_p2p(
+            RealmNetworkCommands::from_channel(commands.clone(), edges[&other]),
+            edges.clone(), edges.values().copied().collect(),
+        );
+        let (input, proof) = valid_end_cap_submission(&env).await?;
+        let bytes = input.psy_ser_to_bytes_vec()?;
+        let input_hash = sha256(&bytes);
+        let proof_hash = sha256(&proof);
+        let header = EndCapForwardHeader {
+            chain_id: env.handler.chain_id, realm_id: TEST_REALM_ID as u32, checkpoint_id: 1,
+            end_cap_id: compute_end_cap_id(env.handler.chain_id, TEST_REALM_ID as u32, 1, &input_hash, &proof_hash),
+            end_cap_input_len: bytes.len() as u32, proof_len: proof.len() as u32,
+        };
+        let err = env.handler.accept_forwarded_end_cap(edges[&proposer], header.clone(), bytes.clone(), proof.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("not primary for scheduled proposer"), "{err:#}");
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        let remote = async {
+            match receiver.recv().await.expect("forwarded public RPC request") {
+                crate::realm::network::RealmNetworkCommand::ForwardEndCap { destination, response, .. } => {
+                    assert_eq!(destination, edges[&proposer]);
+                    response.send(Ok(EndCapForwardResponse::rejected(EndCapRejectReason::Busy))).unwrap();
+                }
+                _ => panic!("expected an EndCap forwarding command"),
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                RealmEdgeRpcServer::submit_user_end_cap(&env.handler, input.clone(), proof.clone()),
+                remote,
+            )
+        }).await.expect("public RPC must finish after the forwarded Busy reply");
+        let err = result.expect_err("forwarded Busy must not report acceptance");
+        assert_eq!(err.code(), jsonrpsee::types::error::SERVER_IS_BUSY_CODE);
+        assert!(err.message().contains("delivery is not confirmed"), "unexpected error: {err}");
+        assert!(err.message().contains("check the user leaf before retrying"), "unexpected error: {err}");
+        assert!(err.data().is_none());
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        env.handler.set_realm_p2p(
+            RealmNetworkCommands::from_channel(commands, edges[&proposer]),
+            edges.clone(), edges.values().copied().collect(),
+        );
+        let temp_db = env.temp_db.clone();
+        env.user_update_queue.set_after_publish_hook(Box::new(move |proc_id| {
+            if proc_id == 0 { set_end_cap_gathering_generation(&temp_db, 0, 1, 11); }
+        }));
+        let expected_id = header.end_cap_id;
+        assert_eq!(env.handler.accept_forwarded_end_cap(edges[&other], header.clone(), bytes.clone(), proof.clone()).await?, expected_id);
+        assert_eq!(env.user_update_queue.published_count(), 2);
+        let first = assert_end_cap_staged_in(&env, 0, 0, &proof).await?;
+        let next = assert_end_cap_staged_in(&env, 1, 11, &proof).await?;
+        assert_eq!(first.submission_nonce, next.submission_nonce);
+        assert!(matches!(receiver.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "receiver must not forward again");
+        set_end_cap_gathering_generation(&env.temp_db, 1, 2, 12);
+        assert!(env.handler.accept_forwarded_end_cap(edges[&other], header.clone(), bytes.clone(), proof.clone()).await.is_err());
+        assert_eq!(env.user_update_queue.published_count(), 2, "old routing authorization cannot enter the next checkpoint");
+        // A published copy may survive churn; the public P2P response must not call it invalid.
+        set_end_cap_gathering_generation(&env.temp_db, 0, 4, 14);
+        let temp_db = env.temp_db.clone();
+        let mut pending_id = 4;
+        env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+            pending_id += 1;
+            set_end_cap_gathering_generation(&temp_db, 0, pending_id, pending_id as u128 + 10);
+        }));
+        let response = env.handler.handle_p2p_end_cap_received(edges[&other], header, bytes, proof).await;
+        assert!(!response.is_accepted());
+        assert_eq!(response.reject_reason(), EndCapRejectReason::Busy);
+        assert_eq!(env.user_update_queue.published_count(), 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_busy_preserves_uncertain_delivery() -> anyhow::Result<()> {
+        use crate::realm::network::RealmNetworkCommand;
+        use crate::guta_planner::realm_guta_planner_tests::test_env::validator_key_fixture;
+        let mut env = end_cap_env().await?;
+        let (source, _, _, _) = validator_key_fixture(10_000, 20_000);
+        let (dest, _, _, _) = validator_key_fixture(30_000, 40_000);
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        env.handler.set_realm_p2p(
+            RealmNetworkCommands::from_channel(commands, source),
+            HashMap::from([(1, dest)]), HashSet::from([source, dest]),
+        );
+        let (input, proof) = valid_end_cap_submission(&env).await?;
+        let remote = async {
+            let command = receiver.recv().await.expect("forwarded request");
+            match command {
+                RealmNetworkCommand::ForwardEndCap { destination, response, .. } => {
+                    assert_eq!(destination, dest);
+                    response.send(Ok(EndCapForwardResponse::rejected(EndCapRejectReason::Busy))).unwrap();
+                }
+                _ => panic!("expected an EndCap forwarding command"),
+            }
+        };
+        let (result, ()) = tokio::join!(
+            env.handler.forward_end_cap_to_scheduled_proposer(&input, proof, 1, dest, 1),
+            remote,
+        );
+        let err = result.expect_err("busy must not be reported as accepted");
+        assert!(matches!(EndCapSubmitError::from_error_chain(&err), Some(EndCapSubmitError::Busy(_))));
+        assert!(err.to_string().contains("check the user leaf before retrying"));
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        Ok(())
+    }
+
+    async fn assert_end_cap_staged_in(
+        env: &EndCapEnv,
+        unique_pending_id: u64,
+        proc_id: u128,
+        proof_bytes: &[u8],
+    ) -> anyhow::Result<PsyRealmUserUpdateQueueItem<PF, PHash>> {
+        use psy_node_core::qblob::{
+            blob_type::QBlobMerkleNodeTreeType,
+            data_views::single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
+        };
+        let published = env.user_update_queue.published_bytes_for(proc_id);
+        assert_eq!(published.len(), 1);
+        let queue_item = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&published[0])?;
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            REALM_USER_ID, EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT, unique_pending_id,
+        )?;
+        assert_eq!(queue_item.job_id, job_id);
+        assert_eq!(env.temp_db.get_proof_bytes_by_job_id(job_id, unique_pending_id).await?.as_deref(), Some(proof_bytes));
+        let contract_updates = env.temp_db
+            .get_contract_updates_for_user(&test_realm_identifier(), unique_pending_id, REALM_USER_ID)
+            .await?.expect("contract updates must follow the publishing batch");
+        let (header, _, _) = QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size_any_unique_pending_id(
+            &contract_updates, env.handler.chain_id, TEST_REALM_ID, TEST_REALM_SUB_ID, QBlobMerkleNodeTreeType::UserContractTree,
+        )?;
+        assert_eq!(header.unique_pending_id, unique_pending_id);
+        assert_eq!(header.checkpoint_id, queue_item.submission_nonce);
+        assert_eq!(env.temp_db.get_submitted_status_for_pending(&test_realm_identifier(), unique_pending_id, REALM_USER_ID).await?, queue_item.submission_nonce);
+        let slot_updates = env.handler.get_user_end_cap_slot_updates_internal(unique_pending_id, REALM_USER_ID)
+            .await?.expect("slot updates must follow the publishing batch");
+        assert_eq!(slot_updates.unique_pending_id, unique_pending_id);
+        assert_eq!(slot_updates.user_id, REALM_USER_ID);
+        assert_eq!(slot_updates.contracts.len(), CONTRACT_COUNT);
+        assert_eq!(slot_updates.accepted_user_leaf_hash, Some(queue_item.new_user_leaf_hash.to_4_felts().map(|felt| felt.to_u64_value())));
+        Ok(queue_item)
+    }
+
+    #[tokio::test]
+    async fn end_cap_restage_refuses_a_batch_where_the_user_already_submitted() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let temp_db = Arc::clone(&env.temp_db);
+        env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+            set_end_cap_gathering_generation(&temp_db, 0, 1, 11);
+            futures::executor::block_on(temp_db.set_submitted_status_for_pending(&test_realm_identifier(), 1, REALM_USER_ID, 99))
+                .expect("seed competing EndCap");
+        }));
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+        let err = env.handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone(), None)
+            .await.expect_err("the next batch's duplicate guard must reject restaging");
+        assert!(matches!(EndCapSubmitError::from_error_chain(&err), Some(EndCapSubmitError::AlreadySubmitted {
+            user_id: REALM_USER_ID, unique_pending_id: 1,
+        })));
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        assert_end_cap_staged_in(&env, 0, 0, &proof_bytes).await?;
+        assert_eq!(env.temp_db.get_submitted_status_for_pending(&test_realm_identifier(), 1, REALM_USER_ID).await?, 99);
+        assert!(env.temp_db.get_contract_updates_for_user(&test_realm_identifier(), 1, REALM_USER_ID).await?.is_none());
+        assert!(env.handler.get_user_end_cap_slot_updates_internal(1, REALM_USER_ID).await?.is_none());
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(REALM_USER_ID, N::GLOBAL_USER_TREE_HEIGHT, 1)?;
+        assert!(!env.temp_db.contains_proof_for_job_id(job_id, 1).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_restage_rejects_checkpoint_or_partial_batch_rotation() -> anyhow::Result<()> {
+        for (checkpoint_id, pending_id, proc_id) in [(1, 0, 0), (1, 1, 11), (0, 0, 11), (0, 1, 0)] {
+            for forwarded_target in [None, Some(1)] {
+                let env = end_cap_env().await?;
+                seed_contract_heights(&env).await?;
+                let temp_db = Arc::clone(&env.temp_db);
+                env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+                    set_end_cap_gathering_generation(&temp_db, checkpoint_id, pending_id, proc_id);
+                }));
+                let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+                env.handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone(), forwarded_target)
+                    .await.expect_err("handoff must preserve the admitted target and require a new batch");
+                assert_eq!(env.user_update_queue.published_count(), 1);
+                assert_end_cap_staged_in(&env, 0, 0, &proof_bytes).await?;
+                assert!(env.temp_db.get_contract_updates_for_user(&test_realm_identifier(), 1, REALM_USER_ID).await?.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_restage_stops_after_max_restages() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let temp_db = Arc::clone(&env.temp_db);
+        let mut next_pending_id = 0u64;
+        env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+            next_pending_id += 1;
+            set_end_cap_gathering_generation(&temp_db, 0, next_pending_id, next_pending_id as u128);
+        }));
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+        let err = RealmEdgeRpcServer::submit_user_end_cap(&env.handler, input, proof_bytes.clone())
+            .await.expect_err("unsettled publication must not report acceptance");
+        assert_eq!(err.code(), jsonrpsee::types::error::SERVER_IS_BUSY_CODE);
+        assert!(err.message().contains("delivery is not confirmed"), "unexpected error: {err}");
+        assert!(err.message().contains("check the user leaf before retrying"), "unexpected error: {err}");
+        assert!(err.data().is_none());
+        assert_eq!(env.user_update_queue.published_count(), 4);
+        let first = assert_end_cap_staged_in(&env, 0, 0, &proof_bytes).await?;
+        for pending_id in 1..=3 {
+            let next = assert_end_cap_staged_in(&env, pending_id, pending_id as u128, &proof_bytes).await?;
+            assert_eq!(next.submission_nonce, first.submission_nonce);
+        }
+        assert!(env.temp_db.get_contract_updates_for_user(&test_realm_identifier(), 4, REALM_USER_ID).await?.is_none());
         Ok(())
     }
 

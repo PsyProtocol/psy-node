@@ -461,16 +461,22 @@ impl QStandardWorkerQueuePublisher for FakeWorkerQueuePublisher {
 
 
 
+pub type AfterPublishHook = Box<dyn FnMut(u128) + Send>;
+
 /// In-memory fake for ephemeral queue publishers: records every published
 /// (unique_id, bytes) pair so tests can assert queue dispatch behavior.
 #[derive(Default)]
 pub struct FakeEphemeralQueuePublisher {
     pub published: Mutex<Vec<(u128, Vec<u8>)>>,
+    after_publish: Mutex<Option<AfterPublishHook>>,
 }
 
 impl FakeEphemeralQueuePublisher {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn set_after_publish_hook(&self, hook: AfterPublishHook) {
+        *self.after_publish.lock().unwrap() = Some(hook);
     }
     pub fn published_count(&self) -> usize {
         self.published.lock().unwrap().len()
@@ -518,6 +524,9 @@ impl psy_node_core::queue::ephemeral::QStandardEphemeralQueuePublisher for FakeE
         item_bytes: &[u8],
     ) -> anyhow::Result<()> {
         self.published.lock().unwrap().push((unique_id, item_bytes.to_vec()));
+        if let Some(hook) = self.after_publish.lock().unwrap().as_mut() {
+            hook(unique_id);
+        }
         Ok(())
     }
     async fn publish_many_ephemeral_queue_items_bytes_ref<QK: PCoreStandardQueueKeyForRealm>(

@@ -43,6 +43,7 @@ Use one verb for one act. Do not invent a synonym.
 | `sync` | Copy authenticated coordinator metadata locally | `sync_with_coordinator`, `sync_to_coordinator_checkpoint_id` |
 | `install` | Verify staged bytes, atomically rename them into their destination, then fsync the parent directory | `ProposalBackup::install` |
 | `stage` | Write a candidate that is not yet retained | `create_staged`, `stage_transition_blocks` |
+| `restage` | Write the same EndCap into a replacement gathering batch at the same admitted checkpoint | `MAX_END_CAP_RESTAGES` |
 | `derive` | Compute a deterministic hash or identity from known inputs | `derive_shield_address`, `derive-shield` |
 
 `persist` is banned. Do not add `store_*` as a verb synonym for `save`/`write`.
@@ -105,6 +106,11 @@ epochs. Name the epoch; do not invent a fourth.
 | Committed | `last_committed_*` | Durable head. Marker is `set_latest_checkpoint_id`. |
 
 `unique_pending_id` isolates one gathering / processing / committed batch.
+
+An EndCap **handoff** is the bounded restaging of its proof, updates and queue
+item when both gathering batch identifiers change after publication. It keeps
+the admitted checkpoint and the existing submission nonce; it is not a guarantee
+of inclusion across checkpoint changes or an unauthenticated gatherer cycle.
 
 ## 4. Protocol objects
 

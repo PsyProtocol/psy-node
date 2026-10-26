@@ -137,7 +137,7 @@ Coordinator trees are owned by these **four** gatherers after startup hydrates t
 
 ## 5. Unique-id rotation
 
-`set_new_unique_ids` runs once per block **before** finalize. The coordinator rotation is `coordinator/processor/db.rs:780`. The realm rotation is `realm/processor/db/commit.rs:154` and takes `Option<N::QHash>`; it rotates ids and does not publish a gathering generation.
+`set_new_unique_ids` runs once per block **before** finalize. The coordinator rotation is in `coordinator/processor/db.rs`. The realm rotation is in `realm/processor/db/commit.rs` and takes `Option<N::QHash>`; it creates the next consumers, rotates ids, updates shared state, and publishes the gathering generation to the temporary store before publishing the processing ids.
 
 ```text
 Before:  processing = P, gathering = G
@@ -145,6 +145,17 @@ After:   processing = G, gathering = fresh
 ```
 
 Finalize consumes one gathering generation. The final post-finalize drain acknowledges and discards any fetched tail items; they are not replayed into the next builder. The runner does not guarantee recovery of later publications to the retired queue key.
+
+The Edge rechecks the gathering generation before storing an EndCap and after
+publishing it. If both batch ids changed but the proof-base checkpoint stayed
+the same, it restages the same submission into the new generation, with at most
+three restages. Checkpoint changes, partial rotations, and exhaustion report
+uncertain delivery and require checking the user's state before retrying. The
+scheduled P2P Edge uses the same admission path; a forwarded Busy response must
+remain Busy rather than being classified as invalid input. This closes a bounded
+publication race, not the gatherer's intentional unauthenticated-cycle discard.
+Forwarding transport failures are also uncertain: a lost reply does not prove
+that the scheduled validator failed to publish the submission.
 
 ```text
 GATHERING --> PROCESSING --> COMMITTED --> next GATHERING
@@ -163,7 +174,7 @@ Realm two-EndCap jobs write mode 1, `PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDRE
 
 ## 7. Security Considerations
 
-Edge EndCap admission checks Merkle-root chaining, not the ZK proof. Proof verification happens when workers prove GUTA jobs. Official finalize identity is fail-closed on snapshot-start mismatch; do not restore a rewrite of `gathering_realm_start_root` to the live end before Coordinator inclusion.
+Edge EndCap admission verifies the submitted ZK proof and its public-input binding as well as Merkle-root chaining. Workers subsequently prove GUTA aggregation jobs. Official finalize identity is fail-closed on snapshot-start mismatch; do not restore a rewrite of `gathering_realm_start_root` to the live end before Coordinator inclusion.
 
 A parked processor (`ProcessorState::Error`) stops every bound gatherer. That is intentional: the gatherer must not keep mutating a tree whose processor will not commit.
 

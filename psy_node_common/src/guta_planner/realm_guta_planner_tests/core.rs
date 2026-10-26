@@ -443,6 +443,76 @@ mod tests {
         assert!(planner.user_leaf_updates_ffs.len() > 0);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn restaged_end_cap_is_applied_once_across_batches() -> anyhow::Result<()> {
+        for is_first_copy_consumed in [false, true] {
+            let (mut chain_state, user_a, _user_b) = test_chain_with_two_users_and_one_contract().await?;
+            chain_state.unique_pending_id += 1;
+            let first_pending_id = chain_state.unique_pending_id;
+            let item = chain_state.run_ups_for_user(user_a, &[RGPContractUpdate {
+                contract_id: 0,
+                leaves: vec![(0, Hash::from_values(1, 2, 3, 4))],
+            }]).await?;
+            let mut realm_tree = chain_state.first_realm_global_user_tree.clone();
+            let backup_file_system = SimpleMockMemoryFileSystem::new();
+            let mut backup_file = backup_file_system.file_like_fs_create("backups/restaged_end_cap").await?;
+            let new_planner = |unique_pending_id, realm_root| {
+                chain_state.configure_validator_proofs(RealmGUTAPlanner::<F, Hash>::new(
+                    chain_state.chain_id,
+                    chain_state.realm_identifier,
+                    chain_state.checkpoint_tree_root,
+                    chain_state.checkpoint_id,
+                    unique_pending_id,
+                    realm_root,
+                    N::REALM_GLOBAL_USER_TREE_HEIGHT,
+                    N::GLOBAL_USER_TREE_HEIGHT,
+                    chain_state.guta_circuit_whitelist,
+                ))
+            };
+            let mut first_batch = new_planner(first_pending_id, realm_tree.get_root())?;
+            let user_index = user_a - first_batch.realm_user_min_id;
+            if is_first_copy_consumed {
+                assert_eq!(first_batch.add_end_cap_job(
+                    &chain_state.checkpoint_tree, &mut realm_tree, &mut backup_file,
+                    chain_state.temp_db.clone(), &item.psy_ser_to_bytes_vec()?, item.clone(),
+                ).await?, 1);
+                assert!(first_batch.finalize_with_reward_ids(
+                    &chain_state.checkpoint_tree, &mut realm_tree, chain_state.temp_db.clone(), 0, 0,
+                ).await?.is_some());
+                assert_eq!(realm_tree.get_leaf_value(user_index), item.new_user_leaf_hash);
+            }
+
+            let next_pending_id = first_pending_id + 1;
+            let contract_updates = chain_state.temp_db.get_contract_updates_for_user(
+                &chain_state.realm_identifier, first_pending_id, user_a,
+            ).await?.expect("first copy's contract updates");
+            chain_state.temp_db.set_contract_updates_for_user(
+                &chain_state.realm_identifier, next_pending_id, user_a, contract_updates,
+            ).await?;
+            let mut restaged = item.clone();
+            restaged.job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+                user_a, N::GLOBAL_USER_TREE_HEIGHT, next_pending_id,
+            )?;
+            let mut next_batch = new_planner(next_pending_id, realm_tree.get_root())?;
+            let added = next_batch.add_end_cap_job(
+                &chain_state.checkpoint_tree, &mut realm_tree, &mut backup_file,
+                chain_state.temp_db.clone(), &restaged.psy_ser_to_bytes_vec()?, restaged,
+            ).await?;
+            assert_eq!(added, usize::from(!is_first_copy_consumed));
+            assert_eq!(first_batch.total_end_caps_processed + next_batch.total_end_caps_processed, 1);
+            if is_first_copy_consumed {
+                assert!(next_batch.end_cap_straggler.is_none());
+                assert!(next_batch.user_leaf_updates_ffs.is_empty());
+            } else {
+                assert!(next_batch.finalize_with_reward_ids(
+                    &chain_state.checkpoint_tree, &mut realm_tree, chain_state.temp_db.clone(), 0, 0,
+                ).await?.is_some());
+            }
+            assert_eq!(realm_tree.get_leaf_value(user_index), item.new_user_leaf_hash);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
