@@ -3955,7 +3955,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-verifier-ffi"
 version = "0.1.0"
-source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=7831c5216f7bc94619af7ee56b22243c08696976#7831c5216f7bc94619af7ee56b22243c08696976"
+source = "git+https://github.com/hellojason3/gnark-plonky2-verifier.git?rev=96a1d13b31f440316af1af7225943a1260f5150d#96a1d13b31f440316af1af7225943a1260f5150d"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -3966,7 +3966,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-wrapper"
 version = "0.1.0"
-source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=7831c5216f7bc94619af7ee56b22243c08696976#7831c5216f7bc94619af7ee56b22243c08696976"
+source = "git+https://github.com/hellojason3/gnark-plonky2-verifier.git?rev=96a1d13b31f440316af1af7225943a1260f5150d#96a1d13b31f440316af1af7225943a1260f5150d"
 dependencies = [
  "anyhow",
  "ff",
