@@ -1,6 +1,7 @@
 use plonky2::{
+    field::extension::Extendable,
     gates::gate::GateRef,
-    hash::hash_types::HashOut,
+    hash::hash_types::{HashOut, RichField},
     iop::{
         target::Target,
         witness::{PartialWitness, WitnessWrite},
@@ -8,7 +9,7 @@ use plonky2::{
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
-        config::{AlgebraicHasher, GenericConfig},
+        config::{AlgebraicHasher, GenericConfig, Hasher},
         proof::ProofWithPublicInputs,
     },
 };
@@ -108,6 +109,19 @@ where
             minifier_chain,
         }
     }
+    /// Estimated heap bytes held by this circuit's prover data: the base circuit
+    /// plus every minifier layer. Used to bound the prover-circuit cache by
+    /// memory rather than by entry count.
+    pub fn estimated_prover_bytes(&self) -> u64 {
+        prover_data_bytes(&self.circuit_data)
+            + self
+                .minifier_chain
+                .minifiers
+                .iter()
+                .map(|minifier| prover_data_bytes(&minifier.circuit_data))
+                .sum::<u64>()
+    }
+
     pub fn prove_base(&self, cfc_input: &DapenContractFunctionCircuitInput<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
@@ -162,4 +176,27 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_standard(input)
     }
+}
+
+/// Rough per-generator heap cost; generators are boxed trait objects whose
+/// size cannot be read, so they are counted at a fixed estimate.
+const WITNESS_GENERATOR_BYTES_ESTIMATE: u64 = 256;
+
+/// Sums the large prover-side buffers of a circuit: the constants/sigmas
+/// commitment (coefficients, LDE Merkle leaves and digests), sigmas, subgroup,
+/// FFT root table, representative map and witness generators. Small indexes
+/// such as generator_indices_by_watches and the common data are not counted.
+fn prover_data_bytes<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(data: &CircuitData<F, C, D>) -> u64 {
+    let prover = &data.prover_only;
+    let field = std::mem::size_of::<F>() as u64;
+    let batch = &prover.constants_sigmas_commitment;
+    let coefficients: u64 = batch.polynomials.iter().map(|poly| poly.coeffs.len() as u64).sum();
+    let leaves: u64 = batch.merkle_tree.leaves.iter().map(|leaf| leaf.len() as u64).sum();
+    let digests = (batch.merkle_tree.digests.len() * std::mem::size_of::<<C::Hasher as Hasher<F>>::Hash>()) as u64;
+    let sigmas: u64 = prover.sigmas.iter().map(|sigma| sigma.len() as u64).sum();
+    let roots: u64 = prover.fft_root_table.as_ref().map_or(0, |table| table.iter().map(|level| level.len() as u64).sum());
+    (coefficients + leaves + sigmas + roots + prover.subgroup.len() as u64) * field
+        + digests
+        + (prover.representative_map.len() * std::mem::size_of::<usize>()) as u64
+        + prover.generators.len() as u64 * WITNESS_GENERATOR_BYTES_ESTIMATE
 }
