@@ -134,3 +134,78 @@ plan/apply/verify modes against **only the new database**, after checking
 all three `envio_chains.max_reorg_depth` values, metadata permissions, all
 three indexed heads and chain-specific reads. No BridgeReader is involved.
 Until these gates pass, `deployment_ready` and `release_approved` remain false.
+
+## Install-Only Tool
+
+`install_envio.py` consumes an independently reviewed `build.json` and the
+complete package inventory, including the pinned Node 22.23.4 binary. It
+requires frozen-install, patch, generated-config and native-help evidence;
+source preparation alone is rejected. Files and relative links must match the
+inventory. Links must stay inside the package, including pnpm's unused
+optional-platform links. No `.env` can enter the package. The remote tool
+uses only Python's standard library, not pnpm or PyYAML.
+
+The private installer spec has exactly these fields:
+
+```json
+{
+  "version": 1,
+  "hostname": "<actual-target-hostname>",
+  "address": "<private-target-IPv4>",
+  "postgres_container_id": "<existing-PG-full-64-hex-container-ID>",
+  "package": "<absolute-new-root-owned-staging-directory>",
+  "build_sha256": "<reviewed-build.json-SHA256>",
+  "secrets": {"path": "<root-owned-private-credentials.json>", "sha256": "<SHA256>"}
+}
+```
+
+Spec and credentials must be root-owned 0600 for host operations. Credentials
+contain only `postgres_password` and `hasura_admin_secret`; each is a 24-256
+character string from letters, digits, underscore, plus, slash, equals and
+hyphen. Values are never printed, placed in argv or copied into the package.
+Use the dedicated PG role's password, not an old application role.
+
+The OS account `psy-envio-fresh` must exist with a same-name primary group,
+nonzero UID/GID and `/usr/sbin/nologin`. If absent, main can create it with
+`useradd --system --user-group --no-create-home --home-dir /nonexistent --shell
+/usr/sbin/nologin psy-envio-fresh`; never modify an existing account to force a
+match. PG login role `envio_bridge_fresh_20261026` must already exist, with the
+supplied password, no elevated attributes and no role memberships. Main can
+provision that new role through its private stdin credential workflow without
+restarting/recreating PG.
+
+```sh
+sudo python3 -B install_envio.py check-host \
+  --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
+sudo python3 -B install_envio.py install --apply \
+  --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
+python3 -B -m unittest discover \
+  -s deploy/multi-chain/gcp/core-only -p test_install_envio.py
+```
+
+`check-host` only reads: exact host/IP and PG container identity/running state,
+new DB absence, role attributes, root-owned staged inputs, new destinations,
+new project/ports/unit absence, cached Hasura image and Compose presence. It
+neither creates resources nor changes PG configuration or shared memory.
+
+`install --apply` copies and rechecks the inventory under the new release;
+creates dedicated writable state and root-only environment files; creates only
+the new empty database with the dedicated owner and revokes PUBLIC CONNECT to
+that database; writes the new unit; and runs daemon-reload. It never starts or
+enables services or runs Compose. No existing release, unit, DB, role, PG
+container or Hasura container is overwritten or removed. Partial failure is
+retained; rerunning against existing output refuses.
+
+The unit runs bundled Node/ts-node directly, not `envio dev` or global pnpm.
+On a later main-owned start, pre-start migration uses
+`runUpMigrations(true,false)`, never reset/down. Code is read-only to the service
+user; only dedicated state is writable. MemoryMax is 1 GiB and IP policy allows
+only private ranges/loopback. Host memory fit, IP-filter support, credential
+validity and startup acceptance remain to be measured.
+
+Main owns activation. The independent Hasura command must use this project,
+this compose file, `--pull never` and the new root-only `hasura.env`; do not use
+the generated default compose (it includes PG). Start only the new indexer unit
+after Hasura is healthy, then apply/check Deposit indexes against the new DB
+and verify metadata permissions/three-chain heads before consumers. Neither
+tool executes activation commands.
