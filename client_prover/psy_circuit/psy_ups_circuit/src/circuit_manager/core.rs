@@ -990,8 +990,24 @@ mod eth_personal_tests {
     #[test]
     fn eth_personal_fingerprint_matches_public_constant() {
         let manager = PsyUPSStepCircuitManager::<PoseidonGoldilocksConfig, 2>::new_with_config(1);
-        let expected = psy_prover_fingerprint::<GoldilocksField>();
+        let expected = QHashOut::from_values(
+            psy_config::network_constants::ETH_PERSONAL_SECP256K1_FINGERPRINT_U64[0],
+            psy_config::network_constants::ETH_PERSONAL_SECP256K1_FINGERPRINT_U64[1],
+            psy_config::network_constants::ETH_PERSONAL_SECP256K1_FINGERPRINT_U64[2],
+            psy_config::network_constants::ETH_PERSONAL_SECP256K1_FINGERPRINT_U64[3],
+        );
         assert_eq!(manager.eth_personal_secp_circuit().get_fingerprint(), expected);
+        assert_ne!(expected, psy_prover_fingerprint::<GoldilocksField>());
+    }
+
+    #[test]
+    fn secp_fingerprint_matches_source_config() {
+        let manager = PsyUPSStepCircuitManager::<PoseidonGoldilocksConfig, 2>::new_with_config(1);
+        let expected = QHashOut(plonky2::hash::hash_types::HashOut {
+            elements: psy_config::network_constants::SECP256K1_FINGERPRINT_U64.map(GoldilocksField::from_canonical_u64),
+        });
+        assert_eq!(manager.secp_circuit().get_fingerprint(), expected);
+        assert_eq!(expected.to_string(), "021dd3bbe9e7ec33a4c2fb0c276e663e920eb87421a4d8114d348f0e1eb93aa1");
     }
 
     fn psy_prover_fingerprint<F: plonky2::hash::hash_types::RichField>() -> QHashOut<F> {
