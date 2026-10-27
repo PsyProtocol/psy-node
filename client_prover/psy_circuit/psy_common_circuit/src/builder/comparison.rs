@@ -210,3 +210,103 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderComparison<F, D
         self.assert_non_zero(hash.elements[3]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use plonky2::{
+        field::types::Field,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{
+            circuit_builder::CircuitBuilder,
+            circuit_data::CircuitConfig,
+            config::{GenericConfig, PoseidonGoldilocksConfig},
+        },
+    };
+
+    use crate::u32::multiple_comparison::list_lte_circuit;
+
+    const BALANCE: u64 = 5;
+    const AMOUNT: u64 = 100;
+    const ALIAS_HIGH: u64 = 0xFFFF_FFFF;
+    const ALIAS_LOW: u64 = 6;
+
+    fn goldilocks_prime() -> u128 {
+        (1u128 << 64) - (1u128 << 32) + 1
+    }
+
+    /// `(2^32 - 1) * 2^32 + 6 = 5 + p`, so the alias is another 64-bit
+    /// decomposition of the field element 5.
+    #[test]
+    fn balance_five_alias_is_five_plus_prime() {
+        const D: usize = 2;
+        type F = <PoseidonGoldilocksConfig as GenericConfig<D>>::F;
+
+        let prime = goldilocks_prime();
+        let alias = ((ALIAS_HIGH as u128) << 32) + ALIAS_LOW as u128;
+        assert_eq!(alias, BALANCE as u128 + prime);
+        assert!(alias < (1u128 << 64));
+
+        let high = F::from_canonical_u64(ALIAS_HIGH);
+        let low = F::from_canonical_u64(ALIAS_LOW);
+        let base = F::from_canonical_u64(1u64 << 32);
+        let reconstructed = high * base + low;
+        assert_eq!(reconstructed, F::from_canonical_u64(BALANCE));
+    }
+
+    /// Constraints copied from `split_low_high(x, 32, 64)` and
+    /// `is_greater_than_or_equal(64, x, y)`. The balance split has no generator,
+    /// so the test supplies the limbs itself.
+    fn balance_ge_amount_with_split(high: u64, low: u64) -> anyhow::Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let balance = builder.add_virtual_target();
+        let amount = builder.constant(F::from_canonical_u64(AMOUNT));
+        let low_target = builder.add_virtual_target();
+        let high_target = builder.add_virtual_target();
+
+        builder.range_check(low_target, 32);
+        builder.range_check(high_target, 32);
+        let base = builder.constant(F::from_canonical_u64(1u64 << 32));
+        let reconstructed = builder.mul_add(high_target, base, low_target);
+        builder.connect(balance, reconstructed);
+
+        let (amount_low, amount_high) = builder.split_low_high(amount, 32, 64);
+        let high_lte = list_lte_circuit(&mut builder, vec![high_target], vec![amount_high], 32);
+        let low_lte = list_lte_circuit(&mut builder, vec![low_target], vec![amount_low], 32);
+        let high_gt = builder.not(high_lte);
+        let low_gt = builder.not(low_lte);
+        let high_eq = builder.is_equal(high_target, amount_high);
+        let equal_high_and_low_gt = builder.and(high_eq, low_gt);
+        let is_gt = builder.or(high_gt, equal_high_and_low_gt);
+        let is_lte = builder.not(is_gt);
+        let balance_gt_amount = builder.not(is_lte);
+        let values_equal = builder.is_equal(balance, amount);
+        let is_gte = builder.or(balance_gt_amount, values_equal);
+        let true_target = builder._true().target;
+        builder.connect(is_gte.target, true_target);
+
+        let data = builder.build::<C>();
+        let mut witness = PartialWitness::new();
+        witness.set_target(balance, F::from_canonical_u64(BALANCE))?;
+        witness.set_target(low_target, F::from_canonical_u64(low))?;
+        witness.set_target(high_target, F::from_canonical_u64(high))?;
+        let proof = data.prove(witness)?;
+        data.verify(proof)
+    }
+
+    #[test]
+    fn alias_split_accepts_balance_five_ge_one_hundred() {
+        balance_ge_amount_with_split(ALIAS_HIGH, ALIAS_LOW).expect("alias split must satisfy 5 >= 100");
+    }
+
+    #[test]
+    fn canonical_split_rejects_balance_five_ge_one_hundred() {
+        assert!(
+            balance_ge_amount_with_split(0, BALANCE).is_err(),
+            "canonical split of 5 must not satisfy 5 >= 100"
+        );
+    }
+}
