@@ -269,16 +269,49 @@ retry is supported; conflicting bytes, modes or ownership stop installation.
 
 After all host packages are verified and installed, start Coordinator Processor,
 then its three Edges; wait for authenticated Genesis/checkpoint reads before
-starting Realm Processors and their Edges. Start matching Workers only against
+starting Realm Processors and their Edges. Allow each Realm Processor to finish
+initializing its fresh namespace before activating the matching Realm Edges;
+systemd `active` alone does not establish namespace readiness. Early Realm Edge
+startup can fail with `keyspace ... does not exist` and automatically retry.
+This dependency failure is distinct from the Type=simple pre-exec observation
+race: `activate_host.py` retries process/executable checks for up to 15 seconds
+only after a new start, while rejecting a wrong executable already active at
+preflight. Use the existing startup logs; no additional Scylla probe is required.
+Start matching Workers only against
 these fresh endpoints. Confirm real proof pickup/submission and increasing
-checkpoints before enabling the new units for reboot. Verify all three validator
+checkpoints before declaring the new runtime ready. Verify all three validator
 positions connect and synchronize; P2P rotation/transaction acceptance is a
 separate result, not implied by active systemd units.
+
+If early Realm Edge attempts exhaust the systemd start limit before its Realm
+Processor has initialized the namespace/tables, do not loop activation or reset
+old units. First confirm the dependency is ready, the installed R3 package/pins
+are unchanged, and old core units remain fenced. On the assigned Realm 1 Edge
+host, the bounded recovery for the affected validator 2 unit is:
+
+```bash
+sudo systemctl show psy-core-r3-realm-1-v2-edge.service --property=ActiveState,MainPID,Job,Result
+# Proceed only with failed, MainPID=0, no queued Job, and diagnosed dependency readiness.
+sudo systemctl reset-failed psy-core-r3-realm-1-v2-edge.service
+sudo python3 activate_host.py --package /absolute/private/host-package --phase edges
+sudo python3 activate_host.py --package /absolute/private/host-package --phase edges --apply
+```
+
+The one exact-unit `reset-failed` clears failure/start-limit accounting only;
+it does not start the service or change data. The normal activation script
+revalidates files, unit sources, host and old-unit fences before starting R3
+edges. Already active edges must pass executable checks and are not restarted.
+If recovery fails again, retain the failure evidence and diagnose; do not repeat
+reset/start automatically or treat process startup as checkpoint acceptance.
 
 Wallet/SDK artifact work is deferred by the operator for this core rollout.
 Keep wallet, Faucet, Services/indexers and Bridge exposure disabled until their
 matching artifacts are ready. The subsequent L1/Bridge rollout is a **fresh
-deployment**: old contract addresses and old Groth16 setup are not inputs to it.
+deployment** and does not reuse old contract addresses. Retaining the SYSTEM
+binary and Groth16 setup is an explicit component exception based on recorded
+unchanged circuit sources, configuration and ABI shape. Keep setup guards and
+original manifests intact. This is not completed four-cohort equivalence
+testing; matching verifiers for the new L1 contracts remain a separate gate.
 Guardian signing keys remain reusable and are not regenerated for that rollout.
 
 ### Fresh Bridge Placement And Startup Order (2026-10-26)
@@ -298,10 +331,11 @@ Existing WireGuard ingress must be inspected before any routing change; the
 System host is not the assumed balancer. Resolve these role placeholders from
 the operator's private deployment inventory.
 
-Start with a pinned testnet Relayer/User CLI build and an isolated new Groth16
-setup root. Generate and verify the bridge aggregation, deposit append,
-withdrawal claim and reward claim cohorts, then export their matching Solidity
-verifiers. System loads all four cohorts; User does not need these setup files.
+When setup regeneration is required, start with a pinned testnet Relayer/User
+CLI build and an isolated new Groth16 setup root. Generate and verify the bridge
+aggregation, deposit append, withdrawal claim and reward claim cohorts, then
+export their matching Solidity verifiers. System loads all four cohorts; User
+does not need these setup files.
 Neither an old setup manifest nor a successful binary build establishes
 compatibility with the new circuits.
 
