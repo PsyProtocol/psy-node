@@ -23,13 +23,13 @@ import sys
 
 
 HERE = Path(__file__).resolve().parent
-SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
-RELEASE_ID = "core-testnet-20261026-r2"
-WORKER_SHA256 = "db160bf77e00fecc92907cc9eaf0bba371853d1c6d6c9f8589238853fbd96f45"
+SOURCE = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
+RELEASE_ID = "core-testnet-20261027-r3"
+WORKER_SHA256 = "08d76103fb40639ecbe8182113e7fc5df61ae9a408abefb2f96de9b0ad56238d"
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-TOPOLOGY_SHA256 = "89a9c4cfaa43d6537427c23c34ac2919291a582926f4841aa6926a419dc65473"
-BUILD_SHA256 = "da174adeccef81c312e1f2eb1e6a136b53fb8a68f6e9f5b39510c6c1305133bf"
-ATTESTATION_SHA256 = "232bc48d7a9978a7d6c8a3b9845cca3858069b3e662ef6c4ad3faef99c6789f6"
+TOPOLOGY_SHA256 = "78403e274c24dd8bbb44405775868477b3cfe0ad9c9a3815cb59a1f267e5675f"
+BUILD_SHA256 = "4432ea02ead2f2fd48a723b911049f5dcdb8d1ef80072518361759ab77628072"
+ATTESTATION_SHA256 = "f6fdece9553ac78e85a3d7636b1883b0efed5f9332c1628d38fc9729b2fa8acb"
 RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
 STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID
@@ -130,7 +130,7 @@ def worker_configs(topology):
 
 
 def unit_name(role):
-    return "psy-core-worker-r2-" + role + ".service"
+    return "psy-core-worker-r3-" + role + ".service"
 
 
 def worker_unit(role):
@@ -139,7 +139,7 @@ def worker_unit(role):
         "Wants=network-online.target", "After=network-online.target",
         "StartLimitIntervalSec=600", "StartLimitBurst=3", "",
         "[Service]", "Type=simple", "User=parth", "Group=parth", "UMask=0077",
-        "Slice=psy-core-worker-r2.slice", "WorkingDirectory=" + str(RELEASE),
+        "Slice=psy-core-worker-r3.slice", "WorkingDirectory=" + str(RELEASE),
         "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(CONFIG / "network.json"),
         "Environment=RUST_LOG=info", "Environment=RUST_MIN_STACK=134217728",
         "Environment=RAYON_NUM_THREADS=" + str(THREADS[role]), "Environment=TOKIO_WORKER_THREADS=2",
@@ -156,6 +156,9 @@ def worker_unit(role):
 
 
 def payloads(inputs):
+    require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in (WORKER_SHA256, CONFIG_SHA256, TOPOLOGY_SHA256, BUILD_SHA256, ATTESTATION_SHA256)),
+            "r3 artifact pins not frozen")
     require(digest(inputs["psy_worker_cli"]) == WORKER_SHA256, "worker binary hash mismatch")
     require(digest(inputs["network.json"]) == CONFIG_SHA256, "compiled network config hash mismatch")
     require(digest(inputs["topology.json"]) == TOPOLOGY_SHA256, "reviewed topology hash mismatch")
@@ -187,7 +190,7 @@ def payloads(inputs):
     for role, template in worker_configs(topology).items():
         files[role + ".json"] = encode(template)
         files[unit_name(role)] = worker_unit(role)
-    files["psy-core-worker-r2.slice"] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
+    files["psy-core-worker-r3.slice"] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
     return files
 
 
@@ -312,7 +315,7 @@ def install_paths(files, keys, user):
         targets[CONFIG / (role + ".json")] = (encode(config), 0o640, ROOT_UID, gid)
         directories[STATE / role] = (0o700, uid, gid)
         targets[UNITS / unit_name(role)] = (files[unit_name(role)], 0o644, ROOT_UID, ROOT_GID)
-    targets[UNITS / "psy-core-worker-r2.slice"] = (files["psy-core-worker-r2.slice"], 0o644, ROOT_UID, ROOT_GID)
+    targets[UNITS / "psy-core-worker-r3.slice"] = (files["psy-core-worker-r3.slice"], 0o644, ROOT_UID, ROOT_GID)
     for path in list(directories):
         for parent in path.parents:
             if parent != Path("/"):
@@ -323,8 +326,8 @@ def install_paths(files, keys, user):
 def check_destinations(targets, directories):
     for root in (RELEASE, CONFIG, STATE):
         require(not os.path.lexists(root), "worker release/config/state already exists; inspection required")
-    for name in [*(unit_name(role) for role in THREADS), "psy-core-worker-r2.slice",
-                 "psy-core-worker-r2-realm-.service", "psy-core-worker-r2-.service",
+    for name in [*(unit_name(role) for role in THREADS), "psy-core-worker-r3.slice",
+                 "psy-core-worker-r3-realm-.service", "psy-core-worker-r3-.service",
                  "psy-core-worker-.service", "psy-core-.service", "psy-.service", "service"]:
         for root in UNIT_SEARCH:
             require(not os.path.lexists(root / name) and not os.path.lexists(root / (name + ".d")),

@@ -51,6 +51,33 @@ class WorkerPreparationTests(unittest.TestCase):
     def prepare(self):
         return workers.prepare_package(self.release, self.network, self.topology, self.package, self.attestation_path)
 
+    def test_r3_release_units_state_and_slice(self):
+        self.assertEqual(workers.SOURCE, "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
+        self.assertEqual(workers.RELEASE_ID, "core-testnet-20261027-r3")
+        for path in (workers.RELEASE, workers.CONFIG, workers.STATE):
+            self.assertEqual(path.name, workers.RELEASE_ID)
+        self.prepare()
+        files = workers.read_package(self.package)
+        self.assertIn("psy-core-worker-r3.slice", files)
+        self.assertFalse(any("r2" in name for name in files))
+        for role in workers.THREADS:
+            name = "psy-core-worker-r3-" + role + ".service"
+            self.assertEqual(workers.unit_name(role), name)
+            unit = files[name].decode()
+            self.assertIn("Slice=psy-core-worker-r3.slice", unit)
+            self.assertIn("ReadWritePaths=" + str(workers.STATE / role), unit)
+        targets, _ = workers.install_paths(files, {r: "test-secret" for r in workers.THREADS}, (999, 999))
+        self.assertIn(workers.UNITS / "psy-core-worker-r3.slice", targets)
+
+    def test_unfrozen_artifact_pins_reject_before_parsing(self):
+        for name in ("WORKER_SHA256", "BUILD_SHA256", "ATTESTATION_SHA256"):
+            with self.subTest(name=name), patch.object(workers, name, None):
+                with self.assertRaisesRegex(workers.WorkerError, "pins not frozen"):
+                    workers.payloads({})
+                with self.assertRaises(workers.WorkerError):
+                    self.prepare()
+                self.assertFalse(self.package.exists())
+
     def map_host(self):
         for name in ("RELEASE", "CONFIG", "STATE", "UNITS"):
             self.stack.enter_context(patch.object(workers, name, self.root / "host" / name.lower()))
@@ -266,6 +293,7 @@ class WorkerHostChecks(unittest.TestCase):
         with patch.object(workers.os, "geteuid", return_value=0), patch.object(workers.pwd, "getpwnam", return_value=account):
             for answers in (["wrong-host"], ["test-c4d", "aarch64"],
                             ["test-c4d", "x86_64", "parth-c4d-worker@realm-0-0.service loaded active running"],
+                            ["test-c4d", "x86_64", "", "psy-core-worker-r2-realm-0.service loaded active running"],
                             ["test-c4d", "x86_64", "", "psy-core-worker-realm-0.service loaded activating start"],
                             ["test-c4d", "x86_64", "", "", "12 psy-core-worker-realm-0.service start waiting"]):
                 with patch.object(workers, "command", side_effect=answers):
