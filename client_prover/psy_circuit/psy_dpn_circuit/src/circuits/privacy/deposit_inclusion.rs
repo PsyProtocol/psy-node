@@ -457,6 +457,15 @@ mod tests {
         let circuit = DepositInclusionCircuit::<C, D>::new();
         assert_eq!(circuit.circuit_data.common.num_public_inputs, 4);
         assert_eq!(circuit.get_common_circuit_data_ref().num_public_inputs, 4);
+        assert_eq!(
+            circuit.get_fingerprint(),
+            QHashOut::from_values(
+                10703802335665618430,
+                10068318241409151045,
+                3414993520734878651,
+                6701097966655937136,
+            ),
+        );
         println!("deposit inclusion fingerprint: {:?}", circuit.get_fingerprint());
     }
 

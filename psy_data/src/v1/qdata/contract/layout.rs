@@ -236,7 +236,9 @@ impl<F: QFelt64, Hash: Q256BitHash>
 ///
 /// Slot widths are supplied by the VM's authoritative encoding table; the
 /// layout hashing code intentionally does not guess them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[repr(u16)]
 pub enum StatePrimitiveTypeTag {
     Felt = 1,
@@ -248,7 +250,9 @@ pub enum StatePrimitiveTypeTag {
     Bytes32 = 7,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[repr(u16)]
 pub enum StateMapKind {
     ContractHashMap = 1,
@@ -257,7 +261,9 @@ pub enum StateMapKind {
 }
 
 /// The verified output of any canonical type-layout construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct StateTypeLayoutSummary<Hash> {
     pub type_layout_hash: Hash,
     pub total_slot_count: u64,
@@ -268,7 +274,9 @@ pub struct StateTypeLayoutSummary<Hash> {
 /// Child type hashes and struct member roots are separate authenticated
 /// commitments. A recursive type-layout proof can verify those commitments
 /// without making the top-level append circuit depend on type nesting depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateTypeLayoutWitness<Hash> {
     Primitive {
@@ -304,7 +312,9 @@ pub const CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT: usize = 5;
 /// Child indices must point to earlier nodes. This representation gives every
 /// contract the same bounded circuit shape and therefore one protocol
 /// verifier, independent of the concrete struct fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CanonicalTypeLayoutNode {
     Primitive {
@@ -327,7 +337,9 @@ pub enum CanonicalTypeLayoutNode {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct CanonicalTypeLayoutDag {
     pub nodes: Vec<CanonicalTypeLayoutNode>,
     pub root: u16,
@@ -656,7 +668,9 @@ pub fn canonical_primitive_slot_width(
 }
 
 /// One direct field of the top-level `ContractState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct StateFieldLayoutLeaf<Hash> {
     /// One-based field-tree position.
     pub field_id: u64,
@@ -746,7 +760,9 @@ impl<Hash: Copy> StateFieldLayoutLeaf<Hash> {
 }
 
 /// One direct member of a fixed-size struct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct StructMemberLayout<Hash> {
     /// One-based member-tree position.
     pub member_id: u64,
@@ -810,14 +826,18 @@ impl<Hash: Copy> StructMemberLayout<Hash> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct StructTypeLayout<Hash> {
     pub members: Vec<StructMemberLayout<Hash>>,
     pub members_root: Hash,
     pub summary: StateTypeLayoutSummary<Hash>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct ContractStateLayout<Hash> {
     pub fields: Vec<StateFieldLayoutLeaf<Hash>>,
     pub state_layout_root: Hash,
@@ -825,7 +845,9 @@ pub struct ContractStateLayout<Hash> {
     pub state_layout_slot_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct CanonicalContractStateLayout<Hash> {
     pub contract_layout: ContractStateLayout<Hash>,
     /// Canonical preimages for the top-level fields, in field order.
@@ -838,12 +860,63 @@ pub struct CanonicalContractStateLayout<Hash> {
 ///
 /// ABI parsing and source-language type resolution happen before this
 /// boundary. The prover receives only consensus types and commitments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct CanonicalLayoutManifest<Hash> {
     pub layout_version: u16,
     pub state_tree_height: u16,
     pub layout: CanonicalContractStateLayout<Hash>,
     pub field_type_dags: Vec<CanonicalTypeLayoutDag>,
+}
+
+impl<Hash: Copy + Default + PartialEq> CanonicalLayoutManifest<Hash> {
+    /// Reconstruct the committed layout without constructing proving circuits.
+    pub fn validate<Hasher, F>(&self) -> anyhow::Result<ContractStateLayout<Hash>>
+    where
+        Hasher: FieldQHasher<F, Hash>,
+        F: QFelt64,
+        Hash: QFHashBase<F>,
+    {
+        anyhow::ensure!(self.layout_version == STATE_LAYOUT_VERSION,
+            "unsupported canonical layout manifest version");
+        anyhow::ensure!(self.state_tree_height < 64, "unsupported contract state tree height");
+        let fields = &self.layout.contract_layout.fields;
+        anyhow::ensure!(self.field_type_dags.len() == fields.len()
+            && self.layout.field_type_layouts.len() == fields.len(),
+            "canonical layout field, DAG and witness counts differ");
+        let mut summaries = Vec::with_capacity(fields.len());
+        let mut payload_offsets = Vec::with_capacity(fields.len());
+        for ((dag, witness), field) in self.field_type_dags.iter()
+            .zip(&self.layout.field_type_layouts).zip(fields)
+        {
+            let summary = dag.evaluate::<Hasher, F, Hash>()?;
+            anyhow::ensure!(summary == witness.summary::<Hasher, F>()?,
+                "canonical type DAG and field witness disagree");
+            witness.validate_field::<Hasher, F>(field)?;
+            summaries.push(summary);
+            payload_offsets.push(field.payload_offset);
+        }
+        let reconstructed = contract_state_layout_with_payload_offsets::<Hasher, F, Hash>(
+            &summaries, &payload_offsets,
+            psy_core::constants::protocol::STATE_LAYOUT_TREE_HEIGHT,
+            usize::from(self.state_tree_height),
+        )?;
+        anyhow::ensure!(reconstructed == self.layout.contract_layout,
+            "canonical layout fields, root or counts do not match reconstruction");
+        for layout in self.layout.struct_layouts.values() {
+            let members = layout.members.iter().map(|member| StateTypeLayoutSummary {
+                type_layout_hash: member.member_type_hash,
+                total_slot_count: member.slot_count,
+            }).collect::<Vec<_>>();
+            let reconstructed_struct = struct_type_layout::<Hasher, F, Hash>(
+                &members, CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT,
+            )?;
+            anyhow::ensure!(&reconstructed_struct == layout,
+                "canonical struct layout does not match reconstruction");
+        }
+        Ok(reconstructed)
+    }
 }
 
 #[derive(Debug, Deserialize)]

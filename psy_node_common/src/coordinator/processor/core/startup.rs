@@ -315,7 +315,7 @@ pub(crate) mod startup_tests {
         // commit exactly those roots or the first block's witness consistency
         // check fails
         PsyGenesisBlockSetupData {
-            contracts: vec![contract],
+            contracts: vec![psy_data::genesis::genesis_block_setup::genesis_contract_with_empty_layout_fixture(contract)],
             users: vec![],
             validators: vec![genesis_validator()],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),

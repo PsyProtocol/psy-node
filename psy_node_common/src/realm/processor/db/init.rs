@@ -1563,12 +1563,12 @@ pub(crate) mod realm_db_test_env {
         assert!(user_count >= 4, "sub-id 2 needs two registered users in realm 1");
         let contracts = (0..contract_count)
             .map(|i| {
-                PQBCDeployContract::new(
+                psy_data::genesis::genesis_block_setup::genesis_contract_with_empty_layout_fixture(PQBCDeployContract::new(
                     i as u64 + 1,
                     ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
                     vec![PHash::from_values(100 + i as u64, 0, 0, 0)],
                     PHash::from_values(200 + i as u64, 0, 0, 0),
-                )
+                ))
             })
             .collect();
         let users = (0..user_count).map(|i| genesis_user((i as u64 + 1) * 1_000)).collect();
