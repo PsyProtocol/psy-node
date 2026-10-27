@@ -53,6 +53,7 @@ sol! {
         uint8 succeededCount,
         uint8 failedCount
     );
+    event WithdrawalClaimed(bytes32 indexed nonce, address indexed recipient, address indexed token, uint256 amount);
     event WithdrawalPendingCreated(
         bytes32 indexed nonce,
         address indexed token,
@@ -149,7 +150,7 @@ pub struct ClaimOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClaimOutcomeKind {
-    /// Registered as a pending withdrawal this round.
+    /// Successfully paid directly or registered as pending this round.
     Registered,
     /// Not resolved; the code explains why and [`ClaimCode::action`] decides.
     Failed(ClaimCode),
@@ -689,6 +690,14 @@ fn parse_claim_receipt(
                 WithdrawalClaimItemFailed::decode_log_data(&log.data)
                     .context("failed to decode WithdrawalClaimItemFailed")?,
             );
+        } else if topic0 == &WithdrawalClaimed::SIGNATURE_HASH {
+            let event = WithdrawalClaimed::decode_log_data(&log.data)
+                .context("failed to decode WithdrawalClaimed")?;
+            // Both direct payment and pending registration resolve this batch slot.
+            pending_created.push(WithdrawalPendingCreated {
+                nonce: event.nonce, token: event.token, recipient: event.recipient,
+                amount: event.amount, claimableAt: 0,
+            });
         } else if topic0 == &WithdrawalPendingCreated::SIGNATURE_HASH {
             pending_created.push(
                 WithdrawalPendingCreated::decode_log_data(&log.data)
@@ -935,7 +944,7 @@ fn flow_delay(config: &TokenFlowConfig, amount: U256, next_total: U256) -> u32 {
     } else if amount > U256::from(config.smallWithdrawalMax) {
         config.mediumWithdrawalDelay
     } else {
-        config.smallWithdrawalDelay
+        0
     }
 }
 
@@ -2586,6 +2595,24 @@ mod tests {
         assert_eq!(rows[0].leaf_hash, rows[1].leaf_hash);
         assert_ne!(rows[0].leaf_hash, rows[2].leaf_hash);
         assert_ne!(rows[2].nonce, rows[3].nonce);
+    }
+
+    #[test]
+    fn direct_payment_and_pending_registration_resolve_their_own_slots() {
+        let chunk = [pending_proof(tagged_withdrawal("paid", 1)), pending_proof(tagged_withdrawal("pending", 2))];
+        let (_, commit) = claim_calldata(&chunk);
+        let identity = claim_slot_identity(&chunk[0].withdrawal);
+        let payment = WithdrawalClaimed { nonce: identity.nonce, recipient: identity.recipient,
+            token: identity.token, amount: identity.amount };
+        let logs = vec![bridge_log(&payment), bridge_log(&registered(&chunk[1])), bridge_log(&summary(commit, 2, 2, 0))];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 2);
+        assert_eq!(applied.kind_of("paid"), Some(ClaimOutcomeKind::Registered));
+        assert_eq!(applied.kind_of("pending"), Some(ClaimOutcomeKind::Registered));
+        let mut duplicate = logs;
+        duplicate.push(bridge_log(&registered(&chunk[0])));
+        assert!(parse_claim_receipt(&duplicate, RECEIPT_BRIDGE, commit,
+            &chunk.iter().map(|p| claim_slot_identity(&p.withdrawal)).collect::<Vec<_>>()).is_err());
     }
 
     #[tokio::test]

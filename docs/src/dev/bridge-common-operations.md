@@ -509,7 +509,7 @@ The withdrawal amount must be positive and no greater than the user's withdrawn-
 
 Section 10 captured the finalization cursor and recipient balance before the L2 withdrawal.
 
-After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. That call registers `pendingWithdrawals[nonce]` and sets `claimedNullifiers[nonce]`; it does not transfer tokens (`psy-contracts/src/Bridge.sol:762-764,810-838`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:584-589,978-995`).
+After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. Small withdrawals within the cap pay directly in that call; medium/governed withdrawals register `pendingWithdrawals[nonce]`. Both consume `claimedNullifiers[nonce]`. Medium claims unlock after their stored delay; large/cap-exceeding claims require governance after their stored delay. The pending-registration checks below apply only to medium/governed withdrawals (`psy-contracts/src/Bridge.sol:762-764,810-838`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:584-589,978-995`).
 
 ```bash
 for attempt in $(seq 1 360); do

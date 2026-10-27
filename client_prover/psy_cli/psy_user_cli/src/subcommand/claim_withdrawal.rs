@@ -307,9 +307,10 @@ const WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT: &str = "WithdrawalClaimItemFailed(byte
 /// Frozen `event WithdrawalPendingCreated(bytes32 indexed nonce, address indexed token, address indexed recipient, uint256 amount, uint64 claimableAt)`
 /// from Bridge.sol, emitted by `_registerPendingWithdrawal`; the only canonical
 /// per-nonce registration evidence, and it survives settlement.
+const WITHDRAWAL_CLAIMED_EVENT: &str = "WithdrawalClaimed(bytes32,address,address,uint256)";
 const WITHDRAWAL_PENDING_CREATED_EVENT: &str = "WithdrawalPendingCreated(bytes32,address,address,uint256,uint64)";
 
-/// Registration tuple carried by WithdrawalPendingCreated: (token, recipient, amount).
+/// Outcome tuple carried by WithdrawalPendingCreated or WithdrawalClaimed: (token, recipient, amount).
 type WithdrawalRegistrationTuple = ([u8; 32], [u8; 32], [u8; 32]);
 
 /// Frozen Bridge.sol CLAIM_REASON_* codes; 0 means valid and 11..=255 are reserved.
@@ -439,7 +440,8 @@ fn parse_withdrawal_pending_created_log(
     let Some(created_topic0) = topics.first().and_then(|topic| topic.as_str()).and_then(hex_word_bytes32) else {
         return Ok(None);
     };
-    if created_topic0.as_slice() != &keccak256(WITHDRAWAL_PENDING_CREATED_EVENT.as_bytes())[..] {
+    let paid = created_topic0.as_slice() == &keccak256(WITHDRAWAL_CLAIMED_EVENT.as_bytes())[..];
+    if !paid && created_topic0.as_slice() != &keccak256(WITHDRAWAL_PENDING_CREATED_EVENT.as_bytes())[..] {
         return Ok(None);
     }
     // Recognized event: the frozen ABI fixes four topics. A malformed count —
@@ -453,15 +455,15 @@ fn parse_withdrawal_pending_created_log(
         return Ok(None);
     }
     let (Some(token), Some(recipient)) = (
-        topics[2].as_str().and_then(hex_word_bytes32),
-        topics[3].as_str().and_then(hex_word_bytes32),
+        topics[if paid { 3 } else { 2 }].as_str().and_then(hex_word_bytes32),
+        topics[if paid { 2 } else { 3 }].as_str().and_then(hex_word_bytes32),
     ) else {
         anyhow::bail!("WithdrawalPendingCreated log has a malformed token or recipient topic");
     };
     let Some(data) = log.get("data").and_then(|value| value.as_str()).and_then(hex_word_bytes) else {
         anyhow::bail!("WithdrawalPendingCreated log has malformed data");
     };
-    if data.len() != 64 || data[32..56].iter().any(|&byte| byte != 0) {
+    if (paid && data.len() != 32) || (!paid && (data.len() != 64 || data[32..56].iter().any(|&byte| byte != 0))) {
         anyhow::bail!("WithdrawalPendingCreated log has a non-canonical amount or claimableAt word");
     }
     let mut amount = [0u8; 32];
@@ -879,7 +881,7 @@ mod tests {
         extract_withdrawal_pending_created_tuples, hex_to_u32x8_be, keccak256, normalize_u256_hex_32bytes, parse_u256_word_array,
         resolve_bridge_address_for_network, run, to_32byte_hex, LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE,
         WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT,
-        WITHDRAWAL_PENDING_CREATED_EVENT,
+        WITHDRAWAL_PENDING_CREATED_EVENT, WITHDRAWAL_CLAIMED_EVENT,
     };
     use crate::result::{CommandResult, L1TransactionStatus};
     use crate::subcommand::args::ClaimWithdrawalArgs;
@@ -1170,6 +1172,23 @@ mod tests {
             ],
             "data": format!("0x{}{}", &amount_word[2..], format!("{:064x}", 0u64)),
         }])
+    }
+
+    #[test]
+    fn direct_payment_receipt_decodes_recipient_and_token_in_claimed_event_order() {
+        let amount = normalize_u256_hex_32bytes("123").unwrap();
+        let mut logs = pending_created_log(&amount);
+        let topics = logs[0]["topics"].as_array_mut().unwrap();
+        topics[0] = serde_json::json!(format!("0x{}", hex::encode(keccak256(WITHDRAWAL_CLAIMED_EVENT.as_bytes()))));
+        topics.swap(2, 3);
+        logs[0]["data"] = serde_json::json!(amount);
+        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
+        let nonce = claimed_nonce_bytes("13").unwrap();
+        let tuples = extract_withdrawal_pending_created_tuples(&logs, &bridge, &nonce).unwrap();
+        let pending = extract_withdrawal_pending_created_tuples(&pending_created_log(&amount), &bridge, &nonce).unwrap();
+        assert_eq!(tuples, pending);
+        logs[0]["data"] = serde_json::json!("0x01");
+        assert!(extract_withdrawal_pending_created_tuples(&logs, &bridge, &nonce).is_err());
     }
 
     /// WithdrawalClaimItemFailed log for nonce 13, slot 0, with a numeric reason.
