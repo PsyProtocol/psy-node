@@ -435,6 +435,14 @@ class InstallTests(unittest.TestCase):
             self.root.chmod(0o755)
             actual, actual_key, actual_credential = installer.host_checks(self.spec, 9700)
             self.assertEqual((actual, actual_key, actual_credential), (service, key, credential))
+            credential_parent = self.root / "root-only-credentials"
+            credential_parent.mkdir(mode=0o700)
+            with patch.object(installer, "CREDENTIALS", credential_parent / "fresh"):
+                self.assertEqual(installer.host_checks(self.spec, 9700)[2], credential)
+            self.root.chmod(0o700)
+            with self.assertRaisesRegex(ValueError, "service ancestor blocks traversal"):
+                installer.host_checks(self.spec, 9700)
+            self.root.chmod(0o755)
             good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
             for name in ("psy-core-relayer.service", "psy-core-relayer-r2.service", installer.UNIT):
                 overrides[name] = good.replace("inactive", "active")

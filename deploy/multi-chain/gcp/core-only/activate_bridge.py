@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import socket
 import time
 import types
@@ -33,7 +34,7 @@ def helper(name, digest):
 
 
 g = helper("install_guardian", "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a")
-r = helper("install_relayer", "e6a7c535cb089297817e110e52e9f7815a36a23fa973dd58022a892116d91a2d")
+r = helper("install_relayer", "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9")
 
 
 def show(name):
@@ -140,8 +141,11 @@ def dependencies(data):
     for guardian in network["guardian_configs"]:
         origin = guardian.get("rpc_url") or "http://" + guardian["listen_address"]
         value = get_json(origin, "/v1/ready")
+        magic = value.get("network_magic")
+        g.require(type(magic) is int or (type(magic) is str and re.fullmatch(r"[0-9]{1,20}", magic)),
+                  "Guardian network magic must be an integer or ASCII decimal string")
         g.require(value.get("schema_version") == 3 and value.get("user_id") == 524288
-                  and value.get("network_magic") == int(network["magic"], 16)
+                  and int(magic) == int(network["magic"], 16)
                   and value.get("runtime_initialized") is True and value.get("halted") is False, "Guardian not ready for configured bridge account")
     daemon = r.validate_daemon(files["daemon.toml"])
     value = get_json(daemon["services_url"], "/health/ready")

@@ -141,6 +141,20 @@ class ActivateTests(unittest.TestCase):
                     self.assertEqual(clock[0], 15 if case == "permanent" else 0)
                 command.assert_called_once_with(["systemctl", "enable", "--now", self.name])
 
+    def test_live_readiness_magic_numeric_and_decimal_string(self):
+        ready = json.loads('{"schema_version":3,"user_id":524288,"network_magic":1384803358401154921,"runtime_initialized":true,"halted":false}')
+        services = {"status": "ready", "details": {"database": {"status": "healthy"}, "cache": {"status": "healthy"}}}
+        self.files["daemon.toml"] = b"synthetic"
+        with patch.object(a.r, "validate_daemon", return_value={"services_url": "http://172.30.0.10:3001"}), \
+                patch.object(a, "get_json", side_effect=lambda origin, path: ready if path == "/v1/ready" else services):
+            for value in (1384803358401154921, "1384803358401154921"):
+                ready["network_magic"] = value
+                a.dependencies(self.data)
+            for value in (True, False, 1384803358401154921.0, "+1384803358401154921", " 1384803358401154921", "1384803358401154921\n", "0x1337CF514544CF69", "١٣٨٤٨٠٣٣٥٨٤٠١١٥٤٩٢١", "1384803358401154922", None):
+                ready["network_magic"] = value
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    a.dependencies(self.data)
+
     def test_process_checks_exact_path_hash_and_pid(self):
         value = {"ActiveState": "active", "MainPID": "123"}
         binary = self.release / "psy_relayer_cli"

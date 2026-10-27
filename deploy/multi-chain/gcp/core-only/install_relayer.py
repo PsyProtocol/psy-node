@@ -309,7 +309,8 @@ def host_checks(spec, port):
         for parent in path.parents:
             if os.path.lexists(parent):
                 g.trusted_directory(parent)
-                g.require(os.stat(parent).st_mode & 0o001, "service ancestor blocks traversal")
+                if path != CREDENTIALS:
+                    g.require(os.stat(parent).st_mode & 0o001, "service ancestor blocks traversal")
     paths = g.command(["systemd-analyze", "unit-paths"]).splitlines()
     g.require(str(UNITS) in paths, "unit search paths invalid")
     for root in paths:
