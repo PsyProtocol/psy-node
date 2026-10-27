@@ -183,7 +183,7 @@ impl PrivateNoteInclusionGadget {
 
     /// Set witness values from a `PrivateNoteInclusionInput`.
     pub fn set_witness<F: RichField>(&self, pw: &mut PartialWitness<F>, input: &PrivateNoteInclusionInput<F>) -> anyhow::Result<()> {
-        tracing::info!(
+        tracing::debug!(
             "PrivateNoteInclusion set_witness: checkpoint_id={} sender_user_id={} contract_id={} note_root_slot={} note_index={} membership_root={} slot_value={} slot_root={}",
             input.checkpoint_id,
             input.sender_user_id,
@@ -343,7 +343,7 @@ where
     }
 
     pub fn prove(&self, input: &PrivateNoteInclusionInput<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        tracing::info!(
+        tracing::debug!(
             "PrivateNoteInclusion prove start: checkpoint_id={} sender_user_id={} contract_id={} note_root_slot={}",
             input.checkpoint_id,
             input.sender_user_id,
