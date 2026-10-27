@@ -59,6 +59,13 @@ network config -------------> build-time constants and runtime membership valida
 
 ## 1. Root `genesis.json`
 
+Fresh Genesis contracts carry a mandatory canonical layout manifest alongside
+the deployment fields. The generator binds each of the six deployments to its
+complete compiler artifact and derives the manifest from that artifact's ABI.
+The runtime builder recomputes layout commitments before initializing contract
+leaves. Missing metadata is rejected; literal-zero fallback is not supported.
+The compiler bundle alone is not the complete generation input.
+
 Faucet operator accounts use a caller-aware SDKey policy. The generator defaults
 to `--sd-key-min-tx-count 1 --sd-key-max-tx-count 64`: this counts the calls in
 one UPS, including nested calls and fee burn, rather than lifetime faucet claims.
@@ -82,6 +89,32 @@ Run generation only when at least one of these changed ([circuit-and-verifier-op
 EndCap metadata, GUTA, cache, verifier JSON, fingerprint, and ordinary witness changes do not trigger it.
 
 ### 1.2 Command
+
+To reuse existing validator and Faucet identities, select the import mode instead
+of `--random-private-keys`. Import requires both the hash-pinned private-key array
+and the prior public Genesis. Before writing outputs, generation checks every
+account fingerprint/public-key parameter and each Validator's Realm/user mapping.
+The selected network still comes from the canonical config; imported keys do not
+permit deterministic keys on a public network. Input errors never generate replacements.
+
+```bash
+PSY_NETWORK=testnet PSY_CONFIG_PATH=<canonical-config> \
+./target/release/psy_dev_cli generate-genesis-data \
+  --repo-root <repo-root> \
+  --private-keys-in <protected-private-key-array> \
+  --private-keys-sha256 <private-key-array-sha256> \
+  --accounts-genesis-in <prior-public-genesis> \
+  --accounts-genesis-sha256 <prior-public-genesis-sha256> \
+  --genesis-out <new-genesis-path> \
+  --private-keys-out <new-protected-private-key-array> \
+  --faucet-operators-out <new-protected-faucet-operators>
+```
+
+Pass the deployment's actual Validator slots and Faucet count as well; the
+example deliberately does not change the generator's global account defaults.
+All import-mode outputs are create-only, including the copied private-key array.
+Reuse Guardian and P2P custody separately and inject the approved public
+membership before final Genesis hashing. Generation does not start or reset a chain.
 
 When generation is authorized, the selected network of `psy-genesis/config.json` must already carry `guardian_initial_member_hashes`: exactly three public member commitments. The generator reads that field and nothing else from the network. The policy compiler artifact is read from the sibling checkout, not from a flag:
 

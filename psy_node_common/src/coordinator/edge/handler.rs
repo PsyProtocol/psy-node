@@ -1209,7 +1209,7 @@ pub(crate) mod tests {
             PHash::from_values(3, 0, 0, 0),
         );
         PsyGenesisBlockSetupData {
-            contracts: vec![contract],
+            contracts: vec![psy_data::genesis::genesis_block_setup::genesis_contract_with_empty_layout_fixture(contract)],
             users: vec![],
             validators: vec![genesis_validator()],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
