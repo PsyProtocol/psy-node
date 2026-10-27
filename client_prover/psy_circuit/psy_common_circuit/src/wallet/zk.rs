@@ -27,6 +27,7 @@ pub trait ZKSignatureBasicWalletProvider<C: GenericConfig<D> + 'static, const D:
     fn get_public_keys(&self) -> Vec<QHashOut<C::F>>;
     fn get_hash_public_keys(&self) -> Vec<QHashOut<C::F>>;
     fn add_hash_public_key(&mut self, hash_public_key: QHashOut<C::F>) -> QHashOut<C::F>;
+    /// Remove the circuit fingerprint returned by `add_hash_public_key`.
     fn remove_public_key(&mut self, public_key: QHashOut<C::F>);
     fn contains_public_key(&self, public_key: QHashOut<C::F>) -> bool;
     fn contains_hash_public_key(&self, hash_public_key: QHashOut<C::F>) -> bool;
@@ -168,9 +169,8 @@ where
     }
 
     fn remove_public_key(&mut self, public_key: QHashOut<C::F>) {
-        let fingerprint_result = self.hash_public_key_to_fingerprint.remove(&public_key);
-        if fingerprint_result.is_some() {
-            self.key_map.remove(&fingerprint_result.unwrap());
+        if let Some(key) = self.key_map.remove(&public_key) {
+            self.hash_public_key_to_fingerprint.remove(&key.hash_public_key);
         }
     }
 
@@ -278,7 +278,7 @@ where
     }
 
     fn contains_hash_public_key(&self, hash_public_key: QHashOut<C::F>) -> bool {
-        self.basic_wallet.contains_public_key(hash_public_key)
+        self.basic_wallet.contains_hash_public_key(hash_public_key)
     }
 
     fn get_public_key_from_hash_public_key(&self, hash_public_key: QHashOut<C::F>) -> Option<QHashOut<C::F>> {
@@ -324,5 +324,55 @@ where
         } else {
             anyhow::bail!("Public key not found")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::plonk::config::PoseidonGoldilocksConfig;
+
+    use super::*;
+
+    #[test]
+    fn remove_public_key_clears_private_key_and_both_public_key_maps() {
+        type C = PoseidonGoldilocksConfig;
+        let mut wallet = MemoryZKSignatureWallet::<C, 2, SimpleZKSignatureWallet<C, 2>>::new_memory();
+        let private_key = QHashOut::from_values(1, 2, 3, 4);
+        let hash_public_key = SimplePrivateKey::new(private_key).get_public_key::<<C as GenericConfig<2>>::Hasher>();
+        let public_key = wallet.add_private_key(private_key);
+        let other_private_key = QHashOut::from_values(5, 6, 7, 8);
+        let other_hash_public_key = SimplePrivateKey::new(other_private_key).get_public_key::<<C as GenericConfig<2>>::Hasher>();
+        let other_public_key = wallet.add_private_key(other_private_key);
+        assert_ne!(public_key, hash_public_key);
+        assert!(wallet.contains_public_key(public_key));
+        assert!(wallet.contains_hash_public_key(hash_public_key));
+
+        // The removal API accepts fingerprints, not hash public keys.
+        wallet.remove_public_key(hash_public_key);
+        assert!(wallet.contains_public_key(public_key));
+        assert!(wallet.contains_hash_public_key(hash_public_key));
+        assert!(wallet.fingerprint_public_key_to_private_key.contains_key(&public_key));
+
+        wallet.remove_public_key(public_key);
+        assert!(!wallet.contains_public_key(public_key));
+        assert!(!wallet.contains_hash_public_key(hash_public_key));
+        assert_eq!(wallet.get_public_key_from_hash_public_key(hash_public_key), None);
+        assert!(!wallet.basic_wallet.key_map.contains_key(&public_key));
+        assert!(!wallet.basic_wallet.hash_public_key_to_fingerprint.contains_key(&hash_public_key));
+        assert!(!wallet.fingerprint_public_key_to_private_key.contains_key(&public_key));
+        assert!(wallet.sign(public_key, hash_public_key).is_err());
+        assert!(wallet.sign_by_hash_public_key(hash_public_key, hash_public_key).is_err());
+
+        // Repeated removal is harmless and leaves the other account intact.
+        wallet.remove_public_key(public_key);
+        assert_eq!(wallet.get_public_keys(), vec![other_public_key]);
+        assert_eq!(wallet.get_hash_public_keys(), vec![other_hash_public_key]);
+        assert_eq!(wallet.fingerprint_public_key_to_private_key.get(&other_public_key), Some(&other_private_key));
+
+        assert_eq!(wallet.add_private_key(private_key), public_key);
+        assert!(wallet.contains_public_key(public_key));
+        assert!(wallet.contains_hash_public_key(hash_public_key));
+        assert_eq!(wallet.get_public_key_from_hash_public_key(hash_public_key), Some(public_key));
+        assert_eq!(wallet.fingerprint_public_key_to_private_key.get(&public_key), Some(&private_key));
     }
 }
