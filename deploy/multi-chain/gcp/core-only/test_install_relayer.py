@@ -363,7 +363,7 @@ class InstallTests(unittest.TestCase):
             if argv == ["systemctl", "--version"]:
                 return "systemd 255"
             if argv[:2] == ["systemctl", "show"]:
-                if argv[2] == "psy-core-relayer.service":
+                if argv[2] == "psy-core-relayer-r2.service":
                     return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return "LoadState=not-found\n"
             if argv[:2] == ["systemctl", "list-jobs"]:
@@ -402,6 +402,7 @@ class InstallTests(unittest.TestCase):
         custody = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         read = installer.g.read
         host_state = {"unit": "LoadState=not-found\n\n", "jobs": ""}
+        overrides = {}
 
         def root_read(path, private=False, uid=None, limit=8*1024*1024):
             return read(path, private=private, uid=os.getuid() if uid == 0 else uid, limit=limit)
@@ -412,7 +413,9 @@ class InstallTests(unittest.TestCase):
             if argv == ["systemctl", "--version"]:
                 return "systemd 255"
             if argv[:2] == ["systemctl", "show"]:
-                if argv[2] == "psy-core-relayer.service" and host_state["unit"].strip() == "LoadState=not-found":
+                if argv[2] in overrides:
+                    return overrides[argv[2]]
+                if argv[2] == "psy-core-relayer-r2.service" and host_state["unit"].strip() == "LoadState=not-found":
                     return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return host_state["unit"]
             if argv[:2] == ["systemctl", "list-jobs"]:
@@ -432,6 +435,18 @@ class InstallTests(unittest.TestCase):
             self.root.chmod(0o755)
             actual, actual_key, actual_credential = installer.host_checks(self.spec, 9700)
             self.assertEqual((actual, actual_key, actual_credential), (service, key, credential))
+            good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
+            for name in ("psy-core-relayer.service", "psy-core-relayer-r2.service", installer.UNIT):
+                overrides[name] = good.replace("inactive", "active")
+                with self.subTest(unit=name), self.assertRaisesRegex(ValueError, "unit active or enabled"):
+                    installer.host_checks(self.spec, 9700)
+                overrides.clear()
+            for output in ("LoadState=not-found\n", good.replace("disabled", "static"),
+                           good.replace("disabled", "enabled"), good.replace("MainPID=0", "MainPID=42")):
+                overrides["psy-core-relayer-r2.service"] = output
+                with self.subTest(r2=output), self.assertRaisesRegex(ValueError, "unit active or enabled"):
+                    installer.host_checks(self.spec, 9700)
+            overrides.clear()
             for active, enabled in (("active", "disabled"), ("inactive", "enabled"), ("inactive", "masked"), ("inactive", "static")):
                 host_state["unit"] = f"LoadState=loaded\nActiveState={active}\nUnitFileState={enabled}\nMainPID=0\n"
                 with self.assertRaisesRegex(ValueError, "unit active or enabled"):
@@ -479,6 +494,15 @@ class InstallTests(unittest.TestCase):
             Path(self.spec["password_credential"]["path"]).chmod(0o644)
             with self.assertRaisesRegex(ValueError, "private file"):
                 installer.host_checks(self.spec, 9700)
+
+    def test_r3_paths_and_unfrozen_build_fail_closed(self):
+        self.assertEqual(installer.UNIT, "psy-core-relayer-r3.service")
+        actual = load("install_relayer")
+        for path in (actual.RELEASE, actual.STATE, actual.CREDENTIALS):
+            self.assertTrue(str(path).endswith("core-testnet-20261027-r3"))
+        with patch.object(installer.g, "BUILD_HASH", None):
+            with self.assertRaisesRegex(ValueError, "approved build manifest"):
+                installer.load_plan(self.spec_path, self.save())
 
     def test_rejects_changed_helper_before_executing_it(self):
         script = self.root / "install_relayer.py"

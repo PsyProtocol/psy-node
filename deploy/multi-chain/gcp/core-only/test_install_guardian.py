@@ -324,6 +324,8 @@ class InstallTests(unittest.TestCase):
 
         old_unit = installer.UNITS / "psy-guardian-1.service"
         old_unit.write_bytes(b"retained old unit")
+        r2_unit = installer.UNITS / "psy-guardian-r2-1.service"
+        r2_unit.write_bytes(b"retained R2 unit")
         with patch.object(installer, "host_checks", side_effect=checked), \
                 patch.object(installer.os, "fchown"), patch.object(installer, "command") as command:
             result = installer.run("install", self.spec_path, self.save(), apply=True)
@@ -338,7 +340,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((keys / "guardian-1.keystore.json").stat().st_mode), 0o600)
         self.assertFalse(result["started"] or result["enabled"])
         self.assertEqual(old_unit.read_bytes(), b"retained old unit")
-        self.assertEqual((installer.UNITS / "psy-guardian-r2-1.service").read_bytes(), installer.unit(self.spec))
+        self.assertEqual(r2_unit.read_bytes(), b"retained R2 unit")
+        self.assertEqual((installer.UNITS / "psy-guardian-r3-1.service").read_bytes(), installer.unit(self.spec))
 
     def test_atomic_write_refuses_existing_target_and_cleans_owned_temporary(self):
         target = self.root / "existing"
@@ -369,12 +372,15 @@ class InstallTests(unittest.TestCase):
         outputs = {"ip": json.dumps([{"addr_info": [{"local": ADDRESS}]}]),
                    "ss": "", "systemd-analyze": str(installer.UNITS)}
         state = {"show": "LoadState=not-found\n", "jobs": ""}
+        overrides = {}
 
         def command(argv):
             if argv[0] == "systemctl":
                 if argv[1] == "--version":
                     return "systemd 252"
-                if argv[1] == "show" and argv[2] == "psy-guardian-1.service" and state["show"] == "LoadState=not-found\n":
+                if argv[1] == "show" and argv[2] in overrides:
+                    return overrides[argv[2]]
+                if argv[1] == "show" and argv[2] == "psy-guardian-r2-1.service" and state["show"] == "LoadState=not-found\n":
                     return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return state["show" if argv[1] == "show" else "jobs"]
             return outputs[argv[0]]
@@ -395,6 +401,20 @@ class InstallTests(unittest.TestCase):
         patch.object(installer, "read", side_effect=read).start()
         _, key = installer.host_checks(self.spec, self.network, 9701)
         self.assertEqual(key, self.key)
+        good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
+        for generation in ("", "r2-", "r3-"):
+            for guardian_id in (1, 2, 3):
+                name = f"psy-guardian-{generation}{guardian_id}.service"
+                overrides[name] = good.replace("inactive", "active")
+                with self.subTest(unit=name), self.assertRaisesRegex(ValueError, "active or enabled"):
+                    installer.host_checks(self.spec, self.network, 9701)
+                overrides.clear()
+        for output in ("LoadState=not-found\n", good.replace("disabled", "static"),
+                       good.replace("disabled", "enabled"), good.replace("MainPID=0", "MainPID=42")):
+            overrides["psy-guardian-r2-1.service"] = output
+            with self.subTest(r2=output), self.assertRaisesRegex(ValueError, "active or enabled"):
+                installer.host_checks(self.spec, self.network, 9701)
+        overrides.clear()
         for field, value in (("node_source", installer.RUNTIME_SOURCE), ("public_key_hash", "f" * 64),
                              ("keystore_sha256", "f" * 64), ("guardian_id", 2), ("host", PROXY)):
             original = public[field]
@@ -427,12 +447,20 @@ class InstallTests(unittest.TestCase):
         write.assert_not_called()
         command.assert_not_called()
 
-    def test_r2_rejects_old_schema_and_uses_fresh_state(self):
+    def test_r3_rejects_old_schema_and_uses_fresh_state(self):
         self.spec["version"] = 2
         with self.assertRaisesRegex(ValueError, "version"):
             installer.load_plan(self.spec_path, self.save())
-        self.assertTrue(str(installer.RELEASES).endswith("-r2"))
-        self.assertTrue(str(installer.STATES).endswith("-r2"))
+        self.assertTrue(str(installer.RELEASES).endswith("core-testnet-20261027-r3"))
+        self.assertTrue(str(installer.STATES).endswith("core-testnet-20261027-r3"))
+        self.assertEqual(installer.KEY_SOURCE, "de539f565ec1a92f91bb4e9686e1442e89ba8639")
+        self.assertEqual(installer.RUNTIME_SOURCE, "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
+
+    def test_unfrozen_or_old_build_manifest_fails_closed(self):
+        for build_hash in (None, "da174adeccef81c312e1f2eb1e6a136b53fb8a68f6e9f5b39510c6c1305133bf"):
+            with self.subTest(pin=build_hash), patch.object(installer, "BUILD_HASH", build_hash):
+                with self.assertRaisesRegex(ValueError, "reviewed build manifest"):
+                    installer.load_plan(self.spec_path, self.save())
 
     def test_retained_unit_must_be_loaded_inactive_disabled_without_jobs(self):
         names = ("old.service", "new.service")

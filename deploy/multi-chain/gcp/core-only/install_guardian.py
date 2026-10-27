@@ -31,10 +31,12 @@ Pending documents permit plan only. Real RPC/proof/membership acceptance and
 any service activation remain separate operator gates, even after installation.
 Before activation, confirm /usr/bin/python3 and its resolved executable are
 root-owned, executable and not group/other-writable on the target host.
-R2 uses new units/releases/state; retained units and custody are never changed.
-The assigned old Guardian must exist and be inactive with PID zero. A disabled
-unit is accepted; a static old Guardian additionally needs no aliases, drop-ins,
-enablement symlinks or queued jobs. This exception never applies to r2/Relayer.
+R3 uses new units/releases/state; retained units and custody are never changed.
+The assigned R2 Guardian must exist, be inactive with PID zero and disabled.
+R1/R2/R3 units are scanned; a static R1 Guardian additionally needs no aliases,
+drop-ins, enablement symlinks or queued jobs. This exception never applies to
+R2/R3/Relayer. Fresh L1 documents require separate operator approval; retained
+deployment documents are not authorization for the new L1 cohort.
 """
 
 import argparse
@@ -53,13 +55,13 @@ import subprocess
 from urllib.parse import urlsplit
 
 
-RUNTIME_SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+RUNTIME_SOURCE = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
 KEY_SOURCE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-BUILD_HASH = "da174adeccef81c312e1f2eb1e6a136b53fb8a68f6e9f5b39510c6c1305133bf"
+BUILD_HASH = "4432ea02ead2f2fd48a723b911049f5dcdb8d1ef80072518361759ab77628072"
 MAGIC = "0x1337CF514544CF69"
 CUSTODY = Path("/var/lib/psy-guardian-custody")
-RELEASES = Path("/opt/psy-guardian/releases/core-testnet-20261026-r2")
-STATES = Path("/var/lib/psy-guardian/core-testnet-20261026-r2")
+RELEASES = Path("/opt/psy-guardian/releases/core-testnet-20261027-r3")
+STATES = Path("/var/lib/psy-guardian/core-testnet-20261027-r3")
 UNITS = Path("/etc/systemd/system")
 CHAINS = {"sepolia": (0, 11155111), "bscTestnet": (1, 97), "baseSepolia": (2, 84532)}
 
@@ -382,8 +384,8 @@ def host_checks(spec, network, port):
             and grp.getgrnam(spec["service_user"]).gr_gid == account.pw_gid,
             "dedicated non-root account/group required")
     require(int(command(["systemctl", "--version"]).split()[1]) >= 250, "systemd 250+ required")
-    inactive_units([f"psy-guardian-{generation}{i}.service" for generation in ("", "r2-") for i in (1, 2, 3)],
-                   {f"psy-guardian-{spec['guardian_id']}.service"},
+    inactive_units([f"psy-guardian-{generation}{i}.service" for generation in ("", "r2-", "r3-") for i in (1, 2, 3)],
+                   {f"psy-guardian-r2-{spec['guardian_id']}.service"},
                    {f"psy-guardian-{i}.service" for i in (1, 2, 3)})
     require(not any(len(row) > 3 and row[3].rsplit(":", 1)[-1] == str(port)
                     for row in map(str.split, command(["ss", "-H", "-ltn"]).splitlines())), "Guardian port occupied")
@@ -414,7 +416,7 @@ def host_checks(spec, network, port):
     unit_paths = command(["systemd-analyze", "unit-paths"]).splitlines()
     require(str(UNITS) in unit_paths, "unit search paths invalid")
     for root in unit_paths:
-        for unit_name in (f"psy-guardian-r2-{guardian_id}.service", "psy-guardian-r2-.service",
+        for unit_name in (f"psy-guardian-r3-{guardian_id}.service", "psy-guardian-r3-.service",
                           "psy-guardian-.service", "psy-.service", "service"):
             for suffix in ("", ".d"):
                 require(not os.path.lexists(path_value(root) / (unit_name + suffix)), "existing unit or inherited drop-in")
@@ -484,7 +486,7 @@ def run(mode, spec_path, spec_hash, apply=False):
                       (0o755 if name == "psy_relayer_cli" else 0o644))
             write(release / f"home/.psy/keystore/guardian-{spec['guardian_id']}.keystore.json", key,
                   uid=account.pw_uid, gid=account.pw_gid)
-            write(UNITS / f"psy-guardian-r2-{spec['guardian_id']}.service", unit(spec), mode=0o644)
+            write(UNITS / f"psy-guardian-r3-{spec['guardian_id']}.service", unit(spec), mode=0o644)
             command(["systemctl", "daemon-reload"])
     return {"guardian_id": spec["guardian_id"], "mode": mode, "runtime_source": RUNTIME_SOURCE,
             "key_source": KEY_SOURCE, "l1_documents_pending": pending, "started": False,

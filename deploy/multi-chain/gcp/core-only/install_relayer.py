@@ -30,8 +30,10 @@ existing history cannot be changed. Genesis commitments and build bytes stay fix
 The encrypted credential must be made on this host with the helper's fixed name.
 Before activation, verify /usr/bin/python3 and its resolved executable are
 root-owned, executable and not group/other-writable on the target host.
-R2 uses a new unit/release/state and copies the existing encrypted credential.
-The old psy-core-relayer.service must exist, be inactive with PID zero and disabled.
+R3 uses a new unit/release/state and copies the existing host-bound credential.
+The old psy-core-relayer-r2.service must exist, be inactive with PID zero and
+disabled; R1 and R3 are also scanned. Never reuse retained deployment documents
+as authorization for the fresh L1 cohort; the operator must approve new exports.
 """
 
 import argparse
@@ -59,16 +61,16 @@ try:
     _helper_bytes = _helper.read_bytes()
 except OSError:
     raise SystemExit("Reviewed install_guardian.py sibling required") from None
-if hashlib.sha256(_helper_bytes).hexdigest() != "21e71a5ec1c48c7b8ce32ae4f85c6c4cbf046fbae94e45f392603221133d283c":
+if hashlib.sha256(_helper_bytes).hexdigest() != "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a":
     raise SystemExit("Reviewed install_guardian.py sibling hash mismatch")
 g = types.ModuleType("guardian_install_files")
 g.__file__ = str(_helper)
 exec(compile(_helper_bytes, str(_helper), "exec"), g.__dict__)
-RELEASE = Path("/opt/psy-core-relayer/releases/core-testnet-20261026-r2")
-STATE = Path("/var/lib/psy-core-relayer/core-testnet-20261026-r2")
-CREDENTIALS = Path("/etc/psy-core-relayer/core-testnet-20261026-r2")
+RELEASE = Path("/opt/psy-core-relayer/releases/core-testnet-20261027-r3")
+STATE = Path("/var/lib/psy-core-relayer/core-testnet-20261027-r3")
+CREDENTIALS = Path("/etc/psy-core-relayer/core-testnet-20261027-r3")
 UNITS = Path("/etc/systemd/system")
-UNIT = "psy-core-relayer-r2.service"
+UNIT = "psy-core-relayer-r3.service"
 USER = "psy-core-relayer"
 PASSWORD_ENV = "PSY_CORE_RELAYER_L1_PASSWORD"
 CREDENTIAL = "psy-core-relayer-l1-password"
@@ -297,8 +299,9 @@ def host_checks(spec, port):
     account = pwd.getpwnam(USER)
     g.require(account.pw_uid > 0 and account.pw_gid > 0 and grp.getgrnam(USER).gr_gid == account.pw_gid, "dedicated non-root user/group required")
     g.require(int(g.command(["systemctl", "--version"]).split()[1]) >= 250, "systemd 250+ required")
-    g.inactive_units((UNIT, "psy-core-relayer.service", "parth-bridge-relayer.service", "parth-relayer.service"),
-                     {"psy-core-relayer.service"})
+    g.inactive_units((UNIT, "psy-core-relayer-r2.service", "psy-core-relayer.service",
+                      "parth-bridge-relayer.service", "parth-relayer.service"),
+                     {"psy-core-relayer-r2.service"})
     g.require(not any(len(row) > 3 and row[3].rsplit(":", 1)[-1] == str(port)
                       for row in map(str.split, g.command(["ss", "-H", "-ltn"]).splitlines())), "history port occupied")
     for path in (RELEASE, STATE, CREDENTIALS):

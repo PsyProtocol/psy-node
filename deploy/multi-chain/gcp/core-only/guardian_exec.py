@@ -59,7 +59,7 @@ def launch(guardian_id):
     if value.startswith("\ufeff"):
         raise ValueError("invalid credential")
     release = Path(__file__).absolute().parent
-    state = Path("/var/lib/psy-guardian/core-testnet-20261026-r2") / f"guardian-{guardian_id}"
+    state = Path("/var/lib/psy-guardian/core-testnet-20261027-r3") / f"guardian-{guardian_id}"
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("GUARDIAN_")}
     environment[f"GUARDIAN_{guardian_id}_KEYSTORE_PASSWORD"] = value
