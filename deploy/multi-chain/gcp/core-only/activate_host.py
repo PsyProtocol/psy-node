@@ -101,9 +101,16 @@ def activate(package, phase, apply=False):
             active = show(name).get("ActiveState") == "active"
             h.command(["systemctl", "enable", *([] if active else ["--now"]), name])
             deadline = time.monotonic() + 15
-            while show(name).get("ActiveState") == "activating" and time.monotonic() < deadline:
-                time.sleep(0.25)
-            result = process(name, expected)
+            # Type=simple can report active before the executor reaches execve.
+            while True:
+                try:
+                    result = process(name, expected)
+                    break
+                except (h.InstallError, FileNotFoundError, ProcessLookupError):
+                    if (active or time.monotonic() >= deadline or
+                            show(name).get("ActiveState") not in ("active", "activating")):
+                        raise
+                    time.sleep(0.25)
             h.require(show(name).get("UnitFileState") == "enabled", "unit not enabled")
             results.append({**result, "already_active": active})
     return {"host": manifest["host"], "phase": phase, "units": selected, "started": apply,

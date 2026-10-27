@@ -129,6 +129,48 @@ class ActivateTests(unittest.TestCase):
             with patch.object(a, "show", side_effect=[self.show(name), {"MainPID": "124", "ActiveState": "active"}]), self.assertRaises(ValueError):
                 a.process(name, digest)
 
+    def test_new_start_waits_through_active_executor_but_rejects_permanent_failed_or_existing_wrong_exe(self):
+        for case in ("transition", "permanent", "failed", "existing"):
+            with self.subTest(case=case):
+                self.manifest.update(host="gcp-edge-1", private_ip=a.h.HOSTS["gcp-edge-1"])
+                self.manifest["files"]["bin/psy_node_cli"] = a.hashlib.sha256(b"binary").hexdigest()
+                first = sorted(a.h.host_inventory("gcp-edge-1")[0])[0]
+                self.active = {first} if case == "existing" else set()
+                self.calls.clear()
+                clock, reads = [0.0], [0]
+                def readlink(path):
+                    reads[0] += 1
+                    if case in ("permanent", "existing") or (case == "transition" and reads[0] == 1):
+                        return "/usr/lib/systemd/systemd-executor"
+                    return str(a.h.RELEASE / "bin/psy_node_cli")
+                def show(name):
+                    value = self.show(name)
+                    if case == "failed" and name in self.active:
+                        value.update(ActiveState="failed", MainPID="0")
+                    return value
+                with patch.object(a.os, "geteuid", return_value=0), \
+                        patch.object(a.h, "read_package", return_value=(self.manifest, {})), \
+                        patch.object(a, "installed"), patch.object(a, "show", side_effect=show), \
+                        patch.object(a.h, "command", side_effect=self.command), \
+                        patch.object(a.os, "readlink", side_effect=readlink), \
+                        patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"binary")), \
+                        patch.object(a.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(a.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                    if case == "transition":
+                        result = a.activate(Path("/unused"), "edges", True)
+                        self.assertEqual(len(result["processes"]), 3)
+                        self.assertGreater(clock[0], 0)
+                    else:
+                        with self.assertRaises(a.h.InstallError):
+                            a.activate(Path("/unused"), "edges", True)
+                    mutations = [c for c in self.calls if c[1] == "enable"]
+                    if case == "permanent":
+                        self.assertGreaterEqual(clock[0], 15)
+                        self.assertEqual(len(mutations), 1)
+                    if case in ("failed", "existing"):
+                        self.assertEqual(clock[0], 0)
+                        self.assertEqual(len(mutations), 0 if case == "existing" else 1)
+
     def test_cli_reports_safe_require_errors_but_not_other_exception_contents(self):
         for error, detail in ((a.h.InstallError("target IP mismatch"), "target IP mismatch"),
                               (OSError("PRIVATE_PAYLOAD_SENTINEL"), "OSError"),
