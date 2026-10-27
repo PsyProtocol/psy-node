@@ -170,6 +170,67 @@ class RunnerTests(unittest.TestCase):
         with patch.object(m, "rpc", return_value="0x1"):
             with self.assertRaises(m.GateError): m.status("sepolia", "own")
 
+    def test_explicit_backup_only_and_sanitized_report(self):
+        values = {"eth_chainId": hex(11155111),
+                  "eth_getBlockByNumber": {"timestamp": hex(1000), "number": "0x2"},
+                  "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4"}
+        with patch.object(m, "rpc", side_effect=lambda url, method, params: values[method]) as rpc, \
+                patch.object(m.time, "time", return_value=1001):
+            report, endpoint = m.status("sepolia", "own", "https://backup.invalid/token",
+                                        "protected-env-backup")
+        self.assertEqual(endpoint, "https://backup.invalid/token")
+        self.assertEqual(report["provider"], "protected-env-backup")
+        self.assertNotIn("token", json.dumps(report))
+        self.assertTrue(all(call.args[0] == endpoint for call in rpc.call_args_list))
+
+    def test_explicit_backup_missing_or_unhealthy_never_uses_own(self):
+        for endpoint in (None, "", "https://backup.invalid/token"):
+            with self.subTest(endpoint=bool(endpoint)), \
+                    patch.object(m, "rpc", side_effect=ValueError("secret URL")) as rpc:
+                with self.assertRaises(m.GateError) as error:
+                    m.status("sepolia", "own", endpoint, "protected-env-backup")
+                self.assertNotIn("secret URL", str(error.exception))
+                self.assertTrue(all(call.args[0] == endpoint for call in rpc.call_args_list))
+                if not endpoint:
+                    rpc.assert_not_called()
+
+    def test_status_cli_preference_default_and_explicit(self):
+        for preference in ("own-node", "protected-env-backup"):
+            argv = ["status"]
+            if preference != "own-node":
+                argv += ["--rpc-preference", preference]
+            with patch.object(m, "secret_env", return_value={}), \
+                    patch.object(m, "own_rpc", return_value="own"), \
+                    patch.object(m, "status", return_value=({}, "selected")) as status:
+                m.main(argv)
+            self.assertEqual(status.call_count, 3)
+            self.assertTrue(all(call.args[3] == preference for call in status.call_args_list))
+
+    def test_deploy_backup_keeps_own_public_metadata(self):
+        output = self.root / "out"
+        output.mkdir()
+        m.write_json(output / "prepared.json", {"manifest_sha256": "approved"})
+        p = self.write(self.root / "policy.json", json.dumps(policy()))
+        budget = self.write(self.root / "gas.json", json.dumps({"maxGasPriceWei": "4",
+            "maxGasPerTransaction": "1", "maxTotalGas": "1", "maxNativeSpendWei": "1",
+            "l1FeeReserveWeiPerTransaction": "0"}))
+        key = self.write(self.root / "key.json", "synthetic")
+        requests = []
+        with patch.object(m, "verify_bundle", return_value=self.root), \
+                patch.object(m, "secret_env", return_value={"WALLET_PASSWORD": "synthetic",
+                    m.NETWORKS["sepolia"][3] + "_RPC_FALLBACK_URL": "backup"}), \
+                patch.object(m, "own_rpc", return_value="own"), \
+                patch.object(m, "status", return_value=({"balance_wei": "3", "gas_price_wei": "4"}, "backup")) as status, \
+                patch.object(m, "child", side_effect=lambda *args: requests.append(copy.deepcopy(args[-1]))):
+            m.main(["deploy", "--execute", "--bundle", str(self.root), "--manifest-sha256", "approved",
+                    "--output", str(output), "--network", "sepolia", "--policy", str(p),
+                    "--policy-sha256", m.digest(p), "--gas-budget", str(budget),
+                    "--gas-budget-sha256", m.digest(budget), "--keystore", str(key), "--node", "/node",
+                    "--rpc-preference", "protected-env-backup"])
+        status.assert_called_once_with("sepolia", "own", "backup", "protected-env-backup")
+        self.assertEqual([r["execute"] for r in requests], [False, True])
+        self.assertTrue(all(r["rpc"] == "backup" and r["public_rpc"] == "own" for r in requests))
+
     def test_child_secrets_only_stdin_and_errors_suppressed(self):
         request = {"password": "SENSITIVE", "rpc": "https://secret@rpc"}
         response = SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "address": m.SIGNER, "network": "sepolia"}))

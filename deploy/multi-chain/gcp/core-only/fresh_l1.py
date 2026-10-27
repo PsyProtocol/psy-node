@@ -302,8 +302,13 @@ def rpc(url, method, params):
     return value["result"]
 
 
-def status(network, primary, fallback=None):
-    for label, url in (("own-node", primary), ("protected-env-backup", fallback)):
+def status(network, primary, fallback=None, rpc_preference="own-node"):
+    require(rpc_preference in ("own-node", "protected-env-backup"), "invalid RPC preference")
+    providers = (("own-node", primary), ("protected-env-backup", fallback))
+    if rpc_preference == "protected-env-backup":
+        require(bool(fallback), "protected-env backup required by RPC preference")
+        providers = (("protected-env-backup", fallback),)
+    for label, url in providers:
         if not url:
             continue
         try:
@@ -318,7 +323,7 @@ def status(network, primary, fallback=None):
             return report, url
         except Exception:
             pass
-    raise GateError("no healthy own-node or protected-env backup")
+    raise GateError("no healthy provider for selected RPC preference")
 
 
 def child(node, bundle, output, network, request):
@@ -364,7 +369,8 @@ def deploy(args):
     key = Path(args.keystore)
     require(key.is_file() and not key.is_symlink() and not key.stat().st_mode & 0o027, "unsafe keystore")
     primary = own_rpc(args.rpc_config, args.network)
-    report, endpoint = status(args.network, primary, secrets.get(NETWORKS[args.network][3] + "_RPC_FALLBACK_URL"))
+    report, endpoint = status(args.network, primary, secrets.get(NETWORKS[args.network][3] + "_RPC_FALLBACK_URL"),
+                              args.rpc_preference)
     require(int(report["balance_wei"]) >= int(budget["maxNativeSpendWei"]), "balance below full approved gas budget")
     require(int(report["gas_price_wei"]) <= int(budget["maxGasPriceWei"]), "current gas price exceeds approved cap")
     request = {"execute": False, "password": secrets["WALLET_PASSWORD"], "keystore": str(key),
@@ -406,6 +412,7 @@ def main(argv=None):
     commands.add_parser("status")
     for name in ("status", "deploy"):
         p = commands.choices[name]
+        p.add_argument("--rpc-preference", choices=("own-node", "protected-env-backup"), default="own-node")
         p.add_argument("--rpc-config", default="/etc/parth/bridge-relayer.toml")
         p.add_argument("--secret-env", action="append", default=None)
     args = parser.parse_args(argv)
@@ -415,7 +422,8 @@ def main(argv=None):
         return pack(args)
     if args.command == "status":
         secrets = secret_env(args.secret_env)
-        return [status(n, own_rpc(args.rpc_config, n), secrets.get(v[3] + "_RPC_FALLBACK_URL"))[0]
+        return [status(n, own_rpc(args.rpc_config, n), secrets.get(v[3] + "_RPC_FALLBACK_URL"),
+                       args.rpc_preference)[0]
                 for n, v in NETWORKS.items()]
     if args.command == "deploy":
         return deploy(args)
