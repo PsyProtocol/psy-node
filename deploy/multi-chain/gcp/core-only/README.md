@@ -3,6 +3,8 @@
 For the Genesis correction, use [Offline Genesis Preparation](GENESIS.md).
 It provides the repository-owned `prepare_genesis.py plan` / `generate` entry
 and the boundary between offline validation and a later reset/start rollout.
+For the five Node binaries, use the [Pinned Offline Node Build](BUILD_RUNTIME.md)
+entrypoint; it keeps Services builds separate and does not approve deployment.
 The frozen inputs and placement notes below describe preceding cohorts; do not
 reuse their release pins, database namespaces or temporary placement without
 reconciling the next release manifest and actual host inventory.

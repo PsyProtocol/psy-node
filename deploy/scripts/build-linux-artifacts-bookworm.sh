@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1:-}" = "--pinned-node-spec" ]; then
+  [ "$#" -eq 2 ] || { echo "usage: $0 --pinned-node-spec SPEC" >&2; exit 2; }
+  exec python3 -B "$(dirname "${BASH_SOURCE[0]}")/../multi-chain/gcp/core-only/build_runtime.py" --spec "$2"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/build-parallelism.sh
