@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 
 HERE = Path(__file__).resolve().parent
-RUNTIME_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+RUNTIME_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
          ((1, 1048576), (3, 1572864), (5, 1310720)))
 PROCESSORS = ("gcp-realm-processor", "realm-processors-b", "realm-processors-c")
@@ -86,7 +86,7 @@ def validate_topology(t):
     require(type(t["schema_version"]) is int and t["schema_version"] == 1, "unsupported schema")
     require(t["runtime_commit"] == RUNTIME_COMMIT,
             "runtime commit must match pinned published source")
-    require(t["release_id"] == "core-testnet-20261026-r2", "unexpected release ID")
+    require(t["release_id"] == "core-testnet-20261027-r3", "unexpected release ID")
     require(t["psy_network"] == "testnet" and t["network"] == "psy-public-testnet",
             "network selection must be testnet / psy-public-testnet")
     require(t["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected proving backend")
@@ -112,10 +112,11 @@ def validate_topology(t):
             "coordinator placement/ports differ from approved plan")
     namespaces, sockets = set(), set()
 
-    def namespace(value):
-        require(isinstance(value, str) and re.fullmatch(r"fresh20261026r2_[a-z0-9_]+", value)
+    def namespace(value, expected):
+        require(isinstance(value, str) and re.fullmatch(r"fresh20261027r3_[a-z0-9_]+", value)
                 and len(value) <= 48, "invalid fresh namespace")
         require(value not in namespaces, "shared namespace across validators/coordinator")
+        require(value == expected, "namespace differs from approved role")
         namespaces.add(value)
 
     def socket(host, port, minimum):
@@ -124,7 +125,7 @@ def validate_topology(t):
         require(identity not in sockets, "duplicate host/listener port")
         sockets.add(identity)
 
-    namespace(c["namespace"])
+    namespace(c["namespace"], "fresh20261027r3_coordinator")
     for port in c["edge_ports"]:
         socket(c["host"], port, 15370)
     require(isinstance(t["realms"], list) and len(t["realms"]) == 2, "exactly two Realms required")
@@ -142,7 +143,7 @@ def validate_topology(t):
                     "validator registration/user order differs from approved slots")
             require(v["processor_host"] == PROCESSORS[index] and v["edge_host"] == EDGES[rid],
                     "validator host differs from approved placement")
-            namespace(v["namespace"])
+            namespace(v["namespace"], f"fresh20261027r3_r{rid}_v{index + 1}")
             socket(v["processor_host"], v["processor_port"], 15400)
             socket(v["edge_host"], v["edge_port"], 15400)
             socket(v["edge_host"], v["http_port"], 15380)
@@ -272,7 +273,7 @@ def services(t):
     def add(role, name, host, namespace, args):
         argv = [release + "/bin/psy_node_cli", "start-" + role, *common,
                 "--db-namespace", namespace, *args]
-        unit = "psy-core-r2-" + name + ".service"
+        unit = "psy-core-r3-" + name + ".service"
         quote = lambda value: '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         preview = "\n".join([
             "[Unit]", "Description=OFFLINE PREVIEW " + name, "After=network-online.target",

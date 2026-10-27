@@ -18,11 +18,6 @@ WORKER_KEY = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 
 def fixture():
     topology, _ = plan.read_json(HERE / "topology.json")
-    topology["runtime_commit"] = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
-    topology["release_id"] = "core-testnet-20261026-r2"
-    topology["coordinator"]["namespace"] = "fresh20261026r2_coordinator"
-    for realm, position, validator in plan.validators(topology):
-        validator["namespace"] = f"fresh20261026r2_r{realm}_v{position}"
     policy = {"enabled": True, "secp256k1": [WORKER_KEY]}
     whitelist = {"networks": {"testnet": {"whitelist": copy.deepcopy(policy)}}}
     selected = copy.deepcopy(plan.CONSENSUS)
@@ -87,7 +82,7 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(report["input_consistency_passed"])
         self.assertEqual(report["blockers"], [plan.RUNTIME_BLOCKER])
         self.assertIn("not installation approval", report["blockers"][0])
-        self.assertEqual(report["runtime_commit"], "5d38eefc07b0925ed9875b74805d9c3fea73d998")
+        self.assertEqual(report["runtime_commit"], "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
         self.assertNotIn("runtime_source_base", report)
         self.assertNotIn("runtime_patch_sha256", report)
         self.assertTrue(report["pending_checks"])
@@ -208,10 +203,45 @@ class PlanTests(unittest.TestCase):
         self.reject("shared namespace")
 
     def test_namespace_normalization_alias_and_injection_rejected(self):
-        for value in ("fresh20261026.r0.v1", "realm_0", "fresh20261026r2_r0;id", "fresh20261026r2_%i"):
+        for value in ("fresh20261027.r0.v1", "realm_0", "fresh20261027r3_r0;id", "fresh20261027r3_%i"):
             with self.subTest(value=value):
                 self.t["realms"][0]["validators"][0]["namespace"] = value
                 self.reject("invalid fresh namespace")
+
+    def test_r3_topology_and_service_paths_are_frozen(self):
+        self.assertEqual(self.t["release_id"], "core-testnet-20261027-r3")
+        expected = {"fresh20261027r3_coordinator"}
+        expected.update(f"fresh20261027r3_r{rid}_v{position}" for rid in (0, 1) for position in (1, 2, 3))
+        services = self.report()["services"]
+        self.assertEqual({s["namespace"] for s in services}, expected)
+        expected_units = {"psy-core-r3-coordinator-processor.service"}
+        expected_units.update(f"psy-core-r3-coordinator-edge-{index}.service" for index in range(3))
+        expected_units.update(f"psy-core-r3-realm-{rid}-v{position}-{role}.service"
+                              for rid in (0, 1) for position in (1, 2, 3) for role in ("processor", "edge"))
+        self.assertEqual({s["unit"] for s in services}, expected_units)
+        self.assertEqual(len(services), len(expected_units))
+        for service in services:
+            self.assertEqual(service["argv"][0], "/opt/psy-core/releases/core-testnet-20261027-r3/bin/psy_node_cli")
+            self.assertEqual(service["environment"]["PSY_CONFIG_PATH"],
+                             "/etc/psy-core/core-testnet-20261027-r3/config.json")
+        self.assertEqual([self.t["hosts"][v["processor_host"]] for _, _, v in plan.validators(self.t)],
+                         ["10.148.0.37", "10.148.0.42", "10.148.0.43"] * 2)
+
+    def test_other_release_ids_are_rejected(self):
+        for value in (None, "core-testnet-20261026", "core-testnet-20261026-r2", "core-testnet-20261027-r3\n"):
+            with self.subTest(value=value):
+                self.t["release_id"] = value
+                self.reject("unexpected release ID")
+
+    def test_old_and_wrong_role_namespaces_are_rejected(self):
+        for target in (self.t["coordinator"], self.t["realms"][0]["validators"][0]):
+            original = target["namespace"]
+            for value in (None, [], "fresh20261026_coordinator", "fresh20261026r2_r0_v1",
+                          "fresh20261027r3_r1_v3", "fresh20261027r3_unused"):
+                with self.subTest(original=original, value=value):
+                    target["namespace"] = value
+                    self.reject("namespace")
+            target["namespace"] = original
 
     def test_port_collision_between_edge_http_and_p2p_rejected(self):
         v = self.t["realms"][0]["validators"][0]
@@ -252,7 +282,9 @@ class PlanTests(unittest.TestCase):
     def test_runtime_commit_must_match_published_pin(self):
         for value in (None, "", True, 123, [], {}, "0" * 40,
                       "de539f565ec1a92f91bb4e9686e1442e89ba8639", "cd" * 20,
-                      "dcc11465", "5d38eefc07b0925ed9875b74805d9c3fea73d998\n"):
+                      "dcc1146514ef3eca2336640f6d95e5a1c04feff9",
+                      "5d38eefc07b0925ed9875b74805d9c3fea73d998",
+                      "3d317587", plan.RUNTIME_COMMIT.upper(), plan.RUNTIME_COMMIT + "\n"):
             with self.subTest(value=value):
                 self.t["runtime_commit"] = value
                 self.reject("runtime commit must match pinned published source")
@@ -362,7 +394,7 @@ class PlanTests(unittest.TestCase):
             self.assertFalse(report["deployment_ready"])
             self.assertFalse(report["release_approved"])
             self.assertTrue(report["input_consistency_passed"])
-            self.assertEqual(report["runtime_commit"], "5d38eefc07b0925ed9875b74805d9c3fea73d998")
+            self.assertEqual(report["runtime_commit"], "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
             self.assertEqual(set(report["input_sha256"]), {"topology", "config", "genesis", "whitelist"})
             self.assertEqual(before, {p.name: p.read_bytes() for p in Path(directory).iterdir()})
 

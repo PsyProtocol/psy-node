@@ -21,7 +21,7 @@ import sys
 
 
 SOURCE_BASE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-RUNTIME_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+RUNTIME_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
 MAX_PUBLIC_INPUT_BYTES = 64 * 1024 * 1024
 MAX_GENESIS_INPUT_BYTES = 1024 * 1024 * 1024
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
@@ -110,6 +110,7 @@ def validate_topology(topology):
     integer(topology["schema_version"], 1, 1, "topology version")
     require(topology["runtime_commit"] == RUNTIME_COMMIT,
             "runtime commit must match pinned published source")
+    require(topology["release_id"] == "core-testnet-20261027-r3", "unexpected release ID")
     require(topology["psy_network"] == "testnet" and topology["network"] == "psy-public-testnet",
             "runtime requires PSY_NETWORK=testnet with --network psy-public-testnet")
     require(topology["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected backend")
@@ -119,6 +120,8 @@ def validate_topology(topology):
         private_ip(value)
     coordinator = topology["coordinator"]
     fields(coordinator, ("host", "namespace", "edge_ports"), "coordinator")
+    require(coordinator["namespace"] == "fresh20261027r3_coordinator",
+            "coordinator namespace differs from approved role")
     require(hosts.get(coordinator["host"]) == "10.148.0.25"
             and coordinator["edge_ports"] == [15370, 15371, 15372],
             "coordinator must use 10.148.0.25 ports 15370/15371/15372")
@@ -145,6 +148,8 @@ def validate_topology(topology):
                                "processor_port", "edge_host", "edge_port", "http_port",
                                "namespace"), "topology validator")
             registration, uid = SLOTS[rid][index]
+            require(validator["namespace"] == f"fresh20261027r3_r{rid}_v{index + 1}",
+                    "validator namespace differs from approved role")
             integer(validator["registration_id"], registration, registration, "registration slot")
             integer(validator["validator_user_id"], uid, uid, "validator user ID")
             socket(validator["processor_host"], validator["processor_port"])

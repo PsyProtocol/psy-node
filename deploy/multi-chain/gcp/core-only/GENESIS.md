@@ -31,11 +31,58 @@ divergent branch happens to be called `mainnet-beta`.
    `plan.py` and `prepare_host_packages.py`, then install with `install_host.py`.
    Reconcile their source pins, release ID and fresh database namespaces first.
 
-The existing topology and host installers remain pinned to the preceding cohort.
-This procedure does not repin them, stop services, clear databases, install host
-packages, reset L1 contracts, or open public admission. Do not run an old
+The topology, planner and network assembler now select the r3 preparation below;
+host installers remain pinned to the preceding cohort. This procedure does not
+repin installers, stop services, clear databases, install host packages, reset L1
+contracts, or open public admission. Do not run an old
 full-stack reset/start entrypoint to complete these steps. L1 replacement and
 service startup require their own reviewed deployment steps after this gate.
+
+## R3 Topology Preparation
+
+Only `topology.json`, `plan.py` and `prepare_network.py` select:
+
+- Runtime `3d31758738f833a7eea6f9ff7fd680a69a0d9a44`, not a later test-only commit.
+- Release `core-testnet-20261027-r3`.
+- All 16 planned units use `psy-core-r3-`, distinct from existing `psy-core-r2-`
+  units; this is not an overwrite of same-name units.
+- Namespaces `fresh20261027r3_coordinator` and `fresh20261027r3_r{0,1}_v{1,2,3}`,
+  with each namespace bound to its exact role.
+- Both Realms' Processor positions 1/2/3 on `.37/.42/.43`; the six retained
+  Validator identities, registration order, ports and Edge placement are unchanged.
+
+The tests consume the checked-in topology without overriding its cohort fields.
+The planner still reports `deployment_ready=false`, `release_approved=false`
+and exits 2 even when input consistency passes. Guardian custody provenance
+remains `de539f565ec1a92f91bb4e9686e1442e89ba8639`.
+
+Pending integration, not approved by this preparation:
+
+| Files | Required before packaging or installation |
+| --- | --- |
+| `prepare_host_packages.py`, `install_host.py` | Freeze final binary/build identity and independently verified Genesis/config hashes; align r3 paths and namespace checks together. Existing r2 artifact pins are unchanged and reject an r3 package. |
+| `prepare_workers.py` | Freeze worker, topology, build and attestation hashes; review release paths and slice names. |
+| `prepare_proxies.py` | Freeze runtime/package pins and review retained-setup compatibility without bypassing circuit/config/bundle comparisons. |
+| `install_guardian.py`, `guardian_exec.py` | Align runtime/release/state paths while retaining custody source and key hashes. |
+| `install_relayer.py` | Align release/state/credential paths and refresh the exact imported Guardian helper hash after review. |
+
+Do not copy old checkpoints or journals into fresh r3 state. Before activation,
+the deployment owner must fence every old instance, including temporary Realm 1
+Processors on `.25`, and review exact old unit/drop-in retirement separately.
+New unit names do not authorize concurrent r2/r3 instances. Keep old r2 units
+fenced before starting r3; do not narrow the installer's `psy-core-*` discovery
+or its stopped-service/queued-job checks to only the new r3 names.
+Keep the installer's existing-file, drop-in, active-service and queued-job guards.
+Expanded hosts still require measured memory headroom and port/storage checks;
+the core unit template does not itself impose MemoryHigh/MemoryMax limits.
+
+Local direct tests, with no Cargo or remote operations:
+
+```sh
+python3 -B -m unittest discover -s deploy/multi-chain/gcp/core-only -p test_plan.py -v
+python3 -B -m unittest discover -s deploy/multi-chain/gcp/core-only -p test_prepare_network.py -v
+python3 -B -m unittest discover -s deploy/multi-chain/gcp/core-only -p test_prepare_genesis.py -v
+```
 
 ## Pinned Inputs
 

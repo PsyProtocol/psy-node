@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "release_id": "core-testnet-20261026",
-  "runtime_commit": "dcc1146514ef3eca2336640f6d95e5a1c04feff9",
+  "release_id": "core-testnet-20261027-r3",
+  "runtime_commit": "3d31758738f833a7eea6f9ff7fd680a69a0d9a44",
   "psy_network": "testnet",
   "network": "psy-public-testnet",
   "proving_backend": "plonky2-poseidon-goldilocks",
@@ -21,24 +21,24 @@
   },
   "coordinator": {
     "host": "gcp-cp-ce",
-    "namespace": "fresh20261026_coordinator",
+    "namespace": "fresh20261027r3_coordinator",
     "edge_ports": [15370, 15371, 15372]
   },
   "realms": [
     {
       "id": 0,
       "validators": [
-        {"registration_id": 0, "validator_user_id": 0, "processor_host": "gcp-realm-processor", "processor_port": 41001, "edge_host": "gcp-edge-1", "edge_port": 41101, "http_port": 15380, "namespace": "fresh20261026_r0_v1"},
-        {"registration_id": 4, "validator_user_id": 262144, "processor_host": "realm-processors-b", "processor_port": 41002, "edge_host": "gcp-edge-1", "edge_port": 41102, "http_port": 15381, "namespace": "fresh20261026_r0_v2"},
-        {"registration_id": 6, "validator_user_id": 786432, "processor_host": "realm-processors-c", "processor_port": 41003, "edge_host": "gcp-edge-1", "edge_port": 41103, "http_port": 15382, "namespace": "fresh20261026_r0_v3"}
+        {"registration_id": 0, "validator_user_id": 0, "processor_host": "gcp-realm-processor", "processor_port": 41001, "edge_host": "gcp-edge-1", "edge_port": 41101, "http_port": 15380, "namespace": "fresh20261027r3_r0_v1"},
+        {"registration_id": 4, "validator_user_id": 262144, "processor_host": "realm-processors-b", "processor_port": 41002, "edge_host": "gcp-edge-1", "edge_port": 41102, "http_port": 15381, "namespace": "fresh20261027r3_r0_v2"},
+        {"registration_id": 6, "validator_user_id": 786432, "processor_host": "realm-processors-c", "processor_port": 41003, "edge_host": "gcp-edge-1", "edge_port": 41103, "http_port": 15382, "namespace": "fresh20261027r3_r0_v3"}
       ]
     },
     {
       "id": 1,
       "validators": [
-        {"registration_id": 1, "validator_user_id": 1048576, "processor_host": "gcp-realm-processor", "processor_port": 41021, "edge_host": "gcp-edge-2", "edge_port": 41121, "http_port": 15383, "namespace": "fresh20261026_r1_v1"},
-        {"registration_id": 3, "validator_user_id": 1572864, "processor_host": "realm-processors-b", "processor_port": 41022, "edge_host": "gcp-edge-2", "edge_port": 41122, "http_port": 15384, "namespace": "fresh20261026_r1_v2"},
-        {"registration_id": 5, "validator_user_id": 1310720, "processor_host": "realm-processors-c", "processor_port": 41023, "edge_host": "gcp-edge-2", "edge_port": 41123, "http_port": 15385, "namespace": "fresh20261026_r1_v3"}
+        {"registration_id": 1, "validator_user_id": 1048576, "processor_host": "gcp-realm-processor", "processor_port": 41021, "edge_host": "gcp-edge-2", "edge_port": 41121, "http_port": 15383, "namespace": "fresh20261027r3_r1_v1"},
+        {"registration_id": 3, "validator_user_id": 1572864, "processor_host": "realm-processors-b", "processor_port": 41022, "edge_host": "gcp-edge-2", "edge_port": 41122, "http_port": 15384, "namespace": "fresh20261027r3_r1_v2"},
+        {"registration_id": 5, "validator_user_id": 1310720, "processor_host": "realm-processors-c", "processor_port": 41023, "edge_host": "gcp-edge-2", "edge_port": 41123, "http_port": 15385, "namespace": "fresh20261027r3_r1_v3"}
       ]
     }
   ]
