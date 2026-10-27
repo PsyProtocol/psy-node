@@ -353,6 +353,25 @@ class WorkerPreparationTests(unittest.TestCase):
             workers.activate_workers(self.package)
         self.processes.assert_not_called()
 
+    def test_distinct_systemd_executor_inode_then_exact_worker(self):
+        state = {"ActiveState": "active", "SubState": "running", "UnitFileState": "enabled", "MainPID": "123"}
+        systemd_info = SimpleNamespace(st_dev=66305, st_ino=5138)
+        executor_info = SimpleNamespace(st_dev=66305, st_ino=5144)
+        binary_info = SimpleNamespace(st_dev=66305, st_ino=9000)
+        identities = {"/usr/lib/systemd/systemd": systemd_info,
+                      "/usr/lib/systemd/systemd-executor": executor_info,
+                      str(workers.RELEASE / "psy_worker_cli"): binary_info}
+        with tempfile.TemporaryFile() as executor, tempfile.TemporaryFile() as binary:
+            binary.write(self.binary)
+            binary.seek(0)
+            with patch.object(workers, "unit_state", return_value=state), \
+                    patch("builtins.open", side_effect=[executor, binary]), \
+                    patch.object(workers.os, "fstat", side_effect=[executor_info, binary_info]), \
+                    patch.object(workers.os, "stat", side_effect=lambda p: identities[str(p)]), \
+                    patch.object(workers.time, "sleep") as sleep:
+                self.assertEqual(workers.verify_worker_process("worker"), 123)
+                sleep.assert_called_once_with(0.25)
+
     def test_running_executable_hash_checked_after_known_executor_grace(self):
         state = {"ActiveState": "active", "SubState": "running", "UnitFileState": "enabled", "MainPID": "123"}
         with tempfile.TemporaryFile() as executor, tempfile.TemporaryFile() as binary:

@@ -427,8 +427,14 @@ def verify_worker_process(name):
                 require(unit_state(name)["MainPID"] == str(pid), "worker PID changed during verification")
                 return pid
             # Type=simple may report the systemd executor before execve completes.
-            executor = os.stat("/usr/lib/systemd/systemd")
-            require((actual.st_dev, actual.st_ino) == (executor.st_dev, executor.st_ino),
+            executors = set()
+            for path in ("/usr/lib/systemd/systemd", "/usr/lib/systemd/systemd-executor"):
+                try:
+                    executor = os.stat(path)
+                except FileNotFoundError:
+                    continue
+                executors.add((executor.st_dev, executor.st_ino))
+            require((actual.st_dev, actual.st_ino) in executors,
                     "wrong running worker executable")
         time.sleep(0.25)
     raise WorkerError("worker exec did not complete within startup grace")
