@@ -11,6 +11,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
@@ -3227,20 +3228,36 @@ async fn build_multichain_l2_plan(
         }
 
         if append_business && pending > l2_count {
-            let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
-                &http,
-                &base.services_url,
-                u64::from(chain.chain_index),
-                u64::from(pending),
-            ).await?;
-            ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, pending);
-            let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
-            ensure!(snapshot_count == u64::from(pending), "deposit snapshot count mismatch for chain {}", chain.chain_index);
-            calls.push(build_set_chain_root_call(
-                u64::from(chain.chain_index),
-                snapshot_count,
-                snapshot.deposit_root.as_deref().context("deposit snapshot missing root")?,
-            )?);
+            let finalized_pending = chain.l1.with_rpc_failover("read_finalized_deposit_progress", |url| {
+                let url = url.to_string();
+                async move {
+                    let provider = crate::bridge::l1_provider::connect_l1_readonly(url.parse()?)?;
+                    fetch_finalized_pending_deposit_count(&provider, chain.bridge).await
+                }
+            }).await?;
+            // Latest remains the backlog metric, not Guardian admission. A
+            // later finalized read may advance past that earlier observation.
+            let deposit_append_target = pending.min(finalized_pending);
+            if deposit_append_target > l2_count {
+                let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
+                    &http,
+                    &base.services_url,
+                    u64::from(chain.chain_index),
+                    u64::from(deposit_append_target),
+                ).await?;
+                ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, deposit_append_target);
+                let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
+                ensure!(snapshot_count == u64::from(deposit_append_target), "deposit snapshot count mismatch for chain {}", chain.chain_index);
+                calls.push(build_set_chain_root_call(
+                    u64::from(chain.chain_index),
+                    snapshot_count,
+                    snapshot.deposit_root.as_deref().context("deposit snapshot missing root")?,
+                )?);
+            }
+            if finalized_pending < pending {
+                tracing::info!(chain_index=chain.chain_index, pending, finalized_pending, l2_count,
+                    "unfinalized deposits deferred; other chains remain eligible");
+            }
         }
         progress.push(ChainRoundProgress {
             chain_index: chain.chain_index,
@@ -3692,6 +3709,19 @@ pub(crate) async fn fetch_proved_deposit_count(provider: &impl Provider, bridge:
 pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let pending = crate::bridge::api_client::eth_call_u256(provider, bridge, pendingDepositCountCall {}).await?;
     u32::try_from(pending).context("pendingDepositCount exceeds u32")
+}
+
+async fn fetch_finalized_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+    let block = provider.get_block_by_number(BlockNumberOrTag::Finalized).await?
+        .context("finalized L1 header unavailable")?;
+    ensure!(block.header.hash != B256::ZERO, "finalized L1 header hash is zero");
+    let call = pendingDepositCountCall {};
+    let tx = TransactionRequest::default().to(bridge).input(call.abi_encode().into());
+    let raw = provider.call(tx).block(BlockId::hash_canonical(block.header.hash)).await
+        .context("finalized pendingDepositCount eth_call failed")?;
+    let pending = pendingDepositCountCall::abi_decode_returns(&raw)
+        .context("failed to decode finalized pendingDepositCount")?;
+    u32::try_from(pending).context("finalized pendingDepositCount exceeds u32")
 }
 
 
@@ -4263,6 +4293,91 @@ mod tests {
 
     fn test_l1() -> Vec<guardian_common::protocol::ChainEndpoint> {
         vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }]
+    }
+
+    async fn finalized_deposit_fixture(latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use serde_json::{json, Value};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let hash = B256::repeat_byte(0x42);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if socket.read_line(&mut line).await.unwrap() == 0 { return; }
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse::<usize>().unwrap(); }
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                received.lock().unwrap().push(request.clone());
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_getBlockByNumber" => {
+                        assert_eq!(request["params"], json!(["finalized", false]));
+                        if header_available {
+                            let mut block: alloy_rpc_types_eth::Block = Default::default();
+                            block.header.hash = hash;
+                            block.header.inner.number = 100;
+                            json!(block)
+                        } else { Value::Null }
+                    }
+                    "eth_call" => {
+                        let pinned = request["params"][1] == json!({"blockHash":hash,"requireCanonical":true});
+                        json!(format!("0x{:064x}", if pinned { finalized } else { latest }))
+                    }
+                    other => panic!("unexpected RPC {other}"),
+                };
+                let body = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        let provider = alloy_provider::ProviderBuilder::new().connect_http(url.parse()?);
+        let result = tokio::time::timeout(Duration::from_secs(10), fetch_finalized_pending_deposit_count(&provider, Address::repeat_byte(1))).await;
+        server.abort();
+        let requests = requests.lock().unwrap().clone();
+        Ok((result??, requests))
+    }
+
+    #[tokio::test]
+    async fn finalized_deposit_count_excludes_latest_only_deposit() {
+        let (count, _) = finalized_deposit_fixture(1, 0, true).await.unwrap();
+        assert_eq!(count, 0, "unfinalized deposit must not enter the Guardian plan");
+    }
+
+    #[tokio::test]
+    async fn finalized_deposit_count_uses_canonical_hash_and_retains_ready_prefix() {
+        let (count, requests) = finalized_deposit_fixture(3, 1, true).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["params"][1]["requireCanonical"], true);
+        assert!(requests[1]["params"][1].get("blockHash").is_some());
+    }
+
+    #[tokio::test]
+    async fn finalized_deposit_count_missing_header_never_falls_back_to_latest() {
+        assert!(finalized_deposit_fixture(1, 0, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn finalized_deposit_count_overflow_fails_closed() {
+        assert!(finalized_deposit_fixture(0, u64::from(u32::MAX)+1, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn finalized_deposit_count_keeps_ready_chain_eligible_while_another_waits() {
+        let (waiting, _) = finalized_deposit_fixture(1, 0, true).await.unwrap();
+        let (ready, _) = finalized_deposit_fixture(2, 1, true).await.unwrap();
+        let targets = [(0, waiting), (1, ready)].into_iter().filter(|(_, target)| *target > 0).collect::<Vec<_>>();
+        assert_eq!(targets, vec![(1, 1)]);
     }
 
     #[tokio::test]
@@ -7513,7 +7628,7 @@ rpc_urls = ["http://127.0.0.1:4"]
         // rather than failing the independent stage/magic guard first.
         let system_prove_proxy_url: serde_json::Value = serde_json::from_str(system_urls).unwrap();
         let json = serde_json::json!({
-            "networks": {"localhost": {
+            "networks": {(psy_config::CURRENT_NETWORK): {
                 "magic": format!("0x{:x}", psy_config::PSY_NETWORK_MAGIC),
                 "users_per_realm": 1048576,
                 "global_user_tree_height": 24,
@@ -7536,7 +7651,7 @@ rpc_urls = ["http://127.0.0.1:4"]
                     "da_fee": 0
                 }
             }},
-            "defaultNetwork": "localhost"
+            "defaultNetwork": psy_config::CURRENT_NETWORK
         }).to_string();
         std::fs::write(&path, json).unwrap();
         path
