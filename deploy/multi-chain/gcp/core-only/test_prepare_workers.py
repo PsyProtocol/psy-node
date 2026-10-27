@@ -286,6 +286,94 @@ class WorkerPreparationTests(unittest.TestCase):
                     workers.read_credentials(os.getgid())
         self.assertEqual(path.stat().st_mtime_ns, before)
 
+    def activation_fixture(self):
+        self.map_host()
+        self.prepare()
+        workers.install_workers(self.package, check_only=False)
+        self.commands.reset_mock()
+        self.commands.side_effect = lambda argv: {"hostname": "test-c4d", "uname": "x86_64"}.get(argv[0], "")
+        self.stack.enter_context(patch.object(workers.os, "geteuid", return_value=0))
+        self.stack.enter_context(patch.object(workers.pwd, "getpwnam",
+                                             return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())))
+        self.stack.enter_context(patch.object(workers, "ACTIVATION_INSTALLER_SHA256",
+                                             workers.digest((self.package / "prepare_workers.py").read_bytes())))
+        def state(name):
+            return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+                    "MainPID": "0", "UnitFileState": "disabled", "DropInPaths": "",
+                    "NeedDaemonReload": "no", "FragmentPath": str(workers.UNITS / name)}
+        self.activation_state = state
+        self.states = self.stack.enter_context(patch.object(workers, "unit_state", side_effect=state))
+        self.processes = self.stack.enter_context(patch.object(workers, "verify_worker_process", return_value=123))
+
+    def test_activate_enables_only_three_r3_units(self):
+        self.activation_fixture()
+        result = workers.activate_workers(self.package)
+        self.assertEqual(result["mode"], "activated")
+        mutations = [call.args[0] for call in self.commands.call_args_list
+                     if call.args[0][0] == "systemctl" and call.args[0][1] not in ("list-units", "list-jobs")]
+        self.assertEqual(mutations, [["systemctl", "enable", "--now",
+                                     *(workers.unit_name(r) for r in workers.THREADS)]])
+        self.assertEqual(self.processes.call_count, 3)
+
+    def test_activate_rejects_old_running_or_enabled_workers(self):
+        self.activation_fixture()
+        for field, value in (("ActiveState", "active"), ("MainPID", "42"), ("UnitFileState", "enabled")):
+            self.states.side_effect = lambda name: dict(self.activation_state(name), **({field: value} if "r2" in name else {}))
+            with self.assertRaises(workers.WorkerError): workers.activate_workers(self.package)
+        self.assertFalse(any(c.args[0][0] == "systemctl" for c in self.commands.call_args_list))
+        self.states.side_effect = self.activation_state
+        for blocked in ("list-units", "list-jobs"):
+            def response(argv):
+                if argv[0] == "hostname": return "test-c4d"
+                if argv[0] == "uname": return "x86_64"
+                if argv[1] == blocked:
+                    return ("parth-c4d-worker@realm-0-0.service loaded active running" if blocked == "list-units"
+                            else "1 parth-c4d-worker@realm-0-0.service start waiting")
+                return ""
+            self.commands.side_effect = response
+            with self.assertRaises(workers.WorkerError): workers.activate_workers(self.package)
+        self.assertFalse(any(c.args[0][:2] == ["systemctl", "enable"] for c in self.commands.call_args_list))
+
+    def test_activate_rejects_changed_installed_config_and_dropin(self):
+        self.activation_fixture()
+        path = workers.CONFIG / "realm-0.json"
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n")
+        with self.assertRaises(workers.WorkerError): workers.activate_workers(self.package)
+        path.write_bytes(original)
+        self.states.side_effect = lambda name: dict(self.activation_state(name), DropInPaths="unexpected.conf")
+        with self.assertRaises(workers.WorkerError): workers.activate_workers(self.package)
+        self.assertFalse(any(c.args[0][0] == "systemctl" for c in self.commands.call_args_list))
+
+    def test_activate_rejects_changed_frozen_package_helper(self):
+        self.activation_fixture()
+        path = self.package / "prepare_workers.py"
+        path.write_bytes(path.read_bytes() + b"\n")
+        with self.assertRaisesRegex(workers.WorkerError, "helper hash"):
+            workers.activate_workers(self.package)
+        self.processes.assert_not_called()
+
+    def test_running_executable_hash_checked_after_known_executor_grace(self):
+        state = {"ActiveState": "active", "SubState": "running", "UnitFileState": "enabled", "MainPID": "123"}
+        with tempfile.TemporaryFile() as executor, tempfile.TemporaryFile() as binary:
+            binary.write(self.binary)
+            binary.seek(0)
+            executor_info, binary_info = os.fstat(executor.fileno()), os.fstat(binary.fileno())
+            with patch.object(workers, "unit_state", return_value=state), \
+                    patch("builtins.open", side_effect=[executor, binary]), \
+                    patch.object(workers.os, "stat", side_effect=lambda p: executor_info if str(p).endswith("systemd") else binary_info), \
+                    patch.object(workers.time, "sleep") as sleep:
+                self.assertEqual(workers.verify_worker_process("worker"), 123)
+                sleep.assert_called_once_with(0.25)
+        with tempfile.TemporaryFile() as binary:
+            binary.write(b"wrong-binary")
+            binary.seek(0)
+            with patch.object(workers, "unit_state", return_value=state), \
+                    patch("builtins.open", return_value=binary), \
+                    patch.object(workers.os, "stat", return_value=os.fstat(binary.fileno())):
+                with self.assertRaisesRegex(workers.WorkerError, "hash mismatch"):
+                    workers.verify_worker_process("worker")
+
 
 class WorkerHostChecks(unittest.TestCase):
     def test_host_activity_and_queued_jobs_rejected(self):

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare a secret-free worker package; check/install on its host without starting.
+"""Prepare/install workers; explicitly activate only the reviewed r3 worker units.
 
 package --release-dir DIR --network-config FILE --build-attestation FILE --output NEW_DIR
 check-host --package DIR             (sudo; read-only)
 install --package DIR                (sudo; separately authorized; never starts)
+activate --package DIR               (sudo; enables/starts only the three r3 units)
 
 The existing parth system account is reused. Existing worker JSON credentials
 are read only on-host. No Genesis private keys are inputs. Fresh installations
@@ -20,6 +21,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +32,7 @@ CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d
 TOPOLOGY_SHA256 = "78403e274c24dd8bbb44405775868477b3cfe0ad9c9a3815cb59a1f267e5675f"
 BUILD_SHA256 = "4432ea02ead2f2fd48a723b911049f5dcdb8d1ef80072518361759ab77628072"
 ATTESTATION_SHA256 = "f6fdece9553ac78e85a3d7636b1883b0efed5f9332c1628d38fc9729b2fa8acb"
+ACTIVATION_INSTALLER_SHA256 = "302522b5e98d3469afc54bfcc8fd0ea60352237df5d68198f07a09dc56558ed8"
 RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
 STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID
@@ -234,7 +237,7 @@ def prepare_package(release_dir, network_config, topology, output, build_attesta
     return {"mode": "prepared", "services": len(THREADS), "contains_credentials": False, "started": False}
 
 
-def read_package(package):
+def read_package(package, *, activation=False):
     fd = directory(package)
     try:
         owner = os.fstat(fd)
@@ -246,7 +249,12 @@ def read_package(package):
     for name in ("psy_worker_cli", "build.json", "network.json", "topology.json", "attestation.json"):
         inputs[name] = read_file(package / name)[0]
     expected = payloads(inputs)
-    expected["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]
+    if activation:
+        installer = read_file(package / "prepare_workers.py")[0]
+        require(digest(installer) == ACTIVATION_INSTALLER_SHA256, "installed package helper hash mismatch")
+        expected["prepare_workers.py"] = installer
+    else:
+        expected["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]
     require(names == set(expected), "package inventory mismatch")
     for name, raw in expected.items():
         actual, info = read_file(package / name)
@@ -263,19 +271,24 @@ def command(argv):
         raise WorkerError("host command failed") from None
 
 
-def check_host():
-    require(os.geteuid() == 0, "sudo required for host credential verification")
-    require(command(["hostname", "-s"]).strip() == "test-c4d", "wrong worker host")
-    require(command(["uname", "-m"]).strip() == "x86_64", "worker architecture mismatch")
+def check_worker_activity(allowed=()):
     for pattern in ("parth-c4d-worker@*.service", "psy-core-worker*.service"):
         units = command(["systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", pattern])
         for line in units.splitlines():
             fields = line.split()
-            require(len(fields) >= 4 and fields[2:4] in (["inactive", "dead"], ["failed", "failed"]),
+            require(len(fields) >= 4 and (fields[0] in allowed
+                    or fields[2:4] in (["inactive", "dead"], ["failed", "failed"])),
                     "worker is active or transitioning")
     jobs = command(["systemctl", "list-jobs", "--no-legend", "--no-pager"])
     require(not any(len(parts) > 1 and parts[1].startswith(("psy-core-worker", "parth-c4d-worker@"))
                     for parts in map(str.split, jobs.splitlines())), "worker has queued systemd job")
+
+
+def check_host():
+    require(os.geteuid() == 0, "sudo required for host credential verification")
+    require(command(["hostname", "-s"]).strip() == "test-c4d", "wrong worker host")
+    require(command(["uname", "-m"]).strip() == "x86_64", "worker architecture mismatch")
+    check_worker_activity()
     account = pwd.getpwnam("parth")
     require(account.pw_uid != 0 and account.pw_gid != 0, "non-root parth account required")
     return account.pw_uid, account.pw_gid
@@ -389,6 +402,69 @@ def install_workers(package, check_only=True):
             "approved_identities": True, "reward_users": [0, 0, 1048576], "started": False, "enabled": False}
 
 
+def unit_state(name):
+    raw = command(["systemctl", "show", "--no-pager",
+                   "--property=Id,LoadState,ActiveState,SubState,MainPID,UnitFileState,FragmentPath,DropInPaths,NeedDaemonReload",
+                   name])
+    return dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+
+
+def verify_worker_process(name):
+    pid = None
+    for attempt in range(20):
+        state = unit_state(name)
+        require(state["ActiveState"] == "active" and state["SubState"] == "running"
+                and state["UnitFileState"] == "enabled", "worker is not running/enabled")
+        current = int(state["MainPID"])
+        require(current > 0 and (pid is None or current == pid), "worker PID changed or disappeared")
+        pid = current
+        with open(f"/proc/{pid}/exe", "rb") as stream:
+            actual = os.fstat(stream.fileno())
+            expected = os.stat(RELEASE / "psy_worker_cli")
+            if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
+                require(hashlib.file_digest(stream, "sha256").hexdigest() == WORKER_SHA256,
+                        "running worker hash mismatch")
+                require(unit_state(name)["MainPID"] == str(pid), "worker PID changed during verification")
+                return pid
+            # Type=simple may report the systemd executor before execve completes.
+            executor = os.stat("/usr/lib/systemd/systemd")
+            require((actual.st_dev, actual.st_ino) == (executor.st_dev, executor.st_ino),
+                    "wrong running worker executable")
+        time.sleep(0.25)
+    raise WorkerError("worker exec did not complete within startup grace")
+
+
+def activate_workers(package):
+    require(os.geteuid() == 0, "sudo required for worker activation")
+    require(command(["hostname", "-s"]).strip() == "test-c4d", "wrong worker host")
+    require(command(["uname", "-m"]).strip() == "x86_64", "worker architecture mismatch")
+    files = read_package(package, activation=True)
+    account = pwd.getpwnam("parth")
+    require(account.pw_uid != 0 and account.pw_gid != 0, "non-root parth account required")
+    keys = read_credentials(account.pw_gid)
+    targets, _ = install_paths(files, keys, (account.pw_uid, account.pw_gid))
+    for path, (expected, mode, uid, gid) in targets.items():
+        actual, info = read_file(path)
+        require(actual == expected and stat.S_IMODE(info.st_mode) == mode
+                and (info.st_uid, info.st_gid) == (uid, gid), "installed worker files differ")
+    names = [unit_name(role) for role in THREADS]
+    for role in THREADS:
+        old = unit_state("psy-core-worker-r2-" + role + ".service")
+        require(old["ActiveState"] == "inactive" and old["SubState"] == "dead"
+                and old["MainPID"] == "0" and old["UnitFileState"] == "disabled",
+                "old r2 worker must be inactive/PID0/disabled")
+    for name in [*names, "psy-core-worker-r3.slice"]:
+        state = unit_state(name)
+        require(state["LoadState"] == "loaded" and state["FragmentPath"] == str(UNITS / name)
+                and not state["DropInPaths"] and state["NeedDaemonReload"] == "no",
+                "effective worker unit differs or needs reload")
+    check_worker_activity(allowed=names)
+    command(["systemctl", "enable", "--now", *names])
+    pids = {name: verify_worker_process(name) for name in names}
+    return {"mode": "activated", "services": 3, "enabled": True, "started": True,
+            "worker_sha256": WORKER_SHA256, "pids": pids}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -398,7 +474,7 @@ def main(argv=None):
     prepare.add_argument("--build-attestation", type=Path, required=True)
     prepare.add_argument("--topology", type=Path, default=HERE / "topology.json")
     prepare.add_argument("--output", type=Path, required=True)
-    for name in ("check-host", "install"):
+    for name in ("check-host", "install", "activate"):
         host = commands.add_parser(name)
         host.add_argument("--package", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -406,6 +482,8 @@ def main(argv=None):
         if args.action == "package":
             report = prepare_package(args.release_dir, args.network_config, args.topology, args.output,
                                      args.build_attestation)
+        elif args.action == "activate":
+            report = activate_workers(args.package)
         else:
             report = install_workers(args.package, args.action == "check-host")
     except WorkerError as error:
