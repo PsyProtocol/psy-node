@@ -214,15 +214,23 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderComparison<F, D
 #[cfg(test)]
 mod tests {
     use plonky2::{
-        field::types::Field,
-        iop::witness::{PartialWitness, WitnessWrite},
+        field::{extension::Extendable, types::Field},
+        hash::hash_types::RichField,
+        iop::{
+            generator::{GeneratedValues, WitnessGenerator, WitnessGeneratorRef},
+            target::Target,
+            wire::Wire,
+            witness::{PartialWitness, PartitionWitness, WitnessWrite},
+        },
         plonk::{
             circuit_builder::CircuitBuilder,
-            circuit_data::CircuitConfig,
+            circuit_data::{CircuitConfig, CommonCircuitData},
             config::{GenericConfig, PoseidonGoldilocksConfig},
         },
+        util::serialization::{Buffer, IoResult},
     };
 
+    use super::CircuitBuilderComparison;
     use crate::u32::multiple_comparison::list_lte_circuit;
 
     const BALANCE: u64 = 5;
@@ -307,6 +315,111 @@ mod tests {
         assert!(
             balance_ge_amount_with_split(0, BALANCE).is_err(),
             "canonical split of 5 must not satisfy 5 >= 100"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FinishedGenerator;
+
+    impl<F: RichField + Extendable<D>, const D: usize> WitnessGenerator<F, D> for FinishedGenerator {
+        fn id(&self) -> String {
+            "FinishedGenerator".to_string()
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            Vec::new()
+        }
+
+        fn run(&self, _witness: &PartitionWitness<F>, _out_buffer: &mut GeneratedValues<F>) -> bool {
+            true
+        }
+
+        fn serialize(&self, _dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+            Ok(())
+        }
+
+        fn deserialize(_src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+            Ok(FinishedGenerator)
+        }
+    }
+
+    fn read_usize(bytes: &mut &[u8]) -> usize {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[..8]);
+        *bytes = &bytes[8..];
+        u64::from_le_bytes(raw) as usize
+    }
+
+    fn read_target(bytes: &mut &[u8]) -> Target {
+        let is_wire = bytes[0] != 0;
+        *bytes = &bytes[1..];
+        if is_wire {
+            let row = read_usize(bytes);
+            let column = read_usize(bytes);
+            Target::Wire(Wire { row, column })
+        } else {
+            Target::VirtualTarget { index: read_usize(bytes) }
+        }
+    }
+
+    /// `is_greater_than_or_equal` calls `split_low_high`. That generator writes the
+    /// canonical limbs, so the alias case replaces it and supplies the other limbs
+    /// to the comparison constraints.
+    fn real_gte_with_balance_split(high: u64, low: u64, replace_balance_generator: bool) -> anyhow::Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let balance = builder.add_virtual_target();
+        let amount = builder.constant(F::from_canonical_u64(AMOUNT));
+        let compared = builder.is_greater_than_or_equal(64, balance, amount);
+        let true_target = builder._true().target;
+        builder.connect(compared.target, true_target);
+        let mut data = builder.build::<C>();
+
+        let mut balance_limbs = None;
+        for generator in &mut data.prover_only.generators {
+            if generator.0.id() != "LowHighGenerator" {
+                continue;
+            }
+            let mut encoded = Vec::new();
+            generator.0.serialize(&mut encoded, &data.common).expect("serialize LowHighGenerator");
+            let mut cursor = encoded.as_slice();
+            let integer = read_target(&mut cursor);
+            let n_log = read_usize(&mut cursor);
+            let low_target = read_target(&mut cursor);
+            let high_target = read_target(&mut cursor);
+            if integer != balance || n_log != 32 {
+                continue;
+            }
+            balance_limbs = Some((low_target, high_target));
+            if replace_balance_generator {
+                *generator = WitnessGeneratorRef::new(FinishedGenerator);
+            }
+        }
+        let (low_target, high_target) = balance_limbs.expect("balance split_low_high generator");
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(balance, F::from_canonical_u64(BALANCE))?;
+        if replace_balance_generator {
+            witness.set_target(low_target, F::from_canonical_u64(low))?;
+            witness.set_target(high_target, F::from_canonical_u64(high))?;
+        }
+        let proof = data.prove(witness)?;
+        data.verify(proof)
+    }
+
+    #[test]
+    fn real_comparison_accepts_alias_split() {
+        real_gte_with_balance_split(ALIAS_HIGH, ALIAS_LOW, true).expect("real >= must accept the alias split of 5");
+    }
+
+    #[test]
+    fn real_comparison_rejects_canonical_split() {
+        assert!(
+            real_gte_with_balance_split(0, BALANCE, false).is_err(),
+            "real >= must reject canonical 5 against 100"
         );
     }
 }
