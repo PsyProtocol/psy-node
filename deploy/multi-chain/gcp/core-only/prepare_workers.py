@@ -251,7 +251,8 @@ def read_package(package, *, activation=False):
     expected = payloads(inputs)
     if activation:
         installer = read_file(package / "prepare_workers.py")[0]
-        require(digest(installer) == ACTIVATION_INSTALLER_SHA256, "installed package helper hash mismatch")
+        require(digest(installer) in (ACTIVATION_INSTALLER_SHA256, digest(read_file(Path(__file__).absolute())[0])),
+                "installed package helper hash mismatch")
         expected["prepare_workers.py"] = installer
     else:
         expected["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]

@@ -176,6 +176,25 @@ class WorkerPreparationTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.package.iterdir()})
 
+    def test_activation_package_accepts_current_source_helper(self):
+        self.prepare()
+        files = workers.read_package(self.package, activation=True)
+        self.assertEqual(files["prepare_workers.py"], Path(workers.__file__).read_bytes())
+        self.assertNotEqual(workers.digest(files["prepare_workers.py"]), workers.ACTIVATION_INSTALLER_SHA256)
+
+    def test_activation_package_accepts_only_pinned_old_or_current_helper(self):
+        self.prepare()
+        path = self.package / "prepare_workers.py"
+        old_helper = b"test-only-pinned-old-helper"
+        path.write_bytes(old_helper)
+        with patch.object(workers, "ACTIVATION_INSTALLER_SHA256", workers.digest(old_helper)):
+            self.assertEqual(workers.read_package(self.package, activation=True)[path.name], old_helper)
+            with self.assertRaises(workers.WorkerError):
+                workers.read_package(self.package)
+            path.write_bytes(old_helper + b"\n")
+            with self.assertRaisesRegex(workers.WorkerError, "helper hash"):
+                workers.read_package(self.package, activation=True)
+
     def test_package_rejects_tampered_unit_or_config(self):
         self.prepare()
         for name in (workers.unit_name("coordinator"), "realm-1.json"):
@@ -295,8 +314,6 @@ class WorkerPreparationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(workers.os, "geteuid", return_value=0))
         self.stack.enter_context(patch.object(workers.pwd, "getpwnam",
                                              return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())))
-        self.stack.enter_context(patch.object(workers, "ACTIVATION_INSTALLER_SHA256",
-                                             workers.digest((self.package / "prepare_workers.py").read_bytes())))
         def state(name):
             return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
                     "MainPID": "0", "UnitFileState": "disabled", "DropInPaths": "",
