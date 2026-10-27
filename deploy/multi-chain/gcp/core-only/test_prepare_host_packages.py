@@ -15,6 +15,12 @@ from test_plan import fixture
 
 
 class PackageTests(unittest.TestCase):
+    def test_unfrozen_binary_blocks_before_reading_inputs(self):
+        with patch.object(package, "NODE_SHA256", None), patch.object(package.plan, "read_json") as read:
+            with self.assertRaisesRegex(ValueError, "r3 artifact pins not frozen"):
+                package.prepare(SimpleNamespace())
+        read.assert_not_called()
+
     def test_unit_uses_pinned_commands_and_private_network(self):
         topology = fixture()[0]
         services = plan.services(topology)
@@ -123,7 +129,7 @@ class PrepareTests(unittest.TestCase):
                     expected[prefix + name] = (self.args.p2p_keys / f"realm_{rid}_sub_{position}_{name}").read_bytes()
             self.assertEqual(manifest, {
                 "schema_version": 1, "release_id": self.topology["release_id"],
-                "source_commit": "5d38eefc07b0925ed9875b74805d9c3fea73d998", "network": "testnet",
+                "source_commit": "3d31758738f833a7eea6f9ff7fd680a69a0d9a44", "network": "testnet",
                 "host": host, "private_ip": ip,
                 "files": {name: hashlib.sha256(content).hexdigest() for name, content in expected.items()}})
             self.assertEqual({str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()},

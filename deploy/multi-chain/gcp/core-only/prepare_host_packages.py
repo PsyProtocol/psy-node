@@ -15,9 +15,9 @@ import plan
 
 
 HERE = Path(__file__).resolve().parent
-NODE_SHA256 = "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb"
+NODE_SHA256 = "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9"
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-GENESIS_SHA256 = "a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8"
+GENESIS_SHA256 = "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173"
 
 
 def require(value, message):
@@ -88,7 +88,7 @@ def publish_packages(source, destination):
 
 
 def prepare(args):
-    require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r2 artifact pins not frozen")
+    require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r3 artifact pins not frozen")
     topology, _ = plan.read_json(args.topology)
     config, config_hash = plan.read_json(regular(args.config))
     genesis, genesis_hash = plan.read_json(regular(args.genesis))

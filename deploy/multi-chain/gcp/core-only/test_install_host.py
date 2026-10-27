@@ -1,6 +1,7 @@
 """Unprivileged filesystem tests; all host commands and account changes mocked."""
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import fnmatch
 import hashlib
 import io
 import json
@@ -142,6 +143,15 @@ class InstallHostTests(unittest.TestCase):
         self.assert_rejected()
         self.commands.assert_not_called()
 
+    def test_unfrozen_binary_blocks_both_modes_before_host_commands(self):
+        with patch.dict(installer.PINNED_SHA256, {"bin/psy_node_cli": None}):
+            for check_only in (True, False):
+                with self.subTest(check_only=check_only), self.assertRaisesRegex(
+                        installer.InstallError, "r3 artifact pins not frozen"):
+                    installer.install_host(self.package, check_only)
+        self.commands.assert_not_called()
+        self.assertFalse((self.root / "host").exists())
+
     def test_rehashed_artifact_tampering_rejected_by_release_pins(self):
         for name, raw in self.artifacts.items():
             with self.subTest(payload=name):
@@ -253,14 +263,61 @@ class InstallHostTests(unittest.TestCase):
         self.assert_rejected()
 
     def test_wrong_host_running_transitioning_and_queued_units(self):
-        for output in ("psy-core-x.service loaded active running test\n",
-                       "psy-core-x.service loaded activating auto-restart test\n"):
-            self.commands.side_effect = [self.command(["ip"]), output]
+        names = ("psy-core-r2-realm-1-v1-processor.service", "psy-core-r3-coordinator-processor.service",
+                 "psy-core-realm-processor.service", "parth-realm-processor@1.service",
+                 "parth-coordinator-processor.service", "psy-realm-processor.service",
+                 "psy-coordinator-edge.service")
+        for name in names:
+            for state in ("active running", "activating auto-restart", "deactivating stop-sigterm"):
+                with self.subTest(name=name, state=state):
+                    self.commands.side_effect = [self.command(["ip"]), f"{name} loaded {state} test\n"]
+                    self.assert_rejected()
+            self.commands.side_effect = [self.command(["ip"]), "", f"123 {name} start waiting\n"]
             self.assert_rejected()
         self.commands.side_effect = ["[]"]
         self.assert_rejected()
-        self.commands.side_effect = [self.command(["ip"]), "", "123 psy-core-x.service start waiting\n"]
-        self.assert_rejected()
+
+    def test_stopped_legacy_units_are_scanned_without_stop_or_overwrite(self):
+        output = "psy-core-r2-realm-1-v1-processor.service loaded inactive dead old\n"
+        output += "parth-realm-processor@1.service loaded failed failed old\n"
+        self.commands.side_effect = [self.command(["ip"]), output, ""]
+        self.assertEqual(installer.install_host(self.package, True)["mode"], "check-only")
+        scan = self.commands.call_args_list[1].args[0]
+        for pattern in ("psy-core-*", "parth-coordinator-*", "parth-realm-*", "psy-realm-*", "psy-coordinator-*"):
+            self.assertIn(pattern, scan)
+        self.assertFalse(any(set(call.args[0]) & {"start", "enable", "restart", "stop"}
+                             for call in self.commands.call_args_list))
+        self.assertFalse((self.root / "host").exists())
+
+    def test_active_non_node_services_do_not_block_host_check(self):
+        names = ("parth-performance-monitor.service", "parth-forwarder.service",
+                 "parth-notifier.service", "parth-worker.service")
+
+        def command(argv):
+            if argv[:2] == ["systemctl", "list-units"]:
+                patterns = [arg for arg in argv if arg.endswith("*")]
+                self.assertEqual(set(patterns), {"psy-core-*", "parth-coordinator-*",
+                                                "parth-realm-*", "psy-realm-*", "psy-coordinator-*"})
+                return "".join(f"{name} loaded active running unrelated\n" for name in names
+                               if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns))
+            if argv[:2] == ["systemctl", "list-jobs"]:
+                return "".join(f"{index} {name} start running\n" for index, name in enumerate(names, 1))
+            return self.command(argv)
+
+        self.commands.side_effect = command
+        self.assertEqual(installer.install_host(self.package, True)["mode"], "check-only")
+        self.assertFalse((self.root / "host").exists())
+
+    def test_r3_dropins_remain_conflicts(self):
+        installer.install_host(self.package)
+        name = next(iter(installer.host_inventory(self.host)[0]))
+        dropin = installer.UNITS / (name + ".d")
+        dropin.mkdir()
+        sentinel = dropin / "90-hold.conf"
+        sentinel.write_bytes(b"[Unit]\nConditionPathExists=/missing-r3-approval\n")
+        with self.assertRaisesRegex(installer.InstallError, "unit drop-in conflict"):
+            installer.install_host(self.package, True)
+        self.assertEqual(sentinel.read_bytes(), b"[Unit]\nConditionPathExists=/missing-r3-approval\n")
 
     def test_existing_file_and_mode_conflicts_are_not_repaired(self):
         installer.install_host(self.package)
@@ -304,7 +361,7 @@ class InstallHostTests(unittest.TestCase):
     def test_unit_old_paths_and_wrong_keys_rejected(self):
         unit = next((self.package / "units").iterdir())
         original = unit.read_bytes()
-        for before, after in ((b"fresh20261026r2_r", b"parth_r"), (b"processor_identity.key", b"edge_identity.key"),
+        for before, after in ((b"fresh20261027r3_r", b"fresh20261026r2_r"), (b"processor_identity.key", b"edge_identity.key"),
                               (b"psy-public-testnet", b"psy-mainnet"), (b"/checkpoints", b"/old-checkpoints")):
             with self.subTest(after=after):
                 unit.write_bytes(original.replace(before, after))
@@ -357,13 +414,15 @@ class HostCommandTests(unittest.TestCase):
     def test_production_pins_match_release_and_builder_plan(self):
         topology = fixture()[0]
         self.assertEqual(installer.PINNED_SHA256, {
-            "bin/psy_node_cli": "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb",
+            "bin/psy_node_cli": "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9",
             "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-            "genesis.json": "a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8",
+            "genesis.json": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
         })
         self.assertEqual(installer.PINNED_SHA256["bin/psy_node_cli"], packages.NODE_SHA256)
         self.assertEqual(installer.PINNED_SHA256["config.json"], packages.CONFIG_SHA256)
-        self.assertEqual(installer.SOURCE_COMMIT, "5d38eefc07b0925ed9875b74805d9c3fea73d998")
+        self.assertEqual(installer.PINNED_SHA256["genesis.json"], packages.GENESIS_SHA256)
+        self.assertEqual(installer.RELEASE_ID, "core-testnet-20261027-r3")
+        self.assertEqual(installer.SOURCE_COMMIT, "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
         self.assertEqual(installer.SOURCE_COMMIT, plan.RUNTIME_COMMIT)
         self.assertEqual(installer.SOURCE_COMMIT, topology["runtime_commit"])
         self.assertEqual(installer.HOSTS, topology["hosts"])

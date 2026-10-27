@@ -5,8 +5,8 @@ Usage: sudo python3 install_host.py --package /private/host --check-only
        sudo python3 install_host.py --package /private/host
 
 manifest.json must contain exactly:
-  {"schema_version": 1, "release_id": "core-testnet-20261026-r2",
-   "source_commit": "5d38eefc07b0925ed9875b74805d9c3fea73d998",
+  {"schema_version": 1, "release_id": "core-testnet-20261027-r3",
+   "source_commit": "3d31758738f833a7eea6f9ff7fd680a69a0d9a44",
    "network": "testnet", "host": "<topology alias>",
    "private_ip": "<host RFC1918 IPv4>", "files": {"relative/path": "sha256"}}
 files covers ALL payload files, excluding manifest.json itself. Allowed payloads:
@@ -18,7 +18,8 @@ The supplied manifest is a trusted deployment input, not a signed attestation
 that proves binary build provenance. Binary, config and Genesis bytes must also
 match this installer's release pins. The caller owns build/key/Genesis checks.
 
-Both modes validate hashes, host IP, stopped core units and existing paths.
+Both modes validate hashes, host IP, stopped core/legacy units and existing paths.
+New r3 unit names do not permit concurrent old r2 or parth instances.
 --check-only makes no writes and does not create the system account. Installation
 creates psy-core, publishes only missing files without overwriting, and calls
 daemon-reload. Exact existing bytes, modes and ownership are idempotent; any
@@ -43,20 +44,21 @@ import sys
 from urllib.parse import urlsplit
 
 
-SOURCE_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
-# No r1 binary or Genesis may be accepted under the r2 release label.
+SOURCE_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
+# Packaging and installation remain blocked until the final binary is approved.
 PINNED_SHA256 = {
-    "bin/psy_node_cli": "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb",
+    "bin/psy_node_cli": "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9",
     "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-    "genesis.json": "a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8",
+    "genesis.json": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
 }
-RELEASE_ID = "core-testnet-20261026-r2"
+RELEASE_ID = "core-testnet-20261027-r3"
 RELEASE = Path("/opt/psy-core/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core") / RELEASE_ID
 STATE = Path("/var/lib/psy-core") / RELEASE_ID
 UNITS = Path("/etc/systemd/system")
 ROOT_UID = 0
 ROOT_GID = 0
+STOPPED_UNIT_PREFIXES = ("psy-core-", "parth-coordinator-", "parth-realm-", "psy-realm-", "psy-coordinator-")
 PROCESSORS = ("gcp-realm-processor", "realm-processors-b", "realm-processors-c")
 EDGES = ("gcp-edge-1", "gcp-edge-2")
 HOSTS = {"gcp-cp-ce": "10.148.0.25", "gcp-realm-processor": "10.148.0.37",
@@ -150,7 +152,7 @@ def read_package(path):
     finally:
         os.close(fd)
     require("manifest.json" in payloads, "manifest missing")
-    require(all(PINNED_SHA256.values()), "r2 artifact pins not frozen")
+    require(all(PINNED_SHA256.values()), "r3 artifact pins not frozen")
     manifest = decode_json(payloads["manifest.json"])
     require(set(manifest) == {"schema_version", "release_id", "source_commit", "network",
                               "host", "private_ip", "files"}, "unexpected manifest fields")
@@ -209,7 +211,7 @@ def host_inventory(host):
         keys = {f"keys/realm-{realm}-v{position}/edge_identity.key" for position in range(1, 4)}
     else:
         raise InstallError("unknown core host")
-    return {"psy-core-r2-" + name + ".service" for name in names}, keys
+    return {"psy-core-r3-" + name + ".service" for name in names}, keys
 
 
 def validate_unit(name, raw, keys, host):
@@ -290,7 +292,7 @@ def validate_unit(name, raw, keys, host):
     require(options.get("--network") == ["psy-public-testnet"] and
             options.get("--proving-backend") == ["plonky2-poseidon-goldilocks"], "unsafe node network/backend")
     namespace = options.get("--db-namespace", [])
-    require(len(namespace) == 1 and re.fullmatch(r"fresh20261026r2_(coordinator|r[01]_v[123])", namespace[0]),
+    require(len(namespace) == 1 and re.fullmatch(r"fresh20261027r3_(coordinator|r[01]_v[123])", namespace[0]),
             "node namespace is not fresh")
     for option, scheme in (("--scylla-db-url", "tcp"), ("--redis-url", "redis"), ("--nats-jetstream-url", "nats")):
         require(option in options, "missing infrastructure option")
@@ -313,9 +315,9 @@ def validate_unit(name, raw, keys, host):
                    "--p2p-bls-key": "bls.key", "--p2p-zk-key": "zk.key"}
     required_keys = set()
     if role.startswith("realm"):
-        slot = name.removeprefix("psy-core-r2-").rsplit("-", 1)[0]
+        slot = name.removeprefix("psy-core-r3-").rsplit("-", 1)[0]
         realm, position = slot.split("-")[1:]
-        require(namespace == [f"fresh20261026r2_r{realm}_{position}"]
+        require(namespace == [f"fresh20261027r3_r{realm}_{position}"]
                 and options.get("--realm-id") == [realm], "unit Realm/namespace mismatch")
         required_keys = {"--p2p-identity-key"}
         if role.endswith("processor"):
@@ -325,12 +327,12 @@ def validate_unit(name, raw, keys, host):
             require(relative in keys and options.get(option) == [str(CONFIG / relative)], "incorrect per-host key path")
     require(set(options) & set(key_options) == required_keys, "unexpected key option")
     if role.startswith("coordinator"):
-        require(namespace == ["fresh20261026r2_coordinator"]
+        require(namespace == ["fresh20261027r3_coordinator"]
                 and options.get("--coordinator-id") == ["0"]
                 and options.get("--coordinator-sub-id") == ["0"], "unit Coordinator/namespace mismatch")
     endpoints = {}
     if role == "coordinator-edge":
-        index = int(name.removeprefix("psy-core-r2-coordinator-edge-").removesuffix(".service"))
+        index = int(name.removeprefix("psy-core-r3-coordinator-edge-").removesuffix(".service"))
         endpoints = {"--listen": [HOSTS[host]], "--port": [str(15370 + index)]}
     elif role.startswith("realm"):
         realm_id, validator_position = int(realm), int(position.removeprefix("v"))
@@ -359,15 +361,15 @@ def check_host(manifest):
     require(any(info.get("local") == manifest["private_ip"] for interface in addresses
                 for info in interface.get("addr_info", [])), "host private IP mismatch")
     output = command(["systemctl", "list-units", "--all", "--type=service", "--no-legend",
-                      "--plain", "--no-pager", "psy-core-*"])
+                      "--plain", "--no-pager", *(prefix + "*" for prefix in STOPPED_UNIT_PREFIXES)])
     for line in output.splitlines():
         fields = line.split()
-        require(len(fields) >= 4 and fields[0].startswith("psy-core-"), "unexpected systemctl output")
+        require(len(fields) >= 4 and fields[0].startswith(STOPPED_UNIT_PREFIXES), "unexpected systemctl output")
         require(fields[2] in {"inactive", "failed"} and fields[3] in {"dead", "failed"},
-                "core unit is running or transitioning")
+                "core or legacy unit is running or transitioning")
     jobs = command(["systemctl", "list-jobs", "--no-legend", "--no-pager"])
-    require(not any(len(fields) > 1 and fields[1].startswith("psy-core-")
-                    for fields in map(str.split, jobs.splitlines())), "core unit has queued job")
+    require(not any(len(fields) > 1 and fields[1].startswith(STOPPED_UNIT_PREFIXES)
+                    for fields in map(str.split, jobs.splitlines())), "core or legacy unit has queued job")
 
 
 def get_runtime_user():
