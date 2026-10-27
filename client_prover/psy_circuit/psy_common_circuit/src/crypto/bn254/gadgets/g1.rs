@@ -379,11 +379,70 @@ mod tests {
     };
 
     use super::*;
-    use crate::crypto::{bn254::gadgets::nonnative_fp::CircuitBuilderNonNative, secp256k1::ecdsa::gadgets::biguint::WitnessBigUint};
+    use crate::crypto::{bn254::gadgets::nonnative_fp::CircuitBuilderNonNative, secp256k1::ecdsa::curve::curve_types::{CurveScalar, ProjectivePoint}, secp256k1::ecdsa::gadgets::biguint::WitnessBigUint};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn test_scalar_mul_g1_matches_native() {
+        let config = crate::crypto::bn254::pairing_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let scalar_value = Bn128Scalar::from_canonical_u64(12345);
+        let expected = (CurveScalar::<G1>(scalar_value) * G1::GENERATOR_AFFINE.to_projective()).to_affine();
+
+        let g1_gen = builder.g1_generator();
+        let scalar = builder.constant_nonnative(scalar_value);
+        let result = builder.scalar_mul_g1(&g1_gen, &scalar);
+
+        let expected_x = builder.constant_nonnative(expected.x);
+        let expected_y = builder.constant_nonnative(expected.y);
+        let not_inf = builder._false().target;
+        builder.connect_nonnative(&result.x, &expected_x);
+        builder.connect_nonnative(&result.y, &expected_y);
+        builder.connect(result.is_infinity.target, not_inf);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn test_g1_msm_matches_native() {
+        let config = crate::crypto::bn254::pairing_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let scalars = [5u64, 8]
+            .iter()
+            .map(|s| Bn128Scalar::from_canonical_u64(*s))
+            .collect::<Vec<_>>();
+        let points = [G1::GENERATOR_AFFINE, (CurveScalar::<G1>(Bn128Scalar::from_canonical_u64(7)) * G1::GENERATOR_AFFINE.to_projective()).to_affine()];
+
+        let mut expected = ProjectivePoint::ZERO;
+        for (point, scalar) in points.iter().zip(scalars.iter()) {
+            expected = expected + CurveScalar::<G1>(*scalar) * point.to_projective();
+        }
+        let expected = expected.to_affine();
+
+        let point_targets: Vec<_> = points.iter().map(|p| builder.constant_g1_affine(*p)).collect();
+        let scalar_targets: Vec<_> = scalars.iter().map(|s| builder.constant_nonnative(*s)).collect();
+        let result = builder.g1_msm(&point_targets, &scalar_targets);
+
+        let expected_x = builder.constant_nonnative(expected.x);
+        let expected_y = builder.constant_nonnative(expected.y);
+        let not_inf = builder._false().target;
+        builder.connect_nonnative(&result.x, &expected_x);
+        builder.connect_nonnative(&result.y, &expected_y);
+        builder.connect(result.is_infinity.target, not_inf);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
+    }
 
     #[test]
     fn test_g1_projective_to_affine_non_zero() -> Result<(), anyhow::Error> {

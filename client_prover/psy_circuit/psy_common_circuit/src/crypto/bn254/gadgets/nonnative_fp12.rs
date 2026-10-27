@@ -614,6 +614,34 @@ mod tests {
     };
 
     #[test]
+    fn test_is_equal_ext12_matches_connect_for_equal_pairings() -> Result<()> {
+        type FF = DodecicExtension<Bn128Base>;
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let x_ff = FF::sample(&mut rand::thread_rng());
+        let y_ff = FF::sample(&mut rand::thread_rng());
+
+        let config = crate::crypto::bn254::pairing_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let x = builder.constant_nonnative_ext12(x_ff);
+        let y = builder.constant_nonnative_ext12(y_ff);
+        // Equal values produced by two independent multiplication paths.
+        let left = builder.mul_nonnative_ext12(&x, &y);
+        let right = builder.mul_nonnative_ext12(&y, &x);
+
+        let is_equal = builder.is_equal_ext12(&left, &right);
+        builder.assert_one(is_equal.target);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof)
+    }
+
+    #[test]
     fn test_nonnative_ext12_add() -> Result<()> {
         type FF = DodecicExtension<Bn128Base>;
         const D: usize = 2;

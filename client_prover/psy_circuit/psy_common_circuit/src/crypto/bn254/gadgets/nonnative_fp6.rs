@@ -401,7 +401,7 @@ mod tests {
 
     fn pairing_config() -> CircuitConfig {
         CircuitConfig {
-            num_wires: 340, // NonnativeMulGate requires 334 wires
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             num_routed_wires: 80,
             num_constants: 2,
             use_base_arithmetic_gate: true,

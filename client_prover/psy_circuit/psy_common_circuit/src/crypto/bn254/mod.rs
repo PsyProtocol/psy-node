@@ -10,7 +10,7 @@ use plonky2::plonk::circuit_data::CircuitConfig;
 
 pub fn pairing_config() -> CircuitConfig {
     CircuitConfig {
-        num_wires: 400,
+        num_wires: 1198,
         ..CircuitConfig::wide_ecc_config()
     }
 }

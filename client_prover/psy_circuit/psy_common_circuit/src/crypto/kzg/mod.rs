@@ -197,7 +197,7 @@ mod tests {
         #[test]
         fn test_quotient_polynomial_lagrange() {
             let config = CircuitConfig {
-                num_wires: 400,
+                num_wires: 1198,
                 ..CircuitConfig::wide_ecc_config()
             };
             let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -260,7 +260,7 @@ mod tests {
         #[test]
         fn test_lagrange_commitment_simple() {
             let config = CircuitConfig {
-                num_wires: 400,
+                num_wires: 1198,
                 ..CircuitConfig::wide_ecc_config()
             };
             let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -319,7 +319,7 @@ mod tests {
         #[test]
         fn test_fft_roundtrip() {
             let config = CircuitConfig {
-                num_wires: 400,
+                num_wires: 1198,
                 ..CircuitConfig::wide_ecc_config()
             };
             let mut builder = CircuitBuilder::<F, D>::new(config);

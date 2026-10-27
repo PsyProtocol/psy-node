@@ -230,7 +230,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderFFT<F, D> for C
     /// # Efficient Formula for Roots of Unity
     ///
     /// For domain {1, ω, ω², ..., ω^(n-1)}:
-    /// p(z) = (z^n - 1)/(n) * Σ(y_i / (z - ω^i))
+    /// p(z) = (z^n - 1)/(n) * Σ(ω^i * y_i / (z - ω^i))
     fn lagrange_interpolate_at_point(
         &mut self,
         evaluations: &[NonNativeTarget<Bn128Scalar>],
@@ -248,7 +248,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderFFT<F, D> for C
             // Compute z - ω^i
             let diff = self.sub_nonnative(point, &settings.roots_of_unity[i]);
             denominators.push(diff);
-            numerators.push(evaluations[i].clone());
+            // L_i(z) = (ω^i / n) * (z^n - 1) / (z - ω^i)
+            let numerator = self.mul_nonnative(&evaluations[i], &settings.roots_of_unity[i]);
+            numerators.push(numerator);
         }
 
         // Batch compute 1/(z - ω^i) for all i
@@ -373,9 +375,47 @@ mod tests {
     type F = <C as GenericConfig<D>>::F;
 
     #[test]
+    fn test_lagrange_interpolate_at_point() {
+        use plonky2::field::types::Field;
+
+        let config = CircuitConfig {
+            num_wires: 1198,
+            ..CircuitConfig::wide_ecc_config()
+        };
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let domain_size = 2;
+        let settings = builder.fft_settings(domain_size);
+
+        let one = Bn128Scalar::ONE;
+        let two = Bn128Scalar::from_canonical_u64(2);
+        let evals_ff = [one, two];
+        let z_ff = two;
+        let roots_ff = [one, -one];
+        let n_inv = Bn128Scalar::from_canonical_u64(domain_size as u64).inverse();
+        let mut sum = Bn128Scalar::ZERO;
+        for i in 0..domain_size {
+            sum = sum + roots_ff[i] * evals_ff[i] * (z_ff - roots_ff[i]).inverse();
+        }
+        let expected = (z_ff * z_ff - one) * n_inv * sum;
+
+        let evals: Vec<_> = evals_ff.iter().map(|e| builder.constant_nonnative(*e)).collect();
+        let point = builder.constant_nonnative(z_ff);
+        let result = builder.lagrange_interpolate_at_point(&evals, &point, &settings);
+
+        let expected_target = builder.constant_nonnative(expected);
+        builder.connect_nonnative(&result, &expected_target);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
     fn test_fft_roundtrip() {
         let config = CircuitConfig {
-            num_wires: 400,
+            num_wires: 1198,
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);

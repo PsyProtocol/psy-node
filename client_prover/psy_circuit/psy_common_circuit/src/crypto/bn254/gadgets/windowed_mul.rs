@@ -302,6 +302,31 @@ mod g2_scalar_mul_tests {
     type F = <C as GenericConfig<D>>::F;
 
     #[test]
+    fn test_curve_scalar_mul_windowed_g2_matches_native() {
+        let config = pairing_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let scalar_value = Bn128Scalar::from_canonical_u64(123456789);
+        let expected = (CurveScalar::<G2>(scalar_value) * G2::GENERATOR_PROJECTIVE).to_affine();
+
+        let g2_gen = builder.constant_g2_affine(G2::GENERATOR_AFFINE);
+        let scalar = builder.constant_nonnative(scalar_value);
+        let result = builder.curve_scalar_mul_windowed_g2(&g2_gen, &scalar);
+
+        let expected_x = builder.constant_nonnative_ext2(expected.x);
+        let expected_y = builder.constant_nonnative_ext2(expected.y);
+        let not_inf = builder._false().target;
+        builder.connect_nonnative_ext2(&result.x, &expected_x);
+        builder.connect_nonnative_ext2(&result.y, &expected_y);
+        builder.connect(result.is_infinity.target, not_inf);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
     fn test_curve_scalar_mul_windowed_g2_simple() {
         let config = pairing_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);

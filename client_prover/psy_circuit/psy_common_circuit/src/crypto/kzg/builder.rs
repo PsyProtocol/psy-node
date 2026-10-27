@@ -406,14 +406,18 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderKZGHelpers<F, D
             inverses[0] = inv_acc.clone();
         }
 
-        let mut running_inv = inv_acc;
+        let mut running_inv = if n > 1 {
+            self.mul_nonnative(&inv_acc, &elements[n - 1])
+        } else {
+            inv_acc
+        };
         for i in (0..n - 1).rev() {
             if i > 0 {
                 inverses[i] = self.mul_nonnative(&acc[i - 1], &running_inv);
             } else {
                 inverses[i] = running_inv.clone();
             }
-            running_inv = self.mul_nonnative(&running_inv, &elements[i + 1]);
+            running_inv = self.mul_nonnative(&running_inv, &elements[i]);
         }
 
         inverses
@@ -472,5 +476,47 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderKZGHelpers<F, D
         }
 
         final_quotient_evals
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::{
+        iop::witness::PartialWitness,
+        plonk::{
+            circuit_builder::CircuitBuilder,
+            config::{GenericConfig, PoseidonGoldilocksConfig},
+        },
+    };
+
+    use crate::crypto::bn254::{
+        field::bn128_scalar::Bn128Scalar, gadgets::CircuitBuilderNonNative, pairing_config,
+    };
+
+    use super::{CircuitBuilderKZG, CircuitBuilderKZGHelpers};
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn test_kzg_batch_inverse() {
+        let mut builder = CircuitBuilder::<F, D>::new(pairing_config());
+        let elements: Vec<_> = [2u64, 3, 5]
+            .iter()
+            .map(|e| builder.constant_nonnative(Bn128Scalar::from_canonical_u64(*e)))
+            .collect();
+
+        let inverses = builder.kzg_batch_inverse(&elements);
+        for (element, inverse) in elements.iter().zip(inverses.iter()) {
+            let product = builder.mul_nonnative(element, inverse);
+            let one = builder.one_nonnative();
+            builder.connect_nonnative(&product, &one);
+        }
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof).unwrap();
     }
 }

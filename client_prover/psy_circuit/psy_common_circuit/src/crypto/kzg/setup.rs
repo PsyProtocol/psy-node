@@ -29,7 +29,7 @@ impl KZGSetup {
     }
 
     /// L_i(x) = ∏_{j≠i} (x - ω^j) / (ω^i - ω^j)
-    /// L_i(x) = (x^n - 1) / (n * (x - ω^i))
+    /// L_i(x) = ω^i * (x^n - 1) / (n * (x - ω^i))
     /// L_i(τ) = (τ^n - 1) / (n * (τ - ω^i))
     // [L_0(τ)G, L_1(τ)G, ..., L_{n-1}(τ)G]
     pub fn new_lagrange_setup(tau: Bn128Scalar, domain_size: usize) -> KZGParams {
@@ -70,7 +70,7 @@ impl KZGSetup {
                 // τ cannot be a root of unity for security
                 panic!("tau cannot be a root of unity for Lagrange setup");
             }
-            let l_i_tau = tau_n_minus_1 * denominator.inverse() * n_inv;
+            let l_i_tau = tau_n_minus_1 * denominator.inverse() * n_inv * roots_of_unity[i];
 
             // Compute L_i(τ) * G
             let g1_gen = G1::GENERATOR_AFFINE;
@@ -289,16 +289,21 @@ mod tests {
 
         let roots = &params.roots_of_unity;
 
-        // Verify L_i(τ) computation matches formula
-        let tau_n = tau.exp_u64(domain_size as u64);
-        let tau_n_minus_1 = tau_n - Bn128Scalar::ONE;
+        // Verify the defining property Σ_i L_i(x) = 1 at non-root points for the
+        // formula L_i(x) = ω^i * (x^n - 1) / (n * (x - ω^i))
         let n_inv = Bn128Scalar::from_canonical_usize(domain_size).inverse();
 
         for i in 0..domain_size {
-            let _expected_li_tau = tau_n_minus_1 * (tau - roots[i]).inverse() * n_inv;
-            // We can't directly verify the G1 points, but we can check the computation
-            // logic
             assert_ne!(tau - roots[i], Bn128Scalar::ZERO, "tau should not equal any root of unity");
+        }
+        for x in [tau, Bn128Scalar::from_canonical_u64(3), Bn128Scalar::from_canonical_u64(1000)] {
+            let x_n_minus_1 = x.exp_u64(domain_size as u64) - Bn128Scalar::ONE;
+            let mut sum = Bn128Scalar::ZERO;
+            for i in 0..domain_size {
+                let l_i_at_x = roots[i] * x_n_minus_1 * (x - roots[i]).inverse() * n_inv;
+                sum = sum + l_i_at_x;
+            }
+            assert_eq!(sum, Bn128Scalar::ONE, "sum of Lagrange basis at x must be 1");
         }
     }
 

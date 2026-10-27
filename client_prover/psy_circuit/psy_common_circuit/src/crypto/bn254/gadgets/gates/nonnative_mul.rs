@@ -71,7 +71,7 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> NonnativeMulGate<F
     }
 
     pub(crate) fn num_ops(config: &CircuitConfig) -> usize {
-        let wires_per_op = 296;
+        let wires_per_op = 1198;
         let routed_wires_per_op = 30;
         (config.num_wires / wires_per_op).min(config.num_routed_wires / routed_wires_per_op)
     }
@@ -94,31 +94,59 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> NonnativeMulGate<F
     pub fn wire_ith_quotient(&self, i: usize, j: usize) -> usize {
         debug_assert!(i < self.num_ops);
         debug_assert!(j < 10);
-        30 * self.num_ops + 304 * i + j
+        30 * self.num_ops + 1168 * i + j
     }
     pub fn wire_ith_output_jth_limb28_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
         debug_assert!(i < self.num_ops);
         debug_assert!(j < 10);
         debug_assert!(k < 14);
         debug_assert!(j != 9 || k < 2);
-        30 * self.num_ops + 304 * i + 10 + 14 * j + k
+        30 * self.num_ops + 1168 * i + 10 + 14 * j + k
     }
     pub fn wire_ith_quotient_jth_limb28_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
         debug_assert!(i < self.num_ops);
         debug_assert!(j < 10);
         debug_assert!(k < 14);
         debug_assert!(j != 9 || k < 2);
-        30 * self.num_ops + 304 * i + 138 + 14 * j + k
+        30 * self.num_ops + 1168 * i + 138 + 14 * j + k
     }
     pub fn wire_ith_carry_left(&self, i: usize, j: usize) -> usize {
         debug_assert!(i < self.num_ops);
         debug_assert!(j < 19);
-        30 * self.num_ops + 304 * i + 138 + 128 + j
+        30 * self.num_ops + 1168 * i + 266 + j
     }
     pub fn wire_ith_carry_right(&self, i: usize, j: usize) -> usize {
         debug_assert!(i < self.num_ops);
         debug_assert!(j < 19);
-        30 * self.num_ops + 304 * i + 138 + 128 + 19 + j
+        30 * self.num_ops + 1168 * i + 266 + 19 + j
+    }
+    pub fn wire_ith_input_x_jth_limb28_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
+        debug_assert!(i < self.num_ops);
+        debug_assert!(j < 10);
+        debug_assert!(k < 14);
+        debug_assert!(j != 9 || k < 2);
+        30 * self.num_ops + 1168 * i + 304 + 14 * j + k
+    }
+    pub fn wire_ith_input_y_jth_limb28_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
+        debug_assert!(i < self.num_ops);
+        debug_assert!(j < 10);
+        debug_assert!(k < 14);
+        debug_assert!(j != 9 || k < 2);
+        30 * self.num_ops + 1168 * i + 432 + 14 * j + k
+    }
+    // Each carry below 2^32 is decomposed into 14 low 2-bit digits (bits 0..28)
+    // and 2 high 2-bit digits (bits 28..32).
+    pub fn wire_ith_carry_left_jth_limb32_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
+        debug_assert!(i < self.num_ops);
+        debug_assert!(j < 19);
+        debug_assert!(k < 16);
+        30 * self.num_ops + 1168 * i + 560 + 16 * j + k
+    }
+    pub fn wire_ith_carry_right_jth_limb32_kth_limb2_bit(&self, i: usize, j: usize, k: usize) -> usize {
+        debug_assert!(i < self.num_ops);
+        debug_assert!(j < 19);
+        debug_assert!(k < 16);
+        30 * self.num_ops + 1168 * i + 864 + 16 * j + k
     }
 
     pub fn limb_bits() -> usize {
@@ -206,6 +234,64 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> Gate<F, D> for Non
                 constraints.push(combined_limbs - quotient[j]);
             }
 
+            // Range-check input limbs: x and y must be 28-bit limb values, otherwise the
+            // carry equations below wrap modulo the Goldilocks prime instead of holding
+            // over the integers.
+            let limb_base = F::Extension::from_canonical_u64(1u64 << Self::limb_bits());
+            for j in 0..10 {
+                let num_limbs = if j == 9 { 2 } else { Self::num_limbs() };
+
+                let mut combined_limbs = F::Extension::ZERO;
+                for k in (0..num_limbs).rev() {
+                    let this_limb = vars.local_wires[self.wire_ith_input_x_jth_limb28_kth_limb2_bit(i, j, k)];
+                    let max_limb = 1 << Self::limb_bits();
+                    let product = (0..max_limb).map(|x| this_limb - F::Extension::from_canonical_usize(x)).product();
+                    constraints.push(product);
+
+                    combined_limbs = limb_base * combined_limbs + this_limb;
+                }
+                constraints.push(combined_limbs - input_x[j]);
+
+                let mut combined_limbs = F::Extension::ZERO;
+                for k in (0..num_limbs).rev() {
+                    let this_limb = vars.local_wires[self.wire_ith_input_y_jth_limb28_kth_limb2_bit(i, j, k)];
+                    let max_limb = 1 << Self::limb_bits();
+                    let product = (0..max_limb).map(|x| this_limb - F::Extension::from_canonical_usize(x)).product();
+                    constraints.push(product);
+
+                    combined_limbs = limb_base * combined_limbs + this_limb;
+                }
+                constraints.push(combined_limbs - input_y[j]);
+            }
+
+            // Range-check carries: every carry is below 2^32, so the carry equations
+            // telescope to the exact integer identity x*y = quotient*p + result.
+            let carry_base = F::Extension::from_canonical_u32(1 << 28);
+            for j in 0..19 {
+                let mut lo_left = F::Extension::ZERO;
+                let mut hi_left = F::Extension::ZERO;
+                let mut lo_right = F::Extension::ZERO;
+                let mut hi_right = F::Extension::ZERO;
+                for k in (0..14).rev() {
+                    let digit_left = vars.local_wires[self.wire_ith_carry_left_jth_limb32_kth_limb2_bit(i, j, k)];
+                    constraints.push((0..4).map(|x| digit_left - F::Extension::from_canonical_usize(x)).product());
+                    lo_left = limb_base * lo_left + digit_left;
+                    let digit_right = vars.local_wires[self.wire_ith_carry_right_jth_limb32_kth_limb2_bit(i, j, k)];
+                    constraints.push((0..4).map(|x| digit_right - F::Extension::from_canonical_usize(x)).product());
+                    lo_right = limb_base * lo_right + digit_right;
+                }
+                for k in (14..16).rev() {
+                    let digit_left = vars.local_wires[self.wire_ith_carry_left_jth_limb32_kth_limb2_bit(i, j, k)];
+                    constraints.push((0..4).map(|x| digit_left - F::Extension::from_canonical_usize(x)).product());
+                    hi_left = limb_base * hi_left + digit_left;
+                    let digit_right = vars.local_wires[self.wire_ith_carry_right_jth_limb32_kth_limb2_bit(i, j, k)];
+                    constraints.push((0..4).map(|x| digit_right - F::Extension::from_canonical_usize(x)).product());
+                    hi_right = limb_base * hi_right + digit_right;
+                }
+                constraints.push(carry_left[j] - (lo_left + carry_base.clone() * hi_left));
+                constraints.push(carry_right[j] - (lo_right + carry_base.clone() * hi_right));
+            }
+
             let mut last_carry_left = F::Extension::ZERO;
             let mut last_carry_right = F::Extension::ZERO;
             let base = F::Extension::from_canonical_u32(1 << 28);
@@ -261,7 +347,7 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> Gate<F, D> for Non
     }
 
     fn num_wires(&self) -> usize {
-        296 + 38
+        1198
     }
 
     fn num_constants(&self) -> usize {
@@ -273,7 +359,7 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> Gate<F, D> for Non
     }
 
     fn num_constraints(&self) -> usize {
-        self.num_ops * (19 + (10 + 128) * 2)
+        self.num_ops * (19 + (10 + 128) * 4 + 19 * 2 * 17)
     }
 }
 
@@ -329,6 +415,59 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> PackedEvaluableBas
                     combined_limbs = combined_limbs * limb_base.clone() + this_limb;
                 }
                 yield_constr.one(combined_limbs - quotient[j]);
+            }
+
+            let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
+            for j in 0..10 {
+                let num_limbs = if j == 9 { 2 } else { Self::num_limbs() };
+
+                let mut combined_limbs = P::ZEROS;
+                for k in (0..num_limbs).rev() {
+                    let this_limb = vars.local_wires[self.wire_ith_input_x_jth_limb28_kth_limb2_bit(i, j, k)];
+                    let max_limb = 1 << Self::limb_bits();
+                    let product = (0..max_limb).map(|x| this_limb - F::from_canonical_usize(x)).product();
+                    yield_constr.one(product);
+
+                    combined_limbs = combined_limbs * limb_base + this_limb;
+                }
+                yield_constr.one(combined_limbs - input_x[j]);
+
+                let mut combined_limbs = P::ZEROS;
+                for k in (0..num_limbs).rev() {
+                    let this_limb = vars.local_wires[self.wire_ith_input_y_jth_limb28_kth_limb2_bit(i, j, k)];
+                    let max_limb = 1 << Self::limb_bits();
+                    let product = (0..max_limb).map(|x| this_limb - F::from_canonical_usize(x)).product();
+                    yield_constr.one(product);
+
+                    combined_limbs = combined_limbs * limb_base + this_limb;
+                }
+                yield_constr.one(combined_limbs - input_y[j]);
+            }
+
+            let carry_base = F::from_canonical_u32(1 << 28);
+            for j in 0..19 {
+                let mut lo_left = P::ZEROS;
+                let mut hi_left = P::ZEROS;
+                let mut lo_right = P::ZEROS;
+                let mut hi_right = P::ZEROS;
+                for k in (0..14).rev() {
+                    let digit_left = vars.local_wires[self.wire_ith_carry_left_jth_limb32_kth_limb2_bit(i, j, k)];
+                    yield_constr.one((0..4).map(|x| digit_left - F::from_canonical_usize(x)).product::<P>());
+                    lo_left = lo_left * limb_base + digit_left;
+                    let digit_right = vars.local_wires[self.wire_ith_carry_right_jth_limb32_kth_limb2_bit(i, j, k)];
+                    yield_constr.one((0..4).map(|x| digit_right - F::from_canonical_usize(x)).product::<P>());
+                    lo_right = lo_right * limb_base + digit_right;
+                }
+                for k in (14..16).rev() {
+                    let digit_left = vars.local_wires[self.wire_ith_carry_left_jth_limb32_kth_limb2_bit(i, j, k)];
+                    yield_constr.one((0..4).map(|x| digit_left - F::from_canonical_usize(x)).product::<P>());
+                    hi_left = hi_left * limb_base + digit_left;
+                    let digit_right = vars.local_wires[self.wire_ith_carry_right_jth_limb32_kth_limb2_bit(i, j, k)];
+                    yield_constr.one((0..4).map(|x| digit_right - F::from_canonical_usize(x)).product::<P>());
+                    hi_right = hi_right * limb_base + digit_right;
+                }
+                yield_constr.one(carry_left[j] - (lo_left + hi_left * carry_base));
+                yield_constr.one(carry_right[j] - (lo_right + hi_right * carry_base));
             }
 
             let mut last_carry_left = P::ZEROS;
@@ -402,8 +541,8 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> SimpleGenerator<F,
     fn dependencies(&self) -> Vec<Target> {
         let local_target = |column| Target::wire(self.row, column);
 
-        let x_range: Vec<_> = (0..8).map(|i| local_target(self.gate.wire_ith_input_x(self.i, i))).collect();
-        let y_range: Vec<_> = (0..8).map(|i| local_target(self.gate.wire_ith_input_y(self.i, i))).collect();
+        let x_range: Vec<_> = (0..10).map(|i| local_target(self.gate.wire_ith_input_x(self.i, i))).collect();
+        let y_range: Vec<_> = (0..10).map(|i| local_target(self.gate.wire_ith_input_y(self.i, i))).collect();
 
         [x_range, y_range].concat()
     }
@@ -484,6 +623,30 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> SimpleGenerator<F,
                 let wire = local_wire(self.gate.wire_ith_quotient_jth_limb28_kth_limb2_bit(self.i, j, k));
                 out_buffer.set_wire(wire, quotient_limbs[k].clone())?;
             }
+
+            let input_x_limbs: Vec<_> = (0..num_limbs)
+                .scan(input_x_u32s[j] as u64, |acc, _| {
+                    let tmp = *acc % limb_base;
+                    *acc /= limb_base;
+                    Some(F::from_canonical_u64(tmp))
+                })
+                .collect();
+            for k in 0..num_limbs {
+                let wire = local_wire(self.gate.wire_ith_input_x_jth_limb28_kth_limb2_bit(self.i, j, k));
+                out_buffer.set_wire(wire, input_x_limbs[k].clone())?;
+            }
+
+            let input_y_limbs: Vec<_> = (0..num_limbs)
+                .scan(input_y_u32s[j] as u64, |acc, _| {
+                    let tmp = *acc % limb_base;
+                    *acc /= limb_base;
+                    Some(F::from_canonical_u64(tmp))
+                })
+                .collect();
+            for k in 0..num_limbs {
+                let wire = local_wire(self.gate.wire_ith_input_y_jth_limb28_kth_limb2_bit(self.i, j, k));
+                out_buffer.set_wire(wire, input_y_limbs[k].clone())?;
+            }
         }
 
         let mut last_carry_left = 0u64;
@@ -511,6 +674,22 @@ impl<F: RichField + Extendable<D>, FF: Field, const D: usize> SimpleGenerator<F,
             let wire = local_wire(self.gate.wire_ith_carry_right(self.i, j));
             out_buffer.set_wire(wire, F::from_canonical_u64(carry_right as u64))?;
 
+            for (carry, digit_wire_fn) in [
+                (carry_left, NonnativeMulGate::<F, FF, D>::wire_ith_carry_left_jth_limb32_kth_limb2_bit as fn(&NonnativeMulGate<F, FF, D>, usize, usize, usize) -> usize),
+                (carry_right, NonnativeMulGate::<F, FF, D>::wire_ith_carry_right_jth_limb32_kth_limb2_bit as fn(&NonnativeMulGate<F, FF, D>, usize, usize, usize) -> usize),
+            ] {
+                let lo = carry & 0xfff_ffff;
+                let hi = carry >> 28;
+                for k in 0..14 {
+                    let wire = local_wire(digit_wire_fn(&self.gate, self.i, j, k));
+                    out_buffer.set_wire(wire, F::from_canonical_u64((lo >> (2 * k)) & 0b11))?;
+                }
+                for k in 0..2 {
+                    let wire = local_wire(digit_wire_fn(&self.gate, self.i, j, 14 + k));
+                    out_buffer.set_wire(wire, F::from_canonical_u64((hi >> (2 * k)) & 0b11))?;
+                }
+            }
+
             last_carry_left = carry_left;
             last_carry_right = carry_right;
         }
@@ -530,5 +709,106 @@ mod tests {
             num_ops: 1,
             _phantom: PhantomData,
         })
+    }
+
+    // Every witness wire is now range-checked: input limbs to 28 bits and each carry to
+    // 32 bits, so the carry equations hold over the integers and a false product claim
+    // makes the constraint system unsatisfiable.
+    #[test]
+    fn nonnative_mul_gate_rejects_false_product() {
+        use plonky2::{hash::hash_types::HashOut, plonk::vars::EvaluationVarsBaseBatch};
+
+        type F = GoldilocksField;
+        let gate = NonnativeMulGate::<F, Bn128Base, 4> {
+            num_ops: 1,
+            _phantom: PhantomData,
+        };
+        let modulus_28 = get_field_modulus_28bit::<Bn128Base>();
+
+        let fill_limb_digits =
+            |wires: &mut Vec<F>, digit_wire: fn(&NonnativeMulGate<F, Bn128Base, 4>, usize, usize, usize) -> usize, j: usize, value: u64| {
+                let num_digits = if j == 9 { 2 } else { 14 };
+                for k in 0..num_digits {
+                    wires[digit_wire(&gate, 0, j, k)] = F::from_canonical_u64((value >> (2 * k)) & 0b11);
+                }
+            };
+
+        let fill_carry_digits =
+            |wires: &mut Vec<F>, digit_wire: fn(&NonnativeMulGate<F, Bn128Base, 4>, usize, usize, usize) -> usize, j: usize, carry: u64| {
+                let lo = carry & 0xfff_ffff;
+                let hi = carry >> 28;
+                for k in 0..14 {
+                    wires[digit_wire(&gate, 0, j, k)] = F::from_canonical_u64((lo >> (2 * k)) & 0b11);
+                }
+                for k in 0..2 {
+                    wires[digit_wire(&gate, 0, j, 14 + k)] = F::from_canonical_u64((hi >> (2 * k)) & 0b11);
+                }
+            };
+
+        let build_wires = |x: u64, y: u64, result: u64| -> Vec<F> {
+            let mut wires = vec![F::ZERO; gate.num_wires()];
+            let limbs = |v: u64| -> Vec<u64> {
+                let mut l = vec![0u64; 10];
+                l[0] = v;
+                l
+            };
+            let (x_l, y_l, r_l, q_l) = (limbs(x), limbs(y), limbs(result), limbs(0));
+
+            for j in 0..10 {
+                wires[gate.wire_ith_input_x(0, j)] = F::from_canonical_u64(x_l[j]);
+                wires[gate.wire_ith_input_y(0, j)] = F::from_canonical_u64(y_l[j]);
+                wires[gate.wire_ith_output_result(0, j)] = F::from_canonical_u64(r_l[j]);
+                wires[gate.wire_ith_quotient(0, j)] = F::from_canonical_u64(q_l[j]);
+
+                fill_limb_digits(&mut wires, NonnativeMulGate::wire_ith_input_x_jth_limb28_kth_limb2_bit, j, x_l[j]);
+                fill_limb_digits(&mut wires, NonnativeMulGate::wire_ith_input_y_jth_limb28_kth_limb2_bit, j, y_l[j]);
+                fill_limb_digits(&mut wires, NonnativeMulGate::wire_ith_output_jth_limb28_kth_limb2_bit, j, r_l[j]);
+                fill_limb_digits(&mut wires, NonnativeMulGate::wire_ith_quotient_jth_limb28_kth_limb2_bit, j, q_l[j]);
+            }
+
+            let base = 1u64 << 28;
+            let mut last_carry_left = 0u64;
+            let mut last_carry_right = 0u64;
+            for j in 0..19 {
+                let start_index = if j < 10 { 0 } else { j - 9 };
+                let end_index = if j < 10 { j } else { 9 };
+                let mut left = last_carry_left;
+                let mut right = last_carry_right;
+                for k in 0..(end_index - start_index + 1) {
+                    left += x_l[k + start_index] * y_l[end_index - k];
+                    right += q_l[k + start_index] * modulus_28[end_index - k] as u64;
+                }
+                if j < 10 {
+                    right += r_l[j];
+                }
+
+                let carry_left = left / base;
+                let carry_right = right / base;
+                wires[gate.wire_ith_carry_left(0, j)] = F::from_canonical_u64(carry_left);
+                wires[gate.wire_ith_carry_right(0, j)] = F::from_canonical_u64(carry_right);
+                fill_carry_digits(&mut wires, NonnativeMulGate::wire_ith_carry_left_jth_limb32_kth_limb2_bit, j, carry_left);
+                fill_carry_digits(&mut wires, NonnativeMulGate::wire_ith_carry_right_jth_limb32_kth_limb2_bit, j, carry_right);
+                last_carry_left = carry_left;
+                last_carry_right = carry_right;
+            }
+            wires
+        };
+
+        let all_constraints_hold = |wires: &[F]| -> (bool, usize) {
+            let vars = EvaluationVarsBaseBatch::new(1, &[], wires, &HashOut::ZERO);
+            let constraints = gate.eval_unfiltered_base_batch(vars);
+            let nonzero = constraints.iter().filter(|c| !c.is_zero()).count();
+            (nonzero == 0, nonzero)
+        };
+
+        // Honest control: 3*5=15 satisfies all constraints.
+        let (ok, bad) = all_constraints_hold(&build_wires(3, 5, 15));
+        assert!(ok, "honest 3*5=15 should satisfy all constraints, {bad} nonzero");
+
+        // False claims 3*5=17 and 0*0=max_limb are rejected.
+        let (ok, bad) = all_constraints_hold(&build_wires(3, 5, 17));
+        assert!(!ok, "false 3*5=17 should violate constraints, {bad} nonzero");
+        let (ok, bad) = all_constraints_hold(&build_wires(0, 0, (1 << 28) - 1));
+        assert!(!ok, "false 0*0=max_limb should violate constraints, {bad} nonzero");
     }
 }

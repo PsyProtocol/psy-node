@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn test_constant_nonnative() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn test_nonnative_addition() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn test_nonnative_subtraction() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             num_routed_wires: 80,
             num_constants: 2,
             use_base_arithmetic_gate: true,
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn test_nonnative_multiplication() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn test_nonnative_negation() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -755,7 +755,7 @@ mod tests {
     fn test_safe_inverse_with_zero() {
         // Test that inverse of zero returns zero (ark-r1cs-std behavior)
         let config = CircuitConfig {
-            num_wires: 400,
+            num_wires: 1198,
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn test_nonnative_inverse() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             num_routed_wires: 80,
             num_constants: 2,
             use_base_arithmetic_gate: true,
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn test_bool_to_nonnative() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn test_mul_by_bool() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn test_select_nonnative() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn test_conditional_neg() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -927,7 +927,7 @@ mod tests {
         use std::time::Instant;
 
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             ..CircuitConfig::wide_ecc_config()
         };
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn test_nonnative_large_field_operations() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             num_routed_wires: 80,
             num_constants: 2,
             use_base_arithmetic_gate: true,
@@ -1012,7 +1012,7 @@ mod tests {
     #[test]
     fn test_nonnative_edge_cases() {
         let config = CircuitConfig {
-            num_wires: 400, // Enough for NonnativeMulGate (334) and some margin
+            num_wires: 1198, // NonnativeMulGate requires 1198 wires
             num_routed_wires: 80,
             num_constants: 2,
             use_base_arithmetic_gate: true,

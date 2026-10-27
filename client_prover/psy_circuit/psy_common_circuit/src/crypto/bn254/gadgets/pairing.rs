@@ -357,30 +357,30 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderCurveG2<F, D> f
                 let c = &precomp.coeffs[idx];
                 idx += 1;
                 f = self.squared_nonnative_ext12(&f);
-                let _ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
-                let _ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
-                // f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
+                let ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
+                let ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
+                f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
 
                 if (j >> i) & 1 == 1 {
                     let c = &precomp.coeffs[idx];
                     idx += 1;
-                    let _ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
-                    let _ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
-                    // f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
+                    let ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
+                    let ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
+                    f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
                 }
             }
         }
 
         let c = &precomp.coeffs[idx];
         idx += 1;
-        let _ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
-        let _ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
-        // f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
+        let ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
+        let ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
+        f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
 
         let c = &precomp.coeffs[idx];
-        let _ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
-        let _ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
-        // f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
+        let ell_vw = self.scale_nonnative_ext2(&c.ell_vw, g1_y);
+        let ell_vv = self.scale_nonnative_ext2(&c.ell_vv, g1_x);
+        f = self.mul_by_024(&f, &c.ell_0, &ell_vw, &ell_vv);
 
         f
     }
@@ -732,5 +732,40 @@ mod tests {
         let res = data.verify(proof);
 
         res
+    }
+
+    // The real pairing of the G1/G2 generators is not one, so the false claim e(P,Q) == 1
+    // must not produce a verifying proof.
+    #[test]
+    fn pairing_of_real_points_rejects_false_one_claim() -> anyhow::Result<()> {
+        use plonky2::iop::witness::PartialWitness;
+
+        use crate::crypto::bn254::curve::G1;
+
+        let config = crate::crypto::bn254::pairing_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let p = G1AffineTarget::<F, D> {
+            x: builder.constant_nonnative(G1::GENERATOR_AFFINE.x),
+            y: builder.constant_nonnative(G1::GENERATOR_AFFINE.y),
+            is_infinity: builder._false(),
+            _phantom: PhantomData,
+        };
+        let q = builder.constant_affine_point_g2::<G2, Bn128Base>(G2::GENERATOR_AFFINE);
+
+        let x = builder.pairing::<Bn128Base, G1, G2>(&p, &q);
+        let one = builder.constant_nonnative_ext12(DodecicExtension::ONE);
+        builder.connect_nonnative_ext12(&one, &x);
+
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        match data.prove(pw) {
+            Ok(proof) => assert!(
+                data.verify(proof).is_err(),
+                "false claim e(P,Q) == 1 must not verify"
+            ),
+            Err(_) => {}
+        }
+        Ok(())
     }
 }
