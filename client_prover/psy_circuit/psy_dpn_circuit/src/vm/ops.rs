@@ -2216,4 +2216,81 @@ mod tests {
         assert_eq!(exec.resolve_target(tgt_ref(2)).to_canonical_u64(), expected[0], "witness quotient");
         assert_eq!(exec.resolve_target(tgt_ref(4)).to_canonical_u64(), expected[1], "witness remainder");
     }
+
+    // Layer-contract regression: `TargetAt` on an array/hash base must carry
+    // a compile-time constant index. The compiler only emits constant
+    // indices (`op_target_at`), but a hand-crafted on-chain definition used
+    // to pass validation with a dynamic index and then panic the circuit
+    // builder (`constant_targets.get(&index1).unwrap()`), killing every
+    // prover at circuit-construction time.
+    #[test]
+    fn dpn_target_at_dynamic_index_rejected_by_validate() {
+        use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
+        use psy_vm::dpn::vm::validate::validate_function_definition;
+
+        const X: u64 = 0x1234_5678_9abc_def7;
+
+        let tgt_ref = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::Target, i);
+        let arr_ref = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::TargetArray, i);
+
+        let defs = vec![
+            DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 0,
+                op_type: DPNOpType::InputTarget,
+                inputs: vec![0],
+            },
+            // Non-constant index: an ordinary circuit input.
+            DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 1,
+                op_type: DPNOpType::InputTarget,
+                inputs: vec![1],
+            },
+            DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::TargetArray,
+                index: 0,
+                op_type: DPNOpType::DivRem4,
+                inputs: vec![tgt_ref(0)],
+            },
+            DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 2,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![arr_ref(0), tgt_ref(1)],
+            },
+        ];
+        let defn = DPNFunctionCircuitDefinition {
+            name: "target_at_dynamic_index_repro".to_string(),
+            method_id: 0,
+            circuit_inputs: vec![tgt_ref(0), tgt_ref(1)],
+            circuit_outputs: vec![tgt_ref(2)],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: defs,
+            events: vec![],
+        };
+
+        // The validator must reject the dynamic index before any prover
+        // reaches circuit construction.
+        validate_function_definition(&defn)
+            .expect_err("validator must reject a dynamic TargetAt index");
+
+        // Constant-index TargetAt still validates; both layers agree.
+        let mut const_defs = defn.definitions.clone();
+        const_defs[1] = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 1,
+            op_type: DPNOpType::Constant,
+            inputs: vec![1],
+        };
+        let const_defn = DPNFunctionCircuitDefinition {
+            definitions: const_defs,
+            circuit_inputs: vec![tgt_ref(0)],
+            ..defn
+        };
+        validate_function_definition(&const_defn).expect("constant index must validate");
+        run_e2e_witness_and_circuit(&const_defn, &[X], &[X & 3]);
+    }
 }

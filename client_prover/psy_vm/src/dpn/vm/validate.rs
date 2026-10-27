@@ -16,7 +16,9 @@
 //! - operand ids decode to a lane/index that exists at that position
 //!   (children-before-parent) and the lane is acceptable for the slot
 //!   (boolean ops require the bool lane; scalar slots accept
-//!   Target/U32Target/Bool; `TargetAt`'s base requires an array lane);
+//!   Target/U32Target/Bool; `TargetAt`'s base requires an array lane and an
+//!   in-range compile-time constant index — the circuit builder resolves the
+//!   element at construction time and would panic on anything else);
 //! - raw input indices `< circuit_inputs.len()` and inputs-first ordering;
 //! - pool occupancy: `def.index` equals the per-lane counter (append-only
 //!   emission) and `def.data_type` matches the opcode's lane;
@@ -38,6 +40,7 @@ use psy_config::network_constants::MAX_EVENT_RECORDS_PER_CALL;
 use crate::dpn::ops::op_types::{
     decode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType,
 };
+use crate::dpn::ops::state_cmd::types::DPNStateCmdCore;
 use crate::dpn::vm::def::DPNFunctionCircuitDefinition;
 
 /// Goldilocks field order; `Constant` words must be canonical (`< ORDER`).
@@ -119,7 +122,7 @@ impl std::error::Error for ValidationError {}
 
 /// Per-lane occupancy counters, mirroring `PsyCompileResult`, plus the
 /// compile-time constant values seen so far (needed where a consumer
-/// requires a constant-0 index operand, e.g. `TargetAt` over a scalar).
+/// requires a compile-time constant index operand, e.g. `TargetAt`).
 #[derive(Default)]
 struct Pools {
     targets: usize,
@@ -131,6 +134,10 @@ struct Pools {
     bool_arrays: usize,
     u32_arrays: usize,
     constants: std::collections::HashMap<(DPNBuiltInDataType, usize), u64>,
+    /// Element count of every array/hash def, keyed like `constants`; the
+    /// circuit resolves `TargetAt` elements at construction time, so the
+    /// validator must bound constant indexes against these lengths.
+    array_lengths: std::collections::HashMap<(DPNBuiltInDataType, usize), u64>,
 }
 
 impl Pools {
@@ -172,11 +179,26 @@ impl Pools {
         self.constants.contains_key(&(lane, index))
     }
 
-    /// True when `id` references a compile-time constant def whose value is
-    /// `value` (used for the constant-0 index convention of `TargetAt`).
-    fn is_constant_value(&self, id: u64, value: u64) -> bool {
+    /// The value of the compile-time constant def `id` references, when `id`
+    /// is on the Target lane. The circuit's `constant_targets` table is
+    /// keyed by the numeric op index and only registers `Constant` defs
+    /// (Target lane); an index def on any other lane would validate here
+    /// but panic — or alias another lane's constant — at circuit build.
+    fn target_constant_value(&self, id: u64) -> Option<u64> {
         let (lane, index) = decode_indexed_op_id(id);
-        self.constants.get(&(lane, index)) == Some(&value)
+        if lane != DPNBuiltInDataType::Target {
+            return None;
+        }
+        self.constants.get(&(lane, index)).copied()
+    }
+
+    fn record_array_length(&mut self, lane: DPNBuiltInDataType, index: usize, length: u64) {
+        self.array_lengths.insert((lane, index), length);
+    }
+
+    /// Element count of the array/hash def at `lane`/`index`, if recorded.
+    fn array_length(&self, lane: DPNBuiltInDataType, index: usize) -> Option<u64> {
+        self.array_lengths.get(&(lane, index)).copied()
     }
 }
 
@@ -232,6 +254,31 @@ pub fn validate_function_definition(
             DPNOpType::ConstantTrue => pools.record_constant(lane, index, 1),
             DPNOpType::ConstantFalse => pools.record_constant(lane, index, 0),
             _ => {}
+        }
+        // Track array lengths so TargetAt can bound its constant index.
+        match def.op_type {
+            DPNOpType::SplitBits => {
+                pools.record_array_length(DPNBuiltInDataType::BoolArray, index, def.inputs[0])
+            }
+            DPNOpType::DivRem4 => {
+                pools.record_array_length(DPNBuiltInDataType::TargetArray, index, 2)
+            }
+            DPNOpType::Keccak256 => {
+                // 32-byte digest as eight big-endian u32 words.
+                pools.record_array_length(DPNBuiltInDataType::U32TargetArray, index, 8)
+            }
+            DPNOpType::GetStateCommandResultArray => {
+                let command = def.inputs[0] as usize;
+                pools.record_array_length(
+                    DPNBuiltInDataType::TargetArray,
+                    index,
+                    defn.state_commands[command].get_output_felt_size() as u64,
+                )
+            }
+            _ => {}
+        }
+        if def.data_type == DPNBuiltInDataType::HashOut {
+            pools.record_array_length(DPNBuiltInDataType::HashOut, index, 4);
         }
     }
 
@@ -500,15 +547,32 @@ fn validate_def(
             }
             let (base_lane, _) = decode_indexed_op_id(def.inputs[0]);
             if ARRAY_LANES.contains(&base_lane) {
-                // Array/hash base: dynamic index is fine.
+                // Array/hash base: the circuit builder resolves the element
+                // at compile time via `constant_targets`, so the index must
+                // be a compile-time constant def (the only shape the
+                // compiler emits) within the array bounds — an out-of-range
+                // constant would panic the builder like a dynamic index.
                 check(0, def.inputs[0], ARRAY_LANES)?;
                 check(1, def.inputs[1], SCALAR_LANES)?;
+                let (base_lane, base_index) = decode_indexed_op_id(def.inputs[0]);
+                let index_in_range = pools
+                    .target_constant_value(def.inputs[1])
+                    .zip(pools.array_length(base_lane, base_index))
+                    .is_some_and(|(idx, len)| idx < len);
+                if !index_in_range {
+                    return Err(ValidationError::BadOperand {
+                        def_index: i,
+                        op,
+                        slot: 1,
+                        id: def.inputs[1],
+                    });
+                }
             } else {
                 // Scalar base (ABI flattening): legal only with a
                 // compile-time constant-0 index — exactly what
                 // `resolve_target_array_ref` asserts at execution.
                 check(0, def.inputs[0], SCALAR_LANES)?;
-                if !pools.is_constant_value(def.inputs[1], 0) {
+                if pools.target_constant_value(def.inputs[1]) != Some(0) {
                     return Err(ValidationError::BadOperand {
                         def_index: i,
                         op,
@@ -784,6 +848,147 @@ mod tests {
         assert!(matches!(
             validate_function_definition(&p),
             Err(ValidationError::BadOutputId { .. })
+        ));
+    }
+
+    #[test]
+    fn target_at_constant_index_must_be_within_array_bounds() {
+        let arr_id = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::TargetArray, i);
+        // DivRem4 produces a two-element [quotient, remainder] array.
+        let program_with_index = |index_value: u64| {
+            with_defs(
+                valid_program(),
+                vec![
+                    def(DPNOpType::InputTarget, 0, vec![0]),
+                    def(DPNOpType::Constant, 1, vec![index_value]),
+                    def(DPNOpType::DivRem4, 0, vec![target_id(0)]),
+                    def(DPNOpType::TargetAt, 2, vec![arr_id(0), target_id(1)]),
+                ],
+            )
+        };
+        // In-range indexes pass.
+        assert_eq!(validate_function_definition(&program_with_index(0)), Ok(()));
+        assert_eq!(validate_function_definition(&program_with_index(1)), Ok(()));
+        // The smallest out-of-range constant is rejected before any executor
+        // touches the definition (the circuit builder would panic on it).
+        assert!(matches!(
+            validate_function_definition(&program_with_index(2)),
+            Err(ValidationError::BadOperand { def_index: 3, slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn target_at_index_must_be_a_target_lane_constant() {
+        // The circuit's `constant_targets` table only registers `Constant`
+        // defs (Target lane), keyed by numeric index and ignoring the lane.
+        // A ConstantU32 index would pass a lane-agnostic constant check but
+        // panic (or alias a Target-lane constant with the same index) at
+        // circuit construction.
+        let arr_id = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::TargetArray, i);
+        let u32_id = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::U32Target, i);
+        let p = with_defs(
+            valid_program(),
+            vec![
+                def(DPNOpType::InputTarget, 0, vec![0]),
+                def(DPNOpType::ConstantU32, 0, vec![1]),
+                def(DPNOpType::DivRem4, 0, vec![target_id(0)]),
+                def(DPNOpType::TargetAt, 1, vec![arr_id(0), u32_id(0)]),
+            ],
+        );
+        assert!(matches!(
+            validate_function_definition(&p),
+            Err(ValidationError::BadOperand { def_index: 3, slot: 1, .. })
+        ));
+
+        // Same hole on the scalar-base branch: only a Target-lane constant-0
+        // is legal there.
+        let p = with_defs(
+            valid_program(),
+            vec![
+                def(DPNOpType::InputTarget, 0, vec![0]),
+                def(DPNOpType::ConstantU32, 0, vec![0]),
+                def(DPNOpType::TargetAt, 1, vec![target_id(0), u32_id(0)]),
+            ],
+        );
+        assert!(matches!(
+            validate_function_definition(&p),
+            Err(ValidationError::BadOperand { def_index: 2, slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn target_at_constant_index_must_be_within_hash_bounds() {
+        // HashNoPad produces a four-element HashOut; index 4 is out of range
+        // and would panic the builder's `assert!(index < 4)`.
+        let p = with_defs(
+            valid_program(),
+            vec![
+                def(DPNOpType::InputTarget, 0, vec![0]),
+                def(DPNOpType::Constant, 1, vec![4]),
+                def(DPNOpType::HashNoPad, 0, vec![target_id(0)]),
+                def(
+                    DPNOpType::TargetAt,
+                    2,
+                    vec![encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0), target_id(1)],
+                ),
+            ],
+        );
+        assert!(matches!(
+            validate_function_definition(&p),
+            Err(ValidationError::BadOperand { def_index: 3, slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn target_at_index_bounds_track_split_bits_width() {
+        let bits_id = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::BoolArray, i);
+        let program_with_width = |num_bits: u64, index_value: u64| {
+            with_defs(
+                valid_program(),
+                vec![
+                    def(DPNOpType::InputTarget, 0, vec![0]),
+                    def(DPNOpType::Constant, 1, vec![index_value]),
+                    // Compiled layout: [num_bits (raw), value_id, num_bits_const_id].
+                    def(DPNOpType::SplitBits, 0, vec![num_bits, target_id(0), target_id(1)]),
+                    def(DPNOpType::TargetAt, 2, vec![bits_id(0), target_id(1)]),
+                ],
+            )
+        };
+        assert_eq!(validate_function_definition(&program_with_width(8, 7)), Ok(()));
+        assert!(matches!(
+            validate_function_definition(&program_with_width(8, 8)),
+            Err(ValidationError::BadOperand { def_index: 3, slot: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn target_at_index_bounds_track_state_command_result_length() {
+        use crate::dpn::ops::state_cmd::data::{
+            DPNStateCmd, DPNStateCmdGetSelfUserCurrentContractStateSlotRange,
+        };
+        let arr_id = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::TargetArray, i);
+        let mut p = with_defs(
+            valid_program(),
+            vec![
+                def(DPNOpType::InputTarget, 0, vec![0]),
+                def(DPNOpType::Constant, 1, vec![3]),
+                // SlotRange read with length 3; resolves at def index 2.
+                def(DPNOpType::GetStateCommandResultArray, 0, vec![0]),
+            ],
+        );
+        p.state_commands = vec![DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(
+            DPNStateCmdGetSelfUserCurrentContractStateSlotRange::new(target_id(0), 3),
+        )];
+        p.state_command_resolution_indices = vec![2];
+        p.circuit_outputs = vec![target_id(1)];
+        assert_eq!(validate_function_definition(&p), Ok(()));
+
+        // Index 3 is out of range for a length-3 result.
+        p.definitions.push(def(DPNOpType::TargetAt, 2, vec![arr_id(0), target_id(1)]));
+        p.circuit_outputs = vec![target_id(2)];
+        assert!(matches!(
+            validate_function_definition(&p),
+            Err(ValidationError::BadOperand { def_index: 3, slot: 1, .. })
         ));
     }
 }
