@@ -22,11 +22,11 @@ class InstallEnvioTests(unittest.TestCase):
         self.package.mkdir()
         self.address = str(ipaddress.IPv4Address(0xAC100102))
         self.placement = {"postgres_host": self.address, "postgres_port": 5432, "postgres_user": installer.DATABASE,
-                          "hasura_bind": self.address, "hasura_port": 28080, "indexer_port": 19898}
+                          "hasura_bind": self.address, "hasura_port": 38081, "indexer_port": 29899}
         self.runtime = {"ENVIO_PG_HOST": self.address, "ENVIO_PG_PORT": "5432", "ENVIO_PG_USER": installer.DATABASE,
                         "ENVIO_PG_DATABASE": installer.DATABASE, "ENVIO_PG_PUBLIC_SCHEMA": "envio",
-                        "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "true", "ENVIO_INDEXER_PORT": "19898",
-                        "TUI_OFF": "true", "HASURA_GRAPHQL_ENDPOINT": f"http://{self.address}:28080/v1/metadata",
+                        "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "true", "ENVIO_INDEXER_PORT": "29899",
+                        "TUI_OFF": "true", "HASURA_GRAPHQL_ENDPOINT": f"http://{self.address}:38081/v1/metadata",
                         "ENVIO_RPC_POLLING_INTERVAL_MILLIS": "12000", "PSY_ENVIO_FRESH_REORG_PARENT": "1",
                         "PSY_ENVIO_ORDERED_FAILOVER": "0"}
         self.write(self.package / "runtime-env.json", self.runtime)

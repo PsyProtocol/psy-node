@@ -30,9 +30,12 @@ PATCHES = {
     "deposit-indexes.py": "c2fcf5d23d3568706f2fc5b263b92dc52821dba96e30effbb232cf723d634711",
 }
 CHAINS = {"sepolia": (0, 11155111, 8), "bscTestnet": (1, 97, 200), "baseSepolia": (2, 84532, 64)}
-DATABASE = "envio_bridge_fresh_20261026"
-PROJECT = "psy-envio-fresh-20261026"
-RELEASE = "/opt/psy-envio/releases/core-testnet-20261026"
+DATABASE = "envio_bridge_fresh_20261027_r3"
+PROJECT = "psy-envio-fresh-20261027-r3"
+RELEASE = "/opt/psy-envio/releases/core-testnet-20261027-r3"
+L1_DOCUMENT_ROOT = "psy-fresh20261027r3b"
+RPC_URLS = {name: f"http://10.148.0.32:{port}" for name, port in
+            zip(CHAINS, (18545, 18645, 18945))}
 
 
 def require(value, message):
@@ -103,8 +106,8 @@ def validate_placement(value):
     for key in ("postgres_port", "hasura_port", "indexer_port"):
         port(value[key])
     require(len({value[key] for key in ("postgres_port", "hasura_port", "indexer_port")}) == 3
-            and value["hasura_port"] not in (8080, 18080, 9898)
-            and value["indexer_port"] not in (8080, 18080, 9898), "new distinct ports required")
+            and value["hasura_port"] == 38081
+            and value["indexer_port"] == 29899, "fresh r3 ports required")
     require(isinstance(value["postgres_user"], str)
             and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value["postgres_user"])
             and value["postgres_user"] != "postgres", "dedicated database role required")
@@ -115,7 +118,7 @@ def validate_routes(routes):
     for name, route in routes.items():
         require(set(route) == {"urls", "confirmed_block_threshold"}, "RPC route fields mismatch")
         urls = route["urls"]
-        require(isinstance(urls, list) and 1 <= len(urls) <= 3 and len(set(urls)) == len(urls), "invalid RPC list")
+        require(urls == [RPC_URLS[name]], "only the protected Alchemy forward is allowed; no node fallback")
         for url in urls:
             require(isinstance(url, str) and not any(c.isspace() for c in url), "invalid RPC URL")
             parsed = urlsplit(url)
@@ -131,9 +134,17 @@ def validate_routes(routes):
 def l1_files(documents):
     require(set(documents) == set(CHAINS), "three complete real L1 document sets required")
     files, networks = {}, []
+    roots = set()
     for name, (index, chain_id, _) in CHAINS.items():
         row = documents[name]
         require(set(row) == {"summary", "bridge_receipt", "state_manager_receipt"}, "L1 document fields mismatch")
+        for descriptor in row.values():
+            path = Path(descriptor["path"])
+            require(path.parent.name == name and path.parent.parent.name == "deployments"
+                    and path.parent.parent.parent.name == L1_DOCUMENT_ROOT,
+                    "final r3b deployment documents required; partial/old cohort rejected")
+            roots.add(path.parent.parent.parent)
+        require(len(roots) == 1, "mixed deployment document roots rejected")
         raw = {key: artifact(value) for key, value in row.items()}
         summary = json.loads(raw["summary"])
         chain = summary["protocol"]["chain"]
@@ -163,7 +174,18 @@ def l1_files(documents):
             contracts.append({"name": contract, "address": [address]})
         require(contracts[0]["address"] != contracts[1]["address"], "distinct proxy addresses required")
         networks.append({"id": chain_id, "start_block": min(blocks), "contracts": contracts})
-        files.update({f"l1/{name}/{key}.json": value for key, value in raw.items()})
+        # Publish only verified public fields, never arbitrary deployment output.
+        public_summary = {key: summary[key] for key in ("network", "chainId", "deploymentBlock")}
+        public_summary.update({"protocol": {"chain": {"l1ChainId": chain_id, "l1ChainIndex": index}},
+                               "core": {key: summary["core"][key] for key in ("Bridge", "StateManager")}})
+        files[f"l1/{name}/summary.json"] = encode(public_summary)
+        for key in ("bridge_receipt", "state_manager_receipt"):
+            receipt = json.loads(raw[key])
+            files[f"l1/{name}/{key}.json"] = encode({
+                "address": receipt["address"], "transactionHash": receipt["transactionHash"],
+                "receipt": {field: receipt["receipt"][field] for field in
+                            ("status", "blockNumber", "contractAddress", "to", "transactionHash")}})
+        files[f"l1/{name}/source-hashes.json"] = encode({key: digest(value) for key, value in raw.items()})
     return files, networks
 
 
@@ -240,6 +262,7 @@ def build_files(spec, repo):
         files.update(documents)
         files["config.yaml"] = config_bytes(files["config.template.yaml"], networks, spec["rpc_routes"])
     report = {"source_commit": SOURCE, "source_files": source_hashes, "database": DATABASE,
+              "l1_document_cohort": L1_DOCUMENT_ROOT, "rpc_policy": "protected-alchemy-only-no-fallback",
               "compose_project": PROJECT, "release_path": RELEASE, "unit_name": PROJECT + ".service",
               "l1_documents_pending": not bool(spec["l1_documents"]),
               "placement_pending": spec["placement"] is None, "rpc_routes_pending": not bool(spec["rpc_routes"]),

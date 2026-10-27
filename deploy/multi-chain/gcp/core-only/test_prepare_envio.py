@@ -54,9 +54,9 @@ class PrepareEnvioTests(unittest.TestCase):
         address = str(ipaddress.IPv4Address(0xAC100102))
         self.spec["placement"] = {"postgres_host": address, "postgres_port": 5432,
                                   "postgres_user": "envio_fresh", "hasura_bind": address,
-                                  "hasura_port": 28080, "indexer_port": 19898}
+                                  "hasura_port": 38081, "indexer_port": 29899}
         for name, (index, chain_id, depth) in envio.CHAINS.items():
-            self.spec["rpc_routes"][name] = {"urls": [f"http://{address}:{12000 + index}"],
+            self.spec["rpc_routes"][name] = {"urls": [envio.RPC_URLS[name]],
                                              "confirmed_block_threshold": depth}
             bridge, manager = "0x" + "1" * 40, "0x" + "2" * 40
             summary = {"network": name, "chainId": chain_id, "deploymentBlock": 120,
@@ -64,12 +64,13 @@ class PrepareEnvioTests(unittest.TestCase):
                        "core": {"Bridge": bridge, "StateManager": manager},
                        "contracts": {"Bridge": bridge, "StateManager": manager},
                        "proxies": {"Bridge_Proxy": bridge, "StateManager_Proxy": manager}}
-            docs = {"summary": self.artifact(name + "/summary", envio.encode(summary))}
+            directory = envio.L1_DOCUMENT_ROOT + "/deployments/" + name + "/"
+            docs = {"summary": self.artifact(directory + "summary", envio.encode(summary))}
             for key, value, block in (("bridge_receipt", bridge, 120), ("state_manager_receipt", manager, 100)):
                 receipt = {"address": value, "transactionHash": "0x" + "a" * 64,
                            "receipt": {"status": 1, "blockNumber": block, "contractAddress": value, "to": None,
                                                          "transactionHash": "0x" + "a" * 64}}
-                docs[key] = self.artifact(name + "/" + key, envio.encode(receipt))
+                docs[key] = self.artifact(directory + key, envio.encode(receipt))
             self.spec["l1_documents"][name] = docs
         lock = {"lockfileVersion": "9.0", "importers": {".": {
             kind: {key: {"specifier": value, "version": value} for key, value in values.items()}
@@ -117,17 +118,19 @@ class PrepareEnvioTests(unittest.TestCase):
         self.assertEqual(runtime["ENVIO_PG_DATABASE"], envio.DATABASE)
         self.assertEqual(runtime["ENVIO_RPC_POLLING_INTERVAL_MILLIS"], "12000")
         self.assertEqual(runtime["HASURA_GRAPHQL_ENDPOINT"],
-                         f'http://{self.spec["placement"]["hasura_bind"]}:28080/v1/metadata')
+                         f'http://{self.spec["placement"]["hasura_bind"]}:38081/v1/metadata')
 
-    def test_ordered_fallback_preserves_supplied_order(self):
+    def test_own_node_or_additional_fallback_is_rejected(self):
         self.complete()
         route = self.spec["rpc_routes"]["sepolia"]
-        route["urls"].append(route["urls"][0] + "/fallback")
         files, _ = self.build()
-        rpc = yaml.safe_load(files["config.yaml"])["networks"][0]["rpc"]
-        self.assertEqual([r["url"] for r in rpc], route["urls"])
-        self.assertEqual([r["for"] for r in rpc], ["sync", "fallback"])
-        self.assertEqual(json.loads(files["runtime-env.json"])["PSY_ENVIO_ORDERED_FAILOVER"], "1")
+        self.assertEqual(json.loads(files["runtime-env.json"])["PSY_ENVIO_ORDERED_FAILOVER"], "0")
+        route["urls"].append(route["urls"][0] + "/fallback")
+        with self.assertRaisesRegex(ValueError, "protected Alchemy"):
+            self.build()
+        route["urls"] = ["http://10.148.0.33:8545"]
+        with self.assertRaisesRegex(ValueError, "protected Alchemy"):
+            self.build()
 
     def test_incomplete_or_failed_or_wrong_chain_documents_rejected(self):
         self.complete()
@@ -147,7 +150,8 @@ class PrepareEnvioTests(unittest.TestCase):
                         value["address"] = "0x" + "3" * 40
                     else:
                         value["receipt"]["status" if kind == "failed" else "blockNumber"] = 0
-                    docs[key] = self.artifact(kind + ".json", envio.encode(value))
+                    directory = str(Path(docs[key]["path"]).parent.relative_to(self.root))
+                    docs[key] = self.artifact(directory + "/" + kind + ".json", envio.encode(value))
                 with self.assertRaises(ValueError):
                     self.build()
 
@@ -184,7 +188,8 @@ class PrepareEnvioTests(unittest.TestCase):
                 value["transactionHash"] = "0x" + "b" * 64
             else:
                 value["receipt"]["contractAddress"] = "0x" + "3" * 40
-            docs[key] = self.artifact(kind + ".json", envio.encode(value))
+            directory = str(Path(docs[key]["path"]).parent.relative_to(self.root))
+            docs[key] = self.artifact(directory + "/" + kind + ".json", envio.encode(value))
             with self.subTest(kind=kind), self.assertRaises((ValueError, KeyError)):
                 self.build()
 
@@ -205,6 +210,26 @@ class PrepareEnvioTests(unittest.TestCase):
         self.spec["patches"]["history.py"] = self.artifact("changed.py", b"different patch")
         with self.assertRaises(ValueError):
             self.build()
+
+    def test_old_or_mixed_document_roots_are_rejected(self):
+        self.complete()
+        docs = self.spec["l1_documents"]["sepolia"]
+        raw = Path(docs["summary"]["path"]).read_bytes()
+        for directory in ("psy-fresh20261027r3", "other/" + envio.L1_DOCUMENT_ROOT):
+            docs["summary"] = self.artifact(directory + "/deployments/sepolia/summary", raw)
+            with self.assertRaisesRegex(ValueError, "cohort rejected|mixed deployment"):
+                self.build()
+
+    def test_package_does_not_copy_extra_document_fields_or_source_paths(self):
+        self.complete()
+        descriptor = self.spec["l1_documents"]["sepolia"]["summary"]
+        value = json.loads(Path(descriptor["path"]).read_bytes())
+        value["private_environment"] = "must-not-be-exported"
+        descriptor.update(self.artifact(str(Path(descriptor["path"]).relative_to(self.root)), envio.encode(value)))
+        files, _ = self.build()
+        public = b"".join(files.values())
+        self.assertNotIn(b"must-not-be-exported", public)
+        self.assertNotIn(str(self.root).encode(), public)
 
     def test_lock_importer_must_match_current_source(self):
         self.complete()

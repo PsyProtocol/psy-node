@@ -17,11 +17,11 @@ from urllib.parse import quote
 
 SOURCE = "da6391549e44d49c07e856eaeb5d0b8d7902ef17"
 NODE_HASH = "94efd062ed066c1a0b332e18249859c905e920eeada5df55d24c99b919629a90"
-DATABASE = "envio_bridge_fresh_20261026"
-PROJECT = "psy-envio-fresh-20261026"
-RELEASE = Path("/opt/psy-envio/releases/core-testnet-20261026")
-STATE = Path("/var/lib/psy-envio/core-testnet-20261026")
-CONFIG = Path("/etc/psy-envio/core-testnet-20261026")
+DATABASE = "envio_bridge_fresh_20261027_r3"
+PROJECT = "psy-envio-fresh-20261027-r3"
+RELEASE = Path("/opt/psy-envio/releases/core-testnet-20261027-r3")
+STATE = Path("/var/lib/psy-envio/core-testnet-20261027-r3")
+CONFIG = Path("/etc/psy-envio/core-testnet-20261027-r3")
 UNIT = Path("/etc/systemd/system") / (PROJECT + ".service")
 USER = "psy-envio-fresh"
 
@@ -113,7 +113,7 @@ def load_plan(spec_path, spec_hash):
             and service["restart"] == "no" and service["image"] == "hasura/graphql-engine:v2.43.0", "Hasura isolation mismatch")
     require(runtime["HASURA_GRAPHQL_ENDPOINT"] == f'http://{spec["address"]}:{hasura_port}/v1/metadata'
             and len({hasura_port, indexer_port, int(runtime["ENVIO_PG_PORT"])}) == 3
-            and all(1024 <= p <= 65535 and p not in (8080, 18080, 9898) for p in (hasura_port, indexer_port)), "port identity mismatch")
+            and (hasura_port, indexer_port) == (38081, 29899), "port identity mismatch")
     database_url = (f'postgresql://{DATABASE}:'
                     '${ENVIO_POSTGRES_PASSWORD_ENCODED:?URL-encoded private password required}'
                     f'@{spec["address"]}:{runtime["ENVIO_PG_PORT"]}/{DATABASE}')
