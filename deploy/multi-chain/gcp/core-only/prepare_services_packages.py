@@ -57,7 +57,7 @@ def service_config(topology, documents):
     }
 
 
-def unit(topology, group, role):
+def unit(topology, group, role, bootstrap_realms=False):
     release = topology["release"]
     if role == "services":
         command = (f"{release}/psy-services --config {release}/services.json --network-type psy-public-testnet "
@@ -67,16 +67,24 @@ def unit(topology, group, role):
     else:
         item = topology["indexers"][role]
         sources = f"--committed-realm-sources {release}/{role}.json " if role.startswith("realm") else ""
+        # This override precedes retained cursors; remove it after first cursor creation.
+        start = "--start-checkpoint 0 " if bootstrap_realms and role.startswith("realm") else ""
         command = (f"{release}/psy-indexer {sources}--edge-url {item['edge_url']} "
                    f"--psy-services-url {topology['services_url']} --backup-dir {topology['backup_dir']} "
-                   f"--network-type psy-public-testnet {item['args']}")
+                   f"--network-type psy-public-testnet {start}{item['args']}")
         writable = f"ReadWritePaths={topology['backup_dir']}/indexer_state\n"
     credentials = topology["credentials"] + ("/services.env" if role == "services" else "/indexer.env")
+    restart = "no" if bootstrap_realms and role.startswith("realm") else "on-failure"
+    cursor_guard = ""
+    if bootstrap_realms and role.startswith("realm"):
+        cursor = f"{topology['backup_dir']}/indexer_state/realm_{role[-1]}_1.json"
+        cursor_guard = f"ExecStartPre=+/usr/bin/test ! -e {cursor}\nExecStartPre=+/usr/bin/test ! -L {cursor}\n"
     return (f"[Unit]\nDescription=Fresh R3 {role}\nWants=network-online.target\nAfter=network-online.target\n\n"
             f"[Service]\nType=simple\nUser={group['user']}\nGroup={group['user']}\nWorkingDirectory={release}\n"
             f"EnvironmentFile={credentials}\nEnvironment=PSY_NETWORK_TYPE=psy-public-testnet\nEnvironment=RUST_LOG=info\n"
+            f"{cursor_guard}"
             f"ExecStartPre=/usr/bin/python3 -I -B {release}/install_services.py guard --package {release} --role {role}\n"
-            f"ExecStart={command}\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\nPrivateTmp=true\n"
+            f"ExecStart={command}\nRestart={restart}\nRestartSec=10\nNoNewPrivileges=true\nPrivateTmp=true\n"
             f"ProtectSystem=strict\nProtectHome=true\nUMask=0027\nLimitNOFILE=65536\n{writable}\n"
             "[Install]\nWantedBy=multi-user.target\n").encode()
 
@@ -123,7 +131,7 @@ def prepare(args):
                 if name == "genesis.json.zst" or name.startswith(("genesis_abi/", "migrations/")):
                     files[name] = (args.inputs / name).read_bytes()
         for role in placement["roles"]:
-            files["units/" + installer.unit_name(role)] = unit(topology, placement, role)
+            files["units/" + installer.unit_name(role)] = unit(topology, placement, role, args.bootstrap_realms)
             if role.startswith("realm"):
                 files[role + ".json"] = encode(inputs.realm_sources(int(role[-1])))
         files.update(documents)
@@ -152,4 +160,6 @@ if __name__ == "__main__":
     parser.add_argument("--envio-spec", type=Path)
     parser.add_argument("--envio-spec-sha256")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--bootstrap-realms", action="store_true",
+                        help="Temporary realm start at checkpoint 1; remove after cursor creation before normal operation")
     print(json.dumps(prepare(parser.parse_args()), sort_keys=True))

@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -61,6 +62,27 @@ class ServicesPackageTests(unittest.TestCase):
         self.assertEqual(str(indexer_backup_mirror.BACKUPS), installer.BACKUPS)
         self.assertEqual(str(indexer_backup_mirror.STATE), "/var/lib/psy-indexer-r3-mirror")
         self.assertEqual(str(indexer_backup_mirror.PROGRAM), "/usr/local/libexec/psy-indexer-r3-mirror.py")
+
+    def test_bootstrap_start_is_explicit_temporary_and_realm_only(self):
+        topology = packages.deployment_topology()
+        for group in topology["groups"].values():
+            for role in group["roles"]:
+                regular = packages.unit(topology, group, role).decode()
+                bootstrap = packages.unit(topology, group, role, bootstrap_realms=True).decode()
+                self.assertNotIn("--start-checkpoint", regular)
+                if role.startswith("realm"):
+                    command = next(line[10:] for line in bootstrap.splitlines() if line.startswith("ExecStart="))
+                    argv = shlex.split(command)
+                    pos = argv.index("--start-checkpoint")
+                    self.assertEqual(argv[pos:pos + 3], ["--start-checkpoint", "0", "realm"])
+                    self.assertIn("\nRestart=no\n", bootstrap)
+                    cursor = f"{topology['backup_dir']}/indexer_state/realm_{role[-1]}_1.json"
+                    guards = f"ExecStartPre=+/usr/bin/test ! -e {cursor}\nExecStartPre=+/usr/bin/test ! -L {cursor}\n"
+                    self.assertIn(guards, bootstrap)
+                    self.assertEqual(bootstrap.replace(guards, "").replace("--start-checkpoint 0 ", "").replace(
+                        "\nRestart=no\n", "\nRestart=on-failure\n"), regular)
+                else:
+                    self.assertEqual(bootstrap, regular)
 
     def test_activation_waits_for_executor_without_restarting(self):
         values = [{"ActiveState": "active", "MainPID": "20"}] * 2
