@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage/check/apply only R3 Faucet routing and retained private maintenance.
+"""Stage/check/apply R3 routing fences with separate Faucet/private approvals.
 
 Adapt-only inspect is read-only. Staging writes only a NEW private directory.
 Check provisions Caddy validation, but never reloads or writes either source.
@@ -22,6 +22,7 @@ SOURCE = Path('/opt/nostr-relay/Caddyfile')
 FAUCETS = ('faucet-stg.psy-protocol.xyz', 'faucet.psy-protocol.xyz')
 PRIVATE_HOST = 'services-stg.psy-protocol.xyz'
 PRIVATE_PATHS = ['/api/v1/wallet/private-claimable', '/api/v1/wallet/private-claimable/*']
+PRIVATE_OPEN_SOURCE_SHA256 = '5138e1c3e41c20d72ad1790727cc13218d0e695c4f80ecec790904ed3420557d'
 OLD, NEW = '10.148.0.31:29998', '10.148.0.32:29998'
 BODY = 'Testnet maintenance. Please retry shortly.\n'
 HEADERS = {'Content-Type': ['text/plain; charset=utf-8'], 'Retry-After': ['60']}
@@ -158,7 +159,9 @@ def wrap_text(body, private, host):
 
 
 def render(raw, current, phase):
-    require(phase in ('prepare', 'open'))
+    require(phase in ('prepare', 'open', 'private-open'))
+    if phase == 'private-open':
+        require(sha(raw) == PRIVATE_OPEN_SOURCE_SHA256)
     text = raw.decode()
     baseline = normalized(adapt(raw))
     expected = copy.deepcopy(baseline)
@@ -181,6 +184,24 @@ def render(raw, current, phase):
             route['handle'] = subroute([{'handle': subroute([
                 nested_gate(host == PRIVATE_HOST, host), {'handle': route['handle']}])}])
             text = text[:start] + wrap_text(body, host == PRIVATE_HOST, host).rstrip('\n') + text[end:]
+    elif phase == 'private-open':
+        require(baseline == normalized(current))
+        route = site(expected, PRIVATE_HOST)
+        inner = route['handle'][0]['routes'][0]['handle'][0]['routes']
+        require(len(inner) == 2 and inner[0] == nested_gate(True) and set(inner[1]) == {'handle'})
+        require(route['handle'] == subroute([{'handle': subroute(inner)}]))
+        route['handle'] = inner[1]['handle']
+        start, end, body = block(text, PRIVATE_HOST)
+        marker = '    # BEGIN psy-r3-fence\n'
+        require(body.count(marker) == 1)
+        cut = body.index(marker)
+        prefix = marker + '    route {\n' + gate_text(True) + '        handle {\n'
+        suffix = '        }\n    }\n    # END psy-r3-fence\n'
+        wrapped = body[cut:]
+        require(wrapped.startswith(prefix) and wrapped.endswith(suffix))
+        restored = body[:cut] + wrapped[len(prefix):-len(suffix)]
+        require(wrap_text(restored, True, PRIVATE_HOST) == body)
+        text = text[:start] + restored.rstrip('\n') + text[end:]
     else:
         require(baseline == normalized(current))
         # Check the private fence exactly; it is never removed or generalized.
@@ -271,25 +292,39 @@ def sync_directory(path):
         os.close(fd)
 
 
+def validate_gate(evidence, phase, source):
+    require(phase in ('open', 'private-open'))
+    gate = json.loads(evidence)
+    require(gate['approved_by_main'] is True and gate['prepared_caddyfile_sha256'] == sha(source))
+    if phase == 'private-open':
+        require(sha(source) == PRIVATE_OPEN_SOURCE_SHA256
+                and gate['action'] == 'open-r3-private-claimable'
+                and set(gate) == {'action', 'approved_by_main', 'prepared_caddyfile_sha256',
+                                  'ingestion_evidence_sha256', 'claim_evidence_sha256'})
+        fields = ('ingestion_evidence_sha256', 'claim_evidence_sha256')
+    else:
+        require(gate['action'] == 'open-r3-faucet')
+        fields = ('grant_evidence_sha256',)
+    require(all(type(gate[field]) is str and re.fullmatch('[0-9a-f]{64}', gate[field]) for field in fields))
+
+
 def stage(args):
     before, raw, mounted, current = snapshot()
     candidate, config = render(raw, current, args.phase)
     evidence = b'null'
-    if args.phase == 'open':
+    if args.phase in ('open', 'private-open'):
         require(args.gate_evidence is not None and args.gate_evidence_sha256 is not None)
         trusted(args.gate_evidence)
         evidence = args.gate_evidence.read_bytes()
         require(sha(evidence) == args.gate_evidence_sha256)
-        gate = json.loads(evidence)
-        require(gate['approved_by_main'] is True and gate['action'] == 'open-r3-faucet'
-                and gate['prepared_caddyfile_sha256'] == sha(raw)
-                and re.fullmatch('[0-9a-f]{64}', gate['grant_evidence_sha256']))
+        validate_gate(evidence, args.phase, raw)
     else:
         require(args.gate_evidence is None and args.gate_evidence_sha256 is None)
     require(snapshot() == (before, raw, mounted, current))
     files = dict(zip(FILES, (raw, mounted, encoded(current), candidate, encoded(config), evidence)))
     report = dict(before, phase=args.phase, files={n: sha(b) for n, b in files.items()}, applied=False,
-                  native_adapt_verified=True, native_validate_verified=False, private_fence_retained=True)
+                  native_adapt_verified=True, native_validate_verified=False,
+                  private_fence_retained=args.phase != 'private-open')
     if args.output:
         trusted(args.output.parent, directory=True)
         args.output.mkdir(mode=0o700)
@@ -354,16 +389,15 @@ def execute(args):
     require(sha(files['report.json']) == args.report_sha256)
     report = json.loads(files['report.json'])
     require(report['files'] == {n: sha(files[n]) for n in FILES})
-    require(report['phase'] in ('prepare', 'open') and report['applied'] is False)
+    require(report['phase'] in ('prepare', 'open', 'private-open') and report['applied'] is False)
     require(not args.apply or report['phase'] != 'open' or args.open_confirmed)
+    require(not args.apply or report['phase'] != 'private-open' or getattr(args, 'private_open_confirmed', False))
+    require(report['private_fence_retained'] is (report['phase'] != 'private-open'))
     old, new = json.loads(files['original.json']), json.loads(files['candidate.json'])
     source, mounted, candidate = files['original.Caddyfile'], files['original-bind.Caddyfile'], files['candidate.Caddyfile']
     require(render(source, old, report['phase']) == (candidate, new))
-    if report['phase'] == 'open':
-        gate = json.loads(files['gate-evidence.json'])
-        require(gate['approved_by_main'] is True and gate['action'] == 'open-r3-faucet'
-                and gate['prepared_caddyfile_sha256'] == sha(source)
-                and re.fullmatch('[0-9a-f]{64}', gate['grant_evidence_sha256']))
+    if report['phase'] in ('open', 'private-open'):
+        validate_gate(files['gate-evidence.json'], report['phase'], source)
     check_snapshot(report, source, mounted, old)
     caddy('validate', candidate)
     check_snapshot(report, source, mounted, old)
@@ -421,7 +455,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     p = commands.add_parser('stage')
-    p.add_argument('--phase', choices=('prepare', 'open'), required=True)
+    p.add_argument('--phase', choices=('prepare', 'open', 'private-open'), required=True)
     p.add_argument('--output', type=Path, help='Omit for read-only adapt/inspect; never applies')
     p.add_argument('--gate-evidence', type=Path)
     p.add_argument('--gate-evidence-sha256')
@@ -430,6 +464,7 @@ def main():
     p.add_argument('--report-sha256', required=True)
     p.add_argument('--apply', action='store_true')
     p.add_argument('--open-confirmed', action='store_true')
+    p.add_argument('--private-open-confirmed', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)
     try:

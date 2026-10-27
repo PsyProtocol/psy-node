@@ -15,7 +15,8 @@ WRITABLE_BIND = c.writable_bind
 
 def fixture():
     text, routes = '', []
-    for host in (*c.FAUCETS, c.PRIVATE_HOST, 'nostr.psy-protocol.xyz', 'rpc-eth-stg.psy-protocol.xyz'):
+    for host in (*c.FAUCETS, c.PRIVATE_HOST, 'services.psy-protocol.xyz',
+                 'nostr.psy-protocol.xyz', 'rpc-eth-stg.psy-protocol.xyz'):
         upstream = c.OLD if host in c.FAUCETS else '10.148.0.38:3001'
         prefix = '    log {\n        output stderr\n    }\n    @not_private_claimable not path /private\n' if host == c.PRIVATE_HOST else ''
         text += host + ' {\n' + prefix + '    reverse_proxy ' + upstream + ' {\n    }\n}\n\n'
@@ -113,6 +114,67 @@ class RenderTests(unittest.TestCase):
         b[1]['group'] = 'group9'
         self.assertNotEqual(c.normalized(a), c.normalized(b))
         self.assertNotEqual(c.normalized({'@id': 'keep-me'}), c.normalized({}))
+
+    def private_source(self):
+        prepared_raw, _ = self.prepare()
+        with patch.object(c, 'adapt', side_effect=[self.prepared, self.opened]):
+            opened_raw, _ = c.render(prepared_raw, self.prepared, 'open')
+        expected = copy.deepcopy(self.opened)
+        c.site(expected, c.PRIVATE_HOST)['handle'] = c.site(self.base, c.PRIVATE_HOST)['handle']
+        return opened_raw, expected
+
+    def test_private_open_restores_exact_service_body_and_preserves_everything_else(self):
+        raw, expected = self.private_source()
+        with patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(raw)), \
+                patch.object(c, 'adapt', side_effect=[self.opened, expected]):
+            candidate, config = c.render(raw, self.opened, 'private-open')
+        self.assertEqual(candidate, self.raw.replace(c.OLD.encode(), c.NEW.encode()))
+        self.assertEqual(c.block(candidate.decode(), c.PRIVATE_HOST)[2], c.block(self.raw.decode(), c.PRIVATE_HOST)[2])
+        for route in c.routes(self.opened):
+            host = route['match'][0]['host'][0]
+            if host != c.PRIVATE_HOST:
+                self.assertEqual(c.site(config, host), route)
+                self.assertEqual(c.block(candidate.decode(), host)[2], c.block(raw.decode(), host)[2])
+        self.assertEqual(config['logging'], self.opened['logging'])
+        self.assertNotIn(b'psy-r3-fence', candidate)
+
+    def test_private_open_rejects_unreviewed_source_before_adapt(self):
+        raw, _ = self.private_source()
+        with patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(raw)), patch.object(c, 'adapt') as adapt:
+            with self.assertRaises(ValueError):
+                c.render(raw + b'\n', self.opened, 'private-open')
+            adapt.assert_not_called()
+
+    def test_private_open_rejects_matcher_drift_missing_gate_and_runtime_drift(self):
+        raw, _ = self.private_source()
+        for kind in ('path', 'status', 'missing', 'runtime'):
+            bad = copy.deepcopy(self.opened)
+            inner = c.site(bad, c.PRIVATE_HOST)['handle'][0]['routes'][0]['handle'][0]['routes']
+            if kind == 'path':
+                inner[0]['match'][0]['path'] = ['/api/*']
+            elif kind == 'status':
+                inner[0]['handle'][0]['routes'][0]['handle'][1]['status_code'] = 200
+            elif kind == 'missing':
+                inner.pop(0)
+            else:
+                bad['logging'] = {}
+            with self.subTest(kind=kind), patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(raw)), \
+                    patch.object(c, 'adapt', return_value=self.opened if kind == 'runtime' else bad):
+                with self.assertRaises(ValueError):
+                    c.render(raw, bad, 'private-open')
+
+    def test_private_open_rejects_candidate_faucet_alias_nostr_or_logging_changes(self):
+        raw, expected = self.private_source()
+        for host in (*c.FAUCETS, 'services.psy-protocol.xyz', 'nostr.psy-protocol.xyz', 'rpc-eth-stg.psy-protocol.xyz', None):
+            bad = copy.deepcopy(expected)
+            if host:
+                c.site(bad, host)['terminal'] = False
+            else:
+                bad['logging'] = {}
+            with self.subTest(host=host), patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(raw)), \
+                    patch.object(c, 'adapt', side_effect=[self.opened, bad]):
+                with self.assertRaises(ValueError):
+                    c.render(raw, self.opened, 'private-open')
 
 
 class TransactionTests(unittest.TestCase):
@@ -234,6 +296,67 @@ class TransactionTests(unittest.TestCase):
     def test_stage_is_create_only(self):
         with self.assertRaises(FileExistsError):
             c.stage(self.stage_args)
+
+    def private_approval(self):
+        return {'action': 'open-r3-private-claimable', 'approved_by_main': True,
+                'prepared_caddyfile_sha256': c.sha(b'source'),
+                'ingestion_evidence_sha256': 'b' * 64, 'claim_evidence_sha256': 'c' * 64}
+
+    def stage_private(self, approval):
+        evidence = self.root / 'private-approval.json'
+        evidence.write_bytes(c.encoded(approval))
+        self.stage_args.phase = 'private-open'
+        self.stage_args.output = self.root / 'private-stage'
+        self.stage_args.gate_evidence = evidence
+        self.stage_args.gate_evidence_sha256 = c.sha(evidence.read_bytes())
+        return c.stage(self.stage_args)
+
+    def test_private_stage_requires_claim_and_ingestion_not_faucet_grant(self):
+        invalid = []
+        good = self.private_approval()
+        for key, value in (('approved_by_main', False), ('action', 'open-r3-faucet'),
+                           ('prepared_caddyfile_sha256', 'd' * 64), ('ingestion_evidence_sha256', 'bad'),
+                           ('claim_evidence_sha256', 'c' * 64 + '\n'), ('claim_evidence_sha256', True)):
+            invalid.append(dict(good, **{key: value}))
+        for key in ('ingestion_evidence_sha256', 'claim_evidence_sha256'):
+            missing = dict(good)
+            del missing[key]
+            missing['grant_evidence_sha256'] = 'a' * 64
+            invalid.append(missing)
+        invalid.append(dict(good, grant_evidence_sha256='a' * 64))
+        with patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(b'source')):
+            for approval in invalid:
+                with self.subTest(approval=approval), self.assertRaises(ValueError):
+                    self.stage_private(approval)
+                self.assertFalse((self.root / 'private-stage').exists())
+        self.assertEqual(self.commands, [])
+
+    def test_private_open_requires_its_own_apply_confirmation(self):
+        with patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(b'source')):
+            report = self.stage_private(self.private_approval())
+            self.assertFalse(report['private_fence_retained'])
+            args = SimpleNamespace(stage=self.stage_args.output, report_sha256=report['report_sha256'],
+                                   apply=True, open_confirmed=True, private_open_confirmed=False)
+            with self.assertRaises(ValueError):
+                c.execute(args)
+            self.assertEqual(self.commands, [])
+            args.private_open_confirmed = True
+            self.assertEqual(c.execute(args)['result'], 'APPLIED')
+
+    def test_private_check_revalidates_evidence_action_even_with_rehashed_stage(self):
+        with patch.object(c, 'PRIVATE_OPEN_SOURCE_SHA256', c.sha(b'source')):
+            self.stage_private(self.private_approval())
+            root = self.stage_args.output
+            evidence = dict(self.private_approval(), action='open-r3-faucet')
+            (root / 'gate-evidence.json').write_bytes(c.encoded(evidence))
+            report = json.loads((root / 'report.json').read_bytes())
+            report['files']['gate-evidence.json'] = c.sha(c.encoded(evidence))
+            (root / 'report.json').write_bytes(c.encoded(report))
+            args = SimpleNamespace(stage=root, report_sha256=c.sha(c.encoded(report)), apply=False,
+                                   open_confirmed=False, private_open_confirmed=False)
+            with self.assertRaises(ValueError):
+                c.execute(args)
+        self.assertEqual(self.commands, [])
 
     def test_real_bind_context_restores_readonly_after_body_failure(self):
         report = json.loads((self.stage / 'report.json').read_bytes())
