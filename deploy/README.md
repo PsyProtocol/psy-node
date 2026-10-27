@@ -23,6 +23,12 @@ not as the functional baseline of this new testnet.
 
 ## Current Fresh Deployment
 
+For the Genesis correction, start with [offline Genesis preparation](multi-chain/gcp/core-only/GENESIS.md).
+This is the current preparation procedure, not a reset/start command. The
+cohort revisions below are historical inputs and must not be mistaken for the
+next release's source/artifact pins. Do not bypass a failed gate with ad-hoc
+remote commands or an old full-stack deployment entrypoint.
+
 The initial `deploy/testnet` functional baseline is `testnet-dev`
 `de539f565ec1a92f91bb4e9686e1442e89ba8639`. The historical deployment directory
 is imported from `6246dc871eebc3f8e80d4994360b45fc36a73040` without importing its
@@ -38,9 +44,9 @@ fix is integrated from `testnet-dev` commit
 and protected fresh-Genesis key generation are integrated at
 `ce6c7f95f4f677f9994fbc2504a33ef3f3047926`. See the
 [circuit acceptance record](multi-chain/gcp/core-only/CIRCUIT-CHECK-20261026.md).
-The core-only release manifest remains unfinalized until the actual Genesis,
-final binaries and runtime checks are complete; its null runtime pin must not
-be interpreted as rollout readiness.
+The next core-only release manifest remains unfinalized until the corrected
+Genesis, final binaries and runtime checks are complete. Neither an old runtime
+pin nor a prepared branch proves rollout readiness.
 
 Older profiles below are retained for provenance and reusable helpers. Their
 source pins, reset commands, account layouts and network selectors are NOT the

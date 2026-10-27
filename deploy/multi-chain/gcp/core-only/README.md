@@ -1,5 +1,12 @@
 # Core-only deployment
 
+For the Genesis correction, use [Offline Genesis Preparation](GENESIS.md).
+It provides the repository-owned `prepare_genesis.py plan` / `generate` entry
+and the boundary between offline validation and a later reset/start rollout.
+The frozen inputs and placement notes below describe preceding cohorts; do not
+reuse their release pins, database namespaces or temporary placement without
+reconciling the next release manifest and actual host inventory.
+
 The assembler and planner remain offline tools, not release approval. The separate
 host package builder and installer below prepare and install an authorized fresh
 core release. Installation never starts services or clears databases. No old
