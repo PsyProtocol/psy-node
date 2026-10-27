@@ -123,6 +123,15 @@ GET /api/v1/bridge/withdrawal-claim-proof
 
 ### Round-trip invariants
 
+The multichain Relayer admits deposits only through a fixed canonical finalized
+L1 header. It reads `pendingDepositCount` with an EIP-1898 block hash and
+`requireCanonical=true`, then requests the exact Services snapshot for that
+finalized prefix. Latest pending remains the backlog metric, not the admission
+target. Deposits beyond the finalized prefix wait without excluding another
+chain's ready calls or withdrawals. A missing finalized header or failed pinned
+read never falls back to latest or safe. Guardian independently verifies the
+anchor and contents; this admission rule does not replace its checks.
+
 1. **Deposit leaf binding.** `note_commitment = PoseidonHash(nullifier_secret || note_secret)`.
 2. **Nullifier uniqueness.** Double-claims fail closed on the exact identity above, not on counts.
 3. **Proof split.** The depositor proves inclusion; the receiver proves ownership and consumes that proof.
