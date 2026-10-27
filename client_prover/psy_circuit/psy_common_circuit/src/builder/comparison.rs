@@ -422,4 +422,54 @@ mod tests {
             "real >= must reject canonical 5 against 100"
         );
     }
+
+    #[test]
+    fn alias_comparison_then_field_sub_wraps_balance() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let balance = builder.add_virtual_target();
+        let amount = builder.constant(F::from_canonical_u64(AMOUNT));
+        let compared = builder.is_greater_than_or_equal(64, balance, amount);
+        let true_target = builder._true().target;
+        builder.connect(compared.target, true_target);
+        let wrapped = builder.sub(balance, amount);
+        builder.register_public_input(wrapped);
+        let mut data = builder.build::<C>();
+
+        let mut balance_limbs = None;
+        for generator in &mut data.prover_only.generators {
+            if generator.0.id() != "LowHighGenerator" {
+                continue;
+            }
+            let mut encoded = Vec::new();
+            generator.0.serialize(&mut encoded, &data.common).expect("serialize LowHighGenerator");
+            let mut cursor = encoded.as_slice();
+            let integer = read_target(&mut cursor);
+            let n_log = read_usize(&mut cursor);
+            let low_target = read_target(&mut cursor);
+            let high_target = read_target(&mut cursor);
+            if integer != balance || n_log != 32 {
+                continue;
+            }
+            balance_limbs = Some((low_target, high_target));
+            *generator = WitnessGeneratorRef::new(FinishedGenerator);
+        }
+        let (low_target, high_target) = balance_limbs.expect("balance split_low_high generator");
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(balance, F::from_canonical_u64(BALANCE)).unwrap();
+        witness.set_target(low_target, F::from_canonical_u64(ALIAS_LOW)).unwrap();
+        witness.set_target(high_target, F::from_canonical_u64(ALIAS_HIGH)).unwrap();
+        let proof = data.prove(witness).expect("aliased 5 >= 100 and field subtraction must prove");
+        data.verify(proof.clone()).expect("proof must verify");
+
+        let prime = goldilocks_prime();
+        let wrapped_value = (prime - (AMOUNT as u128 - BALANCE as u128)) as u64;
+        let expected = F::from_canonical_u64(BALANCE) - F::from_canonical_u64(AMOUNT);
+        assert_eq!(expected, F::from_canonical_u64(wrapped_value));
+        assert_eq!(proof.public_inputs[0], expected);
+    }
 }
