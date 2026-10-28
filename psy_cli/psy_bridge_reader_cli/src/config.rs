@@ -1,0 +1,384 @@
+//! Configuration of the psy-bridge-reader binary: flags and environment.
+
+use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::Parser;
+use psy_bridge_reader_core::admission::{Budgets, LaneBudget};
+use psy_bridge_reader_core::follow::FollowConfig;
+use psy_bridge_reader_core::source::PgConfig;
+
+const MAX_TOKEN_BYTES: u64 = 4096;
+const APPLICATION_NAME: &str = "psy-bridge-reader";
+
+#[derive(Clone, Parser)]
+#[command(name = "psy-bridge-reader")]
+pub struct Config {
+    #[arg(long, env = "PSY_BRIDGE_READER_LISTEN", default_value = "127.0.0.1:8740")]
+    pub listen: SocketAddr,
+    #[arg(long, env = "PSY_BRIDGE_READER_TOKEN_FILE")]
+    pub token_file: PathBuf,
+    #[arg(long, env = "PSY_BRIDGE_READER_DATABASE_URL")]
+    pub database_url: String,
+    /// No default: a wrong default would silently read another schema.
+    #[arg(long, env = "PSY_BRIDGE_READER_DB_SCHEMA")]
+    pub db_schema: String,
+    #[arg(long, env = "PSY_BRIDGE_READER_TICK_MS", default_value_t = 500)]
+    pub tick_ms: u64,
+    #[arg(long, env = "PSY_BRIDGE_READER_MAX_ROWS_PER_TICK", default_value_t = 50000)]
+    pub max_rows_per_tick: u64,
+    #[arg(long, env = "PSY_BRIDGE_READER_MEMORY_BUDGET_BYTES", default_value_t = 10_737_418_240)]
+    pub memory_budget_bytes: u64,
+    #[arg(long, env = "PSY_BRIDGE_READER_STATEMENT_TIMEOUT_MS", default_value_t = 5000)]
+    pub statement_timeout_ms: u32,
+    #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_CONCURRENCY")]
+    pub bridge_progress_concurrency: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_MAX_QUEUE")]
+    pub bridge_progress_max_queue: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_QUEUE_WAIT_MS")]
+    pub bridge_progress_queue_wait_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_DEADLINE_MS")]
+    pub bridge_progress_deadline_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_CLAIM_PROOF_CONCURRENCY")]
+    pub claim_proof_concurrency: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_CLAIM_PROOF_MAX_QUEUE")]
+    pub claim_proof_max_queue: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_CLAIM_PROOF_QUEUE_WAIT_MS")]
+    pub claim_proof_queue_wait_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_CLAIM_PROOF_DEADLINE_MS")]
+    pub claim_proof_deadline_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_INTERACTIVE_CONCURRENCY")]
+    pub interactive_concurrency: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_INTERACTIVE_MAX_QUEUE")]
+    pub interactive_max_queue: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_INTERACTIVE_QUEUE_WAIT_MS")]
+    pub interactive_queue_wait_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_INTERACTIVE_DEADLINE_MS")]
+    pub interactive_deadline_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BACKGROUND_CONCURRENCY")]
+    pub background_concurrency: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BACKGROUND_MAX_QUEUE")]
+    pub background_max_queue: Option<usize>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BACKGROUND_QUEUE_WAIT_MS")]
+    pub background_queue_wait_ms: Option<u64>,
+    #[arg(long, env = "PSY_BRIDGE_READER_BACKGROUND_DEADLINE_MS")]
+    pub background_deadline_ms: Option<u64>,
+}
+
+/// Scheme and host of a database URL; credentials, port, path and query are
+/// dropped. `<redacted>` when the URL does not parse.
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return "<redacted>".to_string() };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let host_part = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let host = host_part.split(['/', ':']).next().unwrap_or("");
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) || host.is_empty() {
+        return "<redacted>".to_string();
+    }
+    format!("{scheme}://{host}")
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No `..`: a new field does not compile until it is listed here.
+        let Config {
+            listen,
+            token_file,
+            database_url,
+            db_schema,
+            tick_ms,
+            max_rows_per_tick,
+            memory_budget_bytes,
+            statement_timeout_ms,
+            bridge_progress_concurrency,
+            bridge_progress_max_queue,
+            bridge_progress_queue_wait_ms,
+            bridge_progress_deadline_ms,
+            claim_proof_concurrency,
+            claim_proof_max_queue,
+            claim_proof_queue_wait_ms,
+            claim_proof_deadline_ms,
+            interactive_concurrency,
+            interactive_max_queue,
+            interactive_queue_wait_ms,
+            interactive_deadline_ms,
+            background_concurrency,
+            background_max_queue,
+            background_queue_wait_ms,
+            background_deadline_ms,
+        } = self;
+        f.debug_struct("Config")
+            .field("listen", listen)
+            .field("token_file", token_file)
+            .field("db_schema", db_schema)
+            .field("tick_ms", tick_ms)
+            .field("max_rows_per_tick", max_rows_per_tick)
+            .field("memory_budget_bytes", memory_budget_bytes)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field("bridge_progress_concurrency", bridge_progress_concurrency)
+            .field("bridge_progress_max_queue", bridge_progress_max_queue)
+            .field("bridge_progress_queue_wait_ms", bridge_progress_queue_wait_ms)
+            .field("bridge_progress_deadline_ms", bridge_progress_deadline_ms)
+            .field("claim_proof_concurrency", claim_proof_concurrency)
+            .field("claim_proof_max_queue", claim_proof_max_queue)
+            .field("claim_proof_queue_wait_ms", claim_proof_queue_wait_ms)
+            .field("claim_proof_deadline_ms", claim_proof_deadline_ms)
+            .field("interactive_concurrency", interactive_concurrency)
+            .field("interactive_max_queue", interactive_max_queue)
+            .field("interactive_queue_wait_ms", interactive_queue_wait_ms)
+            .field("interactive_deadline_ms", interactive_deadline_ms)
+            .field("background_concurrency", background_concurrency)
+            .field("background_max_queue", background_max_queue)
+            .field("background_queue_wait_ms", background_queue_wait_ms)
+            .field("background_deadline_ms", background_deadline_ms)
+            .field("database_url", &redact_database_url(database_url))
+            .finish()
+    }
+}
+
+fn apply(
+    lane: &mut LaneBudget,
+    concurrency: Option<usize>,
+    max_queue: Option<usize>,
+    queue_wait_ms: Option<u64>,
+    deadline_ms: Option<u64>,
+) {
+    if let Some(v) = concurrency {
+        lane.concurrency = v;
+    }
+    if let Some(v) = max_queue {
+        lane.max_queue = v;
+    }
+    if let Some(v) = queue_wait_ms {
+        lane.queue_wait = Duration::from_millis(v);
+    }
+    if let Some(v) = deadline_ms {
+        lane.deadline = Duration::from_millis(v);
+    }
+}
+
+fn is_private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+impl Config {
+    /// Defaults with the lane overrides applied, validated.
+    pub fn budgets(&self) -> Result<Budgets, String> {
+        let mut b = Budgets::default();
+        apply(
+            &mut b.bridge_progress,
+            self.bridge_progress_concurrency,
+            self.bridge_progress_max_queue,
+            self.bridge_progress_queue_wait_ms,
+            self.bridge_progress_deadline_ms,
+        );
+        apply(
+            &mut b.claim_proof,
+            self.claim_proof_concurrency,
+            self.claim_proof_max_queue,
+            self.claim_proof_queue_wait_ms,
+            self.claim_proof_deadline_ms,
+        );
+        apply(
+            &mut b.interactive,
+            self.interactive_concurrency,
+            self.interactive_max_queue,
+            self.interactive_queue_wait_ms,
+            self.interactive_deadline_ms,
+        );
+        apply(
+            &mut b.background,
+            self.background_concurrency,
+            self.background_max_queue,
+            self.background_queue_wait_ms,
+            self.background_deadline_ms,
+        );
+        b.validate()?;
+        Ok(b)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_private_or_loopback(self.listen.ip()) {
+            return Err(format!(
+                "listen address {} is neither loopback nor private",
+                self.listen
+            ));
+        }
+        if !(1..=1000).contains(&self.tick_ms) {
+            return Err(format!("tick_ms {} must be within 1..=1000", self.tick_ms));
+        }
+        if !(1..=50000).contains(&self.max_rows_per_tick) {
+            return Err(format!(
+                "max_rows_per_tick {} must be within 1..=50000",
+                self.max_rows_per_tick
+            ));
+        }
+        if self.statement_timeout_ms == 0 {
+            return Err("statement_timeout_ms must be > 0: 0 disables the server-side statement timeout".to_string());
+        }
+        self.budgets()?;
+        self.follow_config()?.validate().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The follow loop's tick and page size; the timeouts keep their defaults.
+    pub fn follow_config(&self) -> Result<FollowConfig, String> {
+        let max_rows = usize::try_from(self.max_rows_per_tick)
+            .map_err(|_| format!("max_rows_per_tick {} does not fit usize", self.max_rows_per_tick))?;
+        Ok(FollowConfig { tick: Duration::from_millis(self.tick_ms), max_rows, ..FollowConfig::default() })
+    }
+
+    pub fn pg_config(&self) -> PgConfig {
+        PgConfig {
+            url: self.database_url.clone(),
+            schema: self.db_schema.clone(),
+            statement_timeout_ms: self.statement_timeout_ms,
+            application_name: APPLICATION_NAME.to_string(),
+        }
+    }
+
+    /// Reads the bearer token: non-empty, at most 4 KiB, mode 0600 or stricter.
+    pub fn read_token(&self) -> Result<String, String> {
+        let path = &self.token_file;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("token file {}: {e}", path.display()))?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "token file {} must not be accessible by group or others",
+                path.display()
+            ));
+        }
+        if meta.len() > MAX_TOKEN_BYTES {
+            return Err(format!("token file {} exceeds 4 KiB", path.display()));
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("token file {}: {e}", path.display()))?;
+        let token = raw.strip_suffix('\n').unwrap_or(&raw);
+        let token = token.strip_suffix('\r').unwrap_or(token);
+        if token.trim().is_empty() {
+            return Err(format!("token file {} is empty", path.display()));
+        }
+        Ok(token.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Config {
+        let mut args = vec![
+            "psy-bridge-reader",
+            "--token-file",
+            "/nonexistent",
+            "--database-url",
+            "postgres://x",
+            "--db-schema",
+            "s",
+        ];
+        args.extend_from_slice(extra);
+        Config::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn public_listen_address_is_refused() {
+        assert!(parse(&[]).validate().is_ok());
+        assert!(parse(&["--listen", "10.1.2.3:8740"]).validate().is_ok());
+        assert!(parse(&["--listen", "[::1]:8740"]).validate().is_ok());
+        assert!(parse(&["--listen", "8.8.8.8:8740"]).validate().is_err());
+        assert!(parse(&["--listen", "0.0.0.0:8740"]).validate().is_err());
+        assert!(parse(&["--listen", "[2001:db8::1]:8740"]).validate().is_err());
+    }
+
+    #[test]
+    fn tick_over_1000_ms_is_refused() {
+        assert!(parse(&["--tick-ms", "1000"]).validate().is_ok());
+        assert!(parse(&["--tick-ms", "1001"]).validate().is_err());
+        assert!(parse(&["--tick-ms", "0"]).validate().is_err());
+    }
+
+    #[test]
+    fn lane_override_with_deadline_below_queue_wait_is_refused() {
+        let c = parse(&[
+            "--claim-proof-queue-wait-ms",
+            "1500",
+            "--claim-proof-deadline-ms",
+            "1000",
+        ]);
+        assert!(c.budgets().is_err());
+        assert!(c.validate().is_err());
+        let ok = parse(&["--claim-proof-concurrency", "2"]);
+        assert_eq!(ok.budgets().unwrap().claim_proof.concurrency, 2);
+    }
+
+    #[test]
+    fn zero_statement_timeout_is_refused() {
+        assert!(parse(&["--statement-timeout-ms", "0"]).validate().is_err());
+        let c = parse(&["--statement-timeout-ms", "1", "--tick-ms", "250", "--max-rows-per-tick", "7"]);
+        assert!(c.validate().is_ok());
+        assert_eq!(c.pg_config().statement_timeout_ms, 1);
+        assert_eq!(c.pg_config().application_name, "psy-bridge-reader");
+        let follow = c.follow_config().unwrap();
+        assert_eq!((follow.tick, follow.max_rows), (Duration::from_millis(250), 7));
+        assert_eq!(follow.read_timeout, FollowConfig::default().read_timeout);
+    }
+
+    #[test]
+    fn token_file_with_group_or_world_access_is_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "psy-bridge-reader-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "secret\n").unwrap();
+        let p = path.to_str().unwrap();
+        let cfg = || {
+            Config::try_parse_from([
+                "psy-bridge-reader", "--token-file", p, "--database-url", "x", "--db-schema", "s",
+            ])
+            .unwrap()
+        };
+        for mode in [0o640, 0o604, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(cfg().read_token().is_err(), "mode {mode:o}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(cfg().read_token().unwrap(), "secret");
+        std::fs::write(&path, "crlf\r\n").unwrap();
+        assert_eq!(cfg().read_token().unwrap(), "crlf");
+        std::fs::write(&path, "bare").unwrap();
+        assert_eq!(cfg().read_token().unwrap(), "bare");
+        for blank in ["", "\n", "\r\n", "  \n", " \t\r\n"] {
+            std::fs::write(&path, blank).unwrap();
+            assert!(cfg().read_token().is_err(), "{blank:?}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_database_password() {
+        for url in [
+            "postgres://user:hunter2@db.internal:5432/envio?sslmode=require",
+            "postgres://user:hunt@er2@db.internal/envio",
+            "not a url with hunter2",
+        ] {
+            let mut c = parse(&[]);
+            c.database_url = url.to_string();
+            let out = format!("{c:?}");
+            assert!(!out.contains("hunter2") && !out.contains("hunt@er"), "{out}");
+            assert!(!out.contains("user:"), "{out}");
+        }
+        let mut c = parse(&[]);
+        c.database_url = "postgres://user:hunter2@db.internal:5432/envio".to_string();
+        let out = format!("{c:?}");
+        assert!(out.contains("postgres://db.internal"), "{out}");
+        assert!(out.contains("db_schema"), "{out}");
+        c.database_url = "garbage".to_string();
+        assert!(format!("{c:?}").contains("<redacted>"));
+    }
+}

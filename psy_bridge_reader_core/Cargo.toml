@@ -1,0 +1,38 @@
+[package]
+name = "psy_bridge_reader_core"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[features]
+# Reference tree functions and the Envio fixture loader, for tests in this
+# crate and in crates that depend on it.
+test-support = []
+
+[dependencies]
+parth_core = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+psy_bridge_reader_api = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+prometheus = { workspace = true }
+libc = { workspace = true }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "net", "time", "macros", "fs"] }
+serde_json = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+# For `examples/reader_bench.rs` only.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
