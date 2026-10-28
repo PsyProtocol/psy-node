@@ -132,6 +132,10 @@ pub struct ClaimChainView {
 }
 
 impl ClaimChainView {
+    pub(crate) fn not_ready(data: Arc<ClaimData>, reason: String) -> ClaimChainView {
+        ClaimChainView { data, committed_claims: 0, committed_batches: 0, window: Arc::new(ClaimWindow::default()), ready: Err(reason) }
+    }
+
     pub(crate) fn read(&self) -> ClaimRead<'_> {
         ClaimRead { committed: self.data.committed.read(), view: self }
     }

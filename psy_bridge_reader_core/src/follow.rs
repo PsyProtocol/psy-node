@@ -298,7 +298,7 @@ fn reset_for(model: &mut Model, metrics: &Metrics, reason: &ReloadReason) -> Opt
             model.reset_chain(*chain_index);
             Some(*chain_index)
         }
-        // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
+        // reset_chain keeps the chain_id's committed safe block, so only reset_all lowers it.
         ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } | ReloadReason::MetaMissing { .. } => {
             model.reset_all();
             metrics.clear_chain_gauges();

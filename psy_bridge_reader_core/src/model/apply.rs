@@ -410,7 +410,10 @@ fn next_chain_view(
 mod tests {
     use std::sync::Arc;
 
-    use psy_bridge_reader_api::{ClaimProofQuery, DepositRow, DepositsByAddressQuery, DepositsByTxQuery, PrefixQuery, TreeRootQuery};
+    use psy_bridge_reader_api::{
+        ClaimProofQuery, DepositRow, DepositsByAddressQuery, DepositsByTxQuery, ExplorerQuery, PrefixQuery, TreeRootQuery,
+        WithdrawalClaimsRequest,
+    };
 
     use crate::model::{ApplyOutcome, DepositCursor, Model, ReadError, ReloadReason, View};
     use crate::test_support::{naive_root, naive_siblings, TickBuilder};
@@ -684,6 +687,42 @@ mod tests {
         let status = v.status();
         assert!(!status.ready);
         assert!(!status.chains[0].ready && status.chains[1].ready);
+    }
+
+    #[test]
+    fn a_reset_after_replaced_committed_history_drops_its_claims_and_batches() {
+        let claims = |v: &View| {
+            let q = WithdrawalClaimsRequest { chain_id: 1, nullifiers: vec!["n1".to_owned()] };
+            v.withdrawal_claims(&q).map(|r| r.claims)
+        };
+        let batches = |v: &View| v.explorer(&ExplorerQuery { chain_id: 1 }).map(|r| r.batches);
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 90, "A");
+        let claim = b.claim(1, 90, "n1");
+        let batch = b.batch(1, 90, 0);
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        assert_eq!(m.view().chains[&0].committed_len, 1);
+        assert_eq!(claims(&m.view()).unwrap(), vec![claim]);
+        assert_eq!(batches(&m.view()).unwrap(), vec![batch]);
+        // Envio replaced history below the committed safe block between two
+        // polls: the deposit's leaf changed, the claim and the batch are gone,
+        // and progress never went below 100.
+        b.deposits.get_mut(&0).unwrap()[0].leaf = b.leaf(1, 0);
+        b.claims.clear();
+        b.batches.clear();
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::TreeMismatch { chain_index: 0 }));
+        m.reset_chain(0);
+        assert!(matches!(claims(&m.view()), Err(ReadError::NotReady(_))));
+        assert!(matches!(batches(&m.view()), Err(ReadError::NotReady(_))));
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        let v = m.view();
+        assert!(v.status().ready);
+        assert_eq!(root(&v, 0, 1).unwrap(), naive_hex(&b.leaves(0), 1));
+        assert_eq!(claims(&v).unwrap(), vec![]);
+        assert_eq!(batches(&v).unwrap(), vec![]);
+        assert!(m.cursors().claims.is_empty() && m.cursors().batches.is_empty());
     }
 
     #[test]

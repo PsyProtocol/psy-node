@@ -217,8 +217,9 @@ impl Model {
         self.view.clone()
     }
 
-    /// Drops one chain index's rows; it is not ready until a later tick loads
-    /// and verifies it again. Views already taken keep the old rows.
+    /// Drops one chain index's rows and every claim and batch of its chain_id;
+    /// neither is ready until a later tick loads and verifies it again. Views
+    /// already taken keep the old rows.
     pub fn reset_chain(&mut self, chain_index: u64) {
         let chain_id = self.chains.get(&chain_index).and_then(|s| s.chain_id);
         let state = ChainState::new(chain_id);
@@ -227,13 +228,19 @@ impl Model {
         let old = self.view.load_full();
         let mut chains = old.chains.clone();
         chains.insert(chain_index, placeholder);
+        let mut claim_chains = old.claim_chains.clone();
+        if let Some(chain_id) = chain_id {
+            let data = Arc::new(ClaimData::default());
+            claim_chains.insert(chain_id, ClaimChainView::not_ready(data.clone(), RELOADING.to_owned()));
+            self.claim_chains.insert(chain_id, data);
+        }
         self.epoch += 1;
         let revision = self.next_revision(old.revision.as_of_unix_ms);
         self.publish(View {
             revision,
             ready: old.ready.clone(),
             chains,
-            claim_chains: old.claim_chains.clone(),
+            claim_chains,
             envio_chains: old.envio_chains.clone(),
         });
     }
