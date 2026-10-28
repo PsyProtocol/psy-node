@@ -399,43 +399,23 @@ impl L2CallPlan {
 
 // ── Batch packing utilities ──────────────────────────────────────────────────
 
-/// Compute optimal batch sizes for N items using sizes 1, 2, 5.
-/// Minimizes total batch count while keeping x<2, y<5.
+/// Minimize call count using one or two withdrawals per call.
+/// Keep the historical three-item ordering for Guardian session replay.
 fn optimal_batch_sizes(n: usize) -> Vec<usize> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut best_total = usize::MAX;
-    let mut best = (0usize, 0usize, 0usize);
-    for fives in 0..=n / 5 {
-        let rem = n - fives * 5;
-        for twos in 0..=rem / 2 {
-            let singles = rem - twos * 2;
-            if singles < 2 {
-                let total = singles + twos + fives;
-                if total < best_total {
-                    best_total = total;
-                    best = (singles, twos, fives);
-                }
-            }
+    // Five-withdrawal calls encode 176 Felt words; the VM capacity is 128.
+    let mut sizes = vec![2; n / 2];
+    if n % 2 != 0 {
+        if n == 3 {
+            sizes.insert(0, 1);
+        } else {
+            sizes.push(1);
         }
-    }
-    let (singles, twos, fives) = best;
-    let mut sizes = Vec::with_capacity(singles + twos + fives);
-    for _ in 0..singles {
-        sizes.push(1);
-    }
-    for _ in 0..twos {
-        sizes.push(2);
-    }
-    for _ in 0..fives {
-        sizes.push(5);
     }
     sizes
 }
 
 
-/// Build optimized batch `ContractCallArgs` for withdrawal appends.
+/// Build VM-compatible batch `ContractCallArgs` for withdrawal appends.
 /// Sender-auth batch interface:
 /// batch_append_withdrawals_N(
 ///   count,
@@ -476,12 +456,7 @@ pub(crate) fn build_withdrawal_batch_calls(
                     inputs,
                 });
             }
-            2 | 5 => {
-                let method = if chunk_size == 2 {
-                    "batch_append_withdrawals_2"
-                } else {
-                    "batch_append_withdrawals_5"
-                };
+            2 => {
                 let mut inputs = vec![chunk_size as u64];
                 for k in 0..chunk_size {
                     inputs.push(withdrawals[pos + k].sender_user_id);
@@ -506,7 +481,7 @@ pub(crate) fn build_withdrawal_batch_calls(
                 }
                 calls.push(ContractCallArgs {
                     contract_id: WITHDRAWAL_TREE_CONTRACT_ID as u64,
-                    method_name: method.to_string(),
+                    method_name: "batch_append_withdrawals_2".to_string(),
                     inputs,
                 });
             }
@@ -4736,25 +4711,27 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_batch_calls_seven_items_split_into_two_then_five_in_order() {
+    fn withdrawal_batch_calls_seven_items_split_into_pairs_then_single_in_order() {
         let withdrawals = (1..=7).map(sample_withdrawal).collect::<Vec<_>>();
         let calls = build_withdrawal_batch_calls(&withdrawals);
 
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].method_name, "batch_append_withdrawals_2");
         assert_eq!(calls[0].inputs[0], 2);
         assert_eq!(calls[0].inputs.len(), 71);
         assert_eq!(calls[0].inputs[1], withdrawals[0].sender_user_id);
         assert_eq!(calls[0].inputs[2], withdrawals[1].sender_user_id);
 
-        assert_eq!(calls[1].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[1].inputs[0], 5);
-        assert_eq!(calls[1].inputs.len(), 176);
+        assert_eq!(calls[1].method_name, "batch_append_withdrawals_2");
+        assert_eq!(calls[1].inputs[0], 2);
+        assert_eq!(calls[1].inputs.len(), 71);
         assert_eq!(calls[1].inputs[1], withdrawals[2].sender_user_id);
-        assert_eq!(calls[1].inputs[5], withdrawals[6].sender_user_id);
+        assert_eq!(calls[2].inputs[1], withdrawals[4].sender_user_id);
+        assert_eq!(calls[3].method_name, "append_withdrawal");
+        assert_eq!(calls[3].inputs[0], withdrawals[6].sender_user_id);
         assert_eq!(
-            &calls[1].inputs[16..56],
-            &withdrawals[2..]
+            &calls[1].inputs[7..23],
+            &withdrawals[2..4]
                 .iter()
                 .flat_map(|w| w.token_address.iter().map(|&v| v as u64))
                 .collect::<Vec<_>>()
@@ -5930,22 +5907,20 @@ mod tests {
 
     #[test]
     fn optimal_batch_sizes_maps_small_counts_to_minimal_packs() {
-        // The packing primitive that batch-call builders depend on. Each row is
-        // the unique minimal-batch-count decomposition using sizes {1,2,5} with
-        // singles < 2.
+        // Three-item sessions retain their old [1, 2] encoding for replay.
         let cases: &[(usize, &[usize])] = &[
             (0, &[]),
             (1, &[1]),
             (2, &[2]),
             (3, &[1, 2]),
             (4, &[2, 2]),
-            (5, &[5]),
-            (6, &[1, 5]),
-            (7, &[2, 5]),
-            (8, &[1, 2, 5]),
-            (9, &[2, 2, 5]),
-            (10, &[5, 5]),
-            (12, &[2, 5, 5]),
+            (5, &[2, 2, 1]),
+            (6, &[2, 2, 2]),
+            (7, &[2, 2, 2, 1]),
+            (8, &[2, 2, 2, 2]),
+            (9, &[2, 2, 2, 2, 1]),
+            (10, &[2, 2, 2, 2, 2]),
+            (12, &[2, 2, 2, 2, 2, 2]),
         ];
         for (n, expected) in cases {
             assert_eq!(&optimal_batch_sizes(*n), expected, "n={n}");
@@ -5954,27 +5929,17 @@ mod tests {
 
     #[test]
     fn optimal_batch_sizes_satisfies_invariants_for_all_counts_up_to_two_hundred() {
-        // Property: for every n in 0..=200 the decomposition sums to n, uses only
-        // {1,2,5}, keeps singles < 2, and is no worse than the greedy 5s-then-2s
-        // packing (so it really minimises batch count).
+        // Calls contain at most two withdrawals and preserve every item.
         for n in 0..=200usize {
             let sizes = optimal_batch_sizes(n);
             assert_eq!(sizes.iter().sum::<usize>(), n, "sum != n at n={n}");
             assert!(
-                sizes.iter().all(|&s| matches!(s, 1 | 2 | 5)),
+                sizes.iter().all(|&s| matches!(s, 1 | 2)),
                 "illegal size at n={n}: {sizes:?}"
             );
             let singles = sizes.iter().filter(|&&s| s == 1).count();
             assert!(singles < 2, "singles>=2 at n={n}: {sizes:?}");
-            // Independent minimality check: the minimum batch count is the
-            // minimum over f in 0..=n/5 of (f + ceil((n - 5*f) / 2)) — after placing
-            // f five-batches the remainder is filled most efficiently by twos (one
-            // single at most for an odd remainder, staying < 2). This closed-form
-            // derivation is independent of the function's nested brute-force loop.
-            let theoretical_min = (0..=n / 5)
-                .map(|f| f + (n - 5 * f + 1) / 2)
-                .min()
-                .unwrap_or(0);
+            let theoretical_min = (n + 1) / 2;
             assert_eq!(
                 sizes.len(),
                 theoretical_min,
@@ -5993,55 +5958,101 @@ mod tests {
     }
 
     #[test]
-    fn build_withdrawal_batch_calls_five_uses_batch_append_withdrawals_5_layout() {
-        // batch_append_withdrawals_5(count, senders[5], contracts[5], dests[5],
-        //   token_addr[5*8], amount[5*8], recipient[5*8], nonce[5*8]) → 176 inputs.
-        let ws: Vec<_> = (1..=5).map(sample_withdrawal).collect();
-        let calls = build_withdrawal_batch_calls(&ws);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[0].contract_id, WITHDRAWAL_TREE_CONTRACT_ID as u64);
-        assert_eq!(calls[0].inputs.len(), 176);
-        assert_eq!(calls[0].inputs[0], 5);
-        // senders block [1..6], contracts block [6..11], dests block [11..16].
-        assert_eq!(
-            &calls[0].inputs[1..6],
-            &ws.iter().map(|w| w.sender_user_id).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &calls[0].inputs[6..11],
-            &ws.iter().map(|w| w.contract_id).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &calls[0].inputs[11..16],
-            &ws.iter().map(|w| w.destination_chain_index).collect::<Vec<_>>()
-        );
-        // token_address block [16..56], grouped per-withdrawal in original order.
-        let mut token = Vec::new();
-        for w in &ws {
-            token.extend(w.token_address.iter().map(|&v| v as u64));
-        }
-        assert_eq!(&calls[0].inputs[16..56], &token);
+    fn withdrawal_batch_calls_five_fit_vm_calldata_capacity() {
+        use plonky2::field::types::Field;
+        use psy_client_data::dpn::sd_key::SDKEY_MAX_CALLDATA_WORDS;
+        use psy_vm::dpn::vm::exec::{DPNTransactionEntry, SimpleDPNExecutor};
+        let withdrawals = (1..=5).map(sample_withdrawal).collect::<Vec<_>>();
+        let calls = build_withdrawal_batch_calls(&withdrawals);
+        assert!(calls.iter().all(|call| call.inputs.len() <= SDKEY_MAX_CALLDATA_WORDS as usize));
+        assert_eq!(calls.iter().map(|call| call.inputs.len()).collect::<Vec<_>>(), vec![71, 71, 35]);
+        let entries = calls.iter().map(|call| DPNTransactionEntry {
+            contract_id: GoldilocksField::from_canonical_u64(call.contract_id),
+            caller_contract_id: GoldilocksField::ZERO,
+            method_id: GoldilocksField::ZERO,
+            inputs_hash: [GoldilocksField::ZERO; 4],
+            inputs_length: GoldilocksField::from_canonical_usize(call.inputs.len()),
+            inputs: call.inputs.iter().copied().map(GoldilocksField::from_canonical_u64).collect(),
+        }).collect();
+        SimpleDPNExecutor::<GoldilocksField>::new().set_transaction_context(entries, [GoldilocksField::ZERO; 4]);
     }
 
     #[test]
-    fn build_withdrawal_batch_calls_twelve_splits_two_five_five_in_order() {
-        // 12 withdrawals → [2, 5, 5]. Original order is preserved across batches:
-        // first 2 → batch_2, next 5 → batch_5, last 5 → batch_5.
-        let ws: Vec<_> = (1..=12).map(sample_withdrawal).collect();
+    fn withdrawal_batch_calls_preserve_record_order_and_vm_capacity() {
+        use psy_client_data::dpn::sd_key::SDKEY_MAX_CALLDATA_WORDS;
+        for count in 0..=200 {
+            let withdrawals = (1..=count).map(sample_withdrawal).collect::<Vec<_>>();
+            let calls = build_withdrawal_batch_calls(&withdrawals);
+            let mut position = 0;
+            for call in calls {
+                assert!(call.inputs.len() <= SDKEY_MAX_CALLDATA_WORDS as usize);
+                let size = match call.method_name.as_str() {
+                    "append_withdrawal" => {
+                        assert_eq!(call.inputs[0], withdrawals[position].sender_user_id);
+                        assert_eq!(&call.inputs[27..35], &withdrawals[position].nonce.map(u64::from));
+                        1
+                    }
+                    "batch_append_withdrawals_2" => {
+                        assert_eq!(call.inputs[0], 2);
+                        for index in 0..2 {
+                            assert_eq!(call.inputs[1 + index], withdrawals[position + index].sender_user_id);
+                            assert_eq!(&call.inputs[55 + index * 8..63 + index * 8], &withdrawals[position + index].nonce.map(u64::from));
+                        }
+                        2
+                    }
+                    other => panic!("unexpected withdrawal method: {other}"),
+                };
+                position += size;
+            }
+            assert_eq!(position, withdrawals.len());
+        }
+    }
+
+    #[test]
+    fn build_withdrawal_batch_calls_five_splits_two_two_one_in_order() {
+        let ws: Vec<_> = (1..=5).map(sample_withdrawal).collect();
         let calls = build_withdrawal_batch_calls(&ws);
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].method_name, "batch_append_withdrawals_2");
+        assert_eq!(calls[0].contract_id, WITHDRAWAL_TREE_CONTRACT_ID as u64);
+        assert_eq!(calls[0].inputs.len(), 71);
         assert_eq!(calls[0].inputs[0], 2);
-        assert_eq!(calls[1].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[1].inputs[0], 5);
-        assert_eq!(calls[2].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[2].inputs[0], 5);
-        // First batch's senders are ws[0..2]; third batch's senders are ws[7..12].
-        assert_eq!(calls[0].inputs[1], ws[0].sender_user_id);
-        assert_eq!(calls[0].inputs[2], ws[1].sender_user_id);
-        assert_eq!(calls[2].inputs[1], ws[7].sender_user_id);
-        assert_eq!(calls[2].inputs[5], ws[11].sender_user_id);
+        assert_eq!(
+            &calls[0].inputs[1..3],
+            &ws[..2].iter().map(|w| w.sender_user_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &calls[0].inputs[3..5],
+            &ws[..2].iter().map(|w| w.contract_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &calls[0].inputs[5..7],
+            &ws[..2].iter().map(|w| w.destination_chain_index).collect::<Vec<_>>()
+        );
+        let mut token = Vec::new();
+        for w in &ws[..2] {
+            token.extend(w.token_address.iter().map(|&v| v as u64));
+        }
+        assert_eq!(&calls[0].inputs[7..23], &token);
+        assert_eq!(calls[1].inputs[1], ws[2].sender_user_id);
+        assert_eq!(calls[1].inputs[2], ws[3].sender_user_id);
+        assert_eq!(calls[2].method_name, "append_withdrawal");
+        assert_eq!(calls[2].inputs[0], ws[4].sender_user_id);
+        assert_eq!(&calls[2].inputs[27..35], &ws[4].nonce.map(u64::from));
+    }
+
+    #[test]
+    fn build_withdrawal_batch_calls_twelve_splits_six_pairs_in_order() {
+        let ws: Vec<_> = (1..=12).map(sample_withdrawal).collect();
+        let calls = build_withdrawal_batch_calls(&ws);
+        assert_eq!(calls.len(), 6);
+        for (call, pair) in calls.iter().zip(ws.chunks(2)) {
+            assert_eq!(call.method_name, "batch_append_withdrawals_2");
+            assert_eq!(call.inputs.len(), 71);
+            assert_eq!(call.inputs[0], 2);
+            assert_eq!(call.inputs[1], pair[0].sender_user_id);
+            assert_eq!(call.inputs[2], pair[1].sender_user_id);
+        }
     }
 
     // ── apply_claim_report: additional double-claim-defence edges ──────────
