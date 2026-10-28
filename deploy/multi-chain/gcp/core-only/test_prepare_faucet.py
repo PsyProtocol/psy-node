@@ -46,10 +46,11 @@ class FaucetTests(unittest.TestCase):
         self.assertEqual(manifest["operator_count"], 100)
         self.assertNotIn("operators.cred", files)
         unit = files[faucet.UNIT].decode()
-        for value in ("MemoryHigh=22G", "MemoryMax=26G", "MemorySwapMax=12G",
+        for value in ("MemoryMax=20G", "MemorySwapMax=0", "Restart=on-failure",
                       "User=psy-faucet-r2", "LoadCredentialEncrypted=operators.json:",
                       str(faucet.STATE), "--spec-sha256 " + self.args.spec_sha256):
             self.assertIn(value, unit)
+        self.assertNotIn("MemoryHigh=", unit)
         self.assertEqual(stat.S_IMODE(args.package.stat().st_mode), 0o700)
         with self.assertRaises(FileExistsError):
             faucet.prepare(self.args)
@@ -87,6 +88,17 @@ class FaucetTests(unittest.TestCase):
                                  ("UnitFileState", "enabled"), ("Job", "1")):
                 with patch.object(faucet, "unit_state", return_value=dict(stopped, **{field: value})):
                     with self.assertRaises(ValueError): faucet.check_stopped()
+
+    def test_previous_faucet_units_must_be_stopped(self):
+        stopped = {"LoadState": "loaded", "ActiveState": "inactive", "MainPID": "0",
+                   "UnitFileState": "disabled", "Job": ""}
+        with patch.object(Path, "iterdir", return_value=[]), \
+                patch.object(faucet, "unit_state", return_value=stopped) as state:
+            faucet.check_stopped()
+        checked = [c.args[0] for c in state.call_args_list]
+        for name in ("psy-faucet-r3.service", "psy-faucet-r3-memprobe.service",
+                     "psy-faucet-r3-batch.service", faucet.UNIT):
+            self.assertIn(name, checked)
 
     def test_wrong_host_rejected_before_credentials(self):
         with patch.object(faucet.os, "geteuid", return_value=0), \

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and bootstrap a private Faucet using retained host-bound credentials."""
+"""Prepare and bootstrap the r3 batched Faucet (feat/faucet-batch-departure, AVX-512 host build) using the r3 host-bound credentials."""
 import argparse
 import base64
 import hashlib
@@ -14,19 +14,19 @@ import socket
 import stat
 import subprocess
 
-SOURCE = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
+SOURCE = "ffebbba773063b90802745609eddad6b2731bf11"
 GENESIS_SHA256 = "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173"
-BINARY_SHA256 = "601af4fe4c642680720526da1a9dd5b0d75b764a6a9e3916cec07859adca4135"
+BINARY_SHA256 = "0267bc51a62ccd27f1ced0dff5d767f64e193a913e1225b4835f9c61576121de"
 CANONICAL_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
 RPC_SHA256 = "362be1695045cabc4f2df3353f499cabbac1cd70116df742eef3bbc1455ed3a5"
 OPERATORS_SHA256 = "18911c1ed70c5be25af168979499f75a1cb9ea4b91923fbf4743653caaa644df"
 ACCOUNT = "psy-faucet-r2"
-OLD_CUSTODY = Path("/etc/psy-faucet/core-testnet-20261026-r2-x2")
-RELEASE = Path("/opt/psy-faucet/releases/core-testnet-20261027-r3-x2")
-CUSTODY = Path("/etc/psy-faucet/core-testnet-20261027-r3-x2")
-STATE = Path("/var/lib/psy-faucet-r3-x2")
+OLD_CUSTODY = Path("/etc/psy-faucet/core-testnet-20261027-r3-x2")
+RELEASE = Path("/opt/psy-faucet/releases/core-testnet-20261028-r3-batch10-x2")
+CUSTODY = Path("/etc/psy-faucet/core-testnet-20261028-r3-batch10-x2")
+STATE = Path("/var/lib/psy-faucet-r3-batch10-x2")
 UNITS = Path("/etc/systemd/system")
-UNIT = "psy-faucet-r3.service"
+UNIT = "psy-faucet-r3-batch10.service"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/nonexistent", "LANG": "C"}
 
 
@@ -87,7 +87,7 @@ def validate_spec(raw):
 
 def unit(spec_sha):
     return f"""[Unit]
-Description=Psy Faucet r3 private acceptance
+Description=Psy Faucet r3 batched claims (10 per End Cap)
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
@@ -124,9 +124,8 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitCORE=0
 LimitNOFILE=65536
-MemoryHigh=22G
-MemoryMax=26G
-MemorySwapMax=12G
+MemoryMax=20G
+MemorySwapMax=0
 
 [Install]
 WantedBy=multi-user.target
@@ -190,7 +189,7 @@ def unit_state(name):
 
 
 def check_stopped():
-    for name in ("psy-faucet-r2.service", "parth-faucet-server.service", UNIT):
+    for name in ("psy-faucet-r2.service", "parth-faucet-server.service", "psy-faucet-r3.service", "psy-faucet-r3-memprobe.service", "psy-faucet-r3-batch.service", UNIT):
         state = unit_state(name)
         require(state.get("ActiveState") == "inactive" and state.get("MainPID") == "0"
                 and state.get("Job", "") in ("", "0"), "Faucet must be inactive without queued jobs")

@@ -125,6 +125,44 @@ This change prepares the account pool; it does not generate Genesis, regenerate
 Guardian/Validator identities, start Faucet, or increase proof concurrency to 100.
 Keep concurrency bounded separately according to proving capacity.
 
+## Batched Faucet release (r3-batch10)
+
+`prepare_faucet.py` pins the batched Faucet: psy-node `ffebbba7`
+(`feat/faucet-batch-departure`), unit `psy-faucet-r3-batch10.service`,
+`MemoryMax=20G`, `MemorySwapMax=0`, `Restart=on-failure`. Claims depart every
+5 s, up to 10 recipients per operator End Cap and at most 3 End Caps proving at
+once; each End Cap holds one local SD-key signature proof of about 2 GiB, so
+the memory bound no longer depends on the number of concurrent claims. It
+reuses the r3 host-bound operator credential (`OLD_CUSTODY`).
+
+The pinned binary is built on the Faucet host with `build_faucet_host.sh`
+(`-C target-cpu=native`, AVX-512), so it runs only on that host. Prepare
+`<build-root>/src` from `git archive` of the pinned commit plus the r3
+`psy-genesis/` inputs that `build_runtime.py` mounts, and copy the offline Cargo
+home and Go caches to `<build-root>/cargo`, `go` and `go-build`. Then, on the
+host:
+
+```bash
+BUILD_ROOT=<build-root> BUILDER_IMAGE=<local builder image id> ./build_faucet_host.sh
+python3 -I -B prepare_faucet.py prepare --binary <build-root>/out/psy_user_cli \
+  --canonical <r3-release>/canonical.json --rpc <r3-release>/rpc.json \
+  --host-spec <r3-release>/host.json --spec-sha256 <host.json sha256> --output <package>
+```
+
+Bootstrap refuses to run while any listed Faucet unit is active or while the
+listener port is still bound. A just-stopped Faucet leaves TIME-WAIT sockets on
+the port for up to 60 s, so wait until the port binds before bootstrapping:
+
+```bash
+sudo systemctl stop <previous faucet unit>
+sudo python3 -I -B <package>/prepare_faucet.py bootstrap --package <package> \
+  --manifest-sha256 <manifest sha256> --start-private --public-ingress-closed
+```
+
+Roll back by stopping `psy-faucet-r3-batch10.service` and starting
+`psy-faucet-r3.service`; both releases and their state directories stay
+installed side by side.
+
 ## Network selection
 
 The only accepted deployment combination is `PSY_NETWORK=testnet`, CLI network
