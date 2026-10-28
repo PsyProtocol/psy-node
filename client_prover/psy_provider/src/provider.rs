@@ -101,6 +101,30 @@ fn parse_end_cap_already_submitted(error: &crate::request::RpcError) -> Option<E
         unique_pending_id: unique_pending_id.parse().ok()?,
     })
 }
+
+/// The Realm edge forwarded the End Cap but the scheduled proposer refused to
+/// store it, so it was not included. The proposer reports its own checkpoint
+/// race ("not the admissible target") this way, so resending the same End Cap
+/// is safe and usually succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("end cap forward rejected by proposer {proposer} (reason Invalid)")]
+pub struct EndCapForwardRejected {
+    pub proposer: u16,
+}
+
+fn parse_end_cap_forward_rejected(error: &crate::request::RpcError) -> Option<EndCapForwardRejected> {
+    if error.code != crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE) || error.data.is_some() {
+        return None;
+    }
+    let proposer = error
+        .message
+        .strip_prefix("EndCap forward rejected by proposer ")?
+        .strip_suffix(" (reason Invalid)")?;
+    if proposer.is_empty() || !proposer.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(EndCapForwardRejected { proposer: proposer.parse().ok()? })
+}
 // withdrawal_tree storage is felt-addressed, with 4 felts packed per
 // contract-state leaf. Layout:
 //   root[8]                 -> sub-slots 0..7
@@ -555,6 +579,9 @@ impl QUserRpcProvider for RpcProvider {
                 tracing::error!("RPC call failed: {:?}", e);
                 if let Some(ack) = parse_end_cap_already_submitted(&e) {
                     return Err(ack.into());
+                }
+                if let Some(rejected) = parse_end_cap_forward_rejected(&e) {
+                    return Err(rejected.into());
                 }
                 Err(anyhow::format_err!("submit_end_cap_proof rpc call failed `{:?}`", e))
             }
@@ -2308,6 +2335,27 @@ mod tests {
             data: Some(serde_json::json!({ "other": true })),
         };
         assert_eq!(parse_end_cap_already_submitted(&with_data), None);
+    }
+
+    #[test]
+    fn parses_only_the_exact_end_cap_forward_rejection() {
+        let code = crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE);
+        let rejected = rpc_error(code.clone(), "EndCap forward rejected by proposer 3 (reason Invalid)");
+        assert_eq!(parse_end_cap_forward_rejected(&rejected), Some(EndCapForwardRejected { proposer: 3 }));
+        assert_eq!(parse_end_cap_already_submitted(&rejected), None);
+
+        let messages = [
+            "EndCap forward rejected by proposer 3 (reason Busy)",
+            "EndCap forward rejected by proposer x (reason Invalid)",
+            "EndCap forward rejected by proposer  (reason Invalid)",
+            "EndCap forward to proposer 3 failed: timeout",
+            "end cap for user_id 524288 at unique_pending_id 675 has already been submitted",
+        ];
+        for message in messages {
+            assert_eq!(parse_end_cap_forward_rejected(&rpc_error(code.clone(), message)), None, "message={message}");
+        }
+        let wrong_code = rpc_error(crate::request::ErrorCode::InternalError, "EndCap forward rejected by proposer 3 (reason Invalid)");
+        assert_eq!(parse_end_cap_forward_rejected(&wrong_code), None);
     }
 
     #[tokio::test]
