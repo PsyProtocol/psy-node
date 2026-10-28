@@ -4,11 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use parth_core::{
+    crypto::hash::traits::{FieldQHasher, QFieldHashable},
     data::hash::fast_node_serializer::{
         QMerkleStoreFastSingleNodeSerializer, QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE,
         QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE,
     },
-    protocol::core_types::Q256BitHash,
+    protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use psy_data::{
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
@@ -113,7 +114,7 @@ where
 }
 
 /// Nonzero FFS-changed leaves identified as IMT by this update or a previous-checkpoint preimage.
-pub(crate) async fn load_changed_leaves_on_imt_indexed_trees<S, F, Hash>(
+pub(crate) async fn load_changed_leaves_on_imt_indexed_trees<S, F, Hash, H>(
     db: &S,
     previous_checkpoint_id: u64,
     updates: &PsyPreparedRealmBlockStateUpdates<Hash>,
@@ -121,7 +122,8 @@ pub(crate) async fn load_changed_leaves_on_imt_indexed_trees<S, F, Hash>(
 where
     S: psy_node_core::psy_core_db::traits::full::PsyNodeContractStateIMTDatabaseReader<F, Hash> + Sync,
     F: parth_core::felt::QFelt64,
-    Hash: Q256BitHash + Copy + PartialEq,
+    Hash: Q256BitHash + QFHashBase<F> + Copy + PartialEq,
+    H: FieldQHasher<F, Hash>,
 {
     require_width(
         &updates.update_contract_state_imt_leaves_ffs,
@@ -143,14 +145,18 @@ where
         if new_value == empty_leaf {
             continue;
         }
-        if update_imt_leaves.contains(&(user_id, contract_id, index))
-            || db
-                .contract_state_imt_get_leaf_preimage(previous_checkpoint_id, user_id, contract_id, index)
-                .await
-                .with_context(|| format!("previous-checkpoint IMT preimage read failed checkpoint={previous_checkpoint_id} user={user_id} contract={contract_id} index={index}"))?
-                .is_some()
-        {
+        if update_imt_leaves.contains(&(user_id, contract_id, index)) {
             required_imt_leaves.insert((user_id, contract_id, index));
+            continue;
+        }
+        if let Some(previous_preimage) = db
+            .contract_state_imt_get_leaf_preimage(previous_checkpoint_id, user_id, contract_id, index)
+            .await
+            .with_context(|| format!("previous-checkpoint IMT preimage read failed checkpoint={previous_checkpoint_id} user={user_id} contract={contract_id} index={index}"))?
+        {
+            if previous_preimage.qfhash::<H>() != new_value {
+                required_imt_leaves.insert((user_id, contract_id, index));
+            }
         }
     }
     Ok(required_imt_leaves)
@@ -478,19 +484,36 @@ mod tests {
         let hash = PGoldilocksHash::from_owned_32bytes([1u8; 32]);
         let mut updates = empty_updates(hash, hash);
         updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x05);
-        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
         assert_eq!(required, HashSet::from([(1, 2, 0)]));
         let error = require_state_update_record_coverage(&updates, 8, &required)
             .expect_err("known IMT identity without a record must fail");
         assert!(error.to_string().contains("no IMT record"), "{error}");
 
+        let unchanged_hash = db.preimages[&(7, 1, 2, 0)].qfhash::<PoseidonHasher>();
+        updates.update_contract_state_tree_nodes_ffs =
+            QMerkleStoreFastDoubleNodeSerializer::serialize_double_id_node_to_vec(
+                &parth_core::data::hash::merkle_store_key::QMerkleStoreDoubleIdNode {
+                    key: parth_core::data::hash::merkle_store_key::QMerkleStoreDoubleIdKey {
+                        tree_id: 1,
+                        tree_sub_id: 2,
+                        level: 4,
+                        index: 0,
+                    },
+                    value: unchanged_hash,
+                },
+            );
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
+        assert!(required.is_empty(), "unchanged IMT leaf needs no new record");
+        require_state_update_record_coverage(&updates, 8, &required).unwrap();
+
         updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0);
-        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
         assert!(required.is_empty(), "cleared IMT leaves remain exempt");
 
         updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x05);
         db.preimages.clear();
-        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
         assert!(required.is_empty(), "append marker alone does not identify IMT leaves");
         require_state_update_record_coverage(&updates, 8, &required).unwrap();
     }
@@ -513,13 +536,13 @@ mod tests {
                 ),
             );
         }
-        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
         assert_eq!(required, HashSet::from([(1, 2, 2147483671), (1, 2, 2147483672)]));
         require_state_update_record_coverage(&updates, 8, &required)
             .expect("mixed positional and IMT changes must pass coverage");
 
         updates.update_contract_state_imt_leaves_ffs.drain(..IMT_LEAF_FFS_ENTRY_SIZE_V2);
-        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
         assert_eq!(required, HashSet::from([(1, 2, 2147483671), (1, 2, 2147483672)]));
         let error = require_state_update_record_coverage(&updates, 8, &required)
             .expect_err("omitting a changed existing IMT record must still fail");

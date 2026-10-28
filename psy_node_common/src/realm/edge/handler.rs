@@ -14,7 +14,7 @@ use parth_core::{
             traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
+    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier, Q256BitHash}
 };
 use psy_api_core::{
     realm::standard_edge_rpc::{
@@ -25,11 +25,11 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::{ContractStateUpdate, SubmitUserEndCapNonProofInput}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTMembershipProof,
+            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTContractStateUpdate, IMTMembershipProof,
                 IMTNonMembershipProof, IMTPredecessorResult, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
@@ -943,6 +943,10 @@ impl<
         user_end_cap_input.ensure_declared_slots_modified()?;
         timer.lap_micros("ensure_declared_slots_modified");
 
+        self.ensure_imt_leaf_record_coverage(&user_end_cap_input, user_id, current_checkpoint_id)
+            .await?;
+        timer.lap_micros("ensure_imt_leaf_record_coverage");
+
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking(move || {
             proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
@@ -967,6 +971,69 @@ impl<
             },
         )
         .await
+    }
+
+    /// Require IMT records for changed existing IMT leaves before admission,
+    /// matching commit-path coverage; unchanged leaves remain exempt.
+    async fn ensure_imt_leaf_record_coverage(
+        &self,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        user_id: u64,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<()> {
+        let empty_leaf = N::QHash::from_owned_32bytes([0u8; 32]);
+        // Group coverage across histories of each contract, matching aggregated FFS.
+        let mut recorded_imt_leaves: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for csu in user_end_cap_input.contract_state_updates.iter() {
+            let contract_id = csu.user_contract_tree_update_proof.index;
+            for update in csu.updates.iter() {
+                if let ContractStateUpdate::IMT { update } = update {
+                    let leaves = recorded_imt_leaves.entry(contract_id).or_default();
+                    match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => {
+                            leaves.insert(delta_proof.index);
+                        }
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            new_leaf_delta_proof,
+                            ..
+                        } => {
+                            leaves.insert(predecessor_delta_proof.index);
+                            leaves.insert(new_leaf_delta_proof.index);
+                        }
+                    }
+                }
+            }
+        }
+        for csu in user_end_cap_input.contract_state_updates.iter() {
+            let contract_id = csu.user_contract_tree_update_proof.index;
+            for update in csu.updates.iter() {
+                let ContractStateUpdate::Positional { delta_proof } = update else {
+                    continue;
+                };
+                if delta_proof.new_value == empty_leaf {
+                    continue;
+                }
+                if recorded_imt_leaves
+                    .get(&contract_id)
+                    .is_some_and(|leaves| leaves.contains(&delta_proof.index))
+                {
+                    continue;
+                }
+                if let Some(previous_preimage) = self
+                    .db_reader
+                    .contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, contract_id, delta_proof.index)
+                    .await?
+                {
+                    anyhow::ensure!(
+                        previous_preimage.qfhash::<N::HasherBase>() == delta_proof.new_value,
+                        "InvalidEndCapUpdates: contract-state leaf contract={contract_id} index={} re-declares an existing IMT leaf with a changed value but no IMT record",
+                        delta_proof.index,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn forward_end_cap_to_scheduled_proposer(

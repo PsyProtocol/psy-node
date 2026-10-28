@@ -1354,11 +1354,14 @@ impl<
                         } => {
                             let old_hash = resolve_slot_hash(*leaf_index, *from_version)?;
                             let new_hash = resolve_slot_hash(*leaf_index, *to_version)?;
-                            let old_preimage = resolve_preimage_from_hash(old_hash)?;
-                            let new_preimage = resolve_preimage_from_hash(new_hash)?;
                             let delta_proof = self
                                 .set_contract_state_slot_inner(c, F::from_canonical_u64(*leaf_index), new_hash)
                                 .await?;
+                            // Preserve no-op IMT operations: first-touch and
+                            // repeated-touch records affect the modified-key
+                            // count replayed by the node.
+                            let old_preimage = resolve_preimage_from_hash(old_hash)?;
+                            let new_preimage = resolve_preimage_from_hash(new_hash)?;
                             contract_state_tree_updates.push(ContractStateUpdate::IMT {
                                 update: IMTContractStateUpdate::Update {
                                     old_preimage,
@@ -1449,10 +1452,20 @@ impl<
                 })?;
 
                 let delta_proof = self.set_contract_state_slot_inner(c, F::from_canonical_u64(*slot), new_value).await?;
-                contract_state_tree_updates.push(ContractStateUpdate::Positional { delta_proof });
+                if delta_proof.old_value != delta_proof.new_value {
+                    contract_state_tree_updates.push(ContractStateUpdate::Positional { delta_proof });
+                }
             }
 
             let user_contract_tree_update_proof = self.update_contract_state_root_in_user_contract_tree(c).await?;
+            if contract_state_tree_updates.is_empty() {
+                anyhow::ensure!(
+                    user_contract_tree_update_proof.old_root == user_contract_tree_update_proof.new_root,
+                    "contract state changed without a recorded update for contract_id={}",
+                    r.contract_id,
+                );
+                continue;
+            }
             tracing::info!(
                 "DEBUG get_all_state_updates result contract_id={} old_root={} old_value={} new_root={} new_value={} cst_updates={}",
                 r.contract_id,
