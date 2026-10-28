@@ -67,7 +67,7 @@ use psy_crypto::{
 use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
-    provider::{EndCapForwardRejected, ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
+    provider::{EndCapAheadOfGathering, EndCapForwardRejected, ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
             request::{QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest},
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -1208,6 +1208,28 @@ impl ProveError {
 mod prove_error_tests {
     use super::*;
 
+    #[test]
+    fn only_edge_refusals_before_inclusion_resend_the_end_cap() {
+        assert!(is_end_cap_resendable(&EndCapForwardRejected { proposer: 2 }.into()));
+        assert!(is_end_cap_resendable(
+            &EndCapAheadOfGathering { end_cap_checkpoint_id: 9080, gathering_checkpoint_id: 9079 }.into()
+        ));
+        let already_submitted: anyhow::Error = psy_provider::provider::EndCapAlreadySubmitted { user_id: 7, unique_pending_id: 9 }.into();
+        assert!(!is_end_cap_resendable(&already_submitted));
+        assert!(!is_end_cap_resendable(&anyhow::anyhow!("EndCap forward to proposer 3 is busy; delivery is not confirmed")));
+    }
+
+    #[test]
+    fn a_refusal_after_an_earlier_forward_rejection_is_not_reported_as_unstored() {
+        let ahead = || -> anyhow::Error { EndCapAheadOfGathering { end_cap_checkpoint_id: 9080, gathering_checkpoint_id: 9079 }.into() };
+        assert!(drop_unproven_refusal(ahead(), true).downcast_ref::<EndCapAheadOfGathering>().is_some());
+        let downgraded = drop_unproven_refusal(ahead(), false);
+        assert!(downgraded.downcast_ref::<EndCapAheadOfGathering>().is_none());
+        assert_eq!(downgraded.to_string(), ahead().to_string());
+        let forward = drop_unproven_refusal(EndCapForwardRejected { proposer: 2 }.into(), false);
+        assert!(forward.downcast_ref::<EndCapForwardRejected>().is_some());
+    }
+
     fn hash(value: u64) -> QHashOut<F> {
         QHashOut(HashOut {
             elements: [F::from_canonical_u64(value), F::ZERO, F::ZERO, F::ZERO],
@@ -1243,8 +1265,8 @@ pub struct EndCapContractSlotUpdate {
 }
 
 const USER_SESSION_SHARDS: usize = 4096;
-const END_CAP_FORWARD_ATTEMPTS: u32 = 3;
-const END_CAP_FORWARD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const END_CAP_RESEND_ATTEMPTS: u32 = 8;
+const END_CAP_RESEND_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 #[error("end cap submission rejected after proving deterministic leaf {end_user_leaf_hash}: {source}")]
@@ -1253,6 +1275,18 @@ pub struct EndCapSubmissionError {
     pub contract_slot_updates: Vec<EndCapContractSlotUpdate>,
     #[source]
     pub source: anyhow::Error,
+}
+
+fn is_end_cap_resendable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<EndCapForwardRejected>().is_some() || error.downcast_ref::<EndCapAheadOfGathering>().is_some()
+}
+
+// An earlier forwarded copy may have been stored, so the last refusal cannot vouch for every copy.
+fn drop_unproven_refusal(error: anyhow::Error, is_every_refusal_ahead: bool) -> anyhow::Error {
+    match is_every_refusal_ahead || error.downcast_ref::<EndCapAheadOfGathering>().is_none() {
+        true => error,
+        false => anyhow::anyhow!("{error:#}"),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3809,13 +3843,15 @@ impl WalletSession {
 
         let provider = self.st_provider.with_user_id_owned(user_id);
         let mut attempt = 1;
+        let mut is_every_refusal_ahead = true;
         let submitted = loop {
             match provider.submit_end_cap_proof::<F>(req.clone()).await {
                 // The same End Cap carries the same nonce, so resending it can never pay twice.
-                Err(error) if attempt < END_CAP_FORWARD_ATTEMPTS && error.downcast_ref::<EndCapForwardRejected>().is_some() => {
-                    tracing::warn!(user_id, attempt, error = %error, "End Cap forward rejected; resending the same End Cap");
+                Err(error) if attempt < END_CAP_RESEND_ATTEMPTS && is_end_cap_resendable(&error) => {
+                    is_every_refusal_ahead &= error.downcast_ref::<EndCapAheadOfGathering>().is_some();
+                    tracing::warn!(user_id, attempt, error = %error, "End Cap refused by the edge; resending the same End Cap");
                     attempt += 1;
-                    super::sleep(END_CAP_FORWARD_RETRY_DELAY).await;
+                    super::sleep(END_CAP_RESEND_DELAY).await;
                 }
                 result => break result,
             }
@@ -3823,7 +3859,7 @@ impl WalletSession {
         submitted.map_err(|source| EndCapSubmissionError {
             end_user_leaf_hash,
             contract_slot_updates,
-            source,
+            source: drop_unproven_refusal(source, is_every_refusal_ahead),
         })?;
 
         Ok(end_user_leaf_hash)

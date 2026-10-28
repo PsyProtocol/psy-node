@@ -125,6 +125,31 @@ fn parse_end_cap_forward_rejected(error: &crate::request::RpcError) -> Option<En
     }
     Some(EndCapForwardRejected { proposer: proposer.parse().ok()? })
 }
+
+/// The Realm edge's gathering checkpoint is behind the End Cap's checkpoint; the edge
+/// refuses this before storing anything, so resending once it catches up is safe.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("end cap for checkpoint {end_cap_checkpoint_id} is ahead of the edge gathering checkpoint {gathering_checkpoint_id}")]
+pub struct EndCapAheadOfGathering {
+    pub end_cap_checkpoint_id: u64,
+    pub gathering_checkpoint_id: u64,
+}
+
+fn parse_end_cap_ahead_of_gathering(error: &crate::request::RpcError) -> Option<EndCapAheadOfGathering> {
+    if error.code != crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE) || error.data.is_some() {
+        return None;
+    }
+    let (end_cap_checkpoint_id, gathering_checkpoint_id) = error
+        .message
+        .strip_prefix("Submitted end cap for checkpoint ")?
+        .split_once(", but current checkpoint is ")?;
+    let parse = |value: &str| (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())).then(|| value.parse::<u64>().ok()).flatten();
+    let ahead = EndCapAheadOfGathering {
+        end_cap_checkpoint_id: parse(end_cap_checkpoint_id)?,
+        gathering_checkpoint_id: parse(gathering_checkpoint_id)?,
+    };
+    (ahead.end_cap_checkpoint_id > ahead.gathering_checkpoint_id).then_some(ahead)
+}
 // withdrawal_tree storage is felt-addressed, with 4 felts packed per
 // contract-state leaf. Layout:
 //   root[8]                 -> sub-slots 0..7
@@ -582,6 +607,9 @@ impl QUserRpcProvider for RpcProvider {
                 }
                 if let Some(rejected) = parse_end_cap_forward_rejected(&e) {
                     return Err(rejected.into());
+                }
+                if let Some(ahead) = parse_end_cap_ahead_of_gathering(&e) {
+                    return Err(ahead.into());
                 }
                 Err(anyhow::format_err!("submit_end_cap_proof rpc call failed `{:?}`", e))
             }
@@ -2356,6 +2384,39 @@ mod tests {
         }
         let wrong_code = rpc_error(crate::request::ErrorCode::InternalError, "EndCap forward rejected by proposer 3 (reason Invalid)");
         assert_eq!(parse_end_cap_forward_rejected(&wrong_code), None);
+    }
+
+    #[test]
+    fn parses_only_an_end_cap_ahead_of_the_gathering_checkpoint() {
+        let code = crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE);
+        let ahead = rpc_error(code.clone(), "Submitted end cap for checkpoint 9080, but current checkpoint is 9079");
+        assert_eq!(
+            parse_end_cap_ahead_of_gathering(&ahead),
+            Some(EndCapAheadOfGathering { end_cap_checkpoint_id: 9080, gathering_checkpoint_id: 9079 })
+        );
+        assert_eq!(parse_end_cap_forward_rejected(&ahead), None);
+        assert_eq!(parse_end_cap_already_submitted(&ahead), None);
+
+        let messages = [
+            "Submitted end cap for checkpoint 9080, but user's last checkpoint is 9081",
+            "Submitted end cap for checkpoint 9079, but current checkpoint is 9079",
+            "Submitted end cap for checkpoint 9078, but current checkpoint is 9079",
+            "Submitted end cap for checkpoint x, but current checkpoint is 9079",
+            "Submitted end cap for checkpoint 9080, but current checkpoint is ",
+            "Submitted end cap for checkpoint 9080, but current checkpoint is 9079 ",
+            "submitted end cap for checkpoint 9080, but current checkpoint is 9079",
+        ];
+        for message in messages {
+            assert_eq!(parse_end_cap_ahead_of_gathering(&rpc_error(code.clone(), message)), None, "message={message}");
+        }
+        let wrong_code = rpc_error(crate::request::ErrorCode::InternalError, "Submitted end cap for checkpoint 9080, but current checkpoint is 9079");
+        assert_eq!(parse_end_cap_ahead_of_gathering(&wrong_code), None);
+        let with_data = crate::request::RpcError {
+            code,
+            message: Cow::Borrowed("Submitted end cap for checkpoint 9080, but current checkpoint is 9079"),
+            data: Some(serde_json::json!({ "other": true })),
+        };
+        assert_eq!(parse_end_cap_ahead_of_gathering(&with_data), None);
     }
 
     #[tokio::test]
