@@ -67,7 +67,7 @@ use psy_crypto::{
 use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
-    provider::{ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
+    provider::{EndCapForwardRejected, ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
             request::{QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest},
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -1243,6 +1243,8 @@ pub struct EndCapContractSlotUpdate {
 }
 
 const USER_SESSION_SHARDS: usize = 4096;
+const END_CAP_FORWARD_ATTEMPTS: u32 = 3;
+const END_CAP_FORWARD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 #[error("end cap submission rejected after proving deterministic leaf {end_user_leaf_hash}: {source}")]
@@ -3805,15 +3807,24 @@ impl WalletSession {
             })
             .collect();
 
-        self.st_provider
-            .with_user_id_owned(user_id)
-            .submit_end_cap_proof::<F>(req)
-            .await
-            .map_err(|source| EndCapSubmissionError {
-                end_user_leaf_hash,
-                contract_slot_updates,
-                source,
-            })?;
+        let provider = self.st_provider.with_user_id_owned(user_id);
+        let mut attempt = 1;
+        let submitted = loop {
+            match provider.submit_end_cap_proof::<F>(req.clone()).await {
+                // The same End Cap carries the same nonce, so resending it can never pay twice.
+                Err(error) if attempt < END_CAP_FORWARD_ATTEMPTS && error.downcast_ref::<EndCapForwardRejected>().is_some() => {
+                    tracing::warn!(user_id, attempt, error = %error, "End Cap forward rejected; resending the same End Cap");
+                    attempt += 1;
+                    super::sleep(END_CAP_FORWARD_RETRY_DELAY).await;
+                }
+                result => break result,
+            }
+        };
+        submitted.map_err(|source| EndCapSubmissionError {
+            end_user_leaf_hash,
+            contract_slot_updates,
+            source,
+        })?;
 
         Ok(end_user_leaf_hash)
     }
