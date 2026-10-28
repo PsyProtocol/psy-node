@@ -96,12 +96,13 @@ Current contract (`realm_end_cap_gatherer.rs`):
 
 1. If the shared gathering start does not match the cycle start, finalize fails closed without consuming the cycle.
 2. Validator and checkpoint proofs use the planner's fixed checkpoint rather than the advancing Coordinator head.
-3. If that checkpoint no longer authenticates the cycle start, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded by design.
-4. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
+3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, schedules a target in the same rotation epoch, and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
+4. If no such checkpoint exists, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded.
+5. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
 
 FastForward remains the follower path for applying an included proposal; it is separate from generation discard.
 
-The tree runner does not retain raw cycle items for replay. FastForward applies the included updates before constructing a replacement builder; speculative inputs are not replayed. Items fetched from the retired queue after finalize are discarded with a warning. Future-checkpoint EndCaps remain owned by `future_pending_end_cap_jobs`; the lossy raw-input policy does not authorize dropping confirmed FFS.
+The tree runner does not retain raw queue items; only the planner's accepted EndCaps are replayed, and only by the proof-base recreation above. FastForward applies the included updates before constructing a replacement builder; speculative inputs are not replayed. Items fetched from the retired queue after finalize are discarded with a warning. Future-checkpoint EndCaps remain owned by `future_pending_end_cap_jobs`; the lossy raw-input policy does not authorize dropping confirmed FFS.
 
 ### 3.2 Validator fee recovery
 

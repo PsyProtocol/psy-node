@@ -114,7 +114,7 @@ Entry: `realm/processor/core/process_block.rs:422`.
 6. Wait until the Coordinator checkpoint carries the new Realm root, then commit the included state.
 7. Synchronize metadata through the applied checkpoint and delete the processing worker-queue consumer; later transitions are handled by the next `sync_and_verify` iteration.
 
-Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise B reverts and discards that generation before tree commit; it does not rebase or replay accepted EndCaps.
+Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise, when the gathering checkpoint at B's finalize includes A's end root and schedules the same rotation epoch, B replays its accepted EndCaps on that proof base ([Gatherers](gatherers.md#31-n--n1-finalize-seam)). Without such a checkpoint B reverts and discards that generation before tree commit; it does not rebase onto a different root.
 
 ## 5. Commit ordering
 
