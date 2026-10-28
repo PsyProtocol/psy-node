@@ -18,6 +18,7 @@ use psy_client_common::{
 };
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
+use psy_provider::provider::EndCapAheadOfGathering;
 
 use tokio::sync::Semaphore;
 
@@ -588,16 +589,17 @@ impl PsyFaucetService {
             .config
             .faucet_per_claim_amount
             .parse::<u64>()
-            .map_err(|err| BatchFailure::Rejected(format!("invalid faucet amount: {err}")))?;
+            .map_err(|err| BatchFailure::NotSubmitted(format!("invalid faucet amount: {err}")))?;
         let claim_id = self.claim_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let mut excluded: Vec<usize> = Vec::new();
-        let mut last_already_claimed: Option<String> = None;
+        let mut last_failure: Option<BatchFailure> = None;
         let mut stale_retries = 0;
+        let mut session_retries = 0;
         loop {
             let wait_started = Instant::now();
             let mut lease = match self.acquire_operator(&excluded).await {
                 Ok(lease) => lease,
-                Err(_) => return Err(last_already_claimed.map_or(BatchFailure::Busy, BatchFailure::AlreadyClaimed)),
+                Err(_) => return Err(last_failure.unwrap_or(BatchFailure::Busy)),
             };
             let wait_ms = wait_started.elapsed().as_millis() as u64;
             let index = lease.index();
@@ -608,7 +610,7 @@ impl PsyFaucetService {
             let failure = submit_result.as_ref().err().map(|err| classify_failure(err));
             if let Some(end_user_leaf_hash) = match (&submit_result, &failure) {
                 (Ok(end_user_leaf_hash), _) => Some(*end_user_leaf_hash),
-                (Err(_), Some(Failure::Submission { end_user_leaf_hash })) => Some(*end_user_leaf_hash),
+                (Err(_), Some(Failure::Submission { end_user_leaf_hash, is_refused_before_storage: false })) => Some(*end_user_leaf_hash),
                 _ => None,
             } {
                 lease.mark_submitted(end_user_leaf_hash);
@@ -643,25 +645,29 @@ impl PsyFaucetService {
             let is_batch = recipients.len() > 1;
             match failure {
                 _ if !is_batch && is_already_claimed_error(&message) => {
-                    last_already_claimed = Some(message);
+                    last_failure = Some(BatchFailure::AlreadyClaimed(message));
                     excluded.push(index);
                 }
-                Some(Failure::Submission { .. }) => return Err(BatchFailure::Rejected(message)),
+                Some(Failure::Submission { is_refused_before_storage: true, .. }) => return Err(BatchFailure::Refused(message)),
+                Some(Failure::Submission { is_refused_before_storage: false, .. }) => return Err(BatchFailure::Unconfirmed(message)),
                 // Nothing reached the edge, so another operator can safely
                 // take the claim.
                 Some(Failure::StaleBeforeSubmit) if stale_retries < MAX_STALE_RETRIES => {
                     stale_retries += 1;
                     excluded.push(index);
+                    last_failure = Some(BatchFailure::NotSubmitted(message));
                 }
-                // A session that cannot start is an operator or chain problem, not a recipient one.
-                _ if is_batch && timings.failed_phase == Some(CallPhase::Session) && stale_retries < MAX_STALE_RETRIES => {
-                    stale_retries += 1;
+                // A session that cannot start is a chain-head or operator problem, not a recipient one.
+                _ if timings.failed_phase == Some(CallPhase::Session) && session_retries < MAX_SESSION_RETRIES => {
+                    session_retries += 1;
                     excluded.push(index);
+                    last_failure = Some(BatchFailure::NotSubmitted(message));
+                    tokio::time::sleep(SESSION_RETRY_DELAY).await;
                 }
                 _ if is_batch && matches!(timings.failed_phase, Some(CallPhase::Contract | CallPhase::SignSubmit)) => {
                     return Err(BatchFailure::BeforeSubmit(message))
                 }
-                _ => return Err(BatchFailure::Rejected(message)),
+                _ => return Err(BatchFailure::NotSubmitted(message)),
             }
         }
     }
@@ -710,6 +716,8 @@ impl PsyFaucetService {
 }
 
 const MAX_STALE_RETRIES: usize = 2;
+const MAX_SESSION_RETRIES: usize = 3;
+const SESSION_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_QUEUED_CLAIMS: usize = 1024;
 const MIN_BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const OPERATOR_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -727,15 +735,23 @@ async fn dispatch_loop(service: Weak<PsyFaucetService>) {
 enum BatchFailure {
     // Nothing reached the edge; each recipient may still succeed in a smaller batch.
     BeforeSubmit(String),
+    NotSubmitted(String),
     AlreadyClaimed(String),
     Busy,
-    Rejected(String),
+    Refused(String),
+    Unconfirmed(String),
 }
 
 impl BatchFailure {
     fn into_rpc_error(self) -> ErrorObjectOwned {
         match self {
-            BatchFailure::BeforeSubmit(message) | BatchFailure::Rejected(message) => rpc_error_with_data("faucet operator submit failed", message),
+            BatchFailure::BeforeSubmit(message) | BatchFailure::NotSubmitted(message) => {
+                rpc_error_with_data("faucet claim was not submitted; nothing was sent, retry shortly", message)
+            }
+            BatchFailure::Refused(message) => rpc_error_with_data("faucet End Cap was refused by the network before storage; retry shortly", message),
+            BatchFailure::Unconfirmed(message) => {
+                rpc_error_with_data("faucet End Cap delivery is not confirmed; check the claimable balance before retrying", message)
+            }
             BatchFailure::AlreadyClaimed(message) => rpc_error_with_data("faucet already claimed in the current window", message),
             BatchFailure::Busy => rpc_error("all faucet operators are busy; retry shortly"),
         }
@@ -803,7 +819,7 @@ enum Failure {
     // chain state moved while this claim was proved.
     StaleBeforeSubmit,
     // The End Cap may have reached the edge.
-    Submission { end_user_leaf_hash: QHashOut<F> },
+    Submission { end_user_leaf_hash: QHashOut<F>, is_refused_before_storage: bool },
     Other,
 }
 
@@ -821,6 +837,7 @@ fn classify_failure(err: &anyhow::Error) -> Failure {
     if let Some(submission) = err.downcast_ref::<EndCapSubmissionError>() {
         return Failure::Submission {
             end_user_leaf_hash: submission.end_user_leaf_hash,
+            is_refused_before_storage: submission.source.downcast_ref::<EndCapAheadOfGathering>().is_some(),
         };
     }
     let message = format!("{err:#}").to_ascii_lowercase();
@@ -1365,10 +1382,9 @@ mod tests {
         assert!(busy.message().contains("all faucet operators are busy"));
         drop(lease);
 
-        // the unregistered operator key fails the contract call, surfacing as
-        // the operator-submit error
+        // the unregistered operator key cannot start a session, so nothing is submitted
         let failed = service.claim(claim_request(10)).await.err().unwrap();
-        assert!(failed.message().contains("faucet operator submit failed"));
+        assert!(failed.message().contains("faucet claim was not submitted"));
 
         // with no operators at all the service refuses up front
         let mut empty_service = offline_service(wallet_session, None, false, None, &[]);
@@ -1478,12 +1494,7 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// A registered operator drives `claim` end-to-end against the offline
-    /// chain: a successful canned submit completes the claim and records it
-    /// for the window, while the chain's already-claimed rejection for a new
-    /// recipient surfaces through the already-claimed arm after proving.
-    #[tokio::test]
-    async fn faucet_claim_completes_and_reports_window_already_claimed() {
+    async fn registered_offline_service() -> (PsyFaucetService, crate::session::session::offline_trace_pipeline_tests::OfflineResponses) {
         use crate::session::session::offline_trace_pipeline_tests as offline;
 
         let (port, _rpc_seen, responses) = offline::spawn_offline_rpc().await;
@@ -1523,6 +1534,18 @@ mod tests {
             public_key,
         };
         service.batch_interval = Duration::from_millis(300);
+        (service, responses)
+    }
+
+    /// A registered operator drives `claim` end-to-end against the offline
+    /// chain: a successful canned submit completes the claim and records it
+    /// for the window, while the chain's already-claimed rejection for a new
+    /// recipient surfaces through the already-claimed arm after proving.
+    #[tokio::test]
+    async fn faucet_claim_completes_and_reports_window_already_claimed() {
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let (service, responses) = registered_offline_service().await;
         let service = Arc::new(service);
         tokio::spawn(dispatch_loop(Arc::downgrade(&service)));
 
@@ -1573,5 +1596,53 @@ mod tests {
         );
         let rejected = service.claim(claim_request(13)).await.err().unwrap();
         assert!(rejected.message().contains("faucet already claimed in the current window"));
+    }
+
+    #[tokio::test]
+    async fn single_claim_moves_to_another_operator_when_the_session_cannot_start() {
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let (mut service, responses) = registered_offline_service().await;
+        responses.lock().insert(
+            0,
+            offline::OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO).unwrap() }),
+            },
+        );
+        let registered = service.operators[0].clone();
+        service.operators = vec![PsyFaucetOperator { user_id: 7, public_key: QHashOut::ZERO }, registered];
+        service.operator_pool = OperatorPool::new(2, Duration::from_secs(120));
+        let service = Arc::new(service);
+        tokio::spawn(dispatch_loop(Arc::downgrade(&service)));
+
+        let started = Instant::now();
+        let completed = service.claim(claim_request(16)).await.unwrap();
+        assert_eq!(completed.operator_user_id, offline::OFFLINE_USER_ID);
+        assert!(started.elapsed() >= SESSION_RETRY_DELAY);
+        assert!(service.claim_records.get(&(16, 3)).is_some());
+    }
+
+    #[tokio::test]
+    async fn end_cap_ahead_of_gathering_is_refused_and_frees_the_operator() {
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let (service, responses) = registered_offline_service().await;
+        responses.lock().insert(
+            0,
+            offline::OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "error": { "code": -32001, "message": "Submitted end cap for checkpoint 34, but current checkpoint is 33" } }),
+            },
+        );
+        let service = Arc::new(service);
+        tokio::spawn(dispatch_loop(Arc::downgrade(&service)));
+
+        let refused = service.claim(claim_request(17)).await.err().unwrap();
+        assert!(refused.message().contains("refused by the network before storage"), "{}", refused.message());
+        assert!(service.operator_pool.pending().is_empty());
+        assert!(service.claim_records.get(&(17, 3)).is_none());
     }
 }
