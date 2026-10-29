@@ -161,8 +161,11 @@ that the scheduled validator failed to publish the submission.
 The admitting Edge owns every EndCap it stores until the user leaf shows the
 outcome (`realm/edge/end_cap_redelivery.rs`). Admission writes a redelivery
 record keyed by user, holding the input, the proof and the old and new leaf
-hashes, and lists the user under the admitting pending id. A background pass
-walks retired pending ids in order with a compare-and-set cursor. Once the
+hashes, and lists the user under the admitting pending id. The first admission
+initializes a compare-and-set cursor. A background pass walks retired pending
+ids in order, but passes one only after `END_CAP_REDELIVERY_RETIRED_MARGIN_PENDING_IDS`
+newer ids exist, so an admission that read it as gathering can still list
+itself. Once the
 latest checkpoint is `END_CAP_REDELIVERY_DELAY_CHECKPOINTS` past admission, it
 reads the user leaf:
 
@@ -172,8 +175,10 @@ reads the user leaf:
 | Old leaf | Abandoned; resubmitted through the normal route, which re-validates the EndCap and forwards it to the current scheduled proposer |
 | Anything else | Superseded; the record is removed |
 
-A transient resubmission failure requeues the record under the gathering
-pending id. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
+Only the user leaf removes a resubmitted record. `Busy`, an untyped failure,
+and `AlreadySubmitted` all requeue it under the gathering pending id: an earlier
+pass may have claimed that id and then crashed before publishing. The requeue
+is a compare-and-set, so a newer admission is never overwritten. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
 dropped with an error.
 
 Recovery covers generation discard, a lost proposal race, Fatal re-entry,

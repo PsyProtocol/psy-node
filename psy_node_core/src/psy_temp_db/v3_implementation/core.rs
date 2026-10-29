@@ -1012,34 +1012,46 @@ impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> Q
 /// Concurrent admissions of one pending id race on its user list; each lost compare-and-set reads the list again.
 const END_CAP_REDELIVERY_USER_LIST_ATTEMPTS: usize = 16;
 
+async fn list_end_cap_redelivery_user<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync>(
+    store: &T,
+    rid: &QRealmIdentifier,
+    user_id: u64,
+    unique_pending_id: u64,
+) -> anyhow::Result<()> {
+    let users_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES, unique_pending_id);
+    for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
+        let observed = store.qtdb_raw_kv_get_value(&users_key).await?.filter(|bytes| !bytes.is_empty());
+        let users = observed.clone().unwrap_or_default();
+        if users.chunks_exact(8).any(|chunk| chunk == user_id.to_le_bytes()) {
+            return Ok(());
+        }
+        let mut listed = users;
+        listed.extend_from_slice(&user_id.to_le_bytes());
+        if store.qtdb_raw_kv_compare_and_set(&users_key, observed.as_deref(), &listed).await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "could not list user {} for EndCap redelivery under pending id {} after {} attempts",
+        user_id, unique_pending_id, END_CAP_REDELIVERY_USER_LIST_ATTEMPTS
+    )
+}
+
 #[async_trait]
 impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBEndCapRedeliveryStore for T {
     async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<()> {
-        let users_key = tt_get_end_cap_redelivery_key(
-            rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES, record.admitted_unique_pending_id,
-        );
-        let mut is_listed = false;
-        for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
-            let observed = self.qtdb_raw_kv_get_value(&users_key).await?.filter(|bytes| !bytes.is_empty());
-            let users = observed.clone().unwrap_or_default();
-            if users.chunks_exact(8).any(|chunk| chunk == user_id.to_le_bytes()) {
-                is_listed = true;
-                break;
-            }
-            let mut listed = users;
-            listed.extend_from_slice(&user_id.to_le_bytes());
-            if self.qtdb_raw_kv_compare_and_set(&users_key, observed.as_deref(), &listed).await? {
-                is_listed = true;
-                break;
-            }
-        }
-        anyhow::ensure!(
-            is_listed,
-            "could not list user {} for EndCap redelivery under pending id {} after {} attempts",
-            user_id, record.admitted_unique_pending_id, END_CAP_REDELIVERY_USER_LIST_ATTEMPTS
-        );
+        list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
         let record_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
-        self.qtdb_raw_kv_put_value(&record_key, &record.to_bytes()?).await
+        self.qtdb_raw_kv_put_value(&record_key, &record.to_bytes()?).await?;
+        // The first admission starts the cursor, so a cursor never begins after a listed pending id.
+        self.set_end_cap_redelivery_cursor(rid, None, record.admitted_unique_pending_id).await?;
+        Ok(())
+    }
+
+    async fn replace_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, observed: &[u8], record: &EndCapRedeliveryRecord) -> anyhow::Result<bool> {
+        list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
+        let record_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
+        self.qtdb_raw_kv_compare_and_set(&record_key, Some(observed), &record.to_bytes()?).await
     }
 
     async fn get_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64) -> anyhow::Result<Option<Vec<u8>>> {

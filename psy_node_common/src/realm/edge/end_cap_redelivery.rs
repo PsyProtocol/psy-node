@@ -21,6 +21,8 @@ use crate::realm::edge::{error::EndCapSubmitError, handler::RealmEdgeHandler};
 pub const END_CAP_REDELIVERY_DELAY_CHECKPOINTS: u64 = 10;
 /// Measured from the EndCap's own checkpoint, so the bound survives forwarding to another validator.
 pub const END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS: u64 = 300;
+/// Pending ids a retired one waits before the cursor passes it, so an admission that read it as gathering can still list itself.
+pub const END_CAP_REDELIVERY_RETIRED_MARGIN_PENDING_IDS: u64 = 2;
 pub const END_CAP_REDELIVERY_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -58,17 +60,15 @@ where
     N::ZKVerifier: 'static,
     N::ZKProof: 'static,
 {
-    /// Settles admissions of pending ids the local processor retired, in pending-id order.
     pub async fn redeliver_abandoned_end_caps(&self) -> anyhow::Result<EndCapRedeliveryCounts> {
         let rid = self.realm_identifier;
         let (processing_unique_pending_id, _) = self.temp_db.get_unique_pending_ids(&rid).await?;
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
         let mut counts = EndCapRedeliveryCounts::default();
         let Some(mut cursor) = self.temp_db.get_end_cap_redelivery_cursor(&rid).await? else {
-            self.temp_db.set_end_cap_redelivery_cursor(&rid, None, processing_unique_pending_id).await?;
             return Ok(counts);
         };
-        while cursor < processing_unique_pending_id {
+        while cursor.saturating_add(END_CAP_REDELIVERY_RETIRED_MARGIN_PENDING_IDS) < processing_unique_pending_id {
             for user_id in self.temp_db.get_end_cap_redelivery_user_ids(&rid, cursor).await? {
                 let Some(observed) = self.temp_db.get_end_cap_redelivery(&rid, user_id).await? else {
                     continue;
@@ -136,14 +136,17 @@ where
                             counts.redelivered += 1;
                         }
                         Err(error) => match EndCapSubmitError::from_error_chain(&error) {
-                            Some(EndCapSubmitError::AlreadySubmitted { .. }) => counts.superseded += 1,
                             Some(EndCapSubmitError::Invalid(_)) => {
                                 tracing::warn!(user_id, error = %format!("{error:#}"), "Abandoned EndCap is no longer admissible");
                                 counts.superseded += 1;
                             }
-                            Some(EndCapSubmitError::Busy(_)) | None => {
-                                self.requeue_end_cap(user_id, record, latest_checkpoint_id, &error).await?;
-                                counts.requeued += 1;
+                            Some(EndCapSubmitError::AlreadySubmitted { .. } | EndCapSubmitError::Busy(_)) | None => {
+                                if self.requeue_end_cap(user_id, record, observed, latest_checkpoint_id, &error).await? {
+                                    counts.requeued += 1;
+                                } else {
+                                    tracing::info!(user_id, "A newer admission replaced the EndCap redelivery record before its requeue");
+                                    counts.superseded += 1;
+                                }
                                 return Ok(());
                             }
                         },
@@ -160,14 +163,15 @@ where
         &self,
         user_id: u64,
         mut record: EndCapRedeliveryRecord,
+        observed: &[u8],
         latest_checkpoint_id: u64,
         error: &anyhow::Error,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
         tracing::warn!(user_id, error = %format!("{error:#}"), "EndCap redelivery failed; retrying under pending id {}", generation.unique_pending_id);
         record.admitted_unique_pending_id = generation.unique_pending_id;
         record.admitted_checkpoint_id = latest_checkpoint_id;
-        self.temp_db.add_end_cap_redelivery(&self.realm_identifier, user_id, &record).await
+        self.temp_db.replace_end_cap_redelivery(&self.realm_identifier, user_id, observed, &record).await
     }
 
     pub fn spawn_end_cap_redelivery(&self) -> tokio::task::JoinHandle<()> {
@@ -193,7 +197,7 @@ mod tests {
         psy_core_db::traits::full::{PsyNodeCheckpointObjectDatabaseWriter, PsyNodeGlobalUserTreeDatabaseWriter},
         psy_temp_db::{
             tt_get_end_cap_redelivery_key, EndCapRedeliveryRecord, GatheringGeneration, QTempDBEndCapRedeliveryStore,
-            QTempDBPendingIdWriter, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES,
+            QTempDBPendingIdWriter, QTempDBSubmitStatusWriter, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES,
         },
         store::traits::temp_db::QTempDatabaseRawKVWriterBase,
     };
@@ -209,9 +213,9 @@ mod tests {
     use psy_data::p2p::EndCapForwardResponse;
 
     const RETIRED_PENDING_ID: u64 = 0;
-    const GATHERING_PENDING_ID: u64 = 2;
+    const PROCESSING_PENDING_ID: u64 = 3;
+    const GATHERING_PENDING_ID: u64 = 4;
 
-    /// An EndCap admitted in pending id 0 at checkpoint 0, after the processor retired that pending id.
     async fn retired_admission() -> anyhow::Result<(EndCapEnv, EndCapRedeliveryRecord)> {
         let env = end_cap_env().await?;
         seed_contract_heights(&env).await?;
@@ -221,9 +225,9 @@ mod tests {
         let record = stored_record(&env).await?.context("admission record")?;
         assert_eq!((record.admitted_unique_pending_id, record.admitted_checkpoint_id), (RETIRED_PENDING_ID, 0));
         assert_eq!(env.temp_db.get_end_cap_redelivery_user_ids(&rid, RETIRED_PENDING_ID).await?, vec![REALM_USER_ID]);
-        env.temp_db.set_unique_pending_ids(&rid, 1, 1).await?;
+        env.temp_db.set_unique_pending_ids(&rid, PROCESSING_PENDING_ID, 3).await?;
         env.temp_db.set_gathering_generation(&rid, GatheringGeneration {
-            checkpoint_id: 0, unique_pending_id: GATHERING_PENDING_ID, proc_checkpoint_unique_id: 2,
+            checkpoint_id: 0, unique_pending_id: GATHERING_PENDING_ID, proc_checkpoint_unique_id: 4,
         }).await?;
         Ok((env, record))
     }
@@ -251,12 +255,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_pass_starts_at_the_processing_pending_id() -> anyhow::Result<()> {
-        let (env, record) = retired_admission().await?;
-        assert_eq!(settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS, None).await?, EndCapRedeliveryCounts::default());
+    async fn first_admission_starts_the_cursor_at_its_own_pending_id() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
         let rid = test_realm_identifier();
-        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(1));
-        assert_eq!(stored_record(&env).await?, Some(record));
+        env.temp_db.set_unique_pending_ids(&rid, PROCESSING_PENDING_ID, 3).await?;
+        assert_eq!(env.handler.redeliver_abandoned_end_caps().await?, EndCapRedeliveryCounts::default());
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, None, "a pass must not skip admissions it has not seen");
+        seed_contract_heights(&env).await?;
+        let (input, proof) = valid_end_cap_submission(&env).await?;
+        env.handler.handle_user_end_cap_proof_submission(input.clone(), proof.clone(), None).await?;
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID));
+        env.temp_db.set_gathering_generation(&rid, GatheringGeneration {
+            checkpoint_id: 0, unique_pending_id: GATHERING_PENDING_ID, proc_checkpoint_unique_id: 4,
+        }).await?;
+        env.handler.handle_user_end_cap_proof_submission(input, proof, None).await?;
+        assert_eq!(stored_record(&env).await?.context("second admission")?.admitted_unique_pending_id, GATHERING_PENDING_ID);
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_keeps_a_just_retired_pending_id_open_for_late_admissions() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let rid = test_realm_identifier();
+        env.temp_db.set_end_cap_redelivery_cursor(&rid, None, RETIRED_PENDING_ID).await?;
+        env.temp_db.set_unique_pending_ids(&rid, RETIRED_PENDING_ID + 2, 2).await?;
+        assert_eq!(env.handler.redeliver_abandoned_end_caps().await?, EndCapRedeliveryCounts::default());
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID));
+        env.temp_db.set_unique_pending_ids(&rid, RETIRED_PENDING_ID + 3, 3).await?;
+        env.handler.redeliver_abandoned_end_caps().await?;
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID + 1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_submitted_redelivery_keeps_the_record_for_a_later_pass() -> anyhow::Result<()> {
+        let (env, record) = retired_admission().await?;
+        let rid = test_realm_identifier();
+        // A crashed earlier pass claimed the gathering pending id but never published or rewrote the record.
+        env.temp_db.set_submitted_status_for_pending(&rid, GATHERING_PENDING_ID, REALM_USER_ID, 1).await?;
+        let counts = settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS, None).await?;
+        assert_eq!(counts, EndCapRedeliveryCounts { requeued: 1, ..Default::default() });
+        let requeued = stored_record(&env).await?.context("requeued record")?;
+        assert_eq!(requeued.admitted_unique_pending_id, GATHERING_PENDING_ID);
+        assert_eq!((requeued.end_cap_input, requeued.proof), (record.end_cap_input, record.proof));
+        assert_eq!(env.temp_db.get_end_cap_redelivery_user_ids(&rid, GATHERING_PENDING_ID).await?, vec![REALM_USER_ID]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_a_record_never_overwrites_a_newer_admission() -> anyhow::Result<()> {
+        let (env, record) = retired_admission().await?;
+        let rid = test_realm_identifier();
+        let observed = env.temp_db.get_end_cap_redelivery(&rid, REALM_USER_ID).await?.context("record bytes")?;
+        let newer = EndCapRedeliveryRecord { admitted_unique_pending_id: GATHERING_PENDING_ID, proof: vec![42], ..record.clone() };
+        env.temp_db.add_end_cap_redelivery(&rid, REALM_USER_ID, &newer).await?;
+        let requeued = EndCapRedeliveryRecord { admitted_unique_pending_id: GATHERING_PENDING_ID + 1, ..record };
+        assert!(!env.temp_db.replace_end_cap_redelivery(&rid, REALM_USER_ID, &observed, &requeued).await?);
+        assert_eq!(stored_record(&env).await?, Some(newer));
         Ok(())
     }
 
