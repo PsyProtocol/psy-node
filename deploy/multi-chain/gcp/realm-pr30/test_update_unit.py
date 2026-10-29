@@ -1,0 +1,149 @@
+from contextlib import ExitStack
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import update_unit as rollout
+
+
+class PlanTests(unittest.TestCase):
+    def fragment(self, role):
+        return ('[Service]\nExecStart="' + str(rollout.BASE) + '" "start-realm-' + role +
+                '" "--network" "psy-public-testnet" "--proving-backend" "plonky2-poseidon-goldilocks"\n')
+
+    def test_edge_retains_base_as_rollback(self):
+        address, old, sha, override, prior = rollout.plan('psy-core-r3-realm-0-v2-edge.service', self.fragment('edge'))
+        self.assertEqual((address, old, sha, prior), ('10.148.0.36', rollout.BASE, rollout.BASE_SHA, ''))
+        self.assertIn(str(rollout.NEW), override)
+
+    def test_processor_retains_previous_hotfix(self):
+        address, old, sha, override, prior = rollout.plan('psy-core-r3-realm-1-v3-processor.service', self.fragment('processor'))
+        self.assertEqual((address, old, sha), ('10.148.0.43', rollout.PROCESSOR, rollout.PROCESSOR_SHA))
+        self.assertIn(str(rollout.PROCESSOR), prior)
+        self.assertIn(str(rollout.NEW), override)
+
+    def test_reject_coordinator(self):
+        with self.assertRaises(ValueError):
+            rollout.plan('psy-core-r3-coordinator-edge.service', self.fragment('edge'))
+
+    def test_reject_wrong_role(self):
+        with self.assertRaises(ValueError):
+            rollout.plan('psy-core-r3-realm-0-v1-edge.service', self.fragment('processor'))
+
+    def test_reject_wrong_network(self):
+        with self.assertRaises(ValueError):
+            rollout.plan('psy-core-r3-realm-0-v1-edge.service', self.fragment('edge').replace('psy-public-testnet', 'localhost'))
+
+    def test_reject_jtmb(self):
+        with self.assertRaises(ValueError):
+            rollout.plan('psy-core-r3-realm-0-v1-edge.service', self.fragment('edge').replace('plonky2-poseidon-goldilocks', 'jtmb'))
+
+
+class LifecycleTests(unittest.TestCase):
+    def exercise(self, failure):
+        role = 'processor' if failure == 'prior-drift' else 'edge'
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            system = root / 'etc/systemd/system'
+            system.mkdir(parents=True)
+            locks = root / 'run/lock'
+            locks.mkdir(parents=True)
+            unit = 'psy-core-r3-realm-0-v1-' + role + '.service'
+            base, previous_binary, new, candidate = (root / name for name in ('base', 'previous', 'new', 'candidate'))
+            base.write_bytes(b'base')
+            previous_binary.write_bytes(b'previous')
+            candidate.write_bytes(b'new')
+            fragment = system / unit
+            contents = ('[Service]\nExecStart="' + str(base) + '" "start-realm-' + role +
+                        '" "--network" "psy-public-testnet" "--proving-backend" "plonky2-poseidon-goldilocks"\n')
+            fragment.write_text(contents)
+            dropin = fragment.with_name(unit + '.d') / rollout.DROPIN
+            prior = dropin.with_name(rollout.PREVIOUS)
+            if role == 'processor':
+                prior.parent.mkdir()
+                prior.write_text('[Service]\nExecStart=\n' + contents.splitlines()[1].replace(str(base), str(previous_binary)) + '\n')
+            def translate_path(*parts):
+                value = Path(*parts)
+                if str(value).startswith('/etc/systemd/system') or str(value).startswith('/run/lock'):
+                    return root / value.relative_to('/')
+                return value
+            state = {'MainPID': '11', 'ActiveState': 'active', 'FragmentPath': str(fragment),
+                     'WorkingDirectory': rollout.WORKING, 'DropInPaths': str(prior) if role == 'processor' else ''}
+            calls = []
+            starts = 0
+            stops = 0
+            def run(*args, **kwargs):
+                nonlocal starts, stops
+                calls.append(args)
+                if args[:2] == ('ip', '-j'):
+                    address = '10.148.0.37' if role == 'processor' else '10.148.0.36'
+                    return json.dumps([{'addr_info': [{'local': address}]}])
+                if args[:2] == ('systemctl', 'stop'):
+                    stops += 1
+                    if failure == 'stop-timeout':
+                        raise subprocess.TimeoutExpired(args, 330)
+                    state.update(MainPID='0', ActiveState='inactive')
+                    if stops == 1 and failure == 'base-drift':
+                        fragment.write_text(contents + 'Environment=UNREVIEWED=1\n')
+                    if stops == 1 and failure == 'prior-drift':
+                        prior.write_text(prior.read_text() + 'Environment=UNREVIEWED=1\n')
+                    if stops == 1 and failure == 'extra-dropin':
+                        dropin.parent.mkdir(exist_ok=True)
+                        (dropin.parent / '90-unreviewed.conf').write_text('[Service]\nEnvironment=UNREVIEWED=1\n')
+                if args[:2] == ('systemctl', 'start'):
+                    starts += 1
+                    if starts == 1 and failure == 'start-failure':
+                        raise subprocess.CalledProcessError(1, args)
+                    state.update(MainPID='22', ActiveState='active')
+                return ''
+            def properties(_):
+                result = dict(state)
+                result['DropInPaths'] = ' '.join(str(path) for path in sorted(dropin.parent.glob('*.conf')))
+                return result
+            values = {'BASE': base, 'BASE_SHA': hashlib.sha256(b'base').hexdigest(),
+                      'PROCESSOR': previous_binary, 'PROCESSOR_SHA': hashlib.sha256(b'previous').hexdigest(),
+                      'NEW': new, 'ROOT': root / 'backups', 'Path': translate_path,
+                      'properties': properties, 'run': run, 'peers': lambda _: {'other': '1'},
+                      'assert_running': lambda *args: dict(state), 'install': lambda *args: None}
+            for key, value in values.items():
+                stack.enter_context(patch.object(rollout, key, value))
+            stack.enter_context(patch.object(rollout.os, 'geteuid', return_value=0))
+            stack.enter_context(patch('sys.argv', ['update_unit.py', 'activate', '--unit', unit,
+                                               '--candidate', str(candidate), '--sha256', hashlib.sha256(b'new').hexdigest()]))
+            wait = stack.enter_context(patch.object(rollout, 'wait_running', return_value=dict(state)))
+            with self.assertRaises((ValueError, subprocess.SubprocessError)):
+                rollout.main()
+            report = json.loads(next((root / 'backups').glob('*/failure.json')).read_text())
+            if failure == 'start-failure':
+                self.assertEqual(starts, 2)
+                self.assertTrue(report['old_binary_restored'])
+                self.assertFalse(dropin.exists())
+                wait.assert_called_with(unit, base, hashlib.sha256(b'base').hexdigest())
+            else:
+                self.assertEqual(starts, 0)
+                self.assertFalse(report['old_binary_restored'])
+                self.assertTrue(report['manual_inspection_required'])
+            self.assertFalse(any(args[:2] == ('systemctl', 'start') and args[2] != unit for args in calls))
+
+    def test_base_drift_holds_stopped_without_restart(self):
+        self.exercise('base-drift')
+
+    def test_previous_override_drift_holds_stopped_without_restart(self):
+        self.exercise('prior-drift')
+
+    def test_failed_start_restores_previous_binary(self):
+        self.exercise('start-failure')
+
+    def test_extra_override_holds_stopped_without_restart(self):
+        self.exercise('extra-dropin')
+
+    def test_stop_timeout_does_not_start_a_second_process(self):
+        self.exercise('stop-timeout')
+
+
+if __name__ == '__main__':
+    unittest.main()
