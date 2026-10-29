@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "cohort": "core-testnet-20261027-r3",
+  "scope": "six Realm processors and six Realm Edges only",
+  "status": "deployed_with_bounded_runtime_acceptance",
+  "source": {
+    "repository": "PsyProtocol/psy-node",
+    "pr": 30,
+    "reviewed_pr_head": "61c1636b53b0d9db61c28cad020b4d2b060277f3",
+    "testnet_dev_merge": "671093a277f48cbf26bcb8374dbf15979a048c7e",
+    "live_build_commit": "396ea8df7526abf9f711a291425190a892237e50",
+    "live_build_ref": "prepare/realm-pr30-live-20261029",
+    "live_build_base": "5f4f5c905ca6a9fd797f69bd92f45bbd5007ba08",
+    "deployment_runtime_integration": "6a23db2b53341750bd3586cced042f8d7708e7d9",
+    "deployment_branch": "deploy/testnet",
+    "changed_runtime_files_match_live_build": true
+  },
+  "artifact": {
+    "name": "psy_node_cli",
+    "sha256": "aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338",
+    "installed_path": "/opt/psy-core/hotfixes/realm-pr30-61c1636b/psy_node_cli",
+    "builder_image": "sha256:02a4dd5c2ea776982084a4a856610836fc9f944203e85948fd4b475177f6b4af",
+    "build_manifest_sha256": "9c1afcd00b1a2a1a3bd72a622cef5dd9716920775598a14df8430f77f27e5085",
+    "build_config_sha256": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
+    "compiler_bundle_sha256": "a877e15a1762027ae92c38d7d18c50fac4c7772611054dcd6cb82674755a7f8f",
+    "glibc_maximum": "2.34",
+    "network": "testnet",
+    "network_magic": "0x1337CF514544CF69",
+    "proving_backend": "plonky2-poseidon-goldilocks"
+  },
+  "preserved": {
+    "genesis_sha256": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
+    "databases_queues_keys_and_existing_configuration": true,
+    "coordinator_processor_and_three_edge_pids_unchanged": true,
+    "no_manual_test_transactions": true,
+    "other_components_not_deployed_from_this_build": true
+  },
+  "tooling": {
+    "source_commit": "d9acfcff2f5031828ed32f566d9d922eed45b41a",
+    "helper_sha256": "83bcf3ac59b5da8965e72f5cce87fdc5b3475da7aa6b7c1a097f01170216565a",
+    "installed_path": "/opt/psy-maintenance/realm-pr30-20261029/update_unit.py",
+    "owned_override": "80-realm-pr30-20261029.conf",
+    "audit_directory": "/var/backups/psy-realm-pr30-20261029"
+  },
+  "verification": {
+    "identity_sampling_started_utc": "2026-10-29T06:34:43.577216Z",
+    "identity_sampling_ended_utc": "2026-10-29T06:35:20.158902Z",
+    "all_twelve_process_paths_and_hashes_match": true,
+    "all_twelve_restart_counts_zero_at_sampling": true,
+    "genesis_hash_matched_on_all_five_hosts": true,
+    "public_l2_checkpoint_at_20261029T063717Z": {
+      "coordinator": 12388,
+      "realm0": 12388,
+      "realm1": 12388
+    },
+    "realm0_nonempty_replay": {
+      "validator": 2,
+      "pending_id": 50015,
+      "accepted_endcaps": 1,
+      "proof_base_before": 12324,
+      "proof_base_after": 12325,
+      "included_checkpoint": 12326,
+      "pending_mapping_verified_via_rpc": true
+    },
+    "realm1_nonempty_replays": {
+      "validator": 3,
+      "observed_pending_ids": [51083, 51091, 51110],
+      "accepted_endcaps_each": 1
+    },
+    "realm0_redelivery_inclusion": [
+      {
+        "user_id": 983040,
+        "original_pending_id": 49923,
+        "not_included_at_checkpoint": 12290,
+        "included_by_checkpoint": 12305,
+        "expected_and_canonical_leaf_hash": "60d4086e5554c788945a90aa5e4991788344a000eb9fe79c7607f299d664b27a",
+        "nonce_before": 31,
+        "nonce_after": 32
+      },
+      {
+        "user_id": 458752,
+        "original_pending_id": 49923,
+        "not_included_at_checkpoint": 12290,
+        "included_by_checkpoint": 12305,
+        "expected_and_canonical_leaf_hash": "136b88337c2cbbf6238bc3a4eb5015e2b6ff2cd3576d0a135a344f6453023592",
+        "nonce_before": 32,
+        "nonce_after": 33
+      }
+    ]
+  },
+  "process_snapshot": [
+    {"realm": 0, "validator": 1, "role": "edge", "host": "gcp-edge-1", "pid": 289369},
+    {"realm": 0, "validator": 2, "role": "edge", "host": "gcp-edge-1", "pid": 289783},
+    {"realm": 0, "validator": 3, "role": "edge", "host": "gcp-edge-1", "pid": 290380},
+    {"realm": 1, "validator": 1, "role": "edge", "host": "gcp-edge-2", "pid": 315520},
+    {"realm": 1, "validator": 2, "role": "edge", "host": "gcp-edge-2", "pid": 316095},
+    {"realm": 1, "validator": 3, "role": "edge", "host": "gcp-edge-2", "pid": 316419},
+    {"realm": 0, "validator": 1, "role": "processor", "host_private_ip": "10.148.0.37", "pid": 192468},
+    {"realm": 0, "validator": 2, "role": "processor", "host_private_ip": "10.148.0.42", "pid": 1850271},
+    {"realm": 0, "validator": 3, "role": "processor", "host_private_ip": "10.148.0.43", "pid": 1855140},
+    {"realm": 1, "validator": 1, "role": "processor", "host_private_ip": "10.148.0.37", "pid": 193561},
+    {"realm": 1, "validator": 2, "role": "processor", "host_private_ip": "10.148.0.42", "pid": 1857261},
+    {"realm": 1, "validator": 3, "role": "processor", "host_private_ip": "10.148.0.43", "pid": 1861905}
+  ],
+  "limitations": [
+    "A short runtime window does not establish a long-term loss-rate improvement.",
+    "Previously lost admissions without recovery records are not reconstructed by this update.",
+    "Known nonblocking orphan-list and split-write limitations remain.",
+    "Recovery depends on local pending-id progress and the configured age limit.",
+    "Database rewind is not binary rollback; do not clear ER/EU/EC during ordinary rollback.",
+    "Existing transient local-stale sync retries are not fixed by this release.",
+    "No full bridge, wallet, Faucet or Services health verdict is implied."
+  ]
+}

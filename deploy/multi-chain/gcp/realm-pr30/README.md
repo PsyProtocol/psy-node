@@ -1,5 +1,8 @@
 # R3 Realm Accepted-EndCap Recovery Rollout
 
+Execution evidence: [2026-10-29 release](DEPLOYED-20261029.md) and
+[per-component source/artifact mapping](live-release.json).
+
 This is a state-preserving, per-unit hotfix, not a fresh deployment runner.
 Keep Genesis, databases, pending IDs, queues, keys and existing configuration.
 

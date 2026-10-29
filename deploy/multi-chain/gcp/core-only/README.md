@@ -1,5 +1,9 @@
 # Core-only deployment
 
+For the state-preserving R3 Realm hotfix deployed on 2026-10-29, use the
+[PR30 rollout record](../realm-pr30/DEPLOYED-20261029.md) and its component artifact
+pin. Do not run a fresh-deploy/reset procedure to apply that maintenance update.
+
 For the Genesis correction, use [Offline Genesis Preparation](GENESIS.md).
 It provides the repository-owned `prepare_genesis.py plan` / `generate` entry
 and the boundary between offline validation and a later reset/start rollout.
