@@ -69,7 +69,7 @@ Every gatherer follows the same cycle.
 
 **Finalize.** After the drain, the gatherer asks the planner for jobs, writes the backup footer, and returns FFS node updates plus the job tree.
 
-On a tree-gatherer failure, the runner replies to the active command when present and returns the original error. Realm and Coordinator supervisors observe inner task errors, mark recovery required, then cancel and join their remaining tasks. No failed gatherer stays alive to drain commands.
+On a tree-gatherer failure, the runner replies to the active command when present and returns the original error. A failed FastForward is the exception: its reply carries the original error so the caller can downcast `RealmFastForwardBaseMismatch`, and the task returns a rendered copy. Realm and Coordinator supervisors observe inner task errors, mark recovery required, then cancel and join their remaining tasks. No failed gatherer stays alive to drain commands.
 
 ```mermaid
 flowchart LR
@@ -96,7 +96,7 @@ Current contract (`realm_end_cap_gatherer.rs`):
 
 1. If the shared gathering start does not match the cycle start, finalize fails closed without consuming the cycle.
 2. Validator and checkpoint proofs use the planner's fixed checkpoint rather than the advancing Coordinator head.
-3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, schedules a target in the same rotation epoch, and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
+3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, either targets the same rotation epoch or still schedules this validator at its next target (`load_scheduled_proposer_sub_id`), and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
 4. If no such checkpoint exists, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded.
 5. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
 
@@ -157,6 +157,35 @@ remain Busy rather than being classified as invalid input. This closes a bounded
 publication race, not the gatherer's intentional unauthenticated-cycle discard.
 Forwarding transport failures are also uncertain: a lost reply does not prove
 that the scheduled validator failed to publish the submission.
+
+The admitting Edge owns every EndCap it stores until the user leaf shows the
+outcome (`realm/edge/end_cap_redelivery.rs`). Admission writes a redelivery
+record keyed by user, holding the input, the proof and the old and new leaf
+hashes, and lists the user under the admitting pending id. The first admission
+initializes a compare-and-set cursor. A background pass walks retired pending
+ids in order, but passes one only after `END_CAP_REDELIVERY_RETIRED_MARGIN_PENDING_IDS`
+newer ids exist, so an admission that read it as gathering can still list
+itself. Once the
+latest checkpoint is `END_CAP_REDELIVERY_DELAY_CHECKPOINTS` past admission, it
+reads the user leaf:
+
+| User leaf at the latest checkpoint | Action |
+| --- | --- |
+| New leaf | Included; the record is removed |
+| Old leaf | Abandoned; resubmitted through the normal route, which re-validates the EndCap and forwards it to the current scheduled proposer |
+| Anything else | Superseded; the record is removed |
+
+Only the user leaf removes a resubmitted record. `Busy`, an untyped failure,
+and `AlreadySubmitted` all requeue it under the gathering pending id: an earlier
+pass may have claimed that id and then crashed before publishing. The requeue
+is a compare-and-set, and an admission never replaces a record from a newer
+pending id, so a stalled older request cannot overwrite a newer admission. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
+dropped with an error.
+
+Recovery covers generation discard, a lost proposal race, Fatal re-entry,
+process exit and the retired-queue tail drain. A redelivered copy cannot apply
+twice: once the original lands, the copy's old leaf no longer matches, and the
+planner skips it.
 
 ```text
 GATHERING --> PROCESSING --> COMMITTED --> next GATHERING

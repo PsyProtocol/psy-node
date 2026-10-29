@@ -12,6 +12,7 @@ mod job_claim_info;
 mod job_stats;
 mod worker_reputation;
 mod guta_in_flight;
+mod end_cap_redelivery;
 
 use parth_core::{protocol::core_types::QDBHashBase, QJobIdBase};
 pub use proof_metadata::*;
@@ -28,6 +29,7 @@ pub use job_claim_info::*;
 pub use job_stats::*;
 pub use worker_reputation::*;
 pub use guta_in_flight::*;
+pub use end_cap_redelivery::*;
 
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
@@ -43,7 +45,8 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore +
-    QTempDBGutaInFlightStore
+    QTempDBGutaInFlightStore +
+    QTempDBEndCapRedeliveryStore
 {
 
 }
@@ -64,7 +67,8 @@ impl<
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore +
-    QTempDBGutaInFlightStore,
+    QTempDBGutaInFlightStore +
+    QTempDBEndCapRedeliveryStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }
 

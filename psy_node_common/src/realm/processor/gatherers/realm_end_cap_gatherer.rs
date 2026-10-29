@@ -86,6 +86,23 @@ impl<Hash: std::fmt::Debug> std::fmt::Display for RealmBackupStartRootMismatch<H
 
 impl<Hash: std::fmt::Debug> std::error::Error for RealmBackupStartRootMismatch<Hash> {}
 
+/// Typed FastForward refusal: the gatherer tree is committed to a local candidate
+/// that is neither side of the included transition, so only a rebuild from the
+/// database can reach the included root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealmFastForwardBaseMismatch<Hash> {
+    pub committed_root: Hash,
+    pub old_root: Hash,
+}
+
+impl<Hash: std::fmt::Debug> std::fmt::Display for RealmFastForwardBaseMismatch<Hash> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gatherer FastForward committed root {:?} is not old_root {:?}", self.committed_root, self.old_root)
+    }
+}
+
+impl<Hash: std::fmt::Debug> std::error::Error for RealmFastForwardBaseMismatch<Hash> {}
+
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
     realm_id_u64: u64,
@@ -634,6 +651,39 @@ where
     Ok((preimage, validator_tree_proof, roots))
 }
 
+/// Scheduled proposer of target `base_checkpoint_id + 1`, from the validator tree and epoch anchor seed stored at the base.
+pub(crate) async fn load_scheduled_proposer_sub_id<N, S>(
+    tree_store: &S,
+    chain_id: u64,
+    realm_id: u32,
+    base_checkpoint_id: u64,
+) -> anyhow::Result<u16>
+where
+    N: QNetworkTypesConfig,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + ?Sized,
+{
+    let target = base_checkpoint_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+    let roots = tree_store.get_checkpoint_global_state_roots(base_checkpoint_id).await?;
+    let (validator_sub_ids, _, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+        tree_store, chain_id, base_checkpoint_id, realm_id, &roots.validator_tree_root,
+    )
+    .await?;
+    let rotation = parth_common::realm_rotation::RealmRotationConfig {
+        checkpoints_per_epoch: psy_config::CHECKPOINTS_PER_EPOCH,
+        validator_sub_ids,
+    };
+    let epoch = parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH);
+    let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, psy_config::CHECKPOINTS_PER_EPOCH);
+    let seed_felts = tree_store.get_checkpoint_leaf_data(anchor_id).await?.stats.random_seed.to_4_felts();
+    let anchor_seed = seed_felts.map(|felt| felt.to_u64_value());
+    rotation
+        .proposer_sub_id(realm_id, target, anchor_seed)?
+        .ok_or_else(|| anyhow::anyhow!("rotation enabled but proposer_sub_id returned None for realm {} target {}", realm_id, target))
+}
+
 
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
     RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
@@ -744,19 +794,17 @@ fn apply_state_updates_to_tree<Hasher, Hash>(
 ) -> anyhow::Result<()>
 where
     Hasher: MerkleZeroHasher<Hash>,
-    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash + Send + Sync + 'static,
 {
     if tree.get_last_commit_root() == new_root {
         return Ok(());
     }
 
     tree.revert_changes();
-    anyhow::ensure!(
-        tree.get_last_commit_root() == old_root,
-        "gatherer FastForward committed root {:?} is not old_root {:?}",
-        tree.get_last_commit_root(),
-        old_root
-    );
+    let committed_root = tree.get_last_commit_root();
+    if committed_root != old_root {
+        return Err(RealmFastForwardBaseMismatch { committed_root, old_root }.into());
+    }
     apply_zero_id_ffs_nodes(tree, gut_ffs, coordinator_global_user_tree_height, realm_id)?;
     if tree.get_root() != new_root {
         tree.revert_changes();
@@ -903,7 +951,15 @@ impl<
         let proof_base_id = authenticated.gathering_checkpoint_id;
         let target_epoch = |base: u64| base.checked_add(1)
             .map(|target| parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH));
-        if proof_base_id <= planner_checkpoint_id || target_epoch(proof_base_id) != target_epoch(planner_checkpoint_id) {
+        if proof_base_id <= planner_checkpoint_id {
+            return Ok(false);
+        }
+        // The planner's target was this validator's; a later epoch is replayable only while it still schedules this validator.
+        if target_epoch(proof_base_id) != target_epoch(planner_checkpoint_id)
+            && load_scheduled_proposer_sub_id::<N, _>(
+                self.config.tree_store.as_ref(), authenticated.chain_id, self.config.realm_id_u64 as u32, proof_base_id,
+            ).await? != self.config.realm_sub_id_u64 as u16
+        {
             return Ok(false);
         }
         let validator_user_id = self.gathering_start_validator_user_leaf.user_id.to_u64_value();

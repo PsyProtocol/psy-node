@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use parth_core::{
-    crypto::hash::traits::{HashTo4Felts, MerkleZeroHasher},
+    crypto::hash::traits::MerkleZeroHasher,
     felt::ToU64Value,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
@@ -50,7 +50,9 @@ use crate::{
                 votes_meet_wait,
             },
             core::PsyRealmProcessor,
-            gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
+            gatherers::realm_end_cap_gatherer::{
+                load_scheduled_proposer_sub_id, RealmFastForwardBaseMismatch, RealmGUTAEndCapGathererOutput,
+            },
         },
         queue_key::RealmProvingWorkQueueKey,
     },
@@ -406,7 +408,13 @@ where
         if gathering_start != updates.old_realm_root && gathering_start != updates.new_realm_root {
             self.recreate_guta_gatherer().await?;
         } else if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
-            self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
+            if let Err(error) = self.guta_queue_gatherer.fast_forward(updates_bytes).await {
+                let Some(mismatch) = error.downcast_ref::<RealmFastForwardBaseMismatch<N::QHash>>() else {
+                    return Err(error);
+                };
+                tracing::warn!("Rebuilding GUTA gatherer from the database after a lost local candidate: {mismatch}");
+                self.recreate_guta_gatherer().await?;
+            }
         }
         self.db
             .publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id)
@@ -899,33 +907,13 @@ where
         if self.p2p.is_none() || !rotation.is_enabled() {
             return Ok(true);
         }
-        let target = base_checkpoint_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
-        let (validator_sub_ids, _, _, _) = self.load_base_checkpoint_validators(base_checkpoint_id).await?;
-        let tree_rotation = parth_common::realm_rotation::RealmRotationConfig {
-            checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
-            validator_sub_ids,
-        };
-        let epoch = parth_common::realm_rotation::epoch(target, CHECKPOINTS_PER_EPOCH);
-        let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, CHECKPOINTS_PER_EPOCH);
-        let anchor_leaf = self.db.db.get_checkpoint_leaf_data(anchor_id).await?;
-        let seed_felts = anchor_leaf.stats.random_seed.to_4_felts();
-        let anchor_seed = [
-            seed_felts[0].to_u64_value(),
-            seed_felts[1].to_u64_value(),
-            seed_felts[2].to_u64_value(),
-            seed_felts[3].to_u64_value(),
-        ];
-        let scheduled_proposer = tree_rotation
-            .proposer_sub_id(self.db.state.realm_id_u64 as u32, target, anchor_seed)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rotation enabled but proposer_sub_id returned None for realm {} target {}",
-                    self.db.state.realm_id_u64,
-                    target
-                )
-            })?;
+        let scheduled_proposer = load_scheduled_proposer_sub_id::<N, _>(
+            self.db.db.as_ref(),
+            self.db.state.chain_id,
+            self.db.state.realm_id_u64 as u32,
+            base_checkpoint_id,
+        )
+        .await?;
         Ok(scheduled_proposer == self.db.state.realm_sub_id_u64 as u16)
     }
 
