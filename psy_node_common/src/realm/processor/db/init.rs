@@ -806,7 +806,7 @@ where
                 let Some((coordinator_update, transition)) = self.transition_at(checkpoint_id).await? else {
                     // Empty checkpoints still authenticate proof-base roots for a later
                     // included proposal. Persist C only; do not advance the committed marker.
-                    self.persist_checkpoint_metadata_range(checkpoint_id, checkpoint_id, start)
+                    self.persist_checkpoint_metadata_range(checkpoint_id, checkpoint_id, start, None)
                         .await
                         .map_err(|error| {
                             anyhow::anyhow!(
@@ -1582,6 +1582,7 @@ pub(crate) mod realm_db_test_env {
         /// checkpoints the coordinator commits while it handles one `rc_submit_guta_proof` call
         pub checkpoints_committed_during_guta_submit: Mutex<u64>,
         pub wait_calls: Mutex<u64>,
+        pub checkpoint_wait_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
         /// leaves + sync infos published by the coordinator only once a waiter
         /// asks for the next checkpoint (drives the wait-loop deterministically)
         pub staged_leaves: Mutex<VecDeque<PHash>>,
@@ -1662,6 +1663,11 @@ pub(crate) mod realm_db_test_env {
         }
         async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64> {
             *self.wait_calls.lock().unwrap() += 1;
+            let barrier = self.checkpoint_wait_barrier.lock().unwrap().clone();
+            if let Some((entered, resume)) = barrier {
+                entered.notify_one();
+                resume.notified().await;
+            }
             // release one staged checkpoint (leaf + sync info), if any
             Ok(self.commit_next_checkpoint())
         }

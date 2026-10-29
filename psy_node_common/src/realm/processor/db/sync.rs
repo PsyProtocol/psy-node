@@ -165,7 +165,7 @@ where
 
         // 2. Fetch and persist metadata for missing checkpoints
         let latest_sync_info = match self
-            .persist_checkpoint_metadata_range(latest_db_checkpoint_id + 1, latest_synced_checkpoint_id, latest_db_checkpoint_id)
+            .persist_checkpoint_metadata_range(latest_db_checkpoint_id + 1, latest_synced_checkpoint_id, latest_db_checkpoint_id, None)
             .await?
         {
             Some(sync_info) => sync_info,
@@ -244,6 +244,7 @@ where
                 latest_complete_checkpoint_id + 1,
                 latest_synced_checkpoint_id,
                 latest_complete_checkpoint_id,
+                None,
             )
             .await?;
         }
@@ -291,6 +292,7 @@ where
             .await?
             .max(start_wait_checkpoint);
         let mut resend_attempts: u64 = 0;
+        let mut metadata_checkpoint_id = self.state.last_committed_checkpoint_id;
 
         tracing::info!(
             "Waiting for Coordinator to include New Realm Root: {:?}. (Current/Old Root: {:?}). Starting watch at Checkpoint {}.",
@@ -335,6 +337,7 @@ where
                         metadata_from_checkpoint_id,
                         realm_state.checkpoint_id,
                         previous_l2_checkpoint_id,
+                        None,
                     )
                     .await?
                 {
@@ -374,7 +377,15 @@ where
 
             } else if realm_state.value == old_realm_root {
                 // Case: The coordinator is processing other things. Our update is pending.
-                // Action: Wait patiently.
+                // Publish readable metadata while the local user subtree still authenticates this Realm.
+                // Keep committed markers and the latest block-state singleton owned by commit_state.
+                self.persist_checkpoint_metadata_range(
+                    metadata_checkpoint_id.saturating_add(1),
+                    latest_synced_checkpoint_id,
+                    self.state.last_committed_checkpoint_id,
+                    Some(old_realm_root),
+                ).await?;
+                metadata_checkpoint_id = latest_synced_checkpoint_id;
                 tracing::debug!(
                     "Waiting... Latest Checkpoint: {}. Realm Root still old ({:?}).", 
                     latest_synced_checkpoint_id, old_realm_root
@@ -465,6 +476,7 @@ where
         from_checkpoint_id: u64,
         to_checkpoint_id: u64,
         reset_checkpoint_id: u64,
+        expected_realm_root: Option<N::QHash>,
     ) -> anyhow::Result<Option<PsyRealmCoordinatorUpdate<N::F, N::QHash>>> {
         if from_checkpoint_id > to_checkpoint_id {
             return Ok(None);
@@ -503,6 +515,10 @@ where
                     .get_append_root::<N::HasherBase>()
             };
             let realm_proof = &sync_info.merkle_proof_to_realm_root;
+            if let Some(expected_realm_root) = expected_realm_root {
+                anyhow::ensure!(realm_proof.value == expected_realm_root,
+                    "checkpoint {} requires Realm state updates before metadata sync", checkpoint_id);
+            }
             let realm_root_nodes = require_checkpoint_metadata::<N::F, N::QHash, N::HasherBase>(
                 checkpoint_id,
                 self.state.realm_id_u64,
@@ -951,6 +967,84 @@ mod sync_tests {
             Ok(_) => panic!("coordinator behind the local head must fail"),
         };
         assert!(err.to_string().contains("ahead of coordinator"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_publishes_unchanged_checkpoint_proof_before_inclusion() -> anyhow::Result<()> {
+        use parth_core::{crypto::hash::traits::QFieldHashable, pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants};
+        use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointRealmSpecificDatabaseReader;
+        use crate::realm::processor::gatherers::realm_end_cap_gatherer::validator_user_tree_proofs;
+
+        let mut env = env_waiting_on_old_root().await?;
+        let old_root = env.processor.state.last_committed_realm_end_root;
+        let unchanged = env.make_checkpoint_one_update();
+        assert_eq!(unchanged.merkle_proof_to_realm_root.value, old_root);
+        env.seed_checkpoint_one(unchanged.clone(), old_root);
+
+        let mut changed_data = env.genesis_data.clone();
+        changed_data.users[1].balance += 1;
+        let mut included = build_realm_genesis(&changed_data)?.coordinator_update;
+        included.checkpoint_sync_info.checkpoint_id = 2;
+        included.checkpoint_sync_info.block_state.checkpoint_id = 2;
+        included.checkpoint_sync_info.block_state.next_contract_id = unchanged.checkpoint_sync_info.block_state.next_contract_id;
+        included.checkpoint_sync_info.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&[
+            env.genesis_leaf_hash(), unchanged.checkpoint_sync_info.checkpoint_leaf_hash,
+            included.checkpoint_sync_info.checkpoint_leaf.qfhash::<PoseidonHasher>(),
+        ]);
+        let new_root = included.merkle_proof_to_realm_root.value;
+        assert_ne!(new_root, old_root);
+        env.coordinator.stage_checkpoint(included.checkpoint_sync_info.checkpoint_leaf_hash, included.clone());
+        env.coordinator.seed_realm_root(2, new_root);
+
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        *env.coordinator.checkpoint_wait_barrier.lock().unwrap() = Some((entered.clone(), resume.clone()));
+        let user_id = psy_core::user_id::get_user_id_from_user_registration_id(
+            1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT,
+        );
+        let (header, proof) = test_submission();
+        let wait = env.processor.wait_for_realm_update_sync_with_coordinator(
+            new_root, header, &proof, TEST_RESEND_AFTER_CHECKPOINTS, None, None,
+        );
+        tokio::pin!(wait);
+        tokio::select! {
+            result = &mut wait => anyhow::bail!("wait returned before inclusion: {:?}", result.err()),
+            entered_result = tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()) => { entered_result?; }
+        }
+        // Use the exact proof composition called by the Realm RPC while inclusion remains blocked.
+        let (path, top) = validator_user_tree_proofs::<N, _>(&env.db, 1, user_id, TEST_REALM_ID).await?;
+        assert!(path.verify::<PoseidonHasher>());
+        assert_eq!(path.root, unchanged.checkpoint_sync_info.state_roots.user_tree_root);
+        assert_eq!(top.value, old_root);
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        assert!(env.db.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(2).await.is_err());
+
+        resume.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut wait).await??;
+        assert_eq!(result.checkpoint_sync_info.checkpoint_id, 2);
+        // Returning inclusion metadata still does not publish unapplied Realm state as committed.
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_checkpoint_metadata_rejects_an_unapplied_realm_root() -> anyhow::Result<()> {
+        use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointRealmSpecificDatabaseReader;
+
+        let mut env = env_waiting_on_old_root().await?;
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update, zh(73));
+        env.processor.checkpoint_tree_backup_manager
+            .sync_from_coordinator_client::<FakeRealmCoordinatorClient, PF>(&env.coordinator, 2000).await?;
+        // A pending metadata pass must reject even a cryptographically valid top path for another root.
+        let error = env.processor.persist_checkpoint_metadata_range(1, 1, 0, Some(zh(73))).await.unwrap_err();
+        assert!(error.to_string().contains("requires Realm state updates before metadata sync"), "{error:#}");
+        assert!(env.db.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(1).await.is_err());
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
         Ok(())
     }
 
