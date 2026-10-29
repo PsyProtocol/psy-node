@@ -635,7 +635,14 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
                 // SumBits downstream sums at most 64 inputs; keep the
                 // decomposition domain identical on every path.
                 assert!(num_bits <= 64, "SplitBits: num_bits must be at most 64");
-                self.set_bool_array_at(op.index as usize, builder.split_le(target, num_bits), "SplitBits")
+                // Raw split_le is only canonical below 64 bits; at 64 bits the
+                // prover could decompose x as its value plus the modulus.
+                let bit_targets = if num_bits == 64 {
+                    split_canonical_le_64(builder, target)
+                } else {
+                    builder.split_le(target, num_bits)
+                };
+                self.set_bool_array_at(op.index as usize, bit_targets, "SplitBits")
             }
             DPNOpType::SumBits => {
                 assert!(op.inputs.len() <= 64, "Sumbits: can only sum at most 64 bits");
