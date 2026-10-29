@@ -69,7 +69,7 @@ Every gatherer follows the same cycle.
 
 **Finalize.** After the drain, the gatherer asks the planner for jobs, writes the backup footer, and returns FFS node updates plus the job tree.
 
-On a tree-gatherer failure, the runner replies to the active command when present and returns the original error. Realm and Coordinator supervisors observe inner task errors, mark recovery required, then cancel and join their remaining tasks. No failed gatherer stays alive to drain commands.
+On a tree-gatherer failure, the runner replies to the active command when present and returns the original error. A failed FastForward is the exception: its reply carries the original error so the caller can downcast `RealmFastForwardBaseMismatch`, and the task returns a rendered copy. Realm and Coordinator supervisors observe inner task errors, mark recovery required, then cancel and join their remaining tasks. No failed gatherer stays alive to drain commands.
 
 ```mermaid
 flowchart LR
@@ -96,7 +96,7 @@ Current contract (`realm_end_cap_gatherer.rs`):
 
 1. If the shared gathering start does not match the cycle start, finalize fails closed without consuming the cycle.
 2. Validator and checkpoint proofs use the planner's fixed checkpoint rather than the advancing Coordinator head.
-3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, schedules a target in the same rotation epoch, and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
+3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, either targets the same rotation epoch or still schedules this validator at its next target (`load_scheduled_proposer_sub_id`), and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
 4. If no such checkpoint exists, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded.
 5. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
 
