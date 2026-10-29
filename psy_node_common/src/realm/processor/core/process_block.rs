@@ -244,7 +244,9 @@ where
     where
         N::HasherBase: MerkleZeroHasher<N::QHash>,
     {
-        let latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        // Authenticate recovery only through the checkpoint tree synchronized for this pass.
+        // The coordinator may advance after sync_with_coordinator returns.
+        let latest_checkpoint_id = self.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         self.db.set_last_committed_realm_root_from_db().await?;
         let mut coordinator_realm_state = self.db.coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(latest_checkpoint_id, self.db.state.realm_id_u64)
@@ -1185,6 +1187,79 @@ mod process_block_tests {
         assert!(output.job_ids.is_empty());
         assert!(output.db_output.is_noop());
         assert_eq!(output.db_output.total_users_updated, 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_ffs_keeps_synchronized_checkpoint_when_coordinator_advances() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        env.processor.db.sync_with_coordinator().await?;
+        let old_realm_root = env.db_env.local_realm_root().await?;
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+
+        // Publish a new transition after synchronization. This pass must not select it yet.
+        let update = env.db_env.make_checkpoint_one_update();
+        env.db_env.seed_checkpoint_one(update, zh(3));
+        assert_ne!(old_realm_root, zh(3));
+        env.db_env.coordinator.realm_sync_requests.lock().unwrap().clear();
+
+        env.processor.apply_proposal_ffs().await?;
+
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db_env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_realm_end_root, old_realm_root);
+        assert!(!env.db_env.coordinator.realm_sync_requests.lock().unwrap().contains(&1));
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_verification_reproduces_checkpoint_advance_after_sync() -> anyhow::Result<()> {
+        use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+        use parth_core::protocol::core_types::Q256BitHash;
+        use psy_data::p2p::Proposal;
+        use crate::realm::processor::ffs::CheckpointIdentity;
+
+        let mut env = RealmProcessorTestEnv::create().await?;
+        env.processor.db.sync_with_coordinator().await?;
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+
+        // Deterministically advance between sync_with_coordinator and history verification.
+        let update = env.db_env.make_checkpoint_one_update();
+        let included = CheckpointIdentity {
+            checkpoint_id: 1,
+            checkpoint_leaf_hash: update.checkpoint_sync_info.checkpoint_leaf_hash.into_owned_32bytes(),
+        };
+        env.db_env.seed_checkpoint_one(update.clone(), update.merkle_proof_to_realm_root.value);
+        let proposal = Proposal {
+            chain_id: env.processor.db.state.chain_id,
+            realm_id: env.processor.db.state.realm_id_u64 as u32,
+            base_checkpoint_id: 0,
+            proposer_sub_id: 1,
+            validator_tree_root: [0; 32],
+            proposal_id: [0; 32],
+            public_output_hash: [0; 32],
+            finalizer_proof_hash: [0; 32],
+            backup_hash: [0; 32],
+            body_hash: [0; 32],
+        };
+        // Body/proof validation happens later; this fixture isolates checkpoint authentication.
+        let error = env.processor.db.verify_history_proposal(&included, &proposal, &[]).await.unwrap_err();
+        assert!(error.to_string().contains(
+            "MissingHistoryProof at C=1: included.checkpoint_leaf_hash does not match the authenticated checkpoint tree leaf"
+        ), "unexpected error: {error:#}");
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+
+        // Appending the missing checkpoint removes this exact failure without changing coordinator data.
+        env.processor.db.sync_with_coordinator().await?;
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 1);
+        let authenticated_leaf = env.processor.db.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(1);
+        assert_eq!(authenticated_leaf.value.into_owned_32bytes(), included.checkpoint_leaf_hash);
+        let error = env.processor.db.verify_history_proposal(&included, &proposal, &[]).await.unwrap_err();
+        assert!(!error.to_string().contains("authenticated checkpoint tree leaf"), "unexpected error: {error:#}");
         env.abort_gatherers();
         Ok(())
     }
