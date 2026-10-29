@@ -199,5 +199,71 @@ class IMTProfileTests(unittest.TestCase):
                                                        rollout.PROCESSOR, rollout.PROCESSOR_SHA)
 
 
+class MetadataProfileTests(unittest.TestCase):
+    SHA = 'c69e077fd4a51dc6678eb845a1615f9b2254ad0dfe80bd3f2544d1c0674c5633'
+
+    def profile(self, unit, previous_imt=False, sha=None):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name in ('PROCESSOR', 'PROCESSOR_SHA', 'NEW', 'DROPIN', 'PREVIOUS', 'ROOT', 'EXTRA_PRIORS'):
+            stack.enter_context(patch.object(rollout, name, getattr(rollout, name)))
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
+        fragment = Path(directory) / unit
+        fragment.write_text('[Service]\nExecStart="' + str(rollout.BASE) +
+                            '" "start-realm-processor" "--network" "psy-public-testnet" '
+                            '"--proving-backend" "plonky2-poseidon-goldilocks"\n')
+        if previous_imt:
+            dropin = fragment.with_name(unit + '.d') / '90-realm-imt-20261029.conf'
+            dropin.parent.mkdir()
+            dropin.write_text('[Service]\nExecStart=\n' + fragment.read_text().splitlines()[1].replace(
+                str(rollout.BASE), '/opt/psy-core/hotfixes/realm-imt-67634280/psy_node_cli') + '\n')
+        rollout.configure_profile('imt-metadata', unit, fragment, sha or self.SHA)
+        return fragment
+
+    def test_pr30_parent_and_earlier_override_are_retained(self):
+        unit = 'psy-core-r3-realm-0-v1-processor.service'
+        fragment = self.profile(unit)
+        _, old, sha, override, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual(str(old), '/opt/psy-core/hotfixes/realm-pr30-61c1636b/psy_node_cli')
+        self.assertEqual(sha, 'aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338')
+        self.assertEqual(rollout.PREVIOUS, '80-realm-pr30-20261029.conf')
+        self.assertEqual(rollout.DROPIN, '95-realm-imt-metadata-20261029.conf')
+        self.assertEqual({path.name for path in rollout.EXTRA_PRIORS}, {'70-realm-replay-20261028.conf'})
+        self.assertIn(str(old), prior)
+        self.assertIn('/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli', override)
+
+    def test_imt_parent_and_both_earlier_overrides_are_retained(self):
+        unit = 'psy-core-r3-realm-0-v3-processor.service'
+        fragment = self.profile(unit, previous_imt=True)
+        _, old, sha, _, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual(str(old), '/opt/psy-core/hotfixes/realm-imt-67634280/psy_node_cli')
+        self.assertEqual(sha, IMTProfileTests.SHA)
+        self.assertEqual(rollout.PREVIOUS, '90-realm-imt-20261029.conf')
+        self.assertEqual({path.name for path in rollout.EXTRA_PRIORS},
+                         {'70-realm-replay-20261028.conf', '80-realm-pr30-20261029.conf'})
+        previous = fragment.with_name(unit + '.d') / rollout.PREVIOUS
+        self.assertEqual(previous.read_text(), prior)
+
+    def test_reject_edge(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-realm-1-v1-edge.service')
+
+    def test_reject_other_artifact(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-realm-1-v1-processor.service', sha='b' * 64)
+
+    def test_imt_override_drift_blocks_rollback(self):
+        unit = 'psy-core-r3-realm-0-v2-processor.service'
+        fragment = self.profile(unit, previous_imt=True)
+        _, old, sha, _, prior = rollout.plan(unit, fragment.read_text())
+        for path, contents in rollout.EXTRA_PRIORS.items():
+            path.write_text(contents)
+        previous = fragment.with_name(unit + '.d') / rollout.PREVIOUS
+        previous.write_text(prior + 'Environment=UNREVIEWED=1\n')
+        with patch.object(rollout, 'digest', return_value=sha):
+            with self.assertRaisesRegex(ValueError, 'previous override changed'):
+                rollout.ensure_original_configuration(fragment, fragment.read_text(), previous, prior, old, sha)
+
+
 if __name__ == '__main__':
     unittest.main()

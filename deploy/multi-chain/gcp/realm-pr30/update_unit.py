@@ -27,10 +27,11 @@ def configure_profile(profile, unit, fragment, sha):
     global PROCESSOR, PROCESSOR_SHA, NEW, DROPIN, PREVIOUS, ROOT, EXTRA_PRIORS
     if profile == 'pr30':
         return
-    require(profile == 'imt-coverage', 'unknown rollout profile')
+    require(profile in ('imt-coverage', 'imt-metadata'), 'unknown rollout profile')
     require(re.fullmatch(r'psy-core-r3-realm-[01]-v[123]-processor\.service', unit) is not None,
             'IMT coverage rollout permits only six Realm Processors')
-    require(sha == '349cdc3d5548e15d9a026f98690df3b3f997fa54edcb636bde8af090752235fe',
+    require(sha == ('349cdc3d5548e15d9a026f98690df3b3f997fa54edcb636bde8af090752235fe'
+                    if profile == 'imt-coverage' else 'c69e077fd4a51dc6678eb845a1615f9b2254ad0dfe80bd3f2544d1c0674c5633'),
             'unreviewed IMT coverage artifact')
     starts = [line for line in fragment.read_text().splitlines() if line.startswith('ExecStart=')]
     require(len(starts) == 1 and starts[0].count(str(BASE)) == 1, 'unexpected base launch command')
@@ -44,6 +45,18 @@ def configure_profile(profile, unit, fragment, sha):
     PREVIOUS = DROPIN
     DROPIN = '90-realm-imt-20261029.conf'
     ROOT = Path('/var/backups/psy-realm-imt-20261029')
+    if profile == 'imt-metadata':
+        previous_imt = fragment.with_name(fragment.name + '.d') / DROPIN
+        if previous_imt.exists():
+            EXTRA_PRIORS[previous_imt.with_name(PREVIOUS)] = (
+                '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(PROCESSOR), 1) + '\n'
+            )
+            PROCESSOR = NEW
+            PROCESSOR_SHA = '349cdc3d5548e15d9a026f98690df3b3f997fa54edcb636bde8af090752235fe'
+            PREVIOUS = DROPIN
+        NEW = Path('/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli')
+        DROPIN = '95-realm-imt-metadata-20261029.conf'
+        ROOT = Path('/var/backups/psy-realm-imt-metadata-20261029')
 
 
 def require(condition, message):
@@ -173,7 +186,7 @@ def main():
     parser.add_argument('--unit', required=True)
     parser.add_argument('--candidate', default='/var/tmp/psy-realm-pr30-61c1636b/psy_node_cli')
     parser.add_argument('--sha256', required=True)
-    parser.add_argument('--profile', choices=('pr30', 'imt-coverage'), default='pr30')
+    parser.add_argument('--profile', choices=('pr30', 'imt-coverage', 'imt-metadata'), default='pr30')
     args = parser.parse_args()
     require(os.geteuid() == 0, 'root required')
     require(re.fullmatch(r'[0-9a-f]{64}', args.sha256) is not None, 'invalid SHA256')
