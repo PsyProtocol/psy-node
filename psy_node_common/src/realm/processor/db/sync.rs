@@ -155,6 +155,15 @@ where
         // Check if DB is already up to date
         let db_root = self.db.checkpoint_tree_get_root_hash(latest_db_checkpoint_id).await?;
         if latest_synced_checkpoint_id == latest_db_checkpoint_id && latest_synced_checkpoint_root == db_root {
+            // A local commit already wrote this checkpoint; the next finalize still needs it as its proof base.
+            if latest_synced_checkpoint_id > self.state.coordinator_head_synced_checkpoint_id {
+                self.state.coordinator_head_synced_checkpoint_id = latest_synced_checkpoint_id;
+                self.state.coordinator_head_synced_checkpoint_root = latest_synced_checkpoint_root;
+            }
+            if latest_synced_checkpoint_id > self.state.gathering_checkpoint_id {
+                self.state.gathering_checkpoint_id = latest_synced_checkpoint_id;
+                self.state.gathering_checkpoint_root = latest_synced_checkpoint_root;
+            }
             tracing::debug!(
                 "Coordinator processor database is already synced to latest checkpoint ID: {} and root: {:?}",
                 latest_synced_checkpoint_id,
@@ -808,8 +817,10 @@ mod sync_tests {
         PsyNodeCoreDatabaseBasicContractInfoStoreReader,
     };
 
-    use parth_core::{utils::QPGenRandom, PHash, PF};
+    use parth_core::{utils::QPGenRandom, PHash, PF, QCoreProcCheckpointUniqueId};
+    use psy_core::job::job_id::ProvingJobCircuitType;
     use psy_data::guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType;
+    use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
     use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
 
     use crate::realm::processor::db::realm_db_test_env::*;
@@ -928,6 +939,58 @@ mod sync_tests {
         assert_eq!(state.processing_realm_start_root, root_at_one);
         assert_eq!(state.gathering_realm_start_root, root_at_one);
         assert_eq!(state.processing_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_after_own_commit_moves_gathering_base_to_including_checkpoint() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update.clone(), local_root);
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_checkpoint_id = 1;
+        env.processor.state.processing_checkpoint_root = update.checkpoint_sync_info.checkpoint_tree_root;
+        env.processor.state.processing_realm_start_root = local_root;
+        env.processor.state.processing_realm_end_root = local_root;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor.commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![]).await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.processor.state.gathering_checkpoint_id, 0);
+
+        // process_block's post-commit sync is the only advance before the next finalize replays on this base.
+        env.processor.sync_to_coordinator_checkpoint_id(1).await?;
+
+        let state = &env.processor.state;
+        assert_eq!(state.gathering_checkpoint_id, 1);
+        assert_eq!(state.gathering_checkpoint_root, update.checkpoint_sync_info.checkpoint_tree_root);
+        assert_eq!(state.coordinator_head_synced_checkpoint_id, 1);
+        assert_eq!(state.processing_checkpoint_id, 1);
+        assert_eq!(state.last_committed_checkpoint_id, 1);
+        assert_eq!(state.gathering_realm_start_root, local_root);
+
+        // The empty-block path syncs at the last committed checkpoint; a newer gathering base must not move back.
+        let newer_root = zh(88);
+        env.processor.state.gathering_checkpoint_id = 5;
+        env.processor.state.gathering_checkpoint_root = newer_root;
+        env.processor.sync_to_coordinator_checkpoint_id(1).await?;
+        assert_eq!(env.processor.state.gathering_checkpoint_id, 5);
+        assert_eq!(env.processor.state.gathering_checkpoint_root, newer_root);
         Ok(())
     }
 

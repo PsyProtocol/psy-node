@@ -86,6 +86,23 @@ impl<Hash: std::fmt::Debug> std::fmt::Display for RealmBackupStartRootMismatch<H
 
 impl<Hash: std::fmt::Debug> std::error::Error for RealmBackupStartRootMismatch<Hash> {}
 
+/// Typed FastForward refusal: the gatherer tree is committed to a local candidate
+/// that is neither side of the included transition, so only a rebuild from the
+/// database can reach the included root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealmFastForwardBaseMismatch<Hash> {
+    pub committed_root: Hash,
+    pub old_root: Hash,
+}
+
+impl<Hash: std::fmt::Debug> std::fmt::Display for RealmFastForwardBaseMismatch<Hash> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gatherer FastForward committed root {:?} is not old_root {:?}", self.committed_root, self.old_root)
+    }
+}
+
+impl<Hash: std::fmt::Debug> std::error::Error for RealmFastForwardBaseMismatch<Hash> {}
+
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
     realm_id_u64: u64,
@@ -386,6 +403,16 @@ fn apply_realm_end_cap_gatherer_backup_bytes<
     })
 }
 
+async fn write_realm_backup_header<File: TokioFileLike, Hash: Q256BitHash>(file: &mut File, start_root: Hash) -> anyhow::Result<()> {
+    file.file_like_set_len(0).await?;
+    file.seek(tokio::io::SeekFrom::Start(0)).await?;
+    file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32).await?;
+    file.write_all(&start_root.into_owned_32bytes()).await?;
+    file.write_all(&start_root.into_owned_32bytes()).await?;
+    file.write_u64_le(0).await?;
+    Ok(())
+}
+
 fn write_realm_backup_user_leaf<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>>(
     bytes: &mut Vec<u8>,
     offsets: &mut std::collections::HashMap<u64, usize>,
@@ -624,6 +651,39 @@ where
     Ok((preimage, validator_tree_proof, roots))
 }
 
+/// Scheduled proposer of target `base_checkpoint_id + 1`, from the validator tree and epoch anchor seed stored at the base.
+pub(crate) async fn load_scheduled_proposer_sub_id<N, S>(
+    tree_store: &S,
+    chain_id: u64,
+    realm_id: u32,
+    base_checkpoint_id: u64,
+) -> anyhow::Result<u16>
+where
+    N: QNetworkTypesConfig,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + ?Sized,
+{
+    let target = base_checkpoint_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+    let roots = tree_store.get_checkpoint_global_state_roots(base_checkpoint_id).await?;
+    let (validator_sub_ids, _, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+        tree_store, chain_id, base_checkpoint_id, realm_id, &roots.validator_tree_root,
+    )
+    .await?;
+    let rotation = parth_common::realm_rotation::RealmRotationConfig {
+        checkpoints_per_epoch: psy_config::CHECKPOINTS_PER_EPOCH,
+        validator_sub_ids,
+    };
+    let epoch = parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH);
+    let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, psy_config::CHECKPOINTS_PER_EPOCH);
+    let seed_felts = tree_store.get_checkpoint_leaf_data(anchor_id).await?.stats.random_seed.to_4_felts();
+    let anchor_seed = seed_felts.map(|felt| felt.to_u64_value());
+    rotation
+        .proposer_sub_id(realm_id, target, anchor_seed)?
+        .ok_or_else(|| anyhow::anyhow!("rotation enabled but proposer_sub_id returned None for realm {} target {}", realm_id, target))
+}
+
 
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
     RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
@@ -734,19 +794,17 @@ fn apply_state_updates_to_tree<Hasher, Hash>(
 ) -> anyhow::Result<()>
 where
     Hasher: MerkleZeroHasher<Hash>,
-    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug + Q256BitHash + Send + Sync + 'static,
 {
     if tree.get_last_commit_root() == new_root {
         return Ok(());
     }
 
     tree.revert_changes();
-    anyhow::ensure!(
-        tree.get_last_commit_root() == old_root,
-        "gatherer FastForward committed root {:?} is not old_root {:?}",
-        tree.get_last_commit_root(),
-        old_root
-    );
+    let committed_root = tree.get_last_commit_root();
+    if committed_root != old_root {
+        return Err(RealmFastForwardBaseMismatch { committed_root, old_root }.into());
+    }
     apply_zero_id_ffs_nodes(tree, gut_ffs, coordinator_global_user_tree_height, realm_id)?;
     if tree.get_root() != new_root {
         tree.revert_changes();
@@ -876,6 +934,84 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
     }
 }
 
+impl<
+        FileSystem: TokioLikeFileSystem + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+    > RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>
+{
+    /// Replays the cycle's accepted EndCaps on a newer same-epoch gathering checkpoint that authenticates
+    /// the cycle start; returns false when no such proof base exists.
+    async fn recreate_planner_on_proof_base(
+        &mut self,
+        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        authenticated: &RealmProcessorCoreState<N::QHash>,
+    ) -> anyhow::Result<bool> {
+        let planner_checkpoint_id = self.guta_planner.current_checkpoint_id;
+        let proof_base_id = authenticated.gathering_checkpoint_id;
+        let target_epoch = |base: u64| base.checked_add(1)
+            .map(|target| parth_common::realm_rotation::epoch(target, psy_config::CHECKPOINTS_PER_EPOCH));
+        if proof_base_id <= planner_checkpoint_id {
+            return Ok(false);
+        }
+        // The planner's target was this validator's; a later epoch is replayable only while it still schedules this validator.
+        if target_epoch(proof_base_id) != target_epoch(planner_checkpoint_id)
+            && load_scheduled_proposer_sub_id::<N, _>(
+                self.config.tree_store.as_ref(), authenticated.chain_id, self.config.realm_id_u64 as u32, proof_base_id,
+            ).await? != self.config.realm_sub_id_u64 as u16
+        {
+            return Ok(false);
+        }
+        let validator_user_id = self.gathering_start_validator_user_leaf.user_id.to_u64_value();
+        let (_, realm_root_proof) = validator_user_tree_proofs::<N, _>(
+            self.config.tree_store.as_ref(), proof_base_id, validator_user_id, self.config.realm_id_u64).await?;
+        if realm_root_proof.value != self.start_global_user_tree_root {
+            return Ok(false);
+        }
+        tree.revert_changes();
+        anyhow::ensure!(tree.get_root() == self.start_global_user_tree_root,
+            "gatherer committed root {:?} is not cycle start {:?}", tree.get_root(), self.start_global_user_tree_root);
+        let mut planner = RealmGUTAPlanner::<N::F, N::QHash>::new(
+            authenticated.chain_id,
+            authenticated.realm_identifier,
+            authenticated.gathering_checkpoint_root,
+            proof_base_id,
+            self.status.gathering_unique_pending_id,
+            self.start_global_user_tree_root,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            self.config.coordinator_guta_updates_circuit_whitelist,
+        );
+        planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
+        let mut previous_planner = std::mem::replace(&mut self.guta_planner, planner);
+        // Deferred EndCaps belong to the live planner first so a failed replay returns them on drop.
+        self.guta_planner.future_pending_end_cap_jobs = std::mem::take(&mut previous_planner.future_pending_end_cap_jobs);
+        let mut accepted_end_cap_jobs = previous_planner.accepted_end_cap_jobs;
+        anyhow::ensure!(self.total_users_updated as usize <= accepted_end_cap_jobs.len(),
+            "cycle accepted {} EndCaps but restored {} at creation", accepted_end_cap_jobs.len(), self.total_users_updated);
+        let intake_end_cap_jobs = accepted_end_cap_jobs.split_off(self.total_users_updated as usize);
+        write_realm_backup_header(&mut self.new_realm_end_cap_gatherer_file, self.start_global_user_tree_root).await?;
+        let file = &mut self.new_realm_end_cap_gatherer_file;
+        let mut end_cap_count = self.guta_planner.add_future_end_cap_jobs(
+            &self.config.checkpoint_tree, tree, file, self.config.temp_db.clone(), accepted_end_cap_jobs).await?;
+        for accepted_end_cap_job in intake_end_cap_jobs {
+            end_cap_count += self.guta_planner.add_accepted_end_cap_job(
+                &self.config.checkpoint_tree, tree, file, self.config.temp_db.clone(), accepted_end_cap_job).await?;
+        }
+        anyhow::ensure!(end_cap_count == previous_planner.total_end_caps_processed,
+            "proof base {} replayed {} of {} accepted EndCaps", proof_base_id, end_cap_count, previous_planner.total_end_caps_processed);
+        let deferred_end_cap_jobs = std::mem::take(&mut self.guta_planner.future_pending_end_cap_jobs);
+        self.guta_planner.add_future_end_cap_jobs(
+            &self.config.checkpoint_tree, tree, file, self.config.temp_db.clone(), deferred_end_cap_jobs).await?;
+        self.config.file_system.file_like_fs_flush_file_with_path(&self.pending_file_path, file).await?;
+        tracing::info!(
+            "Moved EndCap generation for pending id {} from proof base {} to {} with {} accepted EndCaps",
+            self.status.gathering_unique_pending_id, planner_checkpoint_id, proof_base_id, end_cap_count
+        );
+        Ok(true)
+    }
+}
+
 
 #[derive(Clone)]
 pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
@@ -987,11 +1123,7 @@ impl<
         // file_like_fs_create does not truncate: leftover tail bytes from a
         // prior cycle at the same pending id are cut here.
         let mut new_realm_end_cap_gatherer_file = config.file_system.file_like_fs_create(&backup_path).await?;
-        new_realm_end_cap_gatherer_file.file_like_set_len(0).await?;
-        new_realm_end_cap_gatherer_file.write_u32_le(REALM_END_CAP_GATHERER_BACKUP_V2_MAGIC_U32).await?;
-        new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
-        new_realm_end_cap_gatherer_file.write_all(&current_tree_root.into_owned_32bytes()).await?;
-        new_realm_end_cap_gatherer_file.write_u64_le(0).await?;
+        write_realm_backup_header(&mut new_realm_end_cap_gatherer_file, current_tree_root).await?;
         config
             .file_system
             .file_like_fs_flush_file_with_path(&backup_path, &mut new_realm_end_cap_gatherer_file)
@@ -1181,7 +1313,9 @@ impl<
             self.config.realm_id_u64,
         )
         .await?;
-        if planner_realm_root_proof.value != self.start_global_user_tree_root {
+        if planner_realm_root_proof.value != self.start_global_user_tree_root
+            && !self.recreate_planner_on_proof_base(tree, &authenticated).await?
+        {
             tracing::warn!(
                 "Discarding EndCap generation whose proof base {} does not authenticate cycle start {:?}",
                 planner_checkpoint_id,
@@ -1201,6 +1335,7 @@ impl<
                 job_ids: vec![],
             });
         }
+        let planner_checkpoint_id = self.guta_planner.current_checkpoint_id;
         let proof_checkpoint_root = self
             .config
             .tree_store

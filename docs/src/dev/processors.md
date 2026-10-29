@@ -114,7 +114,9 @@ Entry: `realm/processor/core/process_block.rs:422`.
 6. Wait until the Coordinator checkpoint carries the new Realm root, then commit the included state.
 7. Synchronize metadata through the applied checkpoint and delete the processing worker-queue consumer; later transitions are handled by the next `sync_and_verify` iteration.
 
-Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise B reverts and discards that generation before tree commit; it does not rebase or replay accepted EndCaps.
+Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise, when the gathering checkpoint at B's finalize includes A's end root and is in the same rotation epoch or still schedules this validator at its next target, B replays its accepted EndCaps on that proof base ([Gatherers](gatherers.md#31-n--n1-finalize-seam)). The post-commit `sync_to_coordinator_checkpoint_id` advances the gathering checkpoint to A's including checkpoint even when `commit_state` already wrote that checkpoint, so the next finalize sees it. Without such a checkpoint B reverts and discards that generation before tree commit; it does not rebase onto a different root.
+
+When another validator's proposal from the same start root is included while the gatherer tree is committed to the losing local candidate, FastForward returns a typed `RealmFastForwardBaseMismatch`. `apply_proposal_ffs` then rebuilds the gatherer from the database at the included checkpoint instead of failing the processor.
 
 ## 5. Commit ordering
 

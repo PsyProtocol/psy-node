@@ -30,7 +30,7 @@ pub async fn load_realm_validators_from_tree<Hasher, Hash, Store>(
 where
     Hasher: MerkleZeroHasher<Hash>,
     Hash: Copy + PartialEq + Q256BitHash,
-    Store: PsyNodeValidatorTreeDatabaseReader<Hash> + Sync,
+    Store: PsyNodeValidatorTreeDatabaseReader<Hash> + Sync + ?Sized,
 {
     let tree_root = store.validator_tree_get_root_hash(checkpoint_id).await?;
     anyhow::ensure!(
