@@ -158,6 +158,29 @@ publication race, not the gatherer's intentional unauthenticated-cycle discard.
 Forwarding transport failures are also uncertain: a lost reply does not prove
 that the scheduled validator failed to publish the submission.
 
+The admitting Edge owns every EndCap it stores until the user leaf shows the
+outcome (`realm/edge/end_cap_redelivery.rs`). Admission writes a redelivery
+record keyed by user, holding the input, the proof and the old and new leaf
+hashes, and lists the user under the admitting pending id. A background pass
+walks retired pending ids in order with a compare-and-set cursor. Once the
+latest checkpoint is `END_CAP_REDELIVERY_DELAY_CHECKPOINTS` past admission, it
+reads the user leaf:
+
+| User leaf at the latest checkpoint | Action |
+| --- | --- |
+| New leaf | Included; the record is removed |
+| Old leaf | Abandoned; resubmitted through the normal route, which re-validates the EndCap and forwards it to the current scheduled proposer |
+| Anything else | Superseded; the record is removed |
+
+A transient resubmission failure requeues the record under the gathering
+pending id. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
+dropped with an error.
+
+Recovery covers generation discard, a lost proposal race, Fatal re-entry,
+process exit and the retired-queue tail drain. A redelivered copy cannot apply
+twice: once the original lands, the copy's old leaf no longer matches, and the
+planner skips it.
+
 ```text
 GATHERING --> PROCESSING --> COMMITTED --> next GATHERING
 ```
