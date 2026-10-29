@@ -317,6 +317,14 @@ impl DeltaMerkleProofGadget {
         new_value: QHashOut<F>,
         siblings: &[QHashOut<F>],
     ) -> anyhow::Result<()> {
+        if !self.option_flags.contains(DeltaMerkleProofGadgetOptionFlags::siblings) {
+            anyhow::ensure!(
+                siblings.len() == self.siblings.len(),
+                "merkle proof siblings length mismatch: expected_height={} actual_siblings_len={}",
+                self.siblings.len(),
+                siblings.len()
+            );
+        }
         if !self.option_flags.contains(DeltaMerkleProofGadgetOptionFlags::index) {
             witness.set_target(self.index, index)?;
         }
@@ -342,6 +350,14 @@ impl DeltaMerkleProofGadget {
         new_value: HashOut<F>,
         siblings: &[HashOut<F>],
     ) -> anyhow::Result<()> {
+        if !self.option_flags.contains(DeltaMerkleProofGadgetOptionFlags::siblings) {
+            anyhow::ensure!(
+                siblings.len() == self.siblings.len(),
+                "merkle proof siblings length mismatch: expected_height={} actual_siblings_len={}",
+                self.siblings.len(),
+                siblings.len()
+            );
+        }
         if !self.option_flags.contains(DeltaMerkleProofGadgetOptionFlags::index) {
             witness.set_target(self.index, index)?;
         }

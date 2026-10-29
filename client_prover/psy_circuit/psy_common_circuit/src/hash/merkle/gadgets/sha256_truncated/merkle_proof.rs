@@ -58,6 +58,12 @@ impl MerkleProofTruncatedSha256Gadget {
         value: &[u8; 24],
         siblings: &[[u8; 24]],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            siblings.len() == self.siblings.len(),
+            "merkle proof siblings length mismatch: expected_height={} actual_siblings_len={}",
+            self.siblings.len(),
+            siblings.len()
+        );
         witness.set_hash192_target(&self.value, value)?;
         witness.set_target(self.index, F::from_noncanonical_u64(index))?;
         for (i, sibling) in self.siblings.iter().enumerate() {
