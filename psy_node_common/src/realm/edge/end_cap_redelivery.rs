@@ -309,7 +309,7 @@ mod tests {
         let rid = test_realm_identifier();
         let observed = env.temp_db.get_end_cap_redelivery(&rid, REALM_USER_ID).await?.context("record bytes")?;
         let newer = EndCapRedeliveryRecord { admitted_unique_pending_id: GATHERING_PENDING_ID, proof: vec![42], ..record.clone() };
-        env.temp_db.add_end_cap_redelivery(&rid, REALM_USER_ID, &newer).await?;
+        assert!(env.temp_db.add_end_cap_redelivery(&rid, REALM_USER_ID, &newer).await?);
         let requeued = EndCapRedeliveryRecord { admitted_unique_pending_id: GATHERING_PENDING_ID + 1, ..record };
         assert!(!env.temp_db.replace_end_cap_redelivery(&rid, REALM_USER_ID, &observed, &requeued).await?);
         assert_eq!(stored_record(&env).await?, Some(newer));
@@ -411,13 +411,26 @@ mod tests {
             admitted_unique_pending_id: RETIRED_PENDING_ID, admitted_checkpoint_id: 0, old_user_leaf_hash: [0u8; 32],
             new_user_leaf_hash: [9u8; 32], end_cap_input: vec![], proof: vec![],
         };
-        env.temp_db.add_end_cap_redelivery(&rid, other_user, &truncated).await?;
+        assert!(env.temp_db.add_end_cap_redelivery(&rid, other_user, &truncated).await?);
         let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, other_user);
         env.temp_db.qtdb_raw_kv_put_value(&key, &[1, 2, 3]).await?;
         let counts = settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS, None).await?;
         assert_eq!(counts, EndCapRedeliveryCounts { redelivered: 1, ..Default::default() });
         assert!(env.temp_db.get_end_cap_redelivery(&rid, other_user).await?.is_none());
         assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID + 1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stalled_older_admission_never_replaces_a_newer_one() -> anyhow::Result<()> {
+        let (env, stalled) = retired_admission().await?;
+        let rid = test_realm_identifier();
+        let (input, proof) = valid_end_cap_submission(&env).await?;
+        env.handler.handle_user_end_cap_proof_submission(input, proof, None).await?;
+        let newer = stored_record(&env).await?.context("newer admission")?;
+        assert_eq!(newer.admitted_unique_pending_id, GATHERING_PENDING_ID);
+        assert!(!env.temp_db.add_end_cap_redelivery(&rid, REALM_USER_ID, &stalled).await?);
+        assert_eq!(stored_record(&env).await?, Some(newer));
         Ok(())
     }
 }

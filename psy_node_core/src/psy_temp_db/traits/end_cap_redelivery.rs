@@ -53,12 +53,12 @@ impl EndCapRedeliveryRecord {
 
 #[async_trait]
 pub trait QTempDBEndCapRedeliveryStore {
-    async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<()>;
+    /// Returns false when an admission from a newer pending id already holds the user's record.
+    async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<bool>;
 
     /// Lists the user under `record`'s pending id and replaces the record only if it still holds `observed`.
     async fn replace_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, observed: &[u8], record: &EndCapRedeliveryRecord) -> anyhow::Result<bool>;
 
-    /// The stored record bytes, which `remove_end_cap_redelivery` passes back as `observed`.
     async fn get_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64) -> anyhow::Result<Option<Vec<u8>>>;
 
     /// Removes the user's record only if it still holds `observed`, so a newer admission survives.

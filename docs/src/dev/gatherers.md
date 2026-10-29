@@ -178,7 +178,8 @@ reads the user leaf:
 Only the user leaf removes a resubmitted record. `Busy`, an untyped failure,
 and `AlreadySubmitted` all requeue it under the gathering pending id: an earlier
 pass may have claimed that id and then crashed before publishing. The requeue
-is a compare-and-set, so a newer admission is never overwritten. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
+is a compare-and-set, and an admission never replaces a record from a newer
+pending id, so a stalled older request cannot overwrite a newer admission. An EndCap older than `END_CAP_REDELIVERY_MAX_AGE_CHECKPOINTS` is
 dropped with an error.
 
 Recovery covers generation discard, a lost proposal race, Fatal re-entry,

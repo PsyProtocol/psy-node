@@ -1009,8 +1009,21 @@ impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> Q
     }
 }
 
-/// Concurrent admissions of one pending id race on its user list; each lost compare-and-set reads the list again.
+/// Concurrent writers of one user list or record race; each lost compare-and-set reads the value again.
 const END_CAP_REDELIVERY_USER_LIST_ATTEMPTS: usize = 16;
+
+fn is_newer_end_cap_redelivery_stored(observed: Option<&[u8]>, user_id: u64, unique_pending_id: u64) -> bool {
+    let Some(bytes) = observed else {
+        return false;
+    };
+    match EndCapRedeliveryRecord::from_bytes(bytes) {
+        Ok(stored) => stored.admitted_unique_pending_id > unique_pending_id,
+        Err(error) => {
+            tracing::warn!(user_id, error = %format!("{error:#}"), "Replacing an undecodable EndCap redelivery record");
+            false
+        }
+    }
+}
 
 async fn list_end_cap_redelivery_user<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync>(
     store: &T,
@@ -1039,13 +1052,29 @@ async fn list_end_cap_redelivery_user<T: QTempDatabaseRawKVReaderBase + QTempDat
 
 #[async_trait]
 impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBEndCapRedeliveryStore for T {
-    async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<()> {
-        list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
+    async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<bool> {
         let record_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
-        self.qtdb_raw_kv_put_value(&record_key, &record.to_bytes()?).await?;
-        // The first admission starts the cursor, so a cursor never begins after a listed pending id.
-        self.set_end_cap_redelivery_cursor(rid, None, record.admitted_unique_pending_id).await?;
-        Ok(())
+        let record_bytes = record.to_bytes()?;
+        let mut is_listed = false;
+        for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
+            let observed = self.qtdb_raw_kv_get_value(&record_key).await?.filter(|bytes| !bytes.is_empty());
+            if is_newer_end_cap_redelivery_stored(observed.as_deref(), user_id, record.admitted_unique_pending_id) {
+                return Ok(false);
+            }
+            if !is_listed {
+                list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
+                is_listed = true;
+            }
+            if self.qtdb_raw_kv_compare_and_set(&record_key, observed.as_deref(), &record_bytes).await? {
+                // The first admission starts the cursor, so a cursor never begins after a listed pending id.
+                self.set_end_cap_redelivery_cursor(rid, None, record.admitted_unique_pending_id).await?;
+                return Ok(true);
+            }
+        }
+        anyhow::bail!(
+            "could not write the EndCap redelivery record of user {} for pending id {} after {} attempts",
+            user_id, record.admitted_unique_pending_id, END_CAP_REDELIVERY_USER_LIST_ATTEMPTS
+        )
     }
 
     async fn replace_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, observed: &[u8], record: &EndCapRedeliveryRecord) -> anyhow::Result<bool> {

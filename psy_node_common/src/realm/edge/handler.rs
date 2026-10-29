@@ -1112,7 +1112,9 @@ impl<
             end_cap_input: user_end_cap_input.psy_ser_to_bytes_vec()?,
             proof: proof_bytes.to_vec(),
         };
-        self.temp_db.add_end_cap_redelivery(&self.realm_identifier, user_id, &redelivery).await?;
+        if !self.temp_db.add_end_cap_redelivery(&self.realm_identifier, user_id, &redelivery).await? {
+            tracing::info!(user_id, unique_pending_id, "A newer admission already owns this user's EndCap redelivery record");
+        }
         timer.lap_micros("add_end_cap_redelivery");
 
         self.proof_store
