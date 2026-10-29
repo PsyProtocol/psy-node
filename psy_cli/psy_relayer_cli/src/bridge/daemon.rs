@@ -1128,7 +1128,7 @@ async fn run_multichain(
             let landed = match submit_multichain_l2_plan(provider, &plan, &mut guardian_history, lag, guardian).await {
                 Ok(value) => value,
                 Err(error) => {
-                    tracing::error!(%error, backoff_secs = l2_retry_backoff.as_secs(), "multichain guardian L2 submission failed");
+                    tracing::error!(%error, code = ?error.downcast_ref::<guardian_common::verify_l1::GuardianAccountError>(), backoff_secs = l2_retry_backoff.as_secs(), "multichain guardian L2 submission failed");
                     tokio::time::sleep(l2_retry_backoff).await;
                     l2_retry_backoff = (l2_retry_backoff * 2).min(Duration::from_secs(RELAYER_MAX_RETRY_BACKOFF_SECS));
                     continue;
@@ -4283,6 +4283,16 @@ mod tests {
     #[test]
     fn finalized_deposit_append_target_bounds_the_live_backlog() {
         assert_eq!(finalized_deposit_append_target(1221, 1862, 1844), 1253);
+    }
+
+    #[test]
+    fn guardian_account_error_code_is_retained_under_self_verification_context() {
+        use guardian_common::{protocol::GuardianSignError, verify_l1::GuardianAccountError};
+        let error = anyhow::Error::from(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))
+            .context("fresh withdrawal request self-verification");
+        assert_eq!(error.to_string(), "fresh withdrawal request self-verification");
+        assert!(matches!(error.downcast_ref::<GuardianAccountError>(),
+            Some(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))));
     }
 
     #[test]
