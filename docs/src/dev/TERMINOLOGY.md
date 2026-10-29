@@ -125,6 +125,7 @@ of inclusion across checkpoint changes or an unauthenticated gatherer cycle.
 | Edge | HTTP admission surface in front of a processor. EndCaps enter a Realm edge; GUTA submit enters the Coordinator edge. |
 | Worker | Proves claimed jobs and submits tagged proofs back through the edge. |
 | Relayer | L1/L2 bridge daemon (`psy_relayer_cli`): deposit append, withdrawal claim, Groth16. |
+| Claim readiness | Read-only Services proof and L1 root checks before withdrawal proving or sending. Each chain gets a bounded round budget; unread rows are ReadinessDeferred, retain their pending entry, and spend no attempt. The next round resumes after the checked prefix. |
 | EndCap | Final proof of one user proving session (`UPSStandardEndCapCircuit`). |
 | GUTA | Global user-tree aggregator proof (realm circuit 63 at submit). |
 | Proposal | Signed realm transition: old/new realm root plus body hash. |

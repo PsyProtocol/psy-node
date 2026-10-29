@@ -193,6 +193,8 @@ pub enum ClaimCode {
     NonceConflict,
     /// Services proof missing; the L1 root is not finalized yet.
     ProofNotReady,
+    /// This round's read-only readiness budget was exhausted before this row.
+    ReadinessDeferred,
     /// A services or L1 read failed. Query first, then retry.
     RpcUnavailable,
     /// The transaction's landing is unknown. Query receipts/nullifiers/
@@ -257,6 +259,7 @@ impl ClaimCode {
             | Self::SendFailed
             | Self::BatchReverted => ClaimAction::AttemptSpent,
             Self::ProofNotReady
+            | Self::ReadinessDeferred
             | Self::RpcUnavailable
             | Self::ReceiptUnknown
             | Self::FeeRefused
@@ -278,7 +281,8 @@ impl ClaimCode {
             Self::TotalOverflow => "total withdrawal amount overflow",
             Self::ClaimableOverflow => "claimable time overflow",
             Self::NonceConflict => "nonce is registered for a different withdrawal",
-            Self::ProofNotReady => "withdrawal claim proof not available yet; L1 root not finalized",
+            Self::ProofNotReady => "withdrawal claim proof not available yet",
+            Self::ReadinessDeferred => "withdrawal claim readiness budget exhausted",
             Self::RpcUnavailable => "claim state read failed",
             Self::ReceiptUnknown => "claim transaction outcome unknown; query before rebroadcast",
             Self::FeeRefused => "pre-broadcast fee quote refused",
@@ -398,8 +402,37 @@ fn address_high_bits_are_zero(words: [u32; 8]) -> bool {
     words[0] == 0 && words[1] == 0 && words[2] == 0
 }
 
-const CLAIM_PROOF_FETCH_MAX_ATTEMPTS: usize = 12;
-const CLAIM_PROOF_FETCH_RETRY_DELAY_SECS: u64 = 5;
+const CLAIM_READINESS_ROW_TIMEOUT_SECS: u64 = 2;
+const CLAIM_READINESS_BUDGET_SECS: u64 = 10;
+
+// This phase can be cancelled safely: the callback must only read Services/L1.
+// Every row gets an outcome, including rows that the deadline prevents reading.
+async fn read_claim_proofs<Read, ReadFuture>(
+    count: usize,
+    row_timeout: Duration,
+    budget: Duration,
+    mut read: Read,
+) -> Vec<std::result::Result<WithdrawalClaimProofResult, ClaimCode>>
+where
+    Read: FnMut(usize) -> ReadFuture,
+    ReadFuture: Future<Output = std::result::Result<WithdrawalClaimProofResult, ClaimCode>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut results = Vec::with_capacity(count);
+    for index in 0..count {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            results.extend((index..count).map(|_| Err(ClaimCode::ReadinessDeferred)));
+            break;
+        }
+        let result = match timeout(row_timeout.min(remaining), read(index)).await {
+            Ok(result) => result,
+            Err(_) => Err(ClaimCode::RpcUnavailable),
+        };
+        results.push(result);
+    }
+    results
+}
 
 async fn fetch_claim_proof(
     http: &reqwest::Client,
@@ -489,48 +522,26 @@ fn withdrawal_root_is_authorized(proof_root: B256, current_root: B256, historica
 }
 
 
-async fn poll_claim_proof<P: Provider>(
+async fn check_claim_proof<P: Provider>(
     http: &reqwest::Client,
     services_url: &str,
     provider: &P,
     state_manager: Address,
     withdrawal: &PendingWithdrawal,
-    max_attempts: usize,
-    retry_delay: Duration,
-) -> Result<WithdrawalClaimProofResult> {
-    anyhow::ensure!(max_attempts > 0, "claim proof fetch requires at least one attempt");
-    let mut latest: Result<WithdrawalClaimProofResult> =
-        Err(anyhow::anyhow!("claim proof fetch exhausted without response"));
-    for attempt in 1..=max_attempts {
-        latest = match fetch_claim_proof(http, services_url, withdrawal).await {
-            Ok(r) if !r.found => Ok(r),
-            Ok(r) => {
-                if let Some(root_hex) = r.withdrawal_root.clone() {
-                    match check_withdrawal_root_on_l1(provider, state_manager, &root_hex).await {
-                        Ok((true, _)) => return Ok(r),
-                        Ok((false, l1_root)) => {
-                            tracing::debug!(
-                                services_root = %root_hex,
-                                l1_root = %l1_root,
-                                attempt,
-                                max_attempts,
-                                "claim proof root is not current or known; will retry"
-                            );
-                            Ok(r)
-                        }
-                        Err(err) => Err(err.context("check L1 withdrawal root failed")),
-                    }
-                } else {
-                    return Ok(r);
-                }
-            }
-            Err(err) => Err(err),
-        };
-        if attempt < max_attempts {
-            tokio::time::sleep(retry_delay).await;
+) -> std::result::Result<WithdrawalClaimProofResult, ClaimCode> {
+    let proof = fetch_claim_proof(http, services_url, withdrawal)
+        .await.map_err(|_| ClaimCode::RpcUnavailable)?;
+    if !proof.found {
+        return Err(ClaimCode::ProofNotReady);
+    }
+    if let Some(root) = &proof.withdrawal_root {
+        match check_withdrawal_root_on_l1(provider, state_manager, root).await {
+            Ok((true, _)) => {}
+            Ok((false, _)) => return Err(ClaimCode::RootUnauthorized),
+            Err(_) => return Err(ClaimCode::RpcUnavailable),
         }
     }
-    latest
+    Ok(proof)
 }
 
 fn withdrawal_nullifier_from_nonce(nonce: [u32; 8]) -> B256 {
@@ -1493,46 +1504,35 @@ pub async fn submit_batch_with_hook(
         let _ = (multicall3_address, deployments_network);
     }
     let mut pending_proofs: Vec<PendingProof> = Vec::new();
-    for (i, w) in withdrawals.iter().enumerate() {
-        let state_manager: Address = resolve_contract_address_from_deployments(&deployments_network, "StateManager")
-            .context("failed to resolve StateManager address from deployments")?;
-        let proof_result = match poll_claim_proof(
-            &http,
-            services_url,
-            &provider,
-            state_manager,
-            w,
-            CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
-            Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS),
-        ).await {
-            Ok(r) => r,
-            Err(err) => {
-                tracing::error!(index = i, leaf_hash = %w.leaf_hash, error = %err, "fetch claim proof failed, skipping");
-                fail_row(&mut outcomes, i, &w.leaf_hash, ClaimCode::RpcUnavailable);
+    let state_manager: Address = resolve_contract_address_from_deployments(&deployments_network, "StateManager")
+        .context("failed to resolve StateManager address from deployments")?;
+    let readiness_started = tokio::time::Instant::now();
+    let readiness = read_claim_proofs(
+        withdrawals.len(),
+        Duration::from_secs(CLAIM_READINESS_ROW_TIMEOUT_SECS),
+        Duration::from_secs(CLAIM_READINESS_BUDGET_SECS),
+        |index| {
+            let http = &http;
+            let provider = &provider;
+            async move { check_claim_proof(http, services_url, provider, state_manager, &withdrawals[index]).await }
+        },
+    ).await;
+    tracing::info!(
+        requested = withdrawals.len(),
+        ready = readiness.iter().filter(|result| result.is_ok()).count(),
+        deferred = readiness.iter().filter(|result| matches!(result, Err(ClaimCode::ReadinessDeferred))).count(),
+        elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+        "withdrawal claim readiness checks finished"
+    );
+    for (i, (w, proof_result)) in withdrawals.iter().zip(readiness).enumerate() {
+        let proof_result = match proof_result {
+            Ok(proof) => proof,
+            Err(code) => {
+                tracing::info!(index = i, leaf_hash = %w.leaf_hash, reason = code.label(), "withdrawal claim readiness deferred or rejected");
+                fail_row(&mut outcomes, i, &w.leaf_hash, code);
                 continue;
             }
         };
-
-        if !proof_result.found {
-            tracing::info!(index = i, leaf_hash = %w.leaf_hash, "withdrawal claim proof not available yet (L1 root not finalized); holding to next round");
-                fail_row(&mut outcomes, i, &w.leaf_hash, ClaimCode::ProofNotReady);
-            continue;
-        }
-        if let Some(root_hex) = &proof_result.withdrawal_root {
-            match check_withdrawal_root_on_l1(&provider, state_manager, root_hex).await {
-                Ok((true, _)) => {}
-                Ok((false, l1_root)) => {
-                    tracing::warn!(index = i, leaf_hash = %w.leaf_hash, services_root = %root_hex, l1_root = %l1_root, "withdrawal root is not current or known after retries, skipping");
-                fail_row(&mut outcomes, i, &w.leaf_hash, ClaimCode::RootUnauthorized);
-                    continue;
-                }
-                Err(err) => {
-                    tracing::error!(index = i, leaf_hash = %w.leaf_hash, error = %err, "failed to read L1 withdrawal root, skipping");
-                fail_row(&mut outcomes, i, &w.leaf_hash, ClaimCode::RpcUnavailable);
-                    continue;
-                }
-            }
-        }
 
         let leaf_index = match proof_result.leaf_index {
             Some(idx) => idx,
@@ -2333,13 +2333,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_replaces_unauthorized_root_with_later_rpc_error() {
+    async fn claim_readiness_rejects_unknown_root_without_polling() {
         let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
         let err = with_services_and_l1(
-            vec![
-                Ok(services_body(true, Some(DISPLAY_ROOT))),
-                Err(503),
-            ],
+            vec![Ok(services_body(true, Some(DISPLAY_ROOT)))],
             vec![
                 EthCall::Current([0xaau8; 32]),
                 EthCall::Known { expected_root: proof_l1, known: false },
@@ -2347,56 +2344,62 @@ mod tests {
             |services_url, rpc_url| async move {
                 let http = reqwest::Client::new();
                 let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
-                poll_claim_proof(
+                check_claim_proof(
                     &http,
                     &services_url,
                     &provider,
                     STATE_MANAGER,
                     &dummy_withdrawal(),
-                    2,
-                    Duration::from_millis(1),
                 )
                 .await
                 .unwrap_err()
             },
         )
         .await;
-        assert!(
-            err.to_string().contains("503") || err.to_string().contains("RPC 503"),
-            "later services RPC error must replace earlier unauthorized Ok, got: {err}"
-        );
+        assert_eq!(err, ClaimCode::RootUnauthorized);
     }
 
     #[tokio::test]
-    async fn poll_replaces_not_ready_with_later_rpc_error() {
-        let err = with_services_and_l1(
-            vec![Ok(services_body(false, None)), Err(503)],
+    async fn claim_readiness_missing_proof_does_not_poll() {
+        let result = with_services_and_l1(
+            vec![Ok(services_body(false, None))],
             vec![],
             |services_url, rpc_url| async move {
                 let http = reqwest::Client::new();
                 let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
-                poll_claim_proof(
+                check_claim_proof(
+                    &http, &services_url, &provider, STATE_MANAGER, &dummy_withdrawal(),
+                ).await
+            },
+        ).await;
+        assert_eq!(result.unwrap_err(), ClaimCode::ProofNotReady);
+    }
+
+    #[tokio::test]
+    async fn claim_readiness_rpc_failure_is_not_proof_not_ready() {
+        let proof = with_services_and_l1(
+            vec![Err(503)],
+            vec![],
+            |services_url, rpc_url| async move {
+                let http = reqwest::Client::new();
+                let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+                check_claim_proof(
                     &http,
                     &services_url,
                     &provider,
                     STATE_MANAGER,
                     &dummy_withdrawal(),
-                    2,
-                    Duration::from_millis(1),
                 )
                 .await
                 .unwrap_err()
             },
         )
         .await;
-        assert!(
-            err.to_string().contains("503") || err.to_string().contains("RPC 503"),
-            "later services RPC error must replace earlier found=false, got: {err}"
-        );
+        assert_eq!(proof, ClaimCode::RpcUnavailable);
     }
 
     #[tokio::test]
-    async fn poll_accepts_historically_known_root() {
+    async fn claim_readiness_accepts_historically_known_root() {
         let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
         let proof = with_services_and_l1(
             vec![Ok(services_body(true, Some(DISPLAY_ROOT)))],
@@ -2407,14 +2410,12 @@ mod tests {
             |services_url, rpc_url| async move {
                 let http = reqwest::Client::new();
                 let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
-                poll_claim_proof(
+                check_claim_proof(
                     &http,
                     &services_url,
                     &provider,
                     STATE_MANAGER,
                     &dummy_withdrawal(),
-                    1,
-                    Duration::from_millis(1),
                 )
                 .await
                 .unwrap()
@@ -2426,6 +2427,47 @@ mod tests {
     }
 
     const RECEIPT_BRIDGE: Address = Address::repeat_byte(0xb1);
+
+    #[tokio::test]
+    async fn claim_readiness_budget_defers_every_unread_row_without_calling_it() {
+        let mut called = Vec::new();
+        let results = read_claim_proofs(58, Duration::from_secs(2), Duration::ZERO, |index| {
+            called.push(index);
+            async { Err(ClaimCode::ProofNotReady) }
+        }).await;
+        assert!(called.is_empty());
+        assert_eq!(results.len(), 58);
+        assert!(results.iter().all(|result| matches!(result, Err(ClaimCode::ReadinessDeferred))));
+        assert_eq!(ClaimCode::ReadinessDeferred.action(), ClaimAction::Held);
+    }
+
+    #[tokio::test]
+    async fn claim_readiness_total_budget_bounds_an_unresponsive_batch() {
+        let started = tokio::time::Instant::now();
+        let results = read_claim_proofs(58, Duration::from_secs(2), Duration::from_millis(30), |_| {
+            std::future::pending::<std::result::Result<WithdrawalClaimProofResult, ClaimCode>>()
+        }).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(results.len(), 58);
+        assert!(matches!(results[0], Err(ClaimCode::RpcUnavailable)));
+        assert!(results[1..].iter().all(|result| matches!(result, Err(ClaimCode::ReadinessDeferred))));
+    }
+
+    #[tokio::test]
+    async fn claim_readiness_row_timeout_allows_a_later_ready_row() {
+        let results = read_claim_proofs(3, Duration::from_millis(10), Duration::from_secs(1), |index| async move {
+            match index {
+                0 => std::future::pending().await,
+                1 => Err(ClaimCode::ProofNotReady),
+                _ => Ok(WithdrawalClaimProofResult {
+                    found: true, leaf_index: Some(7), withdrawal_root: Some(DISPLAY_ROOT.into()), siblings: None,
+                }),
+            }
+        }).await;
+        assert!(matches!(results[0], Err(ClaimCode::RpcUnavailable)));
+        assert!(matches!(results[1], Err(ClaimCode::ProofNotReady)));
+        assert!(results[2].as_ref().unwrap().found);
+    }
 
     fn nonce_words(tag: u8) -> [u32; 8] {
         [u32::from_be_bytes([tag, tag, tag, tag]); 8]

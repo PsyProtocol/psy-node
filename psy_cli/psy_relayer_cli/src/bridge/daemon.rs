@@ -993,6 +993,7 @@ async fn run_multichain(
     let mut stalled_rounds: u64 = 0;
     let mut last_round_submitted_l2_work = false;
     let mut l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
+    let mut claim_readiness_starts: HashMap<u8, usize> = HashMap::new();
 
     loop {
         let mut state = load_multichain_state(&guardian.root, &guardian.db)?;
@@ -1256,8 +1257,12 @@ async fn run_multichain(
                 claims.retain(|withdrawal| withdrawal.destination_chain_index == u64::from(chain.chain_index));
                 claims.sort_by_key(|withdrawal| (withdrawal.destination_chain_index, withdrawal.event_id));
                 if claims.is_empty() { continue; }
+                let start = claim_readiness_starts.entry(chain.chain_index).or_default();
+                let claim_count = claims.len();
+                claims.rotate_left(*start % claim_count);
                 let hook = claim_broadcast_hook(&guardian.root, &guardian.db);
                 let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint, &guardian.root.network, Some(hook)).await;
+                *start = next_claim_readiness_start(*start, claims.len(), &result);
                 if result.is_err() {
                     match persisted_claim_retry(&guardian.root, &guardian.db) {
                         Ok(persisted) => adopt_persisted_receipt_holds(&claims, &mut state.claim_retry, &persisted),
@@ -2475,6 +2480,20 @@ fn claims_to_attempt(
         .filter(|w| claim_attempts::is_retriable(claim_retry.get(&w.leaf_hash)))
         .cloned()
         .collect()
+}
+
+// Only the unread suffix is ReadinessDeferred. Resume after the checked prefix
+// next round so a slow oldest row cannot monopolize every readiness budget.
+fn next_claim_readiness_start(
+    start: usize,
+    count: usize,
+    result: &anyhow::Result<claim_withdrawals::BatchWithdrawalsReport>,
+) -> usize {
+    if count == 0 { return 0; }
+    let checked = result.as_ref().map(|report| report.outcomes.iter().take_while(|outcome| {
+        !matches!(outcome.kind, claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred))
+    }).count()).unwrap_or(1).max(1).min(count);
+    ((start % count) + checked) % count
 }
 
 /// Replayed events must not automatically re-arm claims retired by the operator policy.
@@ -5750,6 +5769,53 @@ mod tests {
         assert!(retry.get(&w3.leaf_hash).is_none(), "a Held proof-not-ready leaf writes no retry counter; it stays pending and unheld for the next readiness recheck");
         assert!(retired.contains_key(&w2.leaf_hash));
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn claim_readiness_cursor_resumes_after_checked_prefix() {
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: "slow".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RpcUnavailable), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "unread".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred), tx_hash: None },
+            ],
+            ..empty_report()
+        };
+        assert_eq!(next_claim_readiness_start(0, 2, &Ok(report.clone())), 1);
+        assert_eq!(next_claim_readiness_start(1, 2, &Ok(report)), 0);
+        assert_eq!(next_claim_readiness_start(1, 2, &Err(anyhow::anyhow!("read outage"))), 0);
+        assert_eq!(next_claim_readiness_start(0, 0, &Ok(empty_report())), 0);
+    }
+
+    #[test]
+    fn claim_readiness_budget_does_not_spend_attempts_or_serialize_a_new_hold() {
+        let withdrawal = sample_withdrawal(1);
+        let mut pending = HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![claim_withdrawals::ClaimOutcome {
+                leaf_hash: withdrawal.leaf_hash.clone(),
+                kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred),
+                tx_hash: None,
+            }],
+            ..empty_report()
+        };
+        record_claim_outcome(&[withdrawal.clone()], &report, &mut pending, &mut retry, &mut retired, 0);
+        assert!(pending.contains_key(&withdrawal.leaf_hash));
+        assert!(retry.is_empty());
+        assert!(retired.is_empty());
+        let state = DaemonState { pending_claim_withdrawals: pending, claim_retry: retry, retired_claim_withdrawals: retired };
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let config = crate::guardian::test_fixture::codec_guardian_config();
+        save_chain_state(&config, &db, 0, &state).unwrap();
+        drop(db);
+        let restarted = super::super::guardian_client::RelayerDb::open(&root).unwrap();
+        let saved = load_chain_state(&config, &restarted, 0).unwrap();
+        assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+        assert!(saved.claim_retry.is_empty());
+        assert!(saved.retired_claim_withdrawals.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
