@@ -20,6 +20,30 @@ DROPIN = '80-realm-pr30-20261029.conf'
 PREVIOUS = '70-realm-replay-20261028.conf'
 ROOT = Path('/var/backups/psy-realm-pr30-20261029')
 WORKING = '/opt/psy-core/releases/core-testnet-20261027-r3'
+EXTRA_PRIORS = {}
+
+
+def configure_profile(profile, unit, fragment, sha):
+    global PROCESSOR, PROCESSOR_SHA, NEW, DROPIN, PREVIOUS, ROOT, EXTRA_PRIORS
+    if profile == 'pr30':
+        return
+    require(profile == 'imt-coverage', 'unknown rollout profile')
+    require(re.fullmatch(r'psy-core-r3-realm-[01]-v[123]-processor\.service', unit) is not None,
+            'IMT coverage rollout permits only six Realm Processors')
+    require(sha == '349cdc3d5548e15d9a026f98690df3b3f997fa54edcb636bde8af090752235fe',
+            'unreviewed IMT coverage artifact')
+    starts = [line for line in fragment.read_text().splitlines() if line.startswith('ExecStart=')]
+    require(len(starts) == 1 and starts[0].count(str(BASE)) == 1, 'unexpected base launch command')
+    EXTRA_PRIORS = {
+        fragment.with_name(fragment.name + '.d') / PREVIOUS:
+            '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(PROCESSOR), 1) + '\n',
+    }
+    PROCESSOR = NEW
+    PROCESSOR_SHA = 'aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338'
+    NEW = Path('/opt/psy-core/hotfixes/realm-imt-67634280/psy_node_cli')
+    PREVIOUS = DROPIN
+    DROPIN = '90-realm-imt-20261029.conf'
+    ROOT = Path('/var/backups/psy-realm-imt-20261029')
 
 
 def require(condition, message):
@@ -129,10 +153,13 @@ def ensure_original_configuration(fragment, contents, previous, prior, old, old_
     require(fragment.read_text() == contents, 'base unit changed; hold stopped for inspection')
     if prior:
         require(previous.read_text() == prior, 'previous override changed; hold stopped for inspection')
+    for path, expected in EXTRA_PRIORS.items():
+        require(path.read_text() == expected, 'earlier override changed; hold stopped for inspection')
     require(digest(old) == old_sha, 'rollback binary changed; hold stopped for inspection')
 
 
 def ensure_loaded_configuration(unit, fragment, overrides):
+    overrides = {**EXTRA_PRIORS, **overrides}
     props = properties(unit)
     require(props['FragmentPath'] == str(fragment) and props['WorkingDirectory'] == WORKING, 'loaded unit changed; hold stopped')
     require(props['DropInPaths'].split() == sorted(str(path) for path in overrides), 'loaded overrides changed; hold stopped')
@@ -146,12 +173,14 @@ def main():
     parser.add_argument('--unit', required=True)
     parser.add_argument('--candidate', default='/var/tmp/psy-realm-pr30-61c1636b/psy_node_cli')
     parser.add_argument('--sha256', required=True)
+    parser.add_argument('--profile', choices=('pr30', 'imt-coverage'), default='pr30')
     args = parser.parse_args()
     require(os.geteuid() == 0, 'root required')
     require(re.fullmatch(r'[0-9a-f]{64}', args.sha256) is not None, 'invalid SHA256')
     # Validate the unit name before using it as a filesystem path.
     require(re.fullmatch(r'psy-core-r3-realm-[01]-v[123]-(edge|processor)\.service', args.unit) is not None, 'invalid unit')
     fragment = Path('/etc/systemd/system') / args.unit
+    configure_profile(args.profile, args.unit, fragment, args.sha256)
     contents = fragment.read_text()
     address, old, old_sha, expected, prior = plan(args.unit, contents)
     addresses = json.loads(run('ip', '-j', 'address', 'show'))
@@ -159,7 +188,9 @@ def main():
     require(digest(BASE) == BASE_SHA and digest(old) == old_sha, 'rollback binary mismatch')
     dropin = fragment.with_name(fragment.name + '.d') / DROPIN
     previous = dropin.with_name(PREVIOUS)
-    allowed = []
+    allowed = list(str(path) for path in EXTRA_PRIORS)
+    for path, expected_prior in EXTRA_PRIORS.items():
+        require(path.read_text() == expected_prior, 'earlier processor override changed')
     if prior:
         require(previous.read_text() == prior, 'previous processor override changed')
         allowed.append(str(previous))
@@ -190,6 +221,8 @@ def main():
         shutil.copy2(fragment, audit / 'original.service')
         if prior:
             shutil.copy2(previous, audit / PREVIOUS)
+        for path in EXTRA_PRIORS:
+            shutil.copy2(path, audit / path.name)
         save(audit / 'before.json', dict(unit=args.unit, action=args.action, properties=props, peers=untouched))
         if args.action == 'activate':
             install(Path(args.candidate), args.sha256)
@@ -201,6 +234,8 @@ def main():
             require(fragment.read_text() == contents, 'base unit changed during operation')
             if prior:
                 require(previous.read_text() == prior, 'previous override changed during operation')
+            for path, expected_prior in EXTRA_PRIORS.items():
+                require(path.read_text() == expected_prior, 'earlier override changed during operation')
             if args.action == 'activate':
                 dropin.parent.mkdir(mode=0o755, exist_ok=True)
                 temporary = dropin.with_suffix('.tmp')

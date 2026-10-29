@@ -145,5 +145,59 @@ class LifecycleTests(unittest.TestCase):
         self.exercise('stop-timeout')
 
 
+class IMTProfileTests(unittest.TestCase):
+    SHA = '349cdc3d5548e15d9a026f98690df3b3f997fa54edcb636bde8af090752235fe'
+
+    def profile(self, unit, sha=None):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name in ('PROCESSOR', 'PROCESSOR_SHA', 'NEW', 'DROPIN', 'PREVIOUS', 'ROOT', 'EXTRA_PRIORS'):
+            stack.enter_context(patch.object(rollout, name, getattr(rollout, name)))
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
+        fragment = Path(directory) / unit
+        fragment.write_text('[Service]\nExecStart="' + str(rollout.BASE) +
+                            '" "start-realm-processor" "--network" "psy-public-testnet" '
+                            '"--proving-backend" "plonky2-poseidon-goldilocks"\n')
+        rollout.configure_profile('imt-coverage', unit, fragment, sha or self.SHA)
+        return fragment
+
+    def test_processor_retains_both_prior_overrides(self):
+        unit = 'psy-core-r3-realm-0-v3-processor.service'
+        fragment = self.profile(unit)
+        address, old, sha, override, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual(address, '10.148.0.43')
+        self.assertEqual(str(old), '/opt/psy-core/hotfixes/realm-pr30-61c1636b/psy_node_cli')
+        self.assertEqual(sha, 'aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338')
+        self.assertEqual(rollout.PREVIOUS, '80-realm-pr30-20261029.conf')
+        self.assertEqual(rollout.DROPIN, '90-realm-imt-20261029.conf')
+        self.assertIn(str(rollout.NEW), override)
+        self.assertIn(str(old), prior)
+        path, contents = next(iter(rollout.EXTRA_PRIORS.items()))
+        self.assertEqual(path.name, '70-realm-replay-20261028.conf')
+        self.assertIn('/opt/psy-core/hotfixes/realm-sync-5f4f5c90/psy_node_cli', contents)
+
+    def test_reject_edge(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-realm-0-v1-edge.service')
+
+    def test_reject_other_artifact(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-realm-1-v2-processor.service', 'a' * 64)
+
+    def test_earlier_override_drift_is_detected(self):
+        unit = 'psy-core-r3-realm-0-v3-processor.service'
+        fragment = self.profile(unit)
+        _, _, _, _, prior = rollout.plan(unit, fragment.read_text())
+        earlier = next(iter(rollout.EXTRA_PRIORS))
+        earlier.parent.mkdir()
+        earlier.write_text('unreviewed earlier override')
+        previous = earlier.with_name(rollout.PREVIOUS)
+        previous.write_text(prior)
+        with patch.object(rollout, 'digest', return_value=rollout.PROCESSOR_SHA):
+            with self.assertRaisesRegex(ValueError, 'earlier override changed'):
+                rollout.ensure_original_configuration(fragment, fragment.read_text(), previous, prior,
+                                                       rollout.PROCESSOR, rollout.PROCESSOR_SHA)
+
+
 if __name__ == '__main__':
     unittest.main()
