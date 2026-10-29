@@ -64,6 +64,14 @@ pub const TEMP_TABLE_ID_GUTA_IN_FLIGHT: u16 = 0x4647; // 'GF'
 pub const TEMP_TABLE_ID_GUTA_IN_FLIGHT_BYTES: [u8; 2] = [0x47, 0x46]; // 'GF'
 pub const TEMP_TABLE_GUTA_IN_FLIGHT_KEY_SIZE: usize = 16; // 4 + 2 + 2 + 8
 
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY: u16 = 0x5245; // 'ER'
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES: [u8; 2] = [0x45, 0x52]; // 'ER'
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS: u16 = 0x5545; // 'EU'
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES: [u8; 2] = [0x45, 0x55]; // 'EU'
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR: u16 = 0x4345; // 'EC'
+pub const TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES: [u8; 2] = [0x45, 0x43]; // 'EC'
+pub const TEMP_TABLE_END_CAP_REDELIVERY_KEY_SIZE: usize = 16; // 4 + 2 + 2 + 8
+
 pub const TEMP_TABLE_ID_WORKER_REPUTATION: u16 = 0x5257; // 'WR'
 pub const TEMP_TABLE_ID_WORKER_REPUTATION_BYTES: [u8; 2] = [0x57, 0x52]; // 'WR'
 pub const TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE: usize = 41; // 4 + 2 + 2 + 33 (compressed public key)
@@ -584,9 +592,50 @@ pub fn tt_get_guta_in_flight_key(realm_id: u32, realm_sub_id: u16, submitting_re
     key
 }
 
+/// Key of an EndCap redelivery table entry: the user id for records, the pending id for user lists, 0 for the cursor.
+pub fn tt_get_end_cap_redelivery_key(realm_id: u32, realm_sub_id: u16, table_id: [u8; 2], id: u64) -> [u8; TEMP_TABLE_END_CAP_REDELIVERY_KEY_SIZE] {
+    let mut key = [0u8; TEMP_TABLE_END_CAP_REDELIVERY_KEY_SIZE];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&table_id);
+    key[8..16].copy_from_slice(&id.to_le_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_cap_redelivery_table_ids_are_unique_and_match_their_bytes() {
+        let others: [u16; 15] = [
+            TEMP_TABLE_ID_WORKER_PROOF_METADATA,
+            TEMP_TABLE_ID_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_PROOF_WITNESS_DATA,
+            TEMP_TABLE_ID_SUBMIT_STATUS,
+            TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES,
+            TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES,
+            TEMP_TABLE_ID_TAG_TREE_VALUES,
+            TEMP_TABLE_ID_NODE_PROVING_STATE,
+            TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION,
+            TEMP_TABLE_ID_JOB_CLAIM,
+            TEMP_TABLE_ID_JOB_STATS,
+            TEMP_TABLE_ID_WORKER_REPUTATION,
+            TEMP_TABLE_ID_PROOF_CLAIM_TAG,
+            TEMP_TABLE_ID_GUTA_IN_FLIGHT,
+        ];
+        let tables = [
+            (TEMP_TABLE_ID_END_CAP_REDELIVERY, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES),
+            (TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES),
+            (TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR, TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES),
+        ];
+        for (index, (id, bytes)) in tables.iter().enumerate() {
+            assert!(!others.contains(id));
+            assert!(tables.iter().enumerate().all(|(other, (other_id, _))| other == index || other_id != id));
+            assert_eq!(id.to_le_bytes(), *bytes);
+        }
+    }
 
     #[test]
     fn guta_in_flight_table_id_is_unique_and_matches_its_bytes() {

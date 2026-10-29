@@ -402,6 +402,13 @@ pub async fn gatherer_runner<
 }
 
 
+/// The caller receives the original error so it can act on a typed FastForward refusal; the task keeps a rendered copy.
+fn reply_fast_forward_error(reply: oneshot::Sender<anyhow::Result<()>>, error: anyhow::Error) -> anyhow::Error {
+    let rendered = anyhow::anyhow!("{error:#}");
+    let _ = reply.send(Err(error));
+    rendered
+}
+
 pub async fn gatherer_runner_for_tree<
     const QUEUE_TOPIC_ID: u32,
     QueueItem: PCoreQueueItemBase,
@@ -459,7 +466,7 @@ pub async fn gatherer_runner_for_tree<
                             let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
                         }
                         GathererTreeCommand::FastForward { reply, .. } => {
-                            let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
+                            return Err(reply_fast_forward_error(reply, error));
                         }
                     }
                 }
@@ -516,10 +523,7 @@ pub async fn gatherer_runner_for_tree<
                     }.await;
                     match replacement {
                         Ok(replacement) => { builder = replacement; let _ = reply.send(Ok(())); }
-                        Err(error) => {
-                            let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
-                            return Err(error);
-                        }
+                        Err(error) => return Err(reply_fast_forward_error(reply, error)),
                     }
                 }
 

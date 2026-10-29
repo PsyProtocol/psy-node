@@ -206,6 +206,7 @@ where
         realm_edge_node_ids,
     );
     crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
+    handler.spawn_end_cap_redelivery();
     start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
     Ok(())
 }

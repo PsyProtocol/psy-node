@@ -14,7 +14,7 @@ use parth_core::{
             traits::{HashTo4Felts, MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
+    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
 };
 use psy_api_core::{
     realm::standard_edge_rpc::{
@@ -41,7 +41,7 @@ use psy_node_core::{
         PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
         PsyRealmEdgeAPIStoreReader,
     },
-    psy_temp_db::{GatheringGeneration, StandardEdgeAPITempDBStoreBase},
+    psy_temp_db::{EndCapRedeliveryRecord, GatheringGeneration, StandardEdgeAPITempDBStoreBase},
     qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
     queue::{
         ephemeral::QStandardEphemeralQueuePublisher,
@@ -1103,6 +1103,19 @@ impl<
             }));
         }
         timer.lap_micros("put_submitted_status_if_absent");
+
+        let redelivery = EndCapRedeliveryRecord {
+            admitted_unique_pending_id: unique_pending_id,
+            admitted_checkpoint_id: generation.checkpoint_id,
+            old_user_leaf_hash: old_leaf_hash.into_owned_32bytes(),
+            new_user_leaf_hash: user_end_cap_input.core.new_user_leaf.qfhash::<N::HasherBase>().into_owned_32bytes(),
+            end_cap_input: user_end_cap_input.psy_ser_to_bytes_vec()?,
+            proof: proof_bytes.to_vec(),
+        };
+        if !self.temp_db.add_end_cap_redelivery(&self.realm_identifier, user_id, &redelivery).await? {
+            tracing::info!(user_id, unique_pending_id, "A newer admission already owns this user's EndCap redelivery record");
+        }
+        timer.lap_micros("add_end_cap_redelivery");
 
         self.proof_store
             .put_proof_bytes_for_job_id(job_id, unique_pending_id, proof_bytes)
@@ -2516,14 +2529,14 @@ pub(crate) mod tests {
     pub(crate) type StandardEnv = RealmEdgeTestEnv<TestNetworkConfig>;
     pub(crate) type EndCapEnv = RealmEdgeTestEnv<EndCapTestNetworkConfig>;
 
-    async fn end_cap_env() -> anyhow::Result<EndCapEnv> {
+    pub(crate) async fn end_cap_env() -> anyhow::Result<EndCapEnv> {
         RealmEdgeTestEnv::create(Arc::new(EndCapEchoVerifier {})).await
     }
 
     /// Seeds contract state tree height metadata for contracts 0..CONTRACT_COUNT
     /// at checkpoint 0 (reads use max-checkpoint semantics, so this is visible
     /// at MAX_CHECKPOINT_ID).
-    async fn seed_contract_heights(env: &EndCapEnv) -> anyhow::Result<()> {
+    pub(crate) async fn seed_contract_heights(env: &EndCapEnv) -> anyhow::Result<()> {
         let heights = (0..CONTRACT_COUNT as u64).map(|id| (id, CONTRACT_TREE_HEIGHT)).collect::<Vec<_>>();
         env.db.set_contract_tree_heights(0, &heights).await
     }
@@ -2614,7 +2627,7 @@ pub(crate) mod tests {
 
     /// A submission input + proof bytes pair that passes every gate of
     /// `handle_user_end_cap_proof_submission` on the given fresh env.
-    async fn valid_end_cap_submission(env: &EndCapEnv) -> anyhow::Result<(SubmitUserEndCapNonProofInput<PF, PHash>, Vec<u8>)> {
+    pub(crate) async fn valid_end_cap_submission(env: &EndCapEnv) -> anyhow::Result<(SubmitUserEndCapNonProofInput<PF, PHash>, Vec<u8>)> {
         let checkpoint_root = checkpoint_tree_append_root_zero(&env.db).await?;
         let input = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         let expected_hash = input
@@ -3019,13 +3032,11 @@ pub(crate) mod tests {
         )).expect("set gathering generation");
     }
 
-    #[tokio::test]
-    async fn p2p_forwarded_end_cap_restages_only_on_the_scheduled_edge() -> anyhow::Result<()> {
+    /// Registers validators 1..=3 at checkpoint 0; returns their Edge node ids and the scheduled proposer of target 1.
+    pub(crate) async fn seed_three_validators(env: &EndCapEnv) -> anyhow::Result<(HashMap<u16, NodeId>, u16)> {
         use crate::guta_planner::realm_guta_planner_tests::test_env::validator_key_fixture;
         use psy_node_core::psy_core_db::traits::full::{PsyNodeValidatorTreeDatabaseReader, PsyNodeValidatorTreeDatabaseWriter};
         use psy_data::p2p::ValidatorLeafPreimage;
-        let mut env = end_cap_env().await?;
-        seed_contract_heights(&env).await?;
         let mut edges = HashMap::new();
         for sub_id in 1..=3u16 {
             let (node_id, _, bls_key, _) = validator_key_fixture(10_000 * sub_id as u64, 20_000 * sub_id as u64);
@@ -3059,6 +3070,14 @@ pub(crate) mod tests {
         let seed = checkpoint_leaf.stats.random_seed.to_4_felts().map(|felt| felt.to_u64_value());
         let rotation = RealmRotationConfig { checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH, validator_sub_ids: vec![1, 2, 3] };
         let proposer = rotation.proposer_sub_id(TEST_REALM_ID as u32, 1, seed)?.unwrap();
+        Ok((edges, proposer))
+    }
+
+    #[tokio::test]
+    async fn p2p_forwarded_end_cap_restages_only_on_the_scheduled_edge() -> anyhow::Result<()> {
+        let mut env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let (edges, proposer) = seed_three_validators(&env).await?;
         let other = (1..=3u16).find(|sub_id| *sub_id != proposer).unwrap();
         let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         env.handler.set_realm_p2p(

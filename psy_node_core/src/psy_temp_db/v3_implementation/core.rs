@@ -11,6 +11,8 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key, tt_get_guta_in_flight_key, GutaInFlightRecord, QTempDBGutaInFlightStore,
+        tt_get_end_cap_redelivery_key, EndCapRedeliveryRecord, QTempDBEndCapRedeliveryStore, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES,
+        TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES,
         CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
@@ -1004,5 +1006,116 @@ impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> Q
     ) -> anyhow::Result<bool> {
         let key = tt_get_guta_in_flight_key(rid.realm_id, rid.realm_sub_id, submitting_realm_id);
         self.qtdb_raw_kv_compare_and_set(&key, observed, &record.to_bytes()).await
+    }
+}
+
+/// Concurrent writers of one user list or record race; each lost compare-and-set reads the value again.
+const END_CAP_REDELIVERY_USER_LIST_ATTEMPTS: usize = 16;
+
+fn is_newer_end_cap_redelivery_stored(observed: Option<&[u8]>, user_id: u64, unique_pending_id: u64) -> bool {
+    let Some(bytes) = observed else {
+        return false;
+    };
+    match EndCapRedeliveryRecord::from_bytes(bytes) {
+        Ok(stored) => stored.admitted_unique_pending_id > unique_pending_id,
+        Err(error) => {
+            tracing::warn!(user_id, error = %format!("{error:#}"), "Replacing an undecodable EndCap redelivery record");
+            false
+        }
+    }
+}
+
+async fn list_end_cap_redelivery_user<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync>(
+    store: &T,
+    rid: &QRealmIdentifier,
+    user_id: u64,
+    unique_pending_id: u64,
+) -> anyhow::Result<()> {
+    let users_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES, unique_pending_id);
+    for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
+        let observed = store.qtdb_raw_kv_get_value(&users_key).await?.filter(|bytes| !bytes.is_empty());
+        let users = observed.clone().unwrap_or_default();
+        if users.chunks_exact(8).any(|chunk| chunk == user_id.to_le_bytes()) {
+            return Ok(());
+        }
+        let mut listed = users;
+        listed.extend_from_slice(&user_id.to_le_bytes());
+        if store.qtdb_raw_kv_compare_and_set(&users_key, observed.as_deref(), &listed).await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "could not list user {} for EndCap redelivery under pending id {} after {} attempts",
+        user_id, unique_pending_id, END_CAP_REDELIVERY_USER_LIST_ATTEMPTS
+    )
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBEndCapRedeliveryStore for T {
+    async fn add_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, record: &EndCapRedeliveryRecord) -> anyhow::Result<bool> {
+        let record_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
+        let record_bytes = record.to_bytes()?;
+        let mut is_listed = false;
+        for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
+            let observed = self.qtdb_raw_kv_get_value(&record_key).await?.filter(|bytes| !bytes.is_empty());
+            if is_newer_end_cap_redelivery_stored(observed.as_deref(), user_id, record.admitted_unique_pending_id) {
+                return Ok(false);
+            }
+            if !is_listed {
+                list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
+                is_listed = true;
+            }
+            if self.qtdb_raw_kv_compare_and_set(&record_key, observed.as_deref(), &record_bytes).await? {
+                // The first admission starts the cursor, so a cursor never begins after a listed pending id.
+                self.set_end_cap_redelivery_cursor(rid, None, record.admitted_unique_pending_id).await?;
+                return Ok(true);
+            }
+        }
+        anyhow::bail!(
+            "could not write the EndCap redelivery record of user {} for pending id {} after {} attempts",
+            user_id, record.admitted_unique_pending_id, END_CAP_REDELIVERY_USER_LIST_ATTEMPTS
+        )
+    }
+
+    async fn replace_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, observed: &[u8], record: &EndCapRedeliveryRecord) -> anyhow::Result<bool> {
+        list_end_cap_redelivery_user(self, rid, user_id, record.admitted_unique_pending_id).await?;
+        let record_key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
+        self.qtdb_raw_kv_compare_and_set(&record_key, Some(observed), &record.to_bytes()?).await
+    }
+
+    async fn get_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
+        Ok(self.qtdb_raw_kv_get_value(&key).await?.filter(|raw| !raw.is_empty()))
+    }
+
+    async fn remove_end_cap_redelivery(&self, rid: &QRealmIdentifier, user_id: u64, observed: &[u8]) -> anyhow::Result<bool> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES, user_id);
+        self.qtdb_raw_kv_compare_and_set(&key, Some(observed), &[]).await
+    }
+
+    async fn get_end_cap_redelivery_user_ids(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<Vec<u64>> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES, unique_pending_id);
+        let bytes = self.qtdb_raw_kv_get_value(&key).await?.unwrap_or_default();
+        anyhow::ensure!(bytes.len() % 8 == 0, "EndCap redelivery user list for pending id {} has {} bytes", unique_pending_id, bytes.len());
+        bytes.chunks_exact(8).map(|chunk| Ok(u64::from_le_bytes(chunk.try_into()?))).collect()
+    }
+
+    async fn remove_end_cap_redelivery_user_ids(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES, unique_pending_id);
+        self.qtdb_raw_kv_delete_key(&key).await
+    }
+
+    async fn get_end_cap_redelivery_cursor(&self, rid: &QRealmIdentifier) -> anyhow::Result<Option<u64>> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, 0);
+        match self.qtdb_raw_kv_get_value(&key).await? {
+            Some(raw) if !raw.is_empty() => Ok(Some(u64::from_le_bytes(raw.as_slice().try_into()?))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn set_end_cap_redelivery_cursor(&self, rid: &QRealmIdentifier, observed: Option<u64>, next: u64) -> anyhow::Result<bool> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, 0);
+        let observed = observed.map(u64::to_le_bytes);
+        self.qtdb_raw_kv_compare_and_set(&key, observed.as_ref().map(|bytes| bytes.as_slice()), &next.to_le_bytes()).await
     }
 }

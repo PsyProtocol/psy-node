@@ -41,11 +41,16 @@ mod end_cap_handoff_tests {
     use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
     use tokio::{io::AsyncReadExt, sync::{mpsc, Semaphore}, task::JoinHandle, time::timeout};
 
+    use parth_common::realm_rotation::RealmRotationConfig;
+    use parth_core::crypto::hash::traits::HashTo4Felts;
+    use psy_data::p2p::ValidatorLeafPreimage;
+    use psy_node_core::psy_core_db::traits::full::PsyNodeValidatorTreeDatabaseReader;
+
     use crate::{
         constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
         guta_planner::realm_guta_planner_tests::{
             create_rgp_test_db,
-            test_env::{RGPContractUpdate, RGPTestChainState, RGPUser},
+            test_env::{validator_key_fixture, RGPContractUpdate, RGPTestChainState, RGPUser},
         },
         queue::gatherer::EphemeralQueueGathererWithTree,
         realm::{edge::utils::end_cap::validate_end_cap_and_generate_node_data_for_edge, queue_key::RealmUserUpdateQueueKey},
@@ -53,9 +58,11 @@ mod end_cap_handoff_tests {
         utils::processor_status::ProcessorStatus,
     };
 
+    use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
+
     use super::realm_end_cap_gatherer::{
         get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file,
-        RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig, RealmGUTAEndCapGathererOutput,
+        RealmFastForwardBaseMismatch, RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig, RealmGUTAEndCapGathererOutput,
     };
 
     type N = TestNetworkConfig;
@@ -246,6 +253,7 @@ mod end_cap_handoff_tests {
         config: Config,
         tree: Arc<tokio::sync::RwLock<Tree>>,
         initial_tree: Tree,
+        other_validators: Vec<ValidatorLeafPreimage>,
     }
 
     impl HandoffFixture {
@@ -278,6 +286,7 @@ mod end_cap_handoff_tests {
             let mut fixture = Self {
                 tree: Arc::new(tokio::sync::RwLock::new(initial_tree.clone())),
                 chain, config, initial_tree,
+                other_validators: Vec::new(),
             };
             fixture.save_checkpoint(0, None).await?;
             Ok(fixture)
@@ -338,10 +347,13 @@ mod end_cap_handoff_tests {
             self.chain.coordinator_global_user_tree.set_e_leaf(0, root);
             let top = self.chain.coordinator_global_user_tree.get_e_leaf(0);
             db.global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &top).await?;
-            db.validator_tree_set_leaf_hash(checkpoint_id, 1, PHash::from_owned_32bytes(self.chain.validator_preimage.leaf_hash()?)).await?;
-            db.validator_tree_set_leaf_preimage(checkpoint_id, 1, &self.chain.validator_preimage).await?;
+            for preimage in std::iter::once(&self.chain.validator_preimage).chain(&self.other_validators) {
+                db.validator_tree_set_leaf_hash(checkpoint_id, preimage.tree_index()?, PHash::from_owned_32bytes(preimage.leaf_hash()?)).await?;
+                db.validator_tree_set_leaf_preimage(checkpoint_id, preimage.tree_index()?, preimage).await?;
+            }
             let mut roots = self.chain.finalizer_state_roots;
             roots.user_tree_root = top.root;
+            roots.validator_tree_root = db.validator_tree_get_root_hash(checkpoint_id).await?;
             let leaf = PQEDCheckpointLeaf { global_chain_root: roots.qfhash::<PoseidonHasher>(), stats: self.chain.finalizer_checkpoint_leaf.stats };
             db.set_checkpoint_global_state_roots(checkpoint_id, &roots).await?;
             db.set_checkpoint_leaf_data(checkpoint_id, &leaf).await?;
@@ -352,10 +364,10 @@ mod end_cap_handoff_tests {
             Ok(())
         }
 
-        fn replace_generation(&self, authenticated: bool) {
+        fn replace_generation(&self, checkpoint_id: u64) {
             let mut status = self.config.status.write().unwrap();
-            status.gathering_checkpoint_id = u64::from(authenticated);
-            status.gathering_checkpoint_root = if authenticated { self.config.checkpoint_tree.get_root() } else { self.chain.checkpoint_tree_root };
+            status.gathering_checkpoint_id = checkpoint_id;
+            status.gathering_checkpoint_root = if checkpoint_id == 0 { self.chain.checkpoint_tree_root } else { self.config.checkpoint_tree.get_root() };
             status.gathering_unique_pending_id = 2;
             status.gathering_proc_checkpoint_unique_id = SECOND_QUEUE;
             status.processing_realm_end_root = status.gathering_realm_start_root;
@@ -464,7 +476,7 @@ mod end_cap_handoff_tests {
         }
         fixture.assert_backup(1, &fixture.initial_tree, &first, first_consumed.then_some(&item)).await?;
         fixture.save_checkpoint(1, first_consumed.then_some(&item)).await?;
-        fixture.replace_generation(true);
+        fixture.replace_generation(1);
         let restaged = fixture.restage(&item).await?;
         runner.subscriber.queue.add_items(SECOND_QUEUE, vec![restaged.psy_ser_to_bytes_vec()?]);
         runner.subscriber.release_tail.add_permits(1);
@@ -505,7 +517,7 @@ mod end_cap_handoff_tests {
         let retained_root = fixture.tree.read().await.get_root();
         let retained_validator = fixture.config.current_validator_user_leaf.lock().unwrap().clone();
         // Checkpoint 0 cannot authenticate the replacement's start root, so finalize must discard the accepted EndCap.
-        fixture.replace_generation(false);
+        fixture.replace_generation(0);
         let next = fixture.end_cap(2, 62).await?;
         assert_eq!(next.old_user_leaf_hash, item.new_user_leaf_hash);
         runner.subscriber.queue.add_items(SECOND_QUEUE, vec![next.psy_ser_to_bytes_vec()?]);
@@ -520,6 +532,129 @@ mod end_cap_handoff_tests {
         assert_eq!(*fixture.config.current_validator_user_leaf.lock().unwrap(), retained_validator);
         assert!(fixture.config.future_pending_end_cap_jobs.read().unwrap().is_empty());
         runner.stop_at_tail().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_forward_over_a_committed_local_candidate_returns_typed_base_mismatch() -> anyhow::Result<()> {
+        let mut fixture = HandoffFixture::new().await?;
+        let item = fixture.end_cap(1, 81).await?;
+        let mut runner = HandoffRunner::start(fixture.config.clone(), fixture.tree.clone(), Some(item.psy_ser_to_bytes_vec()?));
+        runner.wait_for(QueueEvent::Idle(FIRST_QUEUE)).await?;
+        let first = runner.finalize(FIRST_QUEUE, SECOND_QUEUE).await?;
+        assert_one_end_cap(&fixture, &first, &item, 1).await?;
+        let local_candidate_root = fixture.tree.read().await.get_last_commit_root();
+        // Another proposer's batch from the same start root was included instead of the local candidate.
+        let included = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: 0,
+            realm_sub_id: 2,
+            unique_pending_id: 9,
+            proc_checkpoint_unique_id: 9,
+            old_realm_root: fixture.initial_tree.get_root(),
+            new_realm_root: PHash::from_values(91, 92, 93, 94),
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        let fast_forward = runner.gatherer.fast_forward(included.psy_ser_to_bytes_vec()?);
+        runner.subscriber.release_tail.add_permits(1);
+        let error = timeout(WAIT, fast_forward).await.context("timed out waiting for FastForward reply")?.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RealmFastForwardBaseMismatch<PHash>>(),
+            Some(&RealmFastForwardBaseMismatch { committed_root: local_candidate_root, old_root: fixture.initial_tree.get_root() }),
+            "unexpected FastForward error: {error:#}"
+        );
+        let task = runner.task.take().expect("runner task");
+        assert!(timeout(WAIT, task).await.context("gatherer task did not stop")??.is_err());
+        Ok(())
+    }
+
+    struct OverlappedGeneration {
+        fixture: HandoffFixture,
+        item: Item,
+        next: Item,
+        first_end_tree: Tree,
+        second: Output,
+    }
+
+    /// Registers validator sub 2 and an anchor seed whose schedule hands target `proof_base_id + 1` to it.
+    fn schedule_other_validator(fixture: &mut HandoffFixture, proof_base_id: u64) -> anyhow::Result<()> {
+        let (node_id, _, bls_public_key, _) = validator_key_fixture(9, 13);
+        fixture.other_validators.push(ValidatorLeafPreimage {
+            chain_id: fixture.chain.chain_id, realm_id: 0, realm_sub_id: 2,
+            validator_user_id: fixture.chain.finalizer_user.user_id - 1,
+            node_id: *node_id.as_raw(), bls_public_key: bls_public_key.to_bytes(),
+        });
+        let rotation = RealmRotationConfig { checkpoints_per_epoch: psy_config::CHECKPOINTS_PER_EPOCH, validator_sub_ids: vec![1, 2] };
+        let seed = (1..64u64)
+            .map(|limb| PHash::from_values(limb, 0, 0, 0))
+            .find(|seed| rotation.proposer_sub_id(0, proof_base_id + 1, seed.to_4_felts().map(|felt| felt.to_u64_value())).ok().flatten() == Some(2))
+            .context("no anchor seed schedules validator 2")?;
+        fixture.chain.finalizer_checkpoint_leaf.stats.random_seed = seed;
+        Ok(())
+    }
+
+    async fn finalize_generation_started_before_inclusion(proof_base_id: u64, is_other_proposer_scheduled: bool) -> anyhow::Result<OverlappedGeneration> {
+        let mut fixture = HandoffFixture::new().await?;
+        if is_other_proposer_scheduled {
+            schedule_other_validator(&mut fixture, proof_base_id)?;
+        }
+        let item = fixture.end_cap(1, 71).await?;
+        let mut runner = HandoffRunner::start(fixture.config.clone(), fixture.tree.clone(), Some(item.psy_ser_to_bytes_vec()?));
+        runner.wait_for(QueueEvent::Idle(FIRST_QUEUE)).await?;
+        let first = runner.finalize(FIRST_QUEUE, SECOND_QUEUE).await?;
+        assert_one_end_cap(&fixture, &first, &item, 1).await?;
+        let first_end_tree = fixture.tree.read().await.clone();
+        for checkpoint_id in 1..=proof_base_id {
+            fixture.save_checkpoint(checkpoint_id, Some(&item)).await?;
+        }
+        // Production order: the replacement bootstraps on the first end root while checkpoint 0 is still the gathering base.
+        fixture.replace_generation(0);
+        let next = fixture.end_cap(2, 72).await?;
+        runner.subscriber.queue.add_items(SECOND_QUEUE, vec![next.psy_ser_to_bytes_vec()?]);
+        runner.subscriber.release_tail.add_permits(1);
+        runner.wait_for(QueueEvent::Idle(SECOND_QUEUE)).await?;
+        let encoded = next.psy_ser_to_bytes_vec()?;
+        assert_eq!(&fixture.backup(2).await?[76..76 + encoded.len()], encoded.as_slice());
+        fixture.replace_generation(proof_base_id);
+        let second = runner.finalize(SECOND_QUEUE, THIRD_QUEUE).await?;
+        runner.stop_at_tail().await?;
+        Ok(OverlappedGeneration { fixture, item, next, first_end_tree, second })
+    }
+
+    #[tokio::test]
+    async fn end_cap_accepted_while_previous_generation_proves_commits_after_inclusion() -> anyhow::Result<()> {
+        assert_generation_moved(&finalize_generation_started_before_inclusion(1, false).await?).await
+    }
+
+    async fn assert_generation_moved(overlapped: &OverlappedGeneration) -> anyhow::Result<()> {
+        let OverlappedGeneration { fixture, next, first_end_tree, second, .. } = overlapped;
+        assert_eq!(second.db_output.old_realm_root, first_end_tree.get_root());
+        assert_one_end_cap(fixture, second, next, 2).await?;
+        fixture.assert_backup(2, first_end_tree, second, Some(next)).await?;
+        assert!(fixture.config.future_pending_end_cap_jobs.read().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_whose_next_epoch_keeps_this_proposer_is_moved() -> anyhow::Result<()> {
+        let proof_base_id = psy_config::CHECKPOINTS_PER_EPOCH - 1;
+        assert_generation_moved(&finalize_generation_started_before_inclusion(proof_base_id, false).await?).await
+    }
+
+    #[tokio::test]
+    async fn generation_whose_next_epoch_schedules_another_proposer_is_discarded() -> anyhow::Result<()> {
+        let proof_base_id = psy_config::CHECKPOINTS_PER_EPOCH - 1;
+        let overlapped = finalize_generation_started_before_inclusion(proof_base_id, true).await?;
+        let first_end_root = overlapped.first_end_tree.get_root();
+        assert_empty(&overlapped.second, first_end_root);
+        let validator = overlapped.fixture.config.current_validator_user_leaf.lock().unwrap().clone();
+        assert_eq!(overlapped.first_end_tree.get_leaf_value(validator.user_id.to_u64_value()), validator.qfhash::<PoseidonHasher>());
+        let tree = overlapped.fixture.tree.read().await;
+        assert_eq!(tree.get_root(), first_end_root);
+        assert_eq!(tree.get_leaf_value(0), overlapped.item.new_user_leaf_hash);
         Ok(())
     }
 }
