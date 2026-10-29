@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "cohort": "core-testnet-20261027-r3",
+  "status": "deployed_with_bounded_runtime_acceptance",
+  "scope": "six Realm Processors only",
+  "source": {
+    "repository": "PsyProtocol/psy-node",
+    "runtime_commit": "ea07ffad395e3bb10f1db3eddb1ae5dd9d974456",
+    "remote_ref": "fix/realm-imt-unchanged-20261029",
+    "base": "396ea8df7526abf9f711a291425190a892237e50",
+    "imt_fix": "67634280f8aeae2d018cf891f23d72f6bcc45880",
+    "original_metadata_fix": "ca261b874b7cd8e00976470e0afe940d20098ffc",
+    "deployment_runtime_integration": "024d21a01c74a69989bc58af08db9364bbe64d3b",
+    "deployment_branch": "deploy/testnet",
+    "five_changed_runtime_files_match_build_source": true,
+    "testnet_dev_not_modified_by_this_rollout": true
+  },
+  "artifact": {
+    "name": "psy_node_cli",
+    "sha256": "c69e077fd4a51dc6678eb845a1615f9b2254ad0dfe80bd3f2544d1c0674c5633",
+    "installed_path": "/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli",
+    "builder_image": "sha256:02a4dd5c2ea776982084a4a856610836fc9f944203e85948fd4b475177f6b4af",
+    "network": "testnet",
+    "network_magic": "0x1337CF514544CF69",
+    "proving_backend": "plonky2-poseidon-goldilocks"
+  },
+  "preserved": {
+    "genesis_sha256": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
+    "base_unit_fragments_unchanged": true,
+    "databases_queues_keys_and_configuration_retained": true,
+    "realm_edge_binary_sha256": "aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338",
+    "realm_edge_pids_unchanged": [289369, 289783, 290380, 315520, 316095, 316419],
+    "coordinator_pids_unchanged": [3669112, 2847782, 2847863, 2847947],
+    "relayer_pid_unchanged": 64787,
+    "no_test_transactions_submitted": true
+  },
+  "tooling": {
+    "profile": "imt-metadata",
+    "source_commit": "27ed9d0f10d74756cb98bb52f0ed3bde1105d043",
+    "sha256": "f1e8400d533d2781320afeee218e536e7907cc430a2e08c101504655b51829b5",
+    "owned_override": "95-realm-imt-metadata-20261029.conf",
+    "audit_directory": "/var/backups/psy-realm-imt-metadata-20261029",
+    "rollback": "remove only owned 95; preserve 70/80 and optional 90; restore immediate PR30 or IMT parent"
+  },
+  "verification": {
+    "common_passed": 683,
+    "common_failed": 0,
+    "common_existing_ignored": 1,
+    "common_filtered_long_random": 1,
+    "sync_subset_passed": 21,
+    "helper_passed": 20,
+    "runtime_and_helper_independent_reviews": "APPROVE",
+    "identity_sampling_utc": "2026-10-29T13:31:04Z to 2026-10-29T13:31:08Z",
+    "all_six_processor_hashes_match": true,
+    "all_six_restart_counts_zero": true,
+    "all_six_checkpoint_at_identity_sampling": 14453,
+    "realm0_canonical_commits": [14411, 14412],
+    "realm1_canonical_commits": [14445, 14459],
+    "realm0_explicit_checkpoint_queries": 90,
+    "realm0_query_errors_or_root_mismatches": 0,
+    "realm0_reads_ahead_of_both_bracketing_markers": 6,
+    "realm1_post_startup_explicit_checkpoint_queries": 60,
+    "realm1_post_startup_query_errors_or_root_mismatches": 0
+  },
+  "processors": [
+    {"realm": 0, "validator": 1, "private_ip": "10.148.0.37", "pid": 222101},
+    {"realm": 0, "validator": 2, "private_ip": "10.148.0.42", "pid": 2090961},
+    {"realm": 0, "validator": 3, "private_ip": "10.148.0.43", "pid": 2100449},
+    {"realm": 1, "validator": 1, "private_ip": "10.148.0.37", "pid": 222803},
+    {"realm": 1, "validator": 2, "private_ip": "10.148.0.42", "pid": 2094197},
+    {"realm": 1, "validator": 3, "private_ip": "10.148.0.43", "pid": 2103546}
+  ],
+  "limitations": [
+    "Short-window acceptance does not prove a long-term loss-rate improvement or all crash modes.",
+    "The existing coordinator-advance-after-sync race still emits transient MissingHistoryProof/local-stale errors; observed nodes recovered without restart.",
+    "The separate b4e2c8b6 fix was not included in this scoped rollout.",
+    "Extra checkpoint metadata RPC/write overhead has not been separately benchmarked.",
+    "No overall bridge health claim: at 13:32 UTC L1 settlement remained 14388 and unproved deposits were Sepolia 669, BSC 2, Base 0."
+  ]
+}

@@ -6,6 +6,43 @@ Execution evidence: [2026-10-29 release](DEPLOYED-20261029.md) and
 This is a state-preserving, per-unit hotfix, not a fresh deployment runner.
 Keep Genesis, databases, pending IDs, queues, keys and existing configuration.
 
+## Combined Processor Hotfix
+
+Current Processor mapping: [combined hotfix manifest](imt-metadata-live-release.json).
+The original `live-release.json` above remains the historical PR30 rollout record.
+
+The later Processor-only release combines IMT unchanged-leaf handling and
+unchanged-checkpoint metadata publication while waiting for inclusion. The PR30
+procedure below remains the historical Edge/Processor rollout, not instructions
+to restart all twelve units for this later fix.
+
+- Runtime source: `ea07ffad395e3bb10f1db3eddb1ae5dd9d974456`, based on
+  `396ea8df7526abf9f711a291425190a892237e50`, with `67634280` and the compatible
+  backport of `ca261b87`. No circuit, Genesis, key, schema or wire-format changes.
+- Deploy only the six Realm Processors, sequentially, first Realm0 then Realm1.
+  Do not upgrade Edges or any other component from this build.
+- Artifact SHA256: `c69e077fd4a51dc6678eb845a1615f9b2254ad0dfe80bd3f2544d1c0674c5633`.
+- Immutable executable: `/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli`.
+- Use `update_unit.py` with explicit `--profile imt-metadata`, `--unit`,
+  `--candidate /var/tmp/psy-realm-imt-metadata-ea07ffad/psy_node_cli` and the SHA above.
+  First `check`, then `activate`, on the matching private host.
+- Install this reviewed helper as root-owned
+  `/opt/psy-maintenance/realm-imt-metadata-20261029/update_unit.py`; SHA256
+  `f1e8400d533d2781320afeee218e536e7907cc430a2e08c101504655b51829b5`.
+- Existing `70` and `80` overrides remain byte-identical. If a prior IMT `90`
+  override exists it must also match exactly and remains installed. Add only
+  `95-realm-imt-metadata-20261029.conf`. Do not delete previous overrides.
+- `rollback --profile imt-metadata` removes only `95` and restores that unit's
+  exact immediate parent: PR30 or the earlier IMT-only binary. Keep both binaries.
+- Audit directory: `/var/backups/psy-realm-imt-metadata-20261029/`.
+- Wait for `PSY_REALM_PROCESSOR_STARTED`, catch-up and loop activity before the
+  next replacement. Require natural proof/proposal/vote/inclusion evidence for
+  Realm0 before starting Realm1, plus explicit-checkpoint RPC proof checks.
+  Active state and matching hashes alone do not establish application readiness.
+- Local release tests: 683 passed, zero failed, one existing ignore and the long
+  random `test_rgp_chain_state_basic` filtered; 21 sync tests are a subset.
+  Helper tests: 20 passed; independent runtime and helper reviews approved.
+
 ## Immutable Inputs
 
 - Reviewed public PR head: `61c1636b53b0d9db61c28cad020b4d2b060277f3`, PR #30.
