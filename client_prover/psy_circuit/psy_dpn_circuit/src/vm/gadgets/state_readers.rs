@@ -1758,32 +1758,39 @@ impl StateReaderGadget {
                 if let Some(existing_result) = self.result_map.get(&ck) {
                     existing_result.clone()
                 } else {
-                    let requested_checkpoint_id = dpn.resolve_target(c.checkpoint_id);
+                    // Roots and stats authenticate the same checkpoint leaf. Reuse
+                    // either command's gadget before creating another proof.
+                    let ref_key = if let Some(ref_key) = self.gadget_map.get(&ck) {
+                        *ref_key
+                    } else {
+                        let requested_checkpoint_id = dpn.resolve_target(c.checkpoint_id);
 
-                    let requested_checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(builder);
+                        let requested_checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(builder);
 
-                    let historical_proof =
-                        HistoricalRootMerkleProofGadget::add_virtual_to_zero_gt::<H, F, D>(builder, CHECKPOINT_TREE_HEIGHT as usize);
+                        let historical_proof =
+                            HistoricalRootMerkleProofGadget::add_virtual_to_zero_gt::<H, F, D>(builder, CHECKPOINT_TREE_HEIGHT as usize);
 
-                    builder.connect(historical_proof.index, requested_checkpoint_id);
+                        builder.connect(historical_proof.index, requested_checkpoint_id);
 
-                    builder.connect_hashes(historical_proof.current_root, self.checkpoint_tree_root);
+                        builder.connect_hashes(historical_proof.current_root, self.checkpoint_tree_root);
 
-                    let checkpoint_stats_hash = requested_checkpoint_stats.to_hash::<H, F, D>(builder);
+                        let checkpoint_stats_hash = requested_checkpoint_stats.to_hash::<H, F, D>(builder);
 
-                    let requested_checkpoint_state_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(builder);
-                    let state_roots_hash = requested_checkpoint_state_roots.to_hash::<H, F, D>(builder);
+                        let requested_checkpoint_state_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(builder);
+                        let state_roots_hash = requested_checkpoint_state_roots.to_hash::<H, F, D>(builder);
 
-                    let checkpoint_leaf_hash = builder.hash_two_to_one::<H>(state_roots_hash, checkpoint_stats_hash);
+                        let checkpoint_leaf_hash = builder.hash_two_to_one::<H>(state_roots_hash, checkpoint_stats_hash);
 
-                    builder.connect_hashes(historical_proof.current_value, checkpoint_leaf_hash);
+                        builder.connect_hashes(historical_proof.current_value, checkpoint_leaf_hash);
 
-                    self.insert_checkpoint_stats_gadget(
-                        ck.clone(),
-                        requested_checkpoint_stats.clone(),
-                        requested_checkpoint_state_roots,
-                        historical_proof,
-                    );
+                        self.insert_checkpoint_stats_gadget(
+                            ck.clone(),
+                            requested_checkpoint_stats.clone(),
+                            requested_checkpoint_state_roots,
+                            historical_proof,
+                        )
+                    };
+                    let requested_checkpoint_stats = &self.checkpoint_stats_requests[ref_key.gadget_index];
 
                     let mut result = Vec::new();
 
@@ -2764,6 +2771,41 @@ mod tests {
             reader.imt_contains_proofs[0].set_witness_core_proof_q(&mut pw, &mp)?;
         }
         data.verify(data.prove(pw)?)
+    }
+
+    #[test]
+    fn checkpoint_roots_and_stats_share_gadget_in_both_orders() {
+        use psy_vm::dpn::ops::state_cmd::data::{DPNStateCmdGetCheckpointLeafStats, DPNStateCmdGetGlobalStateRoots};
+
+        for is_roots_first in [true, false] {
+            let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let mut dpn = new_test_dpn(&mut builder);
+            let checkpoint_id = builder.add_virtual_target();
+            dpn.push_external_target(0, checkpoint_id);
+            let checkpoint_id = encode_indexed_op_id(DPNBuiltInDataType::Target, 0);
+            let roots_cmd = DPNStateCmd::GetGlobalStateRoots(DPNStateCmdGetGlobalStateRoots::new(checkpoint_id));
+            let stats_cmd = DPNStateCmd::GetCheckpointLeafStats(DPNStateCmdGetCheckpointLeafStats::new(checkpoint_id));
+            let zero_hash = builder.constant_hash(HashOut::ZERO);
+            let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+            let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+            let mut state_reader = StateReaderGadget::new(
+                checkpoint_roots, zero_hash, zero_hash, zero_hash, TEST_TREE_HEIGHT,
+                zero_hash, TEST_TREE_HEIGHT, false, checkpoint_stats, zero_hash,
+            );
+            let commands = if is_roots_first { [&roots_cmd, &stats_cmd] } else { [&stats_cmd, &roots_cmd] };
+            let first = state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, commands[0]);
+            let second = state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, commands[1]);
+            assert_eq!(state_reader.checkpoint_stats_requests.len(), 1);
+            assert_eq!(state_reader.checkpoint_state_roots_requests.len(), 1);
+            assert_eq!(state_reader.historical_proofs.len(), 1);
+            let roots = state_reader.checkpoint_state_roots_requests[0].to_targets();
+            assert_eq!(if is_roots_first { &first } else { &second }, &roots);
+            // Repeated commands must return the original targets without adding
+            // an orphaned proof or mixing roots with the stats result cache.
+            assert_eq!(first, state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, commands[0]));
+            assert_eq!(second, state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, commands[1]));
+            assert_eq!(state_reader.historical_proofs.len(), 1);
+        }
     }
 
     #[test]
