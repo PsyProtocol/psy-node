@@ -50,6 +50,7 @@ use crate::bridge::{
 const DEFAULT_PROOF_DIR: &str = "/tmp/psy_bridge_proofs";
 const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEFAULT_MAX_CHECKPOINT_BATCH: u64 = 64;
+const MAX_DEPOSITS_PER_L2_ROUND: u32 = 32;
 /// Per-round catchup truncation size; default 64 preserves prior daemon behavior.
 const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 
@@ -3151,6 +3152,10 @@ async fn build_l2_call_plan(
     })
 }
 
+fn finalized_deposit_append_target(l2_count: u32, pending: u32, finalized_pending: u32) -> u32 {
+    pending.min(finalized_pending).min(l2_count.saturating_add(MAX_DEPOSITS_PER_L2_ROUND))
+}
+
 async fn build_multichain_l2_plan(
     base: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
@@ -3212,7 +3217,12 @@ async fn build_multichain_l2_plan(
             }).await?;
             // Latest remains the backlog metric, not Guardian admission. A
             // later finalized read may advance past that earlier observation.
-            let deposit_append_target = pending.min(finalized_pending);
+            let deposit_append_target = finalized_deposit_append_target(l2_count, pending, finalized_pending);
+            if deposit_append_target < pending.min(finalized_pending) {
+                tracing::info!(chain_index=chain.chain_index, l2_count, pending, finalized_pending,
+                    deposit_append_target, max_deposits=MAX_DEPOSITS_PER_L2_ROUND,
+                    "finalized deposit admission limited for bounded L1 verification");
+            }
             if deposit_append_target > l2_count {
                 let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
                     &http,
@@ -4268,6 +4278,52 @@ mod tests {
 
     fn test_l1() -> Vec<guardian_common::protocol::ChainEndpoint> {
         vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }]
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_bounds_the_live_backlog() {
+        assert_eq!(finalized_deposit_append_target(1221, 1862, 1844), 1253);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_retains_smaller_ready_prefixes() {
+        assert_eq!(finalized_deposit_append_target(100, 200, 117), 117);
+        assert_eq!(finalized_deposit_append_target(100, 115, 117), 115);
+        assert_eq!(finalized_deposit_append_target(100, 132, 132), 132);
+        assert_eq!(finalized_deposit_append_target(100, 133, 133), 132);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_keeps_waiting_chains_idle() {
+        assert_eq!(finalized_deposit_append_target(100, 200, 100), 100);
+        assert_eq!(finalized_deposit_append_target(100, 100, 100), 100);
+        assert_eq!(finalized_deposit_append_target(100, 200, 99), 99);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_is_per_chain() {
+        let targets = [(1221, 1862, 1844), (153, 166, 166), (13, 15, 15)]
+            .map(|(l2_count, pending, finalized_pending)| finalized_deposit_append_target(l2_count, pending, finalized_pending));
+        assert_eq!(targets, [1253, 166, 15]);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_retries_and_drains_without_gaps() {
+        let mut l2_count = 1221;
+        while l2_count < 1844 {
+            let target = finalized_deposit_append_target(l2_count, 1862, 1844);
+            assert!(target > l2_count && target - l2_count <= 32);
+            assert_eq!(finalized_deposit_append_target(l2_count, 1862, 1844), target);
+            l2_count = target;
+        }
+        assert_eq!(l2_count, 1844);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_does_not_overflow() {
+        assert_eq!(finalized_deposit_append_target(u32::MAX - 40, u32::MAX, u32::MAX), u32::MAX - 8);
+        assert_eq!(finalized_deposit_append_target(u32::MAX - 10, u32::MAX, u32::MAX), u32::MAX);
+        assert_eq!(finalized_deposit_append_target(u32::MAX, u32::MAX, u32::MAX), u32::MAX);
     }
 
     async fn finalized_deposit_fixture(latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
