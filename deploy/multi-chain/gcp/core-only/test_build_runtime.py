@@ -146,6 +146,7 @@ class RuntimeBuildTests(unittest.TestCase):
         cargo = next(c for c in runs if "cargo" in c)
         self.assertIn("--offline", cargo)
         self.assertIn("--locked", cargo)
+        self.assertIn("--message-format=json-render-diagnostics", cargo)
         self.assertEqual(sum(x == "--bin" for x in cargo), 5)
 
     def test_reject_existing_output_without_running_docker(self):

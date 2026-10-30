@@ -236,7 +236,7 @@ def build_runtime(spec_path):
             return result
         versions = logged(["rustc", "--version", "--verbose"], "rustc.log")
         go_version = logged(["go", "version"], "go.log")
-        build = ["cargo", "build", "--offline", "--locked", "--release"]
+        build = ["cargo", "build", "--offline", "--locked", "--release", "--message-format=json-render-diagnostics"]
         for binary in BINS:
             build += ["--bin", binary]
         logged(build, "release-build.log")

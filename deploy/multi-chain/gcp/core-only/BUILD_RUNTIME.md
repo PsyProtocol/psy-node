@@ -73,6 +73,12 @@ features, network selector or fallback config can be supplied through the spec.
   stamp revision, source lock/circuit hashes, image/toolchain, commands,
   environment, binary hashes and log hashes. Keep output private.
 
+`release-build.log` retains Cargo's JSON compiler-artifact records with rendered
+diagnostics. Use those exact filenames when compiling the standalone Genesis
+validator against this generator's dependency rlibs; never select a library by
+mtime or a wildcard from a cache containing several source/feature cohorts.
+The JSON records add provenance only, not a new build or acceptance gate.
+
 This manifest is **build evidence only**: `runtime_approved=false` and
 `deployment_ready=false`. No exact circuit tests or new-Genesis native acceptance
 are claimed. The previous four regression tests, if run separately, cannot
