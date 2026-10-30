@@ -126,8 +126,16 @@ The default import mode still rejects every fingerprint change. The opt-in
 requires imported keys, cannot be combined with random generation, and does
 not rotate an account on an existing chain. Keep the old Genesis unchanged;
 write the new Genesis and protected account exports to new create-only paths.
-If a non-Faucet identity also changed, stop and assess it separately rather
-than broadening this flag or replacing the old identity baseline.
+The Faucet flag never permits a non-Faucet change. For a separately approved
+fresh chain whose registration-2 multisig circuit changed, the independent
+`--fresh-relayer-fingerprint` option permits only that registration to change
+to the compiled multisig fingerprint. Its public-key parameter, including the
+ordered Guardian policy commitment, must remain equal to the pinned prior
+Genesis. The new fingerprint must differ; arbitrary fingerprints and a no-op
+reject. All Validator identities remain strict. This option also requires
+hash-pinned imported keys and prior Genesis; it may be combined with the Faucet
+option only when both transitions are needed. Never use either option to
+upgrade an existing chain or reuse its journals under the changed identity.
 
 When generation is authorized, the selected network of `psy-genesis/config.json` must already carry `guardian_initial_member_hashes`: exactly three public member commitments. The generator reads that field and nothing else from the network. The policy compiler artifact is read from the sibling checkout, not from a flag:
 
@@ -151,7 +159,7 @@ The sibling compiler artifact contains the approved policy contract's ABI 2.0.0 
 
 The generator derives the account identity from `multisig_fingerprint()` and the derived initial policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:167-192`.
 
-The stage-magic multisig pin (`0x1337CF514544CF69`, localhost/testnet) is measured from `MultisigSignatureCircuit::new().get_fingerprint()`. After the shared circuit security fixes its value is `4554ad0ac443b495aa1fa68443fd54ed83a59e7a9f7cbd5900bea05a1340e050`; the sole runtime constant is `STAGE_CF69_MULTISIG_FINGERPRINT_U64` in `client_prover/psy_prover/src/wallet/memory_wallet.rs`. The existing `get-user-end-cap-common-data` command constructs the multisig circuit and exports its actual fingerprint and limbs rather than echoing this pin. Validate the pin against the constructed circuit with `PSY_NETWORK=localhost cargo test --release --locked -p psy_prover --lib multisig_fingerprint_matches_signature_circuit_or_rejects_unmeasured_magic`. Mainnet remains unmeasured and the getter rejects it.
+The stage-magic multisig pin (`0x1337CF514544CF69`, localhost/testnet) is measured from `MultisigSignatureCircuit::new().get_fingerprint()`. The current measured value is `61d2ce5c63388f5a3089b61f2708189bd59a5351e5386722465b5c15c6a420c6`; the sole runtime constant is `STAGE_CF69_MULTISIG_FINGERPRINT_U64` in `client_prover/psy_prover/src/wallet/memory_wallet.rs`. The existing `get-user-end-cap-common-data` command constructs the multisig circuit and exports its actual fingerprint and limbs rather than echoing this pin. Validate the pin against the constructed circuit with an explicit testnet `PSY_CONFIG_PATH` and `PSY_NETWORK=testnet cargo test --release --locked -p psy_prover --lib multisig_fingerprint_matches_signature_circuit_or_rejects_unmeasured_magic`. Mainnet remains unmeasured and the getter rejects it.
 
 A fingerprint change changes the account public key even when all member commitments stay identical. Updating the compiled pin does not migrate an existing registration-2 leaf or guardian/relayer journals: they remain bound to the previous identity, and occupied-slot and journal identity checks must not be bypassed. Existing chains require a separately authorized state lifecycle or a verified identity migration; do not register a replacement account, clear journals, or regenerate live Genesis as part of updating this pin.
 
