@@ -116,6 +116,19 @@ All import-mode outputs are create-only, including the copied private-key array.
 Reuse Guardian and P2P custody separately and inject the approved public
 membership before final Genesis hashing. Generation does not start or reset a chain.
 
+For a separately approved **fresh chain** whose Faucet SD-key circuit or policy
+changed, add `--fresh-faucet-identities` to that same hash-pinned import command.
+This preserves private keys, registration count, validator roles, and every
+public-key parameter, but requires all Faucet operators to change from one
+common old fingerprint to one common new nonzero fingerprint. Validator and
+Relayer fingerprints remain strictly equal to the pinned prior Genesis.
+The default import mode still rejects every fingerprint change. The opt-in
+requires imported keys, cannot be combined with random generation, and does
+not rotate an account on an existing chain. Keep the old Genesis unchanged;
+write the new Genesis and protected account exports to new create-only paths.
+If a non-Faucet identity also changed, stop and assess it separately rather
+than broadening this flag or replacing the old identity baseline.
+
 When generation is authorized, the selected network of `psy-genesis/config.json` must already carry `guardian_initial_member_hashes`: exactly three public member commitments. The generator reads that field and nothing else from the network. The policy compiler artifact is read from the sibling checkout, not from a flag:
 
 ```bash
