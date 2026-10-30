@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "release_id": "core-testnet-20261030-sd192",
+  "deployment_branch": "deploy/testnet",
+  "runtime_candidate_commit": "d64871fe87e80b7fbc1203195a5ac1afec5a622c",
+  "network": "testnet",
+  "cli_network": "psy-public-testnet",
+  "network_magic": "0x1337CF514544CF69",
+  "proving_backend": "plonky2",
+  "checkpoints_per_epoch": 32,
+  "sd_key_max_calldata_words": 192,
+  "max_introspectable_transactions": 64,
+  "faucet_operator_count": 100,
+  "withdrawal_append_supported_batch_sizes": [1, 2, 5],
+  "withdrawal_append_max_batch_size": 5,
+  "namespace_prefix": "fresh20261030sd192",
+  "chains": [
+    {"name": "sepolia", "index": 0, "chain_id": 11155111},
+    {"name": "bscTestnet", "index": 1, "chain_id": 97},
+    {"name": "baseSepolia", "index": 2, "chain_id": 84532}
+  ],
+  "deposit_tokens": {"PSY": 0, "pUSDT": 4},
+  "native_deposits_allowed": false,
+  "public_deposits_after_deploy": false,
+  "bridge_reader_included": false,
+  "core_placement": {
+    "coordinator": "gcp-cp-ce",
+    "realm_processors": ["gcp-realm-processor", "realm-processors-b", "realm-processors-c"],
+    "realm_edges": ["gcp-edge-1", "gcp-edge-2"],
+    "guardians": ["guardian-next-1", "guardian-next-2", "guardian-next-3"],
+    "services": "gcp-psy-service",
+    "relayer": "gcp-coordinator-worker",
+    "faucet": "arc99x2",
+    "system_proxy": "arc99x1",
+    "user_proxy": "arc99x3"
+  },
+  "required_next_actions": [
+    "Reconcile the runtime candidate into testnet-dev without merging deployment scripts backward",
+    "Pin Compiler, Genesis, SDK and Services to one accepted published Node revision",
+    "Measure affected circuit fingerprints and rebuild matching generated artifacts",
+    "Prepare fresh Faucet public identities for 100 retained private keys without bypassing old identity validation",
+    "Build final five-CLI artifacts bound to the accepted config, bundle, source and immutable image",
+    "Generate and validate the new Genesis, canonical contract layouts and token0/token4 bindings",
+    "Measure full 64-slot SD-key construction, proof, verification and peak memory",
+    "Freeze a new compatible SDK/WASM and wallet/client build; SDK2.1.0 is not the 192 cohort",
+    "Complete real five-entry withdrawal Guardian/SD-key/EndCap acceptance against the new Genesis",
+    "Adapt host packages, namespaces, journals, indexer cursors and activation scripts to this release",
+    "Verify the owned worker whitelist and retained Guardian/P2P keys on the complete fleet",
+    "Prepare matching setup/verifiers and paused fresh contracts for all three L1s",
+    "Complete illegal-then-legal deposit, claim and withdrawal E2E on every chain before public admission",
+    "Resolve the independent baseline release holds before reset or activation"
+  ]
+}

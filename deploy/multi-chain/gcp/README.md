@@ -1,5 +1,10 @@
 # Public multichain GCP deployment
 
+> October 30 / 192-word candidate: use the
+> [new preparation profile](fresh-192-20261030/README.md). It pins the published
+> runtime candidate and epoch 32 without relabeling R3 or SDK 2.1.0 as compatible.
+> This is preparation only; the historical runner below is not its rollout path.
+
 > October 12 topology preparation: the live fleet has expanded beyond this
 > historical single-host recipe. See [the same-fleet fresh deployment plan and
 > step adapter](fresh-topology/README.md). `config.split.example.env` enables its
