@@ -86,6 +86,18 @@ them for the final production-like preflight.
 
 ## Deployment order
 
+The fresh PostgreSQL installer fixes Docker shared memory at 2 GiB and uses
+compressed `json-file` rotation (`100m`, 100 files). It checks the created
+container's effective policy before checking database readiness. This installer
+replaces a container; do not rerun step 08 as a live maintenance shortcut.
+
+The core-only L1 runner also checks Router mappings at one block before writing
+its success readback: PSY must dual-bind to L2 contract 0, pUSDT to contract 4,
+and the native token must remain unmapped. A failed read or mismatch stops the
+step. The compiled Router ABI is checked before deployment transactions begin.
+This readback is not the three-chain invalid-then-valid deposit E2E gate;
+that acceptance remains required before public deposits are opened.
+
 Hasura logging is bounded by the shared Envio installer: 100 MiB per file,
 100 files including the active file, with rotated-file compression (about
 10 GiB before compression). Step 11 verifies the created container's actual

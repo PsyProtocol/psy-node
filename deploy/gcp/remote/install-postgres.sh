@@ -23,6 +23,11 @@ SQL
 docker run -d \
   --name parth-postgres \
   --restart unless-stopped \
+  --shm-size=2g \
+  --log-driver=json-file \
+  --log-opt=max-size=100m \
+  --log-opt=max-file=100 \
+  --log-opt=compress=true \
   -e POSTGRES_USER="$POSTGRES_USER" \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB=postgres \
@@ -30,6 +35,13 @@ docker run -d \
   -v /var/lib/parth/postgres:/var/lib/postgresql/data \
   -v /opt/parth/postgres-init:/docker-entrypoint-initdb.d:ro \
   "postgres:${POSTGRES_VERSION}"
+
+policy="$(docker inspect --format '{{.HostConfig.ShmSize}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}} {{index .HostConfig.LogConfig.Config "compress"}}' parth-postgres)"
+if [ "$policy" != "2147483648 json-file 100m 100 true" ]; then
+  echo "PostgreSQL container policy not applied" >&2
+  docker stop --time 30 parth-postgres >/dev/null || true
+  exit 1
+fi
 
 for _ in $(seq 1 60); do
   if docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" parth-postgres pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then

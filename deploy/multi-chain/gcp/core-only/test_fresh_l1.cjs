@@ -19,9 +19,9 @@ function temporary(t) {
   return dir;
 }
 
-function fixture() {
+function fixture(network = "sepolia") {
   const events = [];
-  const configs = structuredClone(approved.networks.sepolia);
+  const configs = structuredClone(approved.networks[network]);
   let flags = [1, 0, 1];
   const contracts = {
     PsyACLManager: { isBridgeAdmin: async () => true, isProposer: async () => true, isGuardian: async () => false },
@@ -32,12 +32,23 @@ function fixture() {
       depositRoot: async () => "0xd65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43" },
     StateManager: { lastFinalizedCheckpointId: async () => 0n, checkpointTreeRootsClean: async () => true },
     DefaultProxyAdmin: { owner: async () => address(9) },
+    Router: {
+      l1ToL2Token: async token => token === tokens.pUSDT ? "0x" + "0".repeat(63) + "4" : HASHZERO,
+      l2ToL1Token: async id => id === HASHZERO ? tokens.PSY : tokens.pUSDT,
+      isTokenMapped: async token => token !== ZERO,
+    },
   };
   for (const method of ["lastVerifiedCheckpointRoot", "lastVerifiedDepositTreeRoot", "lastVerifiedWithdrawalTreeRoot", "withdrawalSubtreeRoot"]) {
     contracts.StateManager[method] = async () => HASHZERO;
   }
   const hre = {
-    ethers: { constants: { AddressZero: ZERO, HashZero: HASHZERO }, getContractAt: async name => contracts[name] },
+    artifacts: { readArtifact: async () => ({ abi: [
+      ["l1ToL2Token", "address", "bytes32"], ["l2ToL1Token", "bytes32", "address"],
+      ["isTokenMapped", "address", "bool"],
+    ].map(([name, input, output]) => ({ type: "function", name, stateMutability: "view",
+      inputs: [{ type: input }], outputs: [{ type: output }] })) }) },
+    ethers: { constants: { AddressZero: ZERO, HashZero: HASHZERO }, getContractAt: async name => contracts[name],
+      provider: { getBlockNumber: async () => 123 } },
     run: async (task, args) => { events.push(args.tags || "full"); },
     deployments: {
       get: async name => ({ address: ({ PsyToken: tokens.PSY, USDTToken: tokens.pUSDT, ExecutorWithTimelock: address(9) })[name] || address(1) }),
@@ -78,6 +89,79 @@ test("pause readback failure stops before gateways", async t => {
   f.setFlags([0, 0, 0]);
   await assert.rejects(runner.deployPhases(f.hre, { pause_deposits: true, policy: approved.networks.sepolia }, temporary(t), "sepolia"));
   assert.ok(!f.events.includes("gateways"));
+});
+
+test("deposit token policy rejects native admission", async () => {
+  const f = fixture();
+  f.contracts.Router.isTokenMapped = async () => true;
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /native deposits must remain unmapped/);
+});
+
+test("deposit token policy rejects a hidden native forward mapping", async () => {
+  const f = fixture();
+  const original = f.contracts.Router.l1ToL2Token;
+  f.contracts.Router.l1ToL2Token = async token => token === ZERO ? "0x" + "0".repeat(63) + "5" : original(token);
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /native token has an unexpected L2 mapping/);
+});
+
+test("deposit token policy rejects an unset PSY reverse mapping", async () => {
+  const f = fixture();
+  f.contracts.Router.l2ToL1Token = async () => ZERO;
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /PSY reverse mapping/);
+});
+
+test("deposit token policy rejects wrong forward mappings and RPC failures", async () => {
+  const f = fixture();
+  f.contracts.Router.l1ToL2Token = async () => HASHZERO;
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /pUSDT forward mapping/);
+  f.contracts.Router.l1ToL2Token = async () => { throw new Error("synthetic unavailable RPC"); };
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /synthetic unavailable RPC/);
+});
+
+test("deposit token policy rejects disabled tokens and a wrong nonzero pUSDT id", async () => {
+  for (const name of ["PSY", "pUSDT"]) {
+    const f = fixture();
+    f.contracts.Router.isTokenMapped = async token => token !== ZERO && token !== tokens[name];
+    await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), new RegExp(`${name} deposits are not mapped`));
+  }
+  const f = fixture();
+  f.contracts.Router.l1ToL2Token = async token => token === tokens.pUSDT ? "0x" + "0".repeat(63) + "5" : HASHZERO;
+  await assert.rejects(runner.verifyReadback(f.hre, approved.networks.sepolia, tokens), /pUSDT forward mapping/);
+});
+
+test("deposit token policy rejects missing Router ABI before deployment", async t => {
+  for (const missing of ["l1ToL2Token", "l2ToL1Token", "isTokenMapped"]) {
+    const f = fixture();
+    const artifact = await f.hre.artifacts.readArtifact();
+    f.hre.artifacts.readArtifact = async () => ({ abi: artifact.abi.filter(item => item.name !== missing) });
+    await assert.rejects(runner.deployPhases(f.hre, { pause_deposits: true }, temporary(t), "sepolia"), new RegExp(`Router ABI missing ${missing}`));
+    assert.deepEqual(f.events, []);
+  }
+});
+
+test("deposit token policy checks all mappings at one block on every chain", async t => {
+  for (const network of ["sepolia", "bscTestnet", "baseSepolia"]) {
+    const f = fixture(network);
+    const calls = [];
+    let blockReads = 0;
+    f.hre.ethers.provider.getBlockNumber = async () => 123 + blockReads++;
+    for (const method of ["l1ToL2Token", "l2ToL1Token", "isTokenMapped"]) {
+      const original = f.contracts.Router[method];
+      f.contracts.Router[method] = async (argument, block) => {
+        calls.push(block);
+        return original(argument);
+      };
+    }
+    const output = temporary(t);
+    await runner.deployPhases(f.hre, { pause_deposits: true, policy: approved.networks[network] }, output, network);
+    assert.equal(calls.length, 8);
+    assert.equal(blockReads, 1);
+    assert.ok(calls.every(block => block.blockTag === 123));
+    const readback = JSON.parse(fs.readFileSync(path.join(output, `readback-${network}.json`)));
+    assert.equal(readback.deposit_mapping.native_allowed, false);
+    assert.equal(readback.deposit_mapping.block_number, 123);
+    assert.equal(readback.deposit_mapping.tokens.PSY.l2_contract_id, HASHZERO);
+  }
 });
 
 test("missing Bridge-admin prevents pause and all gateways", async t => {

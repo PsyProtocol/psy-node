@@ -123,6 +123,20 @@ async function verifyReadback(hre, policy, tokens, signer = SIGNER) {
   const guardian = await acl.isGuardian(signer);
   const bridge = await contract("Bridge");
   assert.equal((await bridge.owner()).toLowerCase(), signer.toLowerCase());
+  const router = await contract("Router");
+  const block = { blockTag: await hre.ethers.provider.getBlockNumber() };
+  const depositMapping = { block_number: block.blockTag, native_allowed: false, tokens: {} };
+  assert.equal(await router.isTokenMapped(tokens.native, block), false, "native deposits must remain unmapped");
+  assert.equal(await router.l1ToL2Token(tokens.native, block), hre.ethers.constants.HashZero,
+    "native token has an unexpected L2 mapping");
+  for (const [name, id] of [["PSY", hre.ethers.constants.HashZero], ["pUSDT", "0x" + "0".repeat(63) + "4"]]) {
+    assert.equal(await router.isTokenMapped(tokens[name], block), true, `${name} deposits are not mapped`);
+    assert.equal((await router.l1ToL2Token(tokens[name], block)).toLowerCase(), id,
+      `${name} forward mapping does not match its L2 contract`);
+    assert.equal((await router.l2ToL1Token(id, block)).toLowerCase(), tokens[name].toLowerCase(),
+      `${name} reverse mapping does not match its L1 token`);
+    depositMapping.tokens[name] = { l1_address: tokens[name], l2_contract_id: id };
+  }
   const checked = {};
   for (const name of ["native", "PSY", "pUSDT"]) {
     const actual = await bridge.getTokenFlowConfig(tokens[name]);
@@ -147,11 +161,22 @@ async function verifyReadback(hre, policy, tokens, signer = SIGNER) {
   assert.equal((await hre.deployments.read("DefaultProxyAdmin", "owner")).toLowerCase(),
     (await hre.deployments.get("ExecutorWithTimelock")).address.toLowerCase());
   return { signer, proposer: true, bridge_admin: true, l1_acl_guardian: guardian,
-    deposits_paused: true, withdrawal_registration_paused: false, pending_claims_paused: false, tokens: checked };
+    deposits_paused: true, withdrawal_registration_paused: false, pending_claims_paused: false,
+    deposit_mapping: depositMapping, tokens: checked };
 }
 
 async function deployPhases(hre, request, output, network, signer = SIGNER) {
   assert.equal(request.pause_deposits, true);
+  stage("runtime");
+  const { abi } = await hre.artifacts.readArtifact("Router");
+  for (const [name, input, outputType] of [
+    ["l1ToL2Token", "address", "bytes32"], ["l2ToL1Token", "bytes32", "address"],
+    ["isTokenMapped", "address", "bool"],
+  ]) {
+    assert.ok(abi.some(item => item.type === "function" && item.name === name && item.stateMutability === "view"
+      && item.inputs.length === 1 && item.inputs[0].type === input
+      && item.outputs.length === 1 && item.outputs[0].type === outputType), `Router ABI missing ${name}`);
+  }
   stage("bridge");
   await hre.run("deploy", { tags: "bridge", noCompile: true, write: true });
   stage("pause");
