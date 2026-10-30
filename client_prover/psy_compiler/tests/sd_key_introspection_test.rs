@@ -63,6 +63,17 @@ fn calldata_word_access_uses_transaction_opcode() {
 }
 
 #[test]
+fn calldata_word_access_accepts_196_word_capacity() {
+    for word in [127, 175, 195] {
+        let source = CALLDATA_SOURCE.replace("inputs[2]", &format!("inputs[{word}]"));
+        compile_sd_key(&source).expect("calldata through word 195 should compile");
+    }
+    let source = CALLDATA_SOURCE.replace("inputs[2]", "inputs[196]");
+    let error = compile_sd_key(&source).unwrap_err().to_string();
+    assert!(error.contains("exceeds maximum allowed words"));
+}
+
+#[test]
 fn transaction_and_calldata_limits_match_protocol_constants() {
     let tx_source = CALLDATA_SOURCE.replace("tx[1]", &format!("tx[{}]", MAX_INTROSPECTABLE_TRANSACTIONS));
     let tx_error = compile_sd_key(&tx_source).unwrap_err().to_string();

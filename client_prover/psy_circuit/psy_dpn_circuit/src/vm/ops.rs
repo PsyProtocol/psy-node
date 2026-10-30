@@ -252,7 +252,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
         let max_word_index = builder.constant(F::from_canonical_u64(SDKEY_MAX_CALLDATA_WORDS as u64));
         let word_in_range = builder.is_less_than(COMPARISON_BITS, word_index, max_word_index);
         builder.assert_one(word_in_range.target);
-        // The fixed transaction context has 128 witness targets per slot, but
+        // The fixed transaction context has bounded witness targets per slot, but
         // only the prefix below inputs_length is authenticated by inputs_hash.
         // Reject reads from the padded tail instead of exposing unconstrained
         // witness values.
@@ -1237,6 +1237,45 @@ mod tests {
             dummy_hash(builder),
             dummy_hash(builder),
         )
+    }
+
+    #[test]
+    fn transaction_input_word_enforces_196_word_capacity() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let zero = builder.zero();
+        let zero_hash = builder.constant_hash(plonky2::hash::hash_types::HashOut::ZERO);
+        let mut executor = SimpleDPNBuilder::new_with_contract_ctx(
+            Vec::new(), zero, zero, zero, zero, zero, zero_hash, zero_hash,
+        );
+        let word = builder.add_virtual_target();
+        let length = builder.add_virtual_target();
+        let value = builder.constant(F::from_canonical_u64(11));
+        executor.set_transaction_context(DPNTransactionContextTargets {
+            tx_count: builder.one(),
+            tx_stack_hash: zero_hash,
+            entries: vec![DPNTransactionEntryTargets {
+                caller_contract_id: zero,
+                contract_id: zero,
+                method_id: zero,
+                inputs_length: length,
+                inputs_hash: zero_hash,
+                inputs: vec![value; 196],
+            }],
+        });
+        executor.select_transaction_input_word(&mut builder, zero, word);
+        let data = builder.build::<C>();
+
+        for (word_value, length_value, accepted) in [(195, 196, true), (196, 197, false), (128, 128, false)] {
+            let mut witness = PartialWitness::new();
+            witness.set_target(word, F::from_canonical_u64(word_value)).unwrap();
+            witness.set_target(length, F::from_canonical_u64(length_value)).unwrap();
+            let proof = data.prove(witness);
+            if accepted {
+                data.verify(proof.unwrap()).unwrap();
+            } else {
+                assert!(proof.is_err(), "out-of-range calldata word {word_value} was accepted");
+            }
+        }
     }
 
     #[test]

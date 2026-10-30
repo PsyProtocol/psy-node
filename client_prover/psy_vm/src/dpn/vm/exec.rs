@@ -1171,6 +1171,69 @@ mod tests {
     }
 
     #[test]
+    fn transaction_introspection_accepts_196_word_capacity() {
+        for length in [128, 176, 196] {
+            let mut exec = mk_exec(vec![]);
+            exec.set_transaction_context(
+                vec![DPNTransactionEntry {
+                    contract_id: GoldilocksField::ZERO,
+                    caller_contract_id: GoldilocksField::ZERO,
+                    method_id: GoldilocksField::ZERO,
+                    inputs_length: GoldilocksField::from_canonical_u64(length),
+                    inputs_hash: [GoldilocksField::ZERO; 4],
+                    inputs: (0..length).map(GoldilocksField::from_canonical_u64).collect(),
+                }],
+                [GoldilocksField::ZERO; 4],
+            );
+            exec.process_var_def(&DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 0,
+                op_type: DPNOpType::Constant,
+                inputs: vec![0],
+            });
+            exec.process_var_def(&DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 1,
+                op_type: DPNOpType::Constant,
+                inputs: vec![length - 1],
+            });
+            exec.process_var_def(&DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 2,
+                op_type: DPNOpType::GetTransactionInputWord,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
+                ],
+            });
+            assert_eq!(exec.targets[2].to_canonical_u64(), length - 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "calldata word index out of bounds")]
+    fn transaction_introspection_rejects_word_196() {
+        let mut exec = mk_exec(vec![]);
+        for (index, value) in [0, 196].into_iter().enumerate() {
+            exec.process_var_def(&DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index,
+                op_type: DPNOpType::Constant,
+                inputs: vec![value],
+            });
+        }
+        exec.process_var_def(&DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 2,
+            op_type: DPNOpType::GetTransactionInputWord,
+            inputs: vec![
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
+            ],
+        });
+    }
+
+    #[test]
     #[should_panic(expected = "calldata word index exceeds input length")]
     fn transaction_introspection_rejects_padded_calldata_word() {
         let mut exec = mk_exec(vec![]);

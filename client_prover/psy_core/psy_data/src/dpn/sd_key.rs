@@ -16,7 +16,7 @@ pub const MAX_INTROSPECTABLE_TRANSACTIONS: u32 = 64;
 pub const SDKEY_TX_COUNT_BITS: usize = (u32::BITS - (MAX_INTROSPECTABLE_TRANSACTIONS + 1).leading_zeros()) as usize;
 
 /// Maximum number of Felt words available from each transaction's calldata.
-pub const SDKEY_MAX_CALLDATA_WORDS: u32 = 128;
+pub const SDKEY_MAX_CALLDATA_WORDS: u32 = 196;
 
 /// Compact transaction info for SD key introspection.
 ///
@@ -482,6 +482,16 @@ mod composed_policy_tests {
             totals: vec![SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 150 }],
             cross_transaction: vec![],
         }
+    }
+
+    #[test]
+    fn input_rules_accept_196_word_capacity() {
+        for word in [127, 175, 195] {
+            SDKeyCallRule::Input { word, comparison: SDKeyComparison::Eq, value: 7 }.validate().unwrap();
+            SDKeyInputTotalLimit { word, max_per_tx: 100, max_total: 150 }.validate(2).unwrap();
+        }
+        assert!(SDKeyCallRule::Input { word: 196, comparison: SDKeyComparison::Eq, value: 7 }.validate().is_err());
+        assert!(SDKeyInputTotalLimit { word: 196, max_per_tx: 100, max_total: 150 }.validate(2).is_err());
     }
 
     #[test]
