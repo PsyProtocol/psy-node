@@ -2,7 +2,7 @@
   "schema_version": 1,
   "release_id": "core-testnet-20261030-sd192",
   "deployment_branch": "deploy/testnet",
-  "runtime_candidate_commit": "3c34ab575fc78ac1515f34555af3b70124f1225e",
+  "runtime_candidate_commit": "e28848127f4cef87bea4e63cc9fb9b79edc18d93",
   "network": "testnet",
   "cli_network": "psy-public-testnet",
   "network_magic": "0x1337CF514544CF69",
@@ -12,7 +12,7 @@
   "max_introspectable_transactions": 64,
   "faucet_operator_count": 100,
   "genesis_spec_version": 2,
-  "account_identity_mode": "fresh-faucet",
+  "account_identity_mode": "fresh-faucet-and-relayer",
   "canonical_config_sha256": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
   "retained_public_config_sha256": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
   "guardian_configs": [

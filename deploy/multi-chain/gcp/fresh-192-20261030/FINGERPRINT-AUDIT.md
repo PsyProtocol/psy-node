@@ -14,6 +14,18 @@ revision are the fresh Faucet import opt-in, associated tests and Genesis
 documentation. Circuit sources, embedded artifacts and network constants are
 unchanged; the measurements below retain their original source provenance.
 
+Generator candidate `e28848127f4cef87bea4e63cc9fb9b79edc18d93` additionally
+allows an explicit, separately guarded fresh registration-2 multisig fingerprint
+transition. This also changes only CLI/tests/docs, not measured circuit sources.
+The current measured multisig fingerprint is
+`61d2ce5c63388f5a3089b61f2708189bd59a5351e5386722465b5c15c6a420c6`.
+The pinned previous R3 Genesis (`f839b453...`) instead contains
+`a8e0dc9f01f1f20f0bf8e92644a346e8876b8cbb48aaaed8d91813ea17ea53bb`
+at registration 2. This is a cohort transition inherited from the adopted
+signature-circuit changes, not a new multisig circuit change caused by 192 words.
+Keep the old Genesis unchanged and explicitly derive the fresh account using
+the retained Guardian policy. Never substitute a fingerprint in an existing leaf.
+
 ## Results
 
 | Item | Result | Evidence |

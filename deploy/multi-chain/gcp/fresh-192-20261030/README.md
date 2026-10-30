@@ -2,7 +2,7 @@
 
 This is the next source/config preparation profile, not an activation package.
 The published runtime candidate is
-`3c34ab575fc78ac1515f34555af3b70124f1225e`. Deployment scripts stay on
+`e28848127f4cef87bea4e63cc9fb9b79edc18d93`. Deployment scripts stay on
 `deploy/testnet`; runtime integration into `testnet-dev` remains a separate step.
 Neither a successful preflight nor a Git push authorizes reset or activation.
 
@@ -103,7 +103,7 @@ input set documented in [GENESIS.md](../core-only/GENESIS.md):
 {
   "schema_version": 2,
   "checkpoints_per_epoch": 32,
-  "account_identity_mode": "fresh-faucet"
+  "account_identity_mode": "fresh-faucet-and-relayer"
 }
 ```
 
@@ -114,8 +114,15 @@ spec, keys and new protected output path. Both record the selected identity
 mode and epoch; generation passes the explicit native flag exactly once.
 Version 1 remains strict import with epoch 10. Nothing silently upgrades it.
 
-The generator transition passed 55 release tests (1 existing ignored test).
-Deployment adapter tests passed 21 tests, and the network-assembly regressions
+The retained R3 Genesis also has an older registration-2 multisig fingerprint.
+The combined mode adds the separately guarded `--fresh-relayer-fingerprint`:
+only that registration may change to the compiled multisig fingerprint, and
+its public-key parameter/Guardian policy must stay equal to the prior Genesis.
+The original `fresh-faucet` mode never permits this additional transition.
+Do not reuse old-chain Guardian/Relayer journals with the new identity.
+
+The generator transition passed 57 release tests (1 existing ignored test).
+Deployment adapter tests passed 22 tests, and the network-assembly regressions
 passed 37. Adapter children are mocked: these results do not establish that
 the final actual-key Genesis or matching Compiler/SDK artifacts exist.
 

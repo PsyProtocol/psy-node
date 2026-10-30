@@ -21,9 +21,9 @@ It must be an existing input outside the new output directory, never a new outpu
 The source generator must implement --private-keys-in/--private-keys-sha256 and
 --accounts-genesis-in/--accounts-genesis-sha256, with identity checks before writes.
 There is no random-key fallback. ready_static never means deployment approval.
-Spec v2 adds explicit checkpoints_per_epoch=32 and account_identity_mode,
-either preserve or fresh-faucet. Only fresh-faucet passes the native generator's
---fresh-faucet-identities opt-in. Spec v1 retains strict identities and epoch 10.
+Spec v2 adds explicit checkpoints_per_epoch=32 and account_identity_mode:
+preserve, fresh-faucet, or fresh-faucet-and-relayer. Combined mode forwards
+both independent native fingerprint opt-ins. Spec v1 remains strict at epoch 10.
 Child stdout/stderr are retained in exclusive mode-0600 logs in the protected
 output directory. Treat both logs as private; never publish or stream their content.
 """
@@ -124,7 +124,7 @@ def load(spec_path, keys_path, keys_sha, output):
     identity_mode = spec.get("account_identity_mode", "preserve")
     require(type(epoch) is int and epoch == (32 if spec["schema_version"] == 2 else 10),
             "Genesis epoch differs from the selected spec version")
-    require(isinstance(identity_mode, str) and identity_mode in ("preserve", "fresh-faucet"),
+    require(isinstance(identity_mode, str) and identity_mode in ("preserve", "fresh-faucet", "fresh-faucet-and-relayer"),
             "unsupported account identity mode")
     network.integer(spec["block_time"], 0, 18446744069414584320, "block time")
     network.fields(spec["inputs"], INPUTS, "Genesis inputs")
@@ -267,8 +267,10 @@ def generate(loaded):
                    "--private-keys-out", str(out / "private_keys.json"),
                    "--faucet-operators-out", str(out / "faucetOperators.json"),
                    "--block-time", str(spec["block_time"]), *account_args()]
-        if summary["account_identity_mode"] == "fresh-faucet":
+        if summary["account_identity_mode"] in ("fresh-faucet", "fresh-faucet-and-relayer"):
             command.append("--fresh-faucet-identities")
+        if summary["account_identity_mode"] == "fresh-faucet-and-relayer":
+            command.append("--fresh-relayer-fingerprint")
         stage = "generate-genesis-data"
         recheck(entries)
         log_path = out / "generate-genesis-data.private.log"

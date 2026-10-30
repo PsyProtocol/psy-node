@@ -140,6 +140,7 @@ class GenesisPreparationTests(unittest.TestCase):
         def child(argv, **kwargs):
             if argv[1] == "generate-genesis-data":
                 self.assertEqual(argv.count("--fresh-faucet-identities"), 1)
+                self.assertNotIn("--fresh-relayer-fingerprint", argv)
             return self.child(argv, **kwargs)
         with patch.object(prepare.subprocess, "run", side_effect=child):
             code, summary = self.invoke("generate")
@@ -151,12 +152,34 @@ class GenesisPreparationTests(unittest.TestCase):
     def test_v1_keeps_strict_identity_import_and_epoch_10(self):
         def child(argv, **kwargs):
             self.assertNotIn("--fresh-faucet-identities", argv)
+            self.assertNotIn("--fresh-relayer-fingerprint", argv)
             return self.child(argv, **kwargs)
         with patch.object(prepare.subprocess, "run", side_effect=child):
             code, summary = self.invoke("generate")
         self.assertEqual(code, 0)
         self.assertEqual(summary["account_identity_mode"], "preserve")
         self.assertEqual(summary["checkpoints_per_epoch"], 10)
+
+    def test_v2_combined_transition_forwards_both_explicit_native_flags(self):
+        self.spec.update(schema_version=2, checkpoints_per_epoch=32,
+                         account_identity_mode="fresh-faucet-and-relayer")
+        self.config["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 32
+        self.inputs["config"] = self.input("config", self.encode(self.config))
+        self.identity["config_sha256"] = self.inputs["config"]["sha256"]
+        self.inputs["build_identity"] = self.input("build_identity", self.encode(self.identity))
+        self.measurements["config_sha256"] = self.inputs["config"]["sha256"]
+        self.inputs["measurements"] = self.input("measurements", self.encode(self.measurements))
+        self.save_spec()
+        def child(argv, **kwargs):
+            if argv[1] == "generate-genesis-data":
+                self.assertEqual(argv.count("--fresh-faucet-identities"), 1)
+                self.assertEqual(argv.count("--fresh-relayer-fingerprint"), 1)
+            return self.child(argv, **kwargs)
+        with patch.object(prepare.subprocess, "run", side_effect=child):
+            code, summary = self.invoke("generate")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["account_identity_mode"], "fresh-faucet-and-relayer")
+        self.assertFalse(summary["deployment_ready"])
 
     def test_v2_rejects_unknown_identity_mode_or_non_32_epoch(self):
         for identity, epoch in (("anything", 32), ("fresh-faucet", True), ("fresh-faucet", 10)):
