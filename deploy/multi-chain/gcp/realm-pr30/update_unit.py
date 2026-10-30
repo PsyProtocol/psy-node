@@ -21,11 +21,43 @@ PREVIOUS = '70-realm-replay-20261028.conf'
 ROOT = Path('/var/backups/psy-realm-pr30-20261029')
 WORKING = '/opt/psy-core/releases/core-testnet-20261027-r3'
 EXTRA_PRIORS = {}
+EDGE = None
+EDGE_SHA = None
+ADMISSION_SHA = '4edb97b04c1c8543376eb6b2bf69c298cf51892ae678c23a0537237895ab1bf0'
 
 
 def configure_profile(profile, unit, fragment, sha):
-    global PROCESSOR, PROCESSOR_SHA, NEW, DROPIN, PREVIOUS, ROOT, EXTRA_PRIORS
+    global PROCESSOR, PROCESSOR_SHA, NEW, DROPIN, PREVIOUS, ROOT, EXTRA_PRIORS, EDGE, EDGE_SHA
     if profile == 'pr30':
+        return
+    if profile == 'imt-admission':
+        require(re.fullmatch(r'psy-core-r3-realm-[01]-v[123]-(edge|processor)\.service', unit) is not None,
+                'IMT admission rollout permits only twelve Realm units')
+        require(sha == ADMISSION_SHA, 'unreviewed IMT admission artifact')
+        starts = [line for line in fragment.read_text().splitlines() if line.startswith('ExecStart=')]
+        require(len(starts) == 1 and starts[0].count(str(BASE)) == 1, 'unexpected base launch command')
+        def override(path):
+            return '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(path), 1) + '\n'
+        old_replay = PROCESSOR
+        EDGE = NEW
+        EDGE_SHA = 'aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338'
+        PROCESSOR = Path('/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli')
+        PROCESSOR_SHA = 'c69e077fd4a51dc6678eb845a1615f9b2254ad0dfe80bd3f2544d1c0674c5633'
+        EXTRA_PRIORS = {}
+        PREVIOUS = '80-realm-pr30-20261029.conf'
+        if unit.endswith('-processor.service'):
+            directory = fragment.with_name(fragment.name + '.d')
+            EXTRA_PRIORS = {
+                directory / '70-realm-replay-20261028.conf': override(old_replay),
+                directory / '80-realm-pr30-20261029.conf': override(EDGE),
+            }
+            previous_imt = directory / '90-realm-imt-20261029.conf'
+            if previous_imt.exists():
+                EXTRA_PRIORS[previous_imt] = override(Path('/opt/psy-core/hotfixes/realm-imt-67634280/psy_node_cli'))
+            PREVIOUS = '95-realm-imt-metadata-20261029.conf'
+        NEW = Path('/opt/psy-core/hotfixes/realm-imt-admission-48a490e2/psy_node_cli')
+        DROPIN = '96-realm-imt-admission-20261030.conf'
+        ROOT = Path('/var/backups/psy-realm-imt-admission-20261030')
         return
     require(profile in ('imt-coverage', 'imt-metadata'), 'unknown rollout profile')
     require(re.fullmatch(r'psy-core-r3-realm-[01]-v[123]-processor\.service', unit) is not None,
@@ -103,8 +135,10 @@ def plan(unit, fragment):
     expected_role = 'start-realm-edge' if role == 'edge' else 'start-realm-processor'
     require('"' + expected_role + '"' in starts[0], 'wrong unit role')
     override = '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(NEW), 1) + '\n'
-    prior = '' if role == 'edge' else '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(PROCESSOR), 1) + '\n'
-    return address, (BASE if role == 'edge' else PROCESSOR), (BASE_SHA if role == 'edge' else PROCESSOR_SHA), override, prior
+    old = (EDGE or BASE) if role == 'edge' else PROCESSOR
+    old_sha = (EDGE_SHA or BASE_SHA) if role == 'edge' else PROCESSOR_SHA
+    prior = '' if old == BASE else '[Service]\nExecStart=\n' + starts[0].replace(str(BASE), str(old), 1) + '\n'
+    return address, old, old_sha, override, prior
 
 
 def properties(unit):
@@ -186,7 +220,7 @@ def main():
     parser.add_argument('--unit', required=True)
     parser.add_argument('--candidate', default='/var/tmp/psy-realm-pr30-61c1636b/psy_node_cli')
     parser.add_argument('--sha256', required=True)
-    parser.add_argument('--profile', choices=('pr30', 'imt-coverage', 'imt-metadata'), default='pr30')
+    parser.add_argument('--profile', choices=('pr30', 'imt-coverage', 'imt-metadata', 'imt-admission'), default='pr30')
     args = parser.parse_args()
     require(os.geteuid() == 0, 'root required')
     require(re.fullmatch(r'[0-9a-f]{64}', args.sha256) is not None, 'invalid SHA256')

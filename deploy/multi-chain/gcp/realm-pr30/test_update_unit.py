@@ -265,5 +265,84 @@ class MetadataProfileTests(unittest.TestCase):
                 rollout.ensure_original_configuration(fragment, fragment.read_text(), previous, prior, old, sha)
 
 
+class AdmissionProfileTests(unittest.TestCase):
+    SHA = 'a' * 64
+
+    def profile(self, unit, previous_imt=False, sha=None):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name in ('PROCESSOR', 'PROCESSOR_SHA', 'NEW', 'DROPIN', 'PREVIOUS', 'ROOT', 'EXTRA_PRIORS', 'EDGE', 'EDGE_SHA'):
+            stack.enter_context(patch.object(rollout, name, getattr(rollout, name)))
+        stack.enter_context(patch.object(rollout, 'ADMISSION_SHA', self.SHA))
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
+        fragment = Path(directory) / unit
+        role = 'processor' if unit.endswith('-processor.service') else 'edge'
+        fragment.write_text('[Service]\nExecStart="' + str(rollout.BASE) +
+                            '" "start-realm-' + role + '" "--network" "psy-public-testnet" '
+                            '"--proving-backend" "plonky2-poseidon-goldilocks"\n')
+        if previous_imt:
+            (fragment.with_name(unit + '.d')).mkdir()
+            (fragment.with_name(unit + '.d') / '90-realm-imt-20261029.conf').touch()
+        rollout.configure_profile('imt-admission', unit, fragment, sha or self.SHA)
+        return fragment
+
+    def test_edge_rolls_back_to_pr30_not_r3_base(self):
+        unit = 'psy-core-r3-realm-0-v2-edge.service'
+        fragment = self.profile(unit)
+        address, old, sha, override, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual(address, '10.148.0.36')
+        self.assertEqual(str(old), '/opt/psy-core/hotfixes/realm-pr30-61c1636b/psy_node_cli')
+        self.assertEqual(sha, 'aba982032894347c13fd767c1fdebf8427a3d5e85feeee119569131918cb5338')
+        self.assertEqual(rollout.PREVIOUS, '80-realm-pr30-20261029.conf')
+        self.assertEqual(rollout.DROPIN, '96-realm-imt-admission-20261030.conf')
+        self.assertIn(str(old), prior)
+        self.assertIn('realm-imt-admission-48a490e2', override)
+        self.assertEqual(rollout.EXTRA_PRIORS, {})
+
+    def test_processor_preserves_all_prior_hotfixes(self):
+        unit = 'psy-core-r3-realm-1-v3-processor.service'
+        fragment = self.profile(unit, previous_imt=True)
+        address, old, sha, _, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual(address, '10.148.0.43')
+        self.assertEqual(str(old), '/opt/psy-core/hotfixes/realm-imt-metadata-ea07ffad/psy_node_cli')
+        self.assertEqual(sha, MetadataProfileTests.SHA)
+        self.assertEqual(rollout.PREVIOUS, '95-realm-imt-metadata-20261029.conf')
+        self.assertIn(str(old), prior)
+        self.assertEqual({path.name for path in rollout.EXTRA_PRIORS}, {
+            '70-realm-replay-20261028.conf', '80-realm-pr30-20261029.conf', '90-realm-imt-20261029.conf',
+        })
+
+    def test_processor_without_optional_imt_override(self):
+        unit = 'psy-core-r3-realm-0-v1-processor.service'
+        fragment = self.profile(unit)
+        _, _, _, _, prior = rollout.plan(unit, fragment.read_text())
+        self.assertEqual({path.name for path in rollout.EXTRA_PRIORS}, {
+            '70-realm-replay-20261028.conf', '80-realm-pr30-20261029.conf',
+        })
+        self.assertIn('realm-imt-metadata-ea07ffad', prior)
+
+    def test_reject_coordinator(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-coordinator-processor.service')
+
+    def test_reject_other_artifact(self):
+        with self.assertRaises(ValueError):
+            self.profile('psy-core-r3-realm-0-v1-edge.service', sha='b' * 64)
+
+    def test_retained_override_drift_is_detected(self):
+        unit = 'psy-core-r3-realm-0-v1-processor.service'
+        fragment = self.profile(unit)
+        _, old, sha, _, prior = rollout.plan(unit, fragment.read_text())
+        previous = fragment.with_name(unit + '.d') / rollout.PREVIOUS
+        previous.parent.mkdir()
+        previous.write_text(prior)
+        for path, contents in rollout.EXTRA_PRIORS.items():
+            path.write_text(contents)
+        next(iter(rollout.EXTRA_PRIORS)).write_text('unexpected override')
+        with patch.object(rollout, 'digest', return_value=sha):
+            with self.assertRaisesRegex(ValueError, 'earlier override changed'):
+                rollout.ensure_original_configuration(fragment, fragment.read_text(), previous, prior, old, sha)
+
+
 if __name__ == '__main__':
     unittest.main()
