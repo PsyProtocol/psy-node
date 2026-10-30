@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "cohort": "core-testnet-20261027-r3",
+  "status": "deployed_with_bounded_runtime_acceptance",
+  "scope": "six Realm Edges and six Realm Processors only",
+  "source": {
+    "repository": "PsyProtocol/psy-node",
+    "runtime_commit": "48a490e2b4101f546d162fa10bb2d5214d1fdb4b",
+    "upstream_fix": "a9b9ac38dd4d5ea13f6068d67f6cb0181d56ba5d",
+    "deployment_branch": "deploy/testnet",
+    "retained_deployment_fixes": ["cd93078a", "024d21a0"],
+    "additional_review_correction": "Check final positional values across histories, not intermediate values."
+  },
+  "artifact": {
+    "name": "psy_node_cli",
+    "sha256": "4edb97b04c1c8543376eb6b2bf69c298cf51892ae678c23a0537237895ab1bf0",
+    "installed_path": "/opt/psy-core/hotfixes/realm-imt-admission-48a490e2/psy_node_cli",
+    "builder_image": "sha256:02a4dd5c2ea776982084a4a856610836fc9f944203e85948fd4b475177f6b4af",
+    "build_manifest_sha256": "49927fbbf9bfb60bde71b7f9e4cea4594cfba458897360848786db493ae1de9b",
+    "network": "testnet",
+    "network_magic": "0x1337CF514544CF69",
+    "proving_backend": "plonky2-poseidon-goldilocks",
+    "glibc_maximum": "2.34",
+    "source_clean_and_read_only_during_build": true
+  },
+  "tooling": {
+    "source_commit": "f92116987f456c36af6a56c67b0b93c46f85a53a",
+    "profile": "imt-admission",
+    "helper_sha256": "30410806c0ec46c20f4e2e5cddc5bae87f9a4b61a1dbc1a6cfd8ec78c47408f2",
+    "installed_helper": "/opt/psy-maintenance/realm-imt-admission-20261030/update_unit.py",
+    "owned_override": "96-realm-imt-admission-20261030.conf",
+    "audit_directory": "/var/backups/psy-realm-imt-admission-20261030",
+    "rollback": "remove only 96; retain earlier overrides; Edge returns to PR30, Processor returns to IMT metadata"
+  },
+  "preserved": {
+    "genesis_sha256": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
+    "base_units_and_prior_overrides_retained": true,
+    "databases_queues_keys_and_configuration_retained": true,
+    "coordinator_pids_unchanged": [3669112, 2847782, 2847863, 2847947],
+    "relayer_pid_unchanged": 72999,
+    "no_new_test_transactions": true,
+    "no_wallet_sdk_proxy_faucet_or_l1_release": true
+  },
+  "verification": {
+    "common_release_passed": 687,
+    "common_failed": 0,
+    "common_existing_ignored": 1,
+    "common_filtered_long_random": 1,
+    "client_data_release_passed": 196,
+    "focused_edge_tests_passed_subset": 4,
+    "helper_tests_passed": 26,
+    "independent_runtime_and_helper_review": "APPROVE",
+    "all_twelve_preflight_checks_passed": true,
+    "all_twelve_running_hashes_match": true,
+    "all_twelve_restart_counts_zero": true,
+    "last_processor_startup_gate_utc": "2026-10-30T03:53:46Z",
+    "processor_identity_sample_utc": "2026-10-30T03:55:55Z to 2026-10-30T03:55:57Z",
+    "all_six_processors_checkpoint_at_sample": 18768,
+    "realm0_canary_canonical_commits": [18713, 18714, 18715],
+    "realm1_canonical_commits": [18761, 18763],
+    "realm0_post_ready_canary_proof_queries_passed": 9,
+    "final_explicit_checkpoint_proof_queries_passed": 30,
+    "final_explicit_checkpoint_proof_query_errors": 0,
+    "public_checkpoint_first_all_three": 18764,
+    "public_checkpoint_second_all_three": 18775,
+    "new_baseline_replay_or_record_invariant_errors_observed": 0
+  },
+  "units": [
+    {"realm": 0, "validator": 1, "edge_pid": 311086, "processor_pid": 271573},
+    {"realm": 0, "validator": 2, "edge_pid": 310844, "processor_pid": 2583891},
+    {"realm": 0, "validator": 3, "edge_pid": 311347, "processor_pid": 2595910},
+    {"realm": 1, "validator": 1, "edge_pid": 335155, "processor_pid": 272510},
+    {"realm": 1, "validator": 2, "edge_pid": 334930, "processor_pid": 2588932},
+    {"realm": 1, "validator": 3, "edge_pid": 335359, "processor_pid": 2600522}
+  ],
+  "limitations": [
+    "Short-window natural workload acceptance is not a long-term stability or throughput benchmark.",
+    "Existing Local database is stale and MissingHistoryProof retries remain; affected nodes caught up without service restart.",
+    "One Realm0 v1 gatherer FastForward abort/re-entry diagnostic was observed; the process stayed alive and later committed checkpoint 18749.",
+    "Three exploratory proof reads ran ahead of a starting validator; nine post-ready canary reads and thirty final reads passed.",
+    "The separate Relayer DepositMismatch and RPC 429 conditions remain outside this release.",
+    "Client proving-session source is integrated but existing client, Faucet and proxy binaries were not upgraded."
+  ]
+}

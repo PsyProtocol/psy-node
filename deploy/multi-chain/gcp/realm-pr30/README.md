@@ -7,12 +7,18 @@ This is a state-preserving, per-unit hotfix, not a fresh deployment runner.
 Keep Genesis, databases, pending IDs, queues, keys and existing configuration.
 
 Source-only follow-up: [IMT coverage integration, October 30](IMT-COVERAGE-INTEGRATION-20261030.md).
-That compatible backport is not deployed by the branch push; the live artifact
-records below remain unchanged.
+The branch push itself did not deploy it. The subsequent authorized rollout is
+recorded in [October 30 deployment](IMT-COVERAGE-DEPLOYED-20261030.md) and the
+[current Realm artifact mapping](admission-live-release.json).
+
+Both six Realm Edges and six Realm Processors now use runtime `48a490e2`, binary
+SHA256 `4edb97b04c1c8543376eb6b2bf69c298cf51892ae678c23a0537237895ab1bf0`.
+Use profile `imt-admission` and the exact per-unit procedure/rollback in that
+deployment record; the older profiles below are not instructions for this build.
 
 ## Combined Processor Hotfix
 
-Current Processor mapping: [combined hotfix manifest](imt-metadata-live-release.json).
+Previous Processor-only mapping: [combined hotfix manifest](imt-metadata-live-release.json).
 The original `live-release.json` above remains the historical PR30 rollout record.
 
 The later Processor-only release combines IMT unchanged-leaf handling and

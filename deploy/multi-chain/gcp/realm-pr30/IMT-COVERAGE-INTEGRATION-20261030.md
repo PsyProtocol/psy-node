@@ -4,6 +4,11 @@ Status: source integration only. No live services were changed by this task.
 The deployed Processor manifest remains `imt-metadata-live-release.json`;
 do not interpret this document as a replacement artifact or rollout record.
 
+Subsequent authorized deployment is recorded separately in
+[the October 30 rollout](IMT-COVERAGE-DEPLOYED-20261030.md) and
+`admission-live-release.json`; the source-integration statements above describe
+the earlier merge-only task, not the current live version.
+
 ## Source Mapping
 
 - Repository: `PsyProtocol/psy-node`; destination: `deploy/testnet`.
