@@ -41,8 +41,19 @@ early-execution rejection, state-preserving upgrade, bad deposit rejection, and
 successful PSY/pUSDT deposits. Fork funding used local impersonation of token owners;
 it did not assume the live administrator can mint PSY, and sent no real transactions.
 
-Collect read-only chain audits and retain `Router-before.json` from the exact
-baseline build. Files consumed by `package.cjs` are `sepolia-governance.json`,
+Collect read-only chain audits with the supplied `audit.cjs`, running it on the
+administrator VM using its existing protected loopback RPCs. For example, from the
+script directory (repeat with bscTestnet/baseSepolia and their respective filenames):
+
+```bash
+ssh -J gcp-gateway -o Hostname=10.148.0.33 -o HostKeyAlias=136.110.35.53 \
+  -o BatchMode=yes gcp-faucet \
+  'sudo -n /opt/psy-l1-bundles/node-v22.23.4 - sepolia' \
+  < audit.cjs > sepolia-governance.json
+```
+
+Retain `Router-before.json` from the exact baseline build.
+Files consumed by `package.cjs` are `sepolia-governance.json`,
 `bsc-governance.json`, `base-governance.json`, containing public identity/mapping
 snapshots and implementation bytecode. Never add private RPC URLs or keys to them.
 
