@@ -123,6 +123,10 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "fresh-faucet-identities", requires = "private_keys_in")]
     pub fresh_faucet_identities: bool,
 
+    /// Fresh Genesis only: update registration 2 to the compiled multisig fingerprint.
+    #[arg(long = "fresh-relayer-fingerprint", requires = "private_keys_in")]
+    pub fresh_relayer_fingerprint: bool,
+
     /// Optional assertion against the fingerprint derived from the faucet SDKey policy.
     #[arg(long = "sd-key-fingerprint", default_value = "")]
     pub sd_key_fingerprint: String,
@@ -647,7 +651,8 @@ fn faucet_sd_key_fingerprint(args: &GenerateGenesisDataArgs) -> anyhow::Result<H
 
 fn validate_imported_accounts(args: &GenerateGenesisDataArgs, users: &[PsyCompactUserDefinition<Hash>]) -> anyhow::Result<()> {
     if args.private_keys_in.is_none() {
-        ensure!(!args.fresh_faucet_identities, "fresh Faucet identities require imported private keys");
+        ensure!(!args.fresh_faucet_identities && !args.fresh_relayer_fingerprint,
+            "fresh account fingerprints require imported private keys");
         ensure!(args.accounts_genesis_in.is_none() && args.accounts_genesis_sha256.is_none(),
             "account identity source requires imported private keys");
         return Ok(());
@@ -669,6 +674,15 @@ fn validate_imported_accounts(args: &GenerateGenesisDataArgs, users: &[PsyCompac
     } else {
         None
     };
+    if args.fresh_relayer_fingerprint {
+        ensure!(args.relayer_registration_id == 2, "fresh Relayer fingerprint requires registration 2");
+        let old = retained.get(2).context("missing retained Relayer account")?.public_key_info.fingerprint;
+        let new = users.get(2).context("missing fresh Relayer account")?.public_key_info.fingerprint;
+        let compiled = QHashOut(guardian_common::protocol::multisig_fingerprint()
+            .map_err(|error| anyhow::anyhow!("multisig fingerprint: {error}"))?.0);
+        ensure!(old != new && new == compiled && new != Hash::get_zero_value(),
+            "fresh Relayer must change to the compiled multisig fingerprint");
+    }
     for (registration, (before, after)) in retained.iter().zip(users).enumerate() {
         ensure!(before.public_key_info.public_key_param == after.public_key_info.public_key_param,
             "imported account public key parameter changed");
@@ -676,7 +690,7 @@ fn validate_imported_accounts(args: &GenerateGenesisDataArgs, users: &[PsyCompac
             ensure!(before.public_key_info.fingerprint == old_fingerprint
                 && after.public_key_info.fingerprint == new_fingerprint,
                 "fresh Faucet policy transition must cover every operator consistently");
-        } else {
+        } else if !(args.fresh_relayer_fingerprint && registration == 2) {
             ensure!(before.public_key_info.fingerprint == after.public_key_info.fingerprint,
                 "imported non-Faucet fingerprint changed or fresh Faucet transition was not selected");
         }
@@ -1183,6 +1197,81 @@ mod tests {
         ]).is_err());
         let mut args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
         args.fresh_faucet_identities = true;
+        assert!(validate_imported_accounts(&args, &[]).is_err());
+    }
+
+    #[test]
+    fn fresh_relayer_fingerprint_keeps_guardian_policy_and_every_other_account() {
+        use std::os::unix::fs::DirBuilderExt;
+        use sha2::{Digest, Sha256};
+        let root = std::env::current_dir().unwrap().join(format!(".genesis-fresh-relayer-{}", rand::random::<u64>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("public-genesis.json");
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--validator-slot", "0,1,0;1,1,1;1,2,3;0,2,4;1,3,5;0,3,6",
+        ]).unwrap();
+        let mut old_relayer = relayer_fixture();
+        old_relayer.public_key_info.fingerprint = parse_qhash("a8e0dc9f01f1f20f0bf8e92644a346e8876b8cbb48aaaed8d91813ea17ea53bb").unwrap();
+        let faucet_fingerprint = Hash::from_values(21, 22, 23, 24);
+        let (users, _) = genesis_users(&args, old_relayer, faucet_fingerprint,
+            &mut KeyBytesRng(Default::default())).unwrap();
+        let validators = parse_validator_slots(&args.validator_slots).unwrap().iter().map(|slot| serde_json::json!({
+            "realm_id": slot.realm_id, "validator_user_id": user_id_for(&args, slot.registration_id),
+        })).collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&serde_json::json!({"users": users, "validators": validators})).unwrap();
+        write_exclusive(&path, &bytes).unwrap();
+        args.private_keys_in = Some(root.join("keys-not-opened-by-identity-check.json"));
+        args.accounts_genesis_in = Some(path.clone());
+        args.accounts_genesis_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
+        let mut changed = users.clone();
+        changed[2] = initialized_multisig_user(&account_fixture(), args.initial_fee_balance).unwrap();
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        args.fresh_relayer_fingerprint = true;
+        validate_imported_accounts(&args, &changed).unwrap();
+        assert!(validate_imported_accounts(&args, &users).is_err());
+        let mut invalid = changed.clone();
+        invalid[2].public_key_info.public_key_param = Hash::from_values(41, 42, 43, 44);
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        invalid = changed.clone();
+        invalid[2].public_key_info.fingerprint = Hash::from_values(31, 32, 33, 34);
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        for registration in [0usize, 1, 3, 4, 5, 6, 7, 106] {
+            invalid = changed.clone();
+            invalid[registration].public_key_info.fingerprint = changed[2].public_key_info.fingerprint;
+            assert!(validate_imported_accounts(&args, &invalid).is_err());
+        }
+        let mut both = changed.clone();
+        for user in &mut both[7..] {
+            user.public_key_info.fingerprint = Hash::from_values(51, 52, 53, 54);
+        }
+        assert!(validate_imported_accounts(&args, &both).is_err());
+        args.fresh_faucet_identities = true;
+        validate_imported_accounts(&args, &both).unwrap();
+        args.fresh_faucet_identities = false;
+        args.relayer_registration_id = 3;
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_relayer_fingerprint_requires_hash_pinned_import() {
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint",
+        ]).is_err());
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint", "--random-private-keys",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]).is_err());
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]).unwrap();
+        assert!(args.fresh_relayer_fingerprint);
+        args.private_keys_in = None;
         assert!(validate_imported_accounts(&args, &[]).is_err());
     }
 
