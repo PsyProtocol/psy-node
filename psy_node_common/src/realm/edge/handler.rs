@@ -25,11 +25,11 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::{ContractStateUpdate, SubmitUserEndCapNonProofInput}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTMembershipProof,
+            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTContractStateUpdate, IMTMembershipProof,
                 IMTNonMembershipProof, IMTPredecessorResult, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
@@ -954,6 +954,10 @@ impl<
         user_end_cap_input.ensure_declared_slots_modified()?;
         timer.lap_micros("ensure_declared_slots_modified");
 
+        self.ensure_imt_leaf_record_coverage(&user_end_cap_input, user_id, current_checkpoint_id)
+            .await?;
+        timer.lap_micros("ensure_imt_leaf_record_coverage");
+
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking(move || {
             proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
@@ -997,6 +1001,67 @@ impl<
             );
             generation = next_generation;
         }
+    }
+
+    /// Require IMT records for changed existing IMT leaves before admission,
+    /// matching commit-path coverage; unchanged leaves remain exempt.
+    async fn ensure_imt_leaf_record_coverage(
+        &self,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        user_id: u64,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<()> {
+        let empty_leaf = N::QHash::from_owned_32bytes([0u8; 32]);
+        // Group coverage across histories of each contract, matching aggregated FFS.
+        let mut recorded_imt_leaves: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut final_positional_values = HashMap::new();
+        for csu in user_end_cap_input.contract_state_updates.iter() {
+            let contract_id = csu.user_contract_tree_update_proof.index;
+            for update in csu.updates.iter() {
+                if let ContractStateUpdate::Positional { delta_proof } = update {
+                    final_positional_values.insert((contract_id, delta_proof.index), delta_proof.new_value);
+                }
+                if let ContractStateUpdate::IMT { update } = update {
+                    let leaves = recorded_imt_leaves.entry(contract_id).or_default();
+                    match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => {
+                            leaves.insert(delta_proof.index);
+                        }
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            new_leaf_delta_proof,
+                            ..
+                        } => {
+                            leaves.insert(predecessor_delta_proof.index);
+                            leaves.insert(new_leaf_delta_proof.index);
+                        }
+                    }
+                }
+            }
+        }
+        // Intermediate values may restore or clear an IMT leaf later in the EndCap.
+        for ((contract_id, index), new_value) in final_positional_values {
+            if new_value == empty_leaf {
+                continue;
+            }
+            if recorded_imt_leaves
+                .get(&contract_id)
+                .is_some_and(|leaves| leaves.contains(&index))
+            {
+                continue;
+            }
+            if let Some(previous_preimage) = self
+                .db_reader
+                .contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, contract_id, index)
+                .await?
+            {
+                anyhow::ensure!(
+                    previous_preimage.qfhash::<N::HasherBase>() == new_value,
+                    "InvalidEndCapUpdates: contract-state leaf contract={contract_id} index={index} re-declares an existing IMT leaf with a changed value but no IMT record",
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn forward_end_cap_to_scheduled_proposer(
@@ -2323,6 +2388,7 @@ pub(crate) mod tests {
         psy_core_db::traits::full::{
             PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeCheckpointTreeDatabaseReader,
             PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
+            PsyNodeContractStateIMTDatabaseWriter,
             PsyNodeGlobalUserTreeDatabaseWriter,
         },
         psy_temp_db::{
@@ -2635,6 +2701,108 @@ pub(crate) mod tests {
             .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT);
         let proof_bytes = expected_hash.into_owned_32bytes().to_vec();
         Ok((input, proof_bytes))
+    }
+
+    #[tokio::test]
+    async fn imt_admission_rejects_changed_leaf_without_record() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (input, _) = valid_end_cap_submission(&env).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        let error = env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0)
+            .await.expect_err("changed existing IMT leaf needs a record before admission");
+        assert!(error.to_string().contains("contract=0 index=0"), "{error}");
+        assert!(error.to_string().contains("no IMT record"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_allows_unchanged_cleared_and_positional_leaves() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (mut input, _) = valid_end_cap_submission(&env).await?;
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        for value in [hash, PHash::from_owned_32bytes([0; 32])] {
+            let ContractStateUpdate::Positional { delta_proof } = &mut input.contract_state_updates[0].updates[0] else {
+                panic!("fixture must contain a positional update");
+            };
+            delta_proof.new_value = value;
+            env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_groups_records_by_contract_across_histories() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (mut input, _) = valid_end_cap_submission(&env).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        let ContractStateUpdate::Positional { delta_proof } = input.contract_state_updates[0].updates[0].clone() else {
+            panic!("fixture must contain a positional update");
+        };
+        let mut history = input.contract_state_updates[0].clone();
+        history.updates = vec![ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: leaf, new_preimage: leaf, delta_proof: delta_proof.clone(),
+            },
+        }];
+        input.contract_state_updates.push(history);
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        let history = input.contract_state_updates.last_mut().unwrap();
+        history.updates = vec![ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: leaf, predecessor_new_preimage: leaf, new_leaf_preimage: leaf,
+                predecessor_delta_proof: delta_proof.clone(), new_leaf_delta_proof: delta_proof,
+            },
+        }];
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        input.contract_state_updates.last_mut().unwrap().user_contract_tree_update_proof.index = 1;
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await
+            .expect_err("another contract's IMT record must not cover this leaf");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_allows_restored_and_finally_cleared_histories() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        for final_value in [hash, PHash::from_owned_32bytes([0; 32])] {
+            let (mut input, _) = valid_end_cap_submission(&env).await?;
+            let mut tree = SimpleMemoryMerkleStoreV3::<PoseidonHasher, PHash>::new(CONTRACT_TREE_HEIGHT);
+            tree.set_leaf(0, hash);
+            let changed = tree.set_leaf(0, PHash::from_values(1000, 0, 0, 0));
+            let unrelated = tree.set_leaf(1, PHash::from_values(2000, 0, 0, 0));
+            let restored = tree.set_leaf(0, final_value);
+            let mut first = input.contract_state_updates[0].clone();
+            first.updates = vec![ContractStateUpdate::Positional { delta_proof: changed }];
+            let mut second = first.clone();
+            second.updates = vec![
+                ContractStateUpdate::Positional { delta_proof: unrelated },
+                ContractStateUpdate::Positional { delta_proof: restored },
+            ];
+            input.contract_state_updates = vec![first, second];
+            env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

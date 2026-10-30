@@ -604,6 +604,16 @@ where
             update_global_user_tree_nodes_ffs: guta_update.update_global_user_tree_nodes_ffs,
             update_contract_state_imt_leaves_ffs: guta_update.update_contract_state_imt_leaves_ffs,
         };
+        // Verify the aggregated updates against the local baseline BEFORE the
+        // coordinator can include the new realm root. A coverage/replay failure
+        // must abort the block here; discovering it only in commit_state (after
+        // coordinator inclusion) strands the checkpoint locally.
+        let baseline_checkpoint_id = self.db.state.processing_checkpoint_id;
+        self.db
+            .verify_state_updates_from_baseline(baseline_checkpoint_id, &db_output)
+            .await?;
+        timer.lap("verify_state_updates_from_baseline");
+
         let mut p2p_submission = None;
         if self.p2p.is_some() && self.rotation.as_ref().is_some_and(|rotation| rotation.is_enabled()) {
             p2p_submission = self
