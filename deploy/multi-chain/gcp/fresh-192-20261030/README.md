@@ -2,7 +2,7 @@
 
 This is the next source/config preparation profile, not an activation package.
 The published runtime candidate is
-`d64871fe87e80b7fbc1203195a5ac1afec5a622c`. Deployment scripts stay on
+`3c34ab575fc78ac1515f34555af3b70124f1225e`. Deployment scripts stay on
 `deploy/testnet`; runtime integration into `testnet-dev` remains a separate step.
 Neither a successful preflight nor a Git push authorizes reset or activation.
 
@@ -60,9 +60,8 @@ renamed inputs or replace only their version strings. Likewise, the historical
    and checking token0/token4 layouts, methods and privacy bindings.
 3. Prepare a fresh Genesis and 100 Faucet public identities. Retain Guardian,
    P2P, worker and operator private-key material; the changed Faucet fingerprint
-   does not preserve old public identity. The old import-only generator will
-   reject that change. Implement/review explicit fresh-identity handling before
-   generation; never rewrite the old baseline or disable its identity check.
+   does not preserve old public identity. Use the reviewed explicit transition
+   below; never rewrite the old baseline or disable its identity check.
 4. Rebuild the SDK/WASM and clients from the accepted cohort. No npm publication
    is included here. Measure the full 64-slot SD-key resource envelope.
 5. Build the five CLIs with the pinned offline Bookworm procedure in
@@ -84,3 +83,36 @@ The PostgreSQL installer now fixes 2 GiB Docker shared memory and compressed
 `100m`/100-file logs, checking actual container policy before readiness. It is
 a fresh installer that replaces a container, not a live database maintenance
 command. Hasura's existing bounded logging remains unchanged.
+
+## Explicit Fresh Faucet Generation
+
+The native generator now accepts `--fresh-faucet-identities` only alongside
+hash-pinned imported keys and prior public Genesis. It permits a common old
+Faucet fingerprint to change to a common new nonzero fingerprint for every
+operator. Every public-key parameter, all Validator/Relayer fingerprints and
+the six Validator role mappings remain checked. The normal import mode still
+rejects all fingerprint changes. This is not a live account migration.
+
+Use the existing `core-only/prepare_genesis.py` entrypoint, not manual JSON
+rewrites. Its version-2 public spec adds these exact fields to the version-1
+input set documented in [GENESIS.md](../core-only/GENESIS.md):
+
+```json
+{
+  "schema_version": 2,
+  "checkpoints_per_epoch": 32,
+  "account_identity_mode": "fresh-faucet"
+}
+```
+
+The block time, eight pinned public inputs, six complete compiler artifacts and
+separately hash-pinned private-key array are still required. The snippet is not
+a complete generation spec. Run `plan` first, then `generate` with the same
+spec, keys and new protected output path. Both record the selected identity
+mode and epoch; generation passes the explicit native flag exactly once.
+Version 1 remains strict import with epoch 10. Nothing silently upgrades it.
+
+The generator transition passed 55 release tests (1 existing ignored test).
+Deployment adapter tests passed 21 tests, and the network-assembly regressions
+passed 37. Adapter children are mocked: these results do not establish that
+the final actual-key Genesis or matching Compiler/SDK artifacts exist.

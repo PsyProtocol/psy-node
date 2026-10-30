@@ -157,9 +157,13 @@ def validate_topology(topology):
             socket(validator["edge_host"], validator["http_port"])
 
 
-def validate_consensus(network):
+def validate_consensus(network, *, checkpoints_per_epoch=10):
     require(isinstance(network, dict), "missing network configuration")
+    require(type(checkpoints_per_epoch) is int and checkpoints_per_epoch in (10, 32),
+            "unsupported explicit consensus epoch")
     for name, expected in CONSENSUS.items():
+        if name == "p2p":
+            expected = {**expected, "checkpoints_per_epoch": checkpoints_per_epoch}
         require(json.dumps(network.get(name), sort_keys=True) == json.dumps(expected, sort_keys=True),
                 f"consensus mismatch: {name}")
 

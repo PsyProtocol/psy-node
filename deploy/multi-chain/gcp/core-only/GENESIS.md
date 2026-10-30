@@ -102,6 +102,16 @@ full compiled JSON, including its ABI and canonical layout metadata.
 `prior_genesis` is the retained public account/Validator identity baseline;
 its old contract bytecode is not reused.
 
+Spec version 1 remains the historical R3 input: strict account identity import
+and epoch 10. Version 2 requires two additional fields:
+`checkpoints_per_epoch: 32` and `account_identity_mode`, either `preserve` or
+`fresh-faucet`. Use `fresh-faucet` only for an approved fresh chain with a
+changed Faucet policy/circuit. It adds the native generator's explicit
+`--fresh-faucet-identities` flag; all private-key parameters, non-Faucet
+fingerprints and validator roles still have to match the unchanged prior
+Genesis. The plan and result record both choices. No version has a random-key
+fallback, and version 2 does not repin the old host installers or build inputs.
+
 `build_identity` contains exactly `schema_version=1`, `source_commit` (40 hex),
 `psy_network=testnet`, `cli_network=psy-public-testnet`,
 `proving_backend=plonky2-poseidon-goldilocks`, `private_keys_mode=import-only`,

@@ -8,6 +8,12 @@ Runtime source is `d64871fe87e80b7fbc1203195a5ac1afec5a622c`, published on
 candidate's history; the final source bound is **192** and the transaction
 introspection count remains **64**. No live service or chain was changed.
 
+The subsequent generator candidate is
+`3c34ab575fc78ac1515f34555af3b70124f1225e`. Its only changes from the measured
+revision are the fresh Faucet import opt-in, associated tests and Genesis
+documentation. Circuit sources, embedded artifacts and network constants are
+unchanged; the measurements below retain their original source provenance.
+
 ## Results
 
 | Item | Result | Evidence |
@@ -111,8 +117,8 @@ with the retained production private keys or a generated deployment Genesis.
 
 Retain operator private-key material where possible, but regenerate the public
 identities and new Genesis from the accepted policy. The existing import-only
-generator rejects changed public identities: implement explicit fresh-identity
-handling rather than disabling that check or rewriting the old baseline.
+generator rejects changed public identities. The subsequent candidate adds
+explicit fresh-Faucet handling, retaining the default check and old baseline.
 Faucet runtime must derive/use the same policy and exported accounts.
 
 Legacy `client_prover/Makefile` example SD-key fingerprint literals belong to
