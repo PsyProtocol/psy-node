@@ -13,6 +13,13 @@
   "faucet_operator_count": 100,
   "genesis_spec_version": 2,
   "account_identity_mode": "fresh-faucet",
+  "canonical_config_sha256": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
+  "retained_public_config_sha256": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
+  "guardian_configs": [
+    {"id": 1, "listen_address": "10.148.0.39:15441", "rpc_url": "http://10.148.0.39:15441"},
+    {"id": 2, "listen_address": "10.148.0.40:15442", "rpc_url": "http://10.148.0.40:15442"},
+    {"id": 3, "listen_address": "10.148.0.41:15443", "rpc_url": "http://10.148.0.41:15443"}
+  ],
   "withdrawal_append_supported_batch_sizes": [1, 2, 5],
   "withdrawal_append_max_batch_size": 5,
   "namespace_prefix": "fresh20261030sd192",

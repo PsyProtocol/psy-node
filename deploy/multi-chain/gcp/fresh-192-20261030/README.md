@@ -18,6 +18,8 @@ Host roles are preparation inputs, not fresh SSH or resource measurements.
 See [the measured circuit alignment](FINGERPRINT-AUDIT.md). Inclusion, EndCap,
 ZK and both secp fingerprints match; Faucet SD-key identity changes. These
 measurements do not replace the downstream rebuild and Genesis gates below.
+See [the latest preparation status](PREPARATION-STATUS.md) for local consumer
+commits, actual config evidence and remaining release work.
 
 The Relayer candidate already supports L2 withdrawal-tree append packs of
 1, 2 and 5. Five withdrawals use one `batch_append_withdrawals_5` call with
@@ -116,3 +118,32 @@ The generator transition passed 55 release tests (1 existing ignored test).
 Deployment adapter tests passed 21 tests, and the network-assembly regressions
 passed 37. Adapter children are mocked: these results do not establish that
 the final actual-key Genesis or matching Compiler/SDK artifacts exist.
+
+## Retained Public Configuration
+
+`prepare_config.py` creates a new protected candidate directory from two
+hash-pinned JSON inputs: the canonical config at the selected Node/Genesis
+revision and the retained approved testnet config. It keeps canonical
+consensus parameters and selects testnet, retaining only Guardian commitments,
+the approved ordered Guardian endpoints, Realm membership and the Worker
+whitelist from the prior config. Nested identity objects have exact field
+allowlists; credential-bearing RPC URLs reject. Nonempty Guardian governance
+history rejects and no history is copied. The two input hashes must match
+`release.json`, not merely caller-supplied hashes. The script opens only these
+config files and the release profile, never keystores or private-key files;
+it does not modify inputs or contact hosts. Inputs remain operator-trusted.
+
+```sh
+python3 -B deploy/multi-chain/gcp/fresh-192-20261030/prepare_config.py \
+  --canonical "$CANONICAL_CONFIG" --canonical-sha256 "$CANONICAL_SHA256" \
+  --retained "$RETAINED_CONFIG" --retained-sha256 "$RETAINED_SHA256" \
+  --output "$NEW_CONFIG_DIRECTORY"
+```
+
+Outputs are mode-0600 `config.json` and `manifest.json` in a new mode-0700
+directory. Existing output paths reject rather than overwrite. Preserve any
+partial output for inspection. This establishes only local format/identity
+continuity: verify actual private-key possession, host addresses, native config
+acceptance and Guardian quorum before rollout. Keep generated configs outside
+Git and public client artifacts. Build final caches/artifacts with this exact
+accepted config; the earlier template-based checks are not that final build.
