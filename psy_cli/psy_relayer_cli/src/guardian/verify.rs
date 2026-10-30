@@ -96,13 +96,30 @@ pub fn withdrawal_key(record: &WithdrawalBurnRecord) -> Hash4 {
 }
 
 pub fn withdrawal_leaf(record: &WithdrawalBurnRecord) -> Hash4 {
-    let mut fields = [F::ZERO; 34];
+    let mut fields = [F::ZERO; 35];
     fields[0] = F::from_canonical_u32(record.sender_user_id);
-    for (target, words) in fields[1..33].chunks_exact_mut(8).zip([&record.recipient, &record.token, &record.amount, &record.nonce]) {
+    for (target, words) in fields[1..34].chunks_exact_mut(8).zip([&record.recipient, &record.token, &record.amount, &record.nonce]) {
         for (target, word) in target.iter_mut().zip(words) { *target = F::from_canonical_u32(*word); }
     }
     fields[33] = F::from_canonical_u8(record.destination_chain_index);
+    fields[34] = F::from_canonical_u32(record.token_contract_id);
     PsyHasher::q_hash_many(&fields)
+}
+
+/// Exact withdrawal leaf hash hex: per Goldilocks limb low u32 then high u32,
+/// each word big-endian. This is the 35-felt Merkle leaf hash used as the
+/// services/API lookup identity, not an L1 slot word and not the raw-nonce
+/// `claimedNullifiers` key.
+fn withdrawal_leaf_hex(leaf: Hash4) -> String {
+    let mut hex_string = String::with_capacity(66);
+    hex_string.push_str("0x");
+    for felt in leaf.0.elements {
+        let value = felt.to_canonical_u64();
+        for word in [value as u32, (value >> 32) as u32] {
+            hex_string.push_str(&format!("{word:08x}"));
+        }
+    }
+    hex_string
 }
 
 /// Compiled method binding from `psy-genesis/genesis_abi`. The id is
@@ -146,7 +163,7 @@ fn token_contract(id: u32) -> Result<()> {
 }
 
 pub fn verify_withdrawal_burn(config: &GuardianConfig, record: &WithdrawalBurnRecord, proof: &psy_provider::lps::WithdrawalBurnProof, verified_checkpoint_root: Hash4) -> Result<()> {
-    record.amount_u64()?;
+    record.validate_amount()?;
     token_contract(record.token_contract_id)?;
     config.chain(record.destination_chain_index)?;
     verify_checkpoint(proof.checkpoint_id, &proof.checkpoint_leaf, &proof.global_roots, &proof.checkpoint_path, verified_checkpoint_root)?;
@@ -232,6 +249,7 @@ fn policy_call(operation: GuardianOperation, witness: &MultisigSignatureWitness)
 }
 
 async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, request: &GuardianSignRequest, pending: &GuardianHistory, historical: bool) -> Result<(VerifiedGuardianSession, ContractCallData, Hash4, Vec<DepositTreeState>),GuardianAccountError> {
+    let trace_started = std::time::Instant::now();
     let network_magic = psy_config::parse_magic_hex(&context.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
     if request.network_magic != network_magic { return Err(GuardianSignError::AuthorizationMismatch.into()); }
     request.validate_authorization(config)?;
@@ -274,11 +292,13 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
             // canonical token address. A raw high-bit token slot is not truncated
             // into that lookup; L1 rejects that exact slot before registration.
             // An already-included session authenticates the burn proof and checkpoint.
-            if !historical { guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await?; }
+            if !historical {
+                guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await.map_err(guardian_common::verify_l1::relabel_withdrawal_mapping)?;
+            }
             let count = counts.entry(burn.destination_chain_index).or_insert_with(|| pending.chains.get(&burn.destination_chain_index).map_or(0, |state| state.0));
             appends.push(WithdrawalAppendRecord { chain_index: burn.destination_chain_index, append_index: *count, burn: burn.clone() });
             *count = count.checked_add(1).ok_or(GuardianSignError::WithdrawalMismatch)?;
-            withdrawals.push(crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf(burn).to_string() });
+            withdrawals.push(crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf_hex(withdrawal_leaf(burn)) });
         }
         calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls(&withdrawals));
     } else { calls.push(policy_call(request.operation, &witness)?); }
@@ -289,6 +309,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     if fees.len() != 1 || fees[0].contract_id != 0 || fees[0].method_id != TOKEN_BURN_METHOD_ID || fees[0].method_name != "burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
     let message = Hash256::from(supplied.finalization.sig_hash).0;
     let ending_leaf_hash = supplied.finalization.submit_end_cap_input.core.new_user_leaf.qfhash::<PsyHasher>();
+    tracing::debug!(session_nonce = request.session_nonce, historical, trace_ms = trace_started.elapsed().as_millis() as u64, "[verify_sign_request_trace] trace verified");
     Ok((VerifiedGuardianSession { trace: supplied, current_policy, ending_policy, starting_leaf_hash: start_hash, ending_leaf_hash, message, withdrawal_appends: appends }, expected, historical_checkpoint_root(&checkpoint_path), staged_deposit_tree_states))
 }
 
@@ -551,10 +572,11 @@ pub async fn verify_restored_history(context: &GuardianVerificationContext<'_>, 
 }
 
 
-/// Reads the nonce authenticated at the context's fixed checkpoint. Missing user
-/// indexes wait only until the caller's observer/sign deadline, then return
-/// `IndexCheckpointTimeout`; other user-proof RPC failures return `CheckpointProofUnavailable`.
-pub async fn verified_account_nonce(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, deadline: tokio::time::Instant) -> Result<u64> {
+/// Reads the nonce authenticated at the context's fixed checkpoint. A `Some` deadline
+/// (observer) bounds the missing-index wait and expires as `IndexCheckpointTimeout`;
+/// `None` (sign paths) waits unboundedly for the index, ended only by the caller's
+/// cancellation. Other user-proof RPC failures return `CheckpointProofUnavailable`.
+pub async fn verified_account_nonce(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, deadline: Option<tokio::time::Instant>) -> Result<u64> {
     let id = context.verified_checkpoint_id;
     let checkpoint = context.provider.get_checkpoint_leaf_data(id).await.map_err(|_|GuardianSignError::CheckpointProofUnavailable)?;
     let roots = context.provider.get_checkpoint_global_state_roots(id).await.map_err(|_|GuardianSignError::CheckpointProofUnavailable)?;
@@ -568,7 +590,7 @@ pub async fn verified_account_nonce(context: &GuardianVerificationContext<'_>, c
     if user_path.value != user.qfhash::<PsyHasher>() || user.public_key != account_public_key || user.user_id.to_canonical_u64() != config.user_id() { return Err(GuardianSignError::AccountIdentityConflict); }
     Ok(user.nonce.to_canonical_u64())
 }
-async fn user_tree_proof(provider: &RpcProvider, checkpoint_id: u64, user_id: u64, deadline: tokio::time::Instant) -> Result<MerkleProofCore<Hash4>> {
+async fn user_tree_proof(provider: &RpcProvider, checkpoint_id: u64, user_id: u64, deadline: Option<tokio::time::Instant>) -> Result<MerkleProofCore<Hash4>> {
     wait_user_tree_proof(checkpoint_id, user_id, deadline, |checkpoint, user| provider.get_user_tree_merkle_proof(checkpoint, user)).await
 }
 
@@ -585,26 +607,43 @@ fn classify_user_tree_proof(error: &anyhow::Error, checkpoint_id: u64) -> UserTr
 }
 
 // Retry only the provider's typed missing-checkpoint failure for this checkpoint.
-// Transport, malformed-proof and all other failures retain fail-fast semantics.
-// The caller owns the deadline and cancellation: no task outlives this borrowed future.
-async fn wait_user_tree_proof<Fut>(checkpoint_id: u64, user_id: u64, deadline: tokio::time::Instant, mut fetch: impl FnMut(u64, u64) -> Fut) -> Result<MerkleProofCore<Hash4>>
+// Transport, malformed-proof and all other failures retain fail-fast semantics. A `Some`
+// deadline expires as `IndexCheckpointTimeout`; `None` waits until the index appears and
+// is ended only by dropping this future. No task outlives this borrowed future.
+async fn wait_user_tree_proof<Fut>(checkpoint_id: u64, user_id: u64, deadline: Option<tokio::time::Instant>, mut fetch: impl FnMut(u64, u64) -> Fut) -> Result<MerkleProofCore<Hash4>>
 where Fut: Future<Output = anyhow::Result<MerkleProofCore<Hash4>>> {
+    let started = std::time::Instant::now();
     let mut waiting_for_index = false;
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            tracing::debug!(checkpoint_id, user_id, wait_ms = started.elapsed().as_millis() as u64, outcome = if waiting_for_index { "timeout" } else { "unavailable" }, "[wait_user_tree_proof] loop ended");
             return Err(if waiting_for_index { GuardianSignError::IndexCheckpointTimeout } else { GuardianSignError::CheckpointProofUnavailable });
         }
-        match tokio::time::timeout_at(deadline, fetch(checkpoint_id, user_id)).await {
-            Ok(Ok(path)) => return Ok(path),
+        let attempt = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, fetch(checkpoint_id, user_id)).await,
+            None => Ok(fetch(checkpoint_id, user_id).await),
+        };
+        match attempt {
+            Ok(Ok(path)) => {
+                tracing::debug!(checkpoint_id, user_id, wait_ms = started.elapsed().as_millis() as u64, outcome = "ok", "[wait_user_tree_proof] loop ended");
+                return Ok(path);
+            }
             Ok(Err(error)) => match classify_user_tree_proof(&error, checkpoint_id) {
                 UserTreeProofFailure::MissingCheckpointProof => {
-                    if !waiting_for_index { tracing::warn!(checkpoint_id, user_id, "user tree proof not yet readable; waiting until caller deadline"); }
+                    if !waiting_for_index { tracing::warn!(checkpoint_id, user_id, "user tree proof not yet readable; waiting until index appears or caller cancels"); }
                     waiting_for_index = true;
-                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250))).await;
+                    let next_poll = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+                    tokio::time::sleep_until(deadline.unwrap_or(next_poll).min(next_poll)).await;
                 }
-                UserTreeProofFailure::Other => return Err(GuardianSignError::CheckpointProofUnavailable),
+                UserTreeProofFailure::Other => {
+                    tracing::debug!(checkpoint_id, user_id, wait_ms = started.elapsed().as_millis() as u64, outcome = "unavailable", "[wait_user_tree_proof] loop ended");
+                    return Err(GuardianSignError::CheckpointProofUnavailable);
+                }
             },
-            Err(_) => return Err(if waiting_for_index { GuardianSignError::IndexCheckpointTimeout } else { GuardianSignError::CheckpointProofUnavailable }),
+            Err(_) => {
+                tracing::debug!(checkpoint_id, user_id, wait_ms = started.elapsed().as_millis() as u64, outcome = if waiting_for_index { "timeout" } else { "unavailable" }, "[wait_user_tree_proof] loop ended");
+                return Err(if waiting_for_index { GuardianSignError::IndexCheckpointTimeout } else { GuardianSignError::CheckpointProofUnavailable });
+            }
         }
     }
 }
@@ -626,7 +665,7 @@ mod tests {
     async fn user_index_wait_succeeds_after_old_retry_window_at_fixed_checkpoint() {
         let start = tokio::time::Instant::now();
         let calls = std::cell::Cell::new(0);
-        let proof = wait_user_tree_proof(17, 42, start + std::time::Duration::from_secs(3), |checkpoint, user| {
+        let proof = wait_user_tree_proof(17, 42, Some(start + std::time::Duration::from_secs(3)), |checkpoint, user| {
             assert_eq!((checkpoint, user), (17, 42));
             calls.set(calls.get() + 1);
             std::future::ready(if tokio::time::Instant::now() - start < std::time::Duration::from_secs(2) {
@@ -645,7 +684,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let deadline = start + std::time::Duration::from_millis(1100);
         let calls = std::cell::Cell::new(0);
-        let result = wait_user_tree_proof(17, 42, deadline, |checkpoint, _| {
+        let result = wait_user_tree_proof(17, 42, Some(deadline), |checkpoint, _| {
             calls.set(calls.get() + 1);
             std::future::ready(Err(missing_user_index(checkpoint)))
         }).await;
@@ -661,7 +700,7 @@ mod tests {
         for case in [Case::Transport, Case::VerifyFailed, Case::WrongCheckpoint] {
             let start = tokio::time::Instant::now();
             let calls = std::cell::Cell::new(0);
-            let result = wait_user_tree_proof(17, 42, start + std::time::Duration::from_secs(30), |_, _| {
+            let result = wait_user_tree_proof(17, 42, Some(start + std::time::Duration::from_secs(30)), |_, _| {
                 calls.set(calls.get() + 1);
                 let error = match case {
                     Case::Transport => anyhow!("connection refused"),
@@ -683,7 +722,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             let _guard = mutex.lock().await;
-            wait_user_tree_proof(17, 42, deadline, |checkpoint, _| {
+            wait_user_tree_proof(17, 42, Some(deadline), |checkpoint, _| {
                 calls.set(calls.get() + 1);
                 std::future::ready(Err(missing_user_index(checkpoint)))
             }).await
@@ -700,7 +739,7 @@ mod tests {
             let mutex = tokio::sync::Mutex::new(());
             let calls = std::cell::Cell::new(0);
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-            let result = wait_user_tree_proof(17, 42, deadline, |checkpoint, _| {
+            let result = wait_user_tree_proof(17, 42, Some(deadline), |checkpoint, _| {
                 calls.set(calls.get() + 1);
                 let first = calls.get() == 1;
                 let mutex = &mutex;
@@ -722,13 +761,60 @@ mod tests {
     async fn user_index_wait_stops_if_retry_returns_non_index_error() {
         let start = tokio::time::Instant::now();
         let calls = std::cell::Cell::new(0);
-        let result = wait_user_tree_proof(17, 42, start + std::time::Duration::from_secs(30), |checkpoint, _| {
+        let result = wait_user_tree_proof(17, 42, Some(start + std::time::Duration::from_secs(30)), |checkpoint, _| {
             calls.set(calls.get() + 1);
             std::future::ready(Err(if calls.get() == 1 { missing_user_index(checkpoint) } else { anyhow!("user tree merkle proof verify failed") }))
         }).await;
         assert!(matches!(result, Err(GuardianSignError::CheckpointProofUnavailable)));
         assert_eq!(calls.get(), 2);
         assert_eq!(tokio::time::Instant::now() - start, std::time::Duration::from_millis(250));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_index_wait_without_deadline_accepts_proof_after_old_sign_threshold() {
+        let start = tokio::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let proof = wait_user_tree_proof(17, 42, None, |checkpoint, user| {
+            assert_eq!((checkpoint, user), (17, 42));
+            calls.set(calls.get() + 1);
+            std::future::ready(if tokio::time::Instant::now() - start < std::time::Duration::from_secs(601) {
+                Err(missing_user_index(checkpoint))
+            } else {
+                Ok(MerkleProofCore { root: Hash4::ZERO, index: user, value: Hash4::ZERO, siblings: vec![] })
+            })
+        }).await.unwrap();
+        assert_eq!(proof.index, 42);
+        assert_eq!(calls.get(), 2405);
+        assert_eq!(tokio::time::Instant::now() - start, std::time::Duration::from_secs(601));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_index_wait_without_deadline_ends_when_the_caller_is_cancelled() {
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_fetch = std::sync::Arc::clone(&dropped);
+        let (sender, first_fetch) = tokio::sync::oneshot::channel();
+        let mut begun = Some(sender);
+        let waiter = tokio::spawn(wait_user_tree_proof(17, 42, None, move |_checkpoint, _user| {
+            if let Some(sender) = begun.take() { let _ = sender.send(()); }
+            let probe = DropProbe(std::sync::Arc::clone(&dropped_in_fetch));
+            async move {
+                let _guard = probe;
+                std::future::pending::<anyhow::Result<MerkleProofCore<Hash4>>>().await
+            }
+        }));
+        // Distinct contract from the 601 s acceptance test: once the wait is parked inside
+        // its never-resolving fetch (signalled by the oneshot), only cancelling the caller
+        // can end it — the joined error must be cancellation and the in-flight fetch future
+        // must actually be dropped, proving no detached wait survives the caller.
+        first_fetch.await.unwrap();
+        waiter.abort();
+        let aborted = waiter.await.unwrap_err();
+        assert!(aborted.is_cancelled());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn recovery_commitment_fixture() -> (GuardianConfig, GuardianSignRequest, TxTrace, ContractCallData, Hash4) {
@@ -869,15 +955,15 @@ mod tests {
         assert_ne!(withdrawal_key(&burn),PsyHasher::q_hash_many(&burn.nonce.map(F::from_canonical_u32)));
         let mut changed = burn.clone(); changed.destination_chain_index=1;
         assert_ne!(withdrawal_leaf(&burn),withdrawal_leaf(&changed));
-        changed=burn.clone(); changed.amount=[0,0,0,0,0,0,0xffff_ffff,1];
-        assert!(changed.amount_u64().is_err());
-        changed.amount[7]=0; assert_eq!(changed.amount_u64().unwrap(),GOLDILOCKS_MODULUS-1);
+        let mut changed = burn.clone(); changed.amount=[0,0,0,0,0,0,0xffff_ffff,1];
+        assert!(changed.validate_amount().is_ok());
+        changed.amount=[0; 8]; assert!(changed.validate_amount().is_err());
     }
 
     #[test]
     fn raw_high_bit_and_zero_recipient_stay_in_the_leaf() {
         let mut burn = WithdrawalBurnRecord { sender_user_id: 7, token_contract_id: 4, destination_chain_index: 0, token: [1, 0, 0, 0, 0, 0, 0, 9], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0; 8], nonce: [1, 2, 3, 4, 5, 6, 7, 8] };
-        assert!(burn.amount_u64().is_ok());
+        assert!(burn.validate_amount().is_ok());
         assert!(burn.token_address().is_err());
         assert_eq!(burn.recipient_address().unwrap().0, [0; 20]);
         let high = withdrawal_leaf(&burn);

@@ -330,7 +330,8 @@ pub(crate) mod startup_tests {
     pub(crate) struct RealmProcessorTestEnv {
         pub db_env: RealmDbTestEnv,
         pub processor: TestProcessor,
-        _proposal_backup_dir: tempfile::TempDir,
+        /// Keeps the proposal-backup directory alive for the processor's lifetime.
+        pub _proposal_backup_dir: tempfile::TempDir,
     }
 
     impl RealmProcessorTestEnv {
@@ -339,9 +340,11 @@ pub(crate) mod startup_tests {
         pub(crate) async fn create_over_db_env(db_env: RealmDbTestEnv) -> anyhow::Result<Self> {
             db_env.coordinator.seed_realm_root(0, db_env.genesis.prepared_updates.new_realm_root);
             let proposal_backup_dir = tempfile::tempdir()?;
-            let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
+            let proposal_backup = Arc::new(
+                crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?,
+            );
             let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-                u64::from(TEST_CHAIN_ID),
+                TEST_CHAIN_ID,
                 &db_env.genesis_data,
                 Arc::clone(&db_env.file_system),
                 TEST_GUTA_BACKUP_DIR.to_string(),
@@ -356,7 +359,7 @@ pub(crate) mod startup_tests {
                 fingerprint_config(),
                 Arc::clone(&db_env.coordinator),
                 Arc::new(crate::test_common::TestZKVerifier {}),
-                proposal_backup,
+                Arc::clone(&proposal_backup),
                 None,
             )
             .await?;
@@ -373,7 +376,9 @@ pub(crate) mod startup_tests {
         }
 
         pub(crate) fn abort_gatherers(&self) {
-            if let Some(handle) = &self.processor.guta_gatherer_join { handle.abort(); }
+            if let Some(handle) = self.processor.guta_gatherer_join.as_ref() {
+                handle.abort();
+            }
         }
 
         /// The db-level processor from the underlying env, for seeding
@@ -430,10 +435,12 @@ pub(crate) mod startup_tests {
 
         // restart with the same database, checkpoint-tree backup file and
         // coordinator, as a real process restart would
-        let second_proposal_backup_dir = tempfile::tempdir()?;
-        let second_proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(second_proposal_backup_dir.path()).await?);
+        let proposal_backup_dir = tempfile::tempdir()?;
+        let proposal_backup = Arc::new(
+            crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?,
+        );
         let second_processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-            u64::from(TEST_CHAIN_ID),
+            TEST_CHAIN_ID,
             &genesis_data,
             file_system,
             TEST_GUTA_BACKUP_DIR.to_string(),
@@ -448,7 +455,7 @@ pub(crate) mod startup_tests {
             fingerprint_config(),
             coordinator,
             Arc::new(crate::test_common::TestZKVerifier {}),
-            second_proposal_backup,
+            Arc::clone(&proposal_backup),
             None,
         )
         .await?;

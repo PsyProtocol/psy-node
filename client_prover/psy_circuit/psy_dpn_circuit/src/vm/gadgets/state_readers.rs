@@ -403,12 +403,16 @@ pub struct CKWriteIMTCurrentContract {
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKReadIMTCurrentContract {
     pub key_targets: [u64; 4],
+    pub base_offset: u64,
+    pub capacity: u64,
     pub write_epoch: u32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKReadIMTContainsCurrentContract {
     pub key_targets: [u64; 4],
+    pub base_offset: u64,
+    pub capacity: u64,
     pub write_epoch: u32,
 }
 
@@ -619,11 +623,11 @@ impl StateCommandCacheKey {
             write_epoch,
         })
     }
-    pub fn new_read_imt_current_contract(key_targets: [u64; 4], write_epoch: u32) -> Self {
-        Self::ReadIMTCurrentContract(CKReadIMTCurrentContract { key_targets, write_epoch })
+    pub fn new_read_imt_current_contract(key_targets: [u64; 4], base_offset: u64, capacity: u64, write_epoch: u32) -> Self {
+        Self::ReadIMTCurrentContract(CKReadIMTCurrentContract { key_targets, base_offset, capacity, write_epoch })
     }
-    pub fn new_read_imt_contains_current_contract(key_targets: [u64; 4], write_epoch: u32) -> Self {
-        Self::ReadIMTContainsCurrentContract(CKReadIMTContainsCurrentContract { key_targets, write_epoch })
+    pub fn new_read_imt_contains_current_contract(key_targets: [u64; 4], base_offset: u64, capacity: u64, write_epoch: u32) -> Self {
+        Self::ReadIMTContainsCurrentContract(CKReadIMTContainsCurrentContract { key_targets, base_offset, capacity, write_epoch })
     }
     pub fn new_read_imt_self_user_external_contract(contract_target_id: u64, key_targets: [u64; 4], contract_call_epoch: u32) -> Self {
         Self::ReadIMTSelfUserExternalContract(CKReadIMTSelfUserExternalContract {
@@ -698,6 +702,21 @@ pub struct StateReaderGadget {
 }
 
 impl StateReaderGadget {
+    /// Pins a leaf index to one IMT map's slot range; also guards write indices,
+    /// so the name covers more than reads.
+    fn constrain_imt_read_index<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, index: Target, base_offset: Target, capacity: Target) {
+        builder.range_check(index, 32);
+        builder.range_check(base_offset, 34);
+        builder.range_check(capacity, 32);
+        let offset = builder.mul_const(F::from_canonical_u64(4), index);
+        let capacity_offset = builder.mul_const(F::from_canonical_u64(4), capacity);
+        let last_offset = builder.add(base_offset, capacity_offset);
+        let above_base = builder.is_less_than_or_equal(36, base_offset, offset);
+        let below_end = builder.is_less_than_or_equal(36, offset, last_offset);
+        let in_range = builder.and(above_base, below_end);
+        builder.assert_one(in_range.target);
+    }
+
     pub fn new(
         chain_state_roots: PsyCheckpointGlobalStateRootsGadget,
         user_contract_tree_state_root: HashOutTarget,
@@ -1886,6 +1905,40 @@ impl StateReaderGadget {
                 let sentinel_next_zero = builder.is_zero_hash(insert_predecessor_old_leaf.next_key);
                 let new_lt_sentinel_next = is_qhashout_lt::<F, D>(builder, insert_new_leaf.key, insert_predecessor_old_leaf.next_key);
                 let sentinel_ordering_ok = builder.or(sentinel_next_zero, new_lt_sentinel_next);
+                let base_offset = dpn.resolve_target(c.base_offset);
+                let capacity = dpn.resolve_target(c.capacity);
+                let zero = builder.zero();
+                let update_index = builder.select(condition_and_update, update_delta_proof.index, zero);
+                let update_base = builder.select(condition_and_update, base_offset, zero);
+                let update_capacity = builder.select(condition_and_update, capacity, zero);
+                // admits the sentinel slot because the zero-key guard below
+                // makes it unreachable as an update target
+                Self::constrain_imt_read_index(builder, update_index, update_base, update_capacity);
+                let key_is_zero = builder.is_zero_hash(key_target);
+                builder.connect_if_true(condition, key_is_zero.target, zero);
+                let active_base_offset = builder.select(condition_and_insert, base_offset, zero);
+                let active_capacity = builder.select(condition_and_insert, capacity, zero);
+                builder.range_check(active_base_offset, 34);
+                builder.range_check(active_capacity, 32);
+                let capacity_offset = builder.mul_const(F::from_canonical_u64(4), active_capacity);
+                let last_leaf_offset = builder.add(active_base_offset, capacity_offset);
+                let first_leaf_offset = builder.add_const(active_base_offset, F::from_canonical_u64(4));
+                builder.range_check(insert_predecessor_delta_proof.index, self.contract_state_tree_height);
+                builder.range_check(insert_new_leaf_delta_proof.index, self.contract_state_tree_height);
+                let predecessor_offset = builder.mul_const(F::from_canonical_u64(4), insert_predecessor_delta_proof.index);
+                let new_leaf_offset = builder.mul_const(F::from_canonical_u64(4), insert_new_leaf_delta_proof.index);
+                let virgin_predecessor = builder.and(condition_and_insert, pred_dmp_old_is_zero);
+                // Only this map's sentinel can supply a virgin predecessor.
+                builder.connect_if_true(virgin_predecessor, predecessor_offset, active_base_offset);
+                builder.connect_if_true(condition_and_insert_without_predecessor, predecessor_offset, active_base_offset);
+                let predecessor_above_base = builder.is_less_than_or_equal(36, active_base_offset, predecessor_offset);
+                let predecessor_below_end = builder.is_less_than_or_equal(36, predecessor_offset, last_leaf_offset);
+                let predecessor_in_range = builder.and(predecessor_above_base, predecessor_below_end);
+                builder.connect_if_true(condition_and_insert_with_predecessor, predecessor_in_range.target, one.target);
+                let new_leaf_above_base = builder.is_less_than_or_equal(36, first_leaf_offset, new_leaf_offset);
+                let new_leaf_below_end = builder.is_less_than_or_equal(36, new_leaf_offset, last_leaf_offset);
+                let new_leaf_in_range = builder.and(new_leaf_above_base, new_leaf_below_end);
+                builder.connect_if_true(condition_and_insert, new_leaf_in_range.target, one.target);
                 // When old_value != 0: verify hash(pred_old) == old_value
                 let cond_hash_check = builder.and(condition_and_insert, pred_dmp_old_not_zero);
                 builder.connect_hashes_if_true(cond_hash_check, insert_pred_old_hash, insert_predecessor_delta_proof.old_value);
@@ -1969,7 +2022,9 @@ impl StateReaderGadget {
                     let pred_lt_new = is_qhashout_lt::<F, D>(builder, insert_predecessor_old_leaf.key, insert_new_leaf.key);
                     let next_key_is_zero = builder.is_zero_hash(insert_predecessor_old_leaf.next_key);
                     let new_lt_next = is_qhashout_lt::<F, D>(builder, insert_new_leaf.key, insert_predecessor_old_leaf.next_key);
-                    let ordering_ok = builder.or(next_key_is_zero, new_lt_next);
+                    let next_index_is_zero = builder.is_zero(insert_predecessor_old_leaf.next_index);
+                    let is_last = builder.and(next_key_is_zero, next_index_is_zero);
+                    let ordering_ok = builder.or(is_last, new_lt_next);
                     builder.connect_if_true(condition_and_insert_with_predecessor, pred_lt_new.target, one.target);
                     builder.connect_if_true(condition_and_insert_with_predecessor, ordering_ok.target, one.target);
                 }
@@ -2027,12 +2082,8 @@ impl StateReaderGadget {
                         insert_predecessor_new_leaf.next_index,
                         insert_new_leaf_delta_proof.index,
                     );
-                    // 3. ordering: new_leaf.key < sentinel_old.next_key OR
-                    //    sentinel_old.next_key == 0
-                    // TEMP debug: disable the no-predecessor ordering assertion
-                    // while narrowing the 1 != 0 branch
-                    // conflict in first-insert IMT claim_deposit proving.
-                    // builder.connect_if_true(condition_and_insert_without_predecessor, sentinel_ordering_ok.target, one.target);
+                    // A sentinel insertion must precede the current minimum unless the map is empty.
+                    builder.connect_if_true(condition_and_insert_without_predecessor, sentinel_ordering_ok.target, one.target);
                 }
 
                 // State root multiplexing:
@@ -2076,11 +2127,12 @@ impl StateReaderGadget {
                 result
             }
             DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, self.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, c.base_offset, c.capacity, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&ck) {
                     existing_result.clone()
                 } else {
                     let merkle_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                    Self::constrain_imt_read_index(builder, merkle_proof.index, dpn.resolve_target(c.base_offset), dpn.resolve_target(c.capacity));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let query_key = HashOutTarget {
                         elements: [
@@ -2107,12 +2159,13 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, self.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, c.base_offset, c.capacity, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&ck) {
                     existing_result.clone()
                 } else {
                     let end_contract_state_root = self.end_contract_state_root;
                     let mp = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                    Self::constrain_imt_read_index(builder, mp.index, dpn.resolve_target(c.base_offset), dpn.resolve_target(c.capacity));
 
                     // Witnessed IMT leaf preimage and existence selector.
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
@@ -2141,12 +2194,12 @@ impl StateReaderGadget {
                     // Membership branch: leaf.key == query_key
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
 
-                    // Non-membership branch: leaf.key < query_key and (query_key < leaf.next_key ||
-                    // leaf.next_key == 0)
+                    // Non-membership requires a bracketing predecessor or a fully terminated tail.
                     let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
                     let next_key_zero = builder.is_zero_hash(leaf.next_key);
                     let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
-                    let next_ok = builder.or(next_key_zero, query_lt_next);
+                    let is_last = builder.and(next_key_zero, leaf_next_index_zero);
+                    let next_ok = builder.or(is_last, query_lt_next);
                     let non_member = builder.and(pred_lt_query, next_ok);
 
                     let one = builder._true();
@@ -2155,9 +2208,11 @@ impl StateReaderGadget {
                     let non_empty_case = builder.not(empty_non_member);
                     builder.connect_hashes_if_true(non_empty_case, leaf_hash, mp.value);
                     builder.connect_hashes_if_true(empty_non_member, mp.value, zero_hash);
+                    let slot_offset = builder.mul_const(F::from_canonical_u64(4), mp.index);
+                    builder.connect_if_true(empty_non_member, slot_offset, dpn.resolve_target(c.base_offset));
                     builder.connect_if_true(exists, key_eq.target, one.target);
-                    //                     //
-                    // builder.connect_if_true(not_exists, non_member.target, one.target);
+                    let non_empty_non_member = builder.and(not_exists, non_empty_case);
+                    builder.connect_if_true(non_empty_non_member, non_member.target, one.target);
 
                     builder.connect_hashes(mp.root, end_contract_state_root);
                     self.insert_imt_contains_gadget(ck, mp, leaf, exists.target);
@@ -2193,6 +2248,7 @@ impl StateReaderGadget {
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    Self::constrain_imt_read_index(builder, state_slot_proof.index, dpn.resolve_target(c.base_offset), dpn.resolve_target(c.capacity));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let query_key = HashOutTarget {
                         elements: [
@@ -2230,6 +2286,7 @@ impl StateReaderGadget {
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    Self::constrain_imt_read_index(builder, state_slot_proof.index, dpn.resolve_target(c.base_offset), dpn.resolve_target(c.capacity));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let query_key = HashOutTarget {
                         elements: [
@@ -2267,6 +2324,7 @@ impl StateReaderGadget {
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    Self::constrain_imt_read_index(builder, state_slot_proof.index, dpn.resolve_target(c.base_offset), dpn.resolve_target(c.capacity));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
                     let exists = builder.add_virtual_bool_target_safe();
 
@@ -2294,12 +2352,12 @@ impl StateReaderGadget {
                     // Membership branch: leaf.key == query_key
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
 
-                    // Non-membership branch: leaf.key < query_key && (query_key < leaf.next_key
-                    // || leaf.next_key == 0)
+                    // Non-membership requires a bracketing predecessor or a fully terminated tail.
                     let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
                     let next_key_zero = builder.is_zero_hash(leaf.next_key);
                     let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
-                    let next_ok = builder.or(next_key_zero, query_lt_next);
+                    let is_last = builder.and(next_key_zero, leaf_next_index_zero);
+                    let next_ok = builder.or(is_last, query_lt_next);
                     let non_member = builder.and(pred_lt_query, next_ok);
 
                     let one = builder._true();
@@ -2311,6 +2369,8 @@ impl StateReaderGadget {
                     // zero hash.
                     builder.connect_hashes_if_true(non_empty_case, leaf_hash, state_slot_proof.value);
                     builder.connect_hashes_if_true(empty_non_member, state_slot_proof.value, zero_hash);
+                    let slot_offset = builder.mul_const(F::from_canonical_u64(4), state_slot_proof.index);
+                    builder.connect_if_true(empty_non_member, slot_offset, dpn.resolve_target(c.base_offset));
                     // exists => leaf.key == query_key
                     builder.connect_if_true(exists, key_eq.target, one.target);
                     // (!exists && !leaf_is_empty) => predecessor bracketing holds
@@ -2361,6 +2421,10 @@ mod tests {
         state_cmd::data::{DPNStateCmd, DPNStateCmdSetIMTContractStateValue},
     };
 
+    use psy_client_data::models::user::contract_state_tree::UserContractStateTreeId;
+    use psy_crypto::{hash::merkle::core::MerkleProofCore, hash::traits::qhashable::QFieldHashable};
+    use psy_vm::dpn::ops::state_cmd::data::DPNStateCmdContainsSelfUserCurrentIMTContractStateValue;
+    use plonky2::{iop::generator::{CopyGenerator, SimpleGenerator, WitnessGeneratorRef}, util::serialization::{Buffer, Read, Write}};
     use super::*;
 
     const D: usize = 2;
@@ -2382,7 +2446,7 @@ mod tests {
     }
 
     fn new_test_dpn(builder: &mut CircuitBuilder<F, D>) -> SimpleDPNBuilder<F, D> {
-        SimpleDPNBuilder::new_with_contract_ctx(
+        let mut dpn = SimpleDPNBuilder::new_with_contract_ctx(
             Vec::new(),
             builder.zero(),
             builder.zero(),
@@ -2391,33 +2455,248 @@ mod tests {
             builder.zero(),
             dummy_hash(builder),
             dummy_hash(builder),
-        )
+        );
+        let base_offset = builder.zero();
+        let capacity = builder.constant(F::from_canonical_u64(3));
+        dpn.push_external_target(1000, base_offset);
+        dpn.push_external_target(1001, capacity);
+        dpn
+    }
+    fn prove_imt_absence(query: QHashOut<F>, leaf: IMTContractStateLeaf<F>, mp: MerkleProofCore<QHashOut<F>>, base_slot: u64) -> anyhow::Result<()> {
+        prove_imt_read(query, leaf, mp, base_slot, false, false)
+    }
+
+    fn prove_imt_read(query: QHashOut<F>, leaf: IMTContractStateLeaf<F>, mp: MerkleProofCore<QHashOut<F>>, base_slot: u64, get: bool, alias: bool) -> anyhow::Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut dpn = new_test_dpn(&mut builder);
+        let base_offset = builder.constant(F::from_canonical_u64(base_slot * 4));
+        dpn.push_external_target(0, base_offset);
+        let query_targets: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+        for (i, target) in query_targets.into_iter().enumerate() {
+            dpn.push_external_target(i + 1, target);
+        }
+        let root = builder.constant_hash(mp.root.0);
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut reader = StateReaderGadget::new(roots, zero_hash, zero_hash, root, TEST_TREE_HEIGHT, zero_hash, TEST_TREE_HEIGHT, false, stats, zero_hash);
+        let cmd = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue {
+            base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+            capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
+            key: core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i + 1)),
+        });
+        let cmd = if get {
+            DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(psy_vm::dpn::ops::state_cmd::data::DPNStateCmdGetSelfUserCurrentIMTContractStateValue {
+                base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
+                key: core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i + 1)),
+            })
+        } else { cmd };
+        reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        let mut data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (target, value) in query_targets.into_iter().zip(query.0.elements) {
+            pw.set_target(target, value)?;
+        }
+        if alias {
+            let mut replacements = 0;
+            for generator in &mut data.prover_only.generators {
+                if generator.0.id() != "LowHighGenerator" { continue; }
+                let mut bytes = Vec::new();
+                generator.0.serialize(&mut bytes, &data.common).unwrap();
+                let mut buffer = Buffer::new(&bytes);
+                let integer = buffer.read_target().unwrap();
+                let bits = buffer.read_usize().unwrap();
+                let low = buffer.read_target().unwrap();
+                let high = buffer.read_target().unwrap();
+                if integer != query_targets[0] || bits != 32 { continue; }
+                pw.set_target(low, query.0.elements[0] + F::ONE)?;
+                pw.set_target(high, F::from_canonical_u64(u32::MAX as u64))?;
+                let mut copy = Vec::new();
+                copy.write_target(low).unwrap();
+                copy.write_target(low).unwrap();
+                let replacement = <CopyGenerator as SimpleGenerator<F, D>>::deserialize(&mut Buffer::new(&copy), &data.common).unwrap();
+                *generator = WitnessGeneratorRef::new(replacement.adapter());
+                replacements += 1;
+            }
+            assert!(replacements > 0);
+        }
+        if get {
+            reader.imt_read_requests[0].leaf.set_witness(&mut pw, &leaf)?;
+            reader.imt_read_requests[0].merkle_proof.set_witness_core_proof_q(&mut pw, &mp)?;
+        } else {
+            pw.set_target(reader.imt_contains_exists_targets[0], F::ZERO)?;
+            reader.imt_contains_leaf_requests[0].set_witness(&mut pw, &leaf)?;
+            reader.imt_contains_proofs[0].set_witness_core_proof_q(&mut pw, &mp)?;
+        }
+        data.verify(data.prove(pw)?)
     }
 
     #[test]
-    fn state_reader_imt_set_first_insert_proves() {
+    fn state_reader_imt_contains_aliased_query_rejected() {
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        for key in [10, 20] {
+            let key = QHashOut::from_values(key, 0, 0, 0);
+            imt.insert(&store, key, key).unwrap();
+        }
+        let tail = imt.get_membership_proof(&store, &QHashOut::from_values(20, 0, 0, 0)).unwrap();
+        assert!(prove_imt_read(QHashOut::from_values(10, 0, 0, 0), tail.leaf, tail.merkle_proof, 0, false, true).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_foreign_map_reads_rejected() {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        let leaf = IMTContractStateLeaf::new(key, key, QHashOut::ZERO, F::ZERO);
+        tree.set_leaf_ucs(&store, 100, 5, leaf.qfhash::<PoseidonHash>()).unwrap();
+        let mp = tree.get_leaf_ucs(&store, 100, 5).unwrap();
+        let get_rejected = prove_imt_read(key, leaf, mp.clone(), 0, true, false).is_err();
+        let contains_rejected = prove_imt_absence(QHashOut::from_values(20, 0, 0, 0), leaf, mp, 0).is_err();
+        assert!(get_rejected && contains_rejected, "get_rejected={get_rejected}, contains_rejected={contains_rejected}");
+    }
+
+    #[test]
+    fn state_reader_imt_two_maps_same_key_prove() {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        let leaves = [11, 22].map(|value| IMTContractStateLeaf::new(key, QHashOut::from_values(value, 0, 0, 0), QHashOut::ZERO, F::ZERO));
+        for (index, leaf) in [1, 5].into_iter().zip(leaves) {
+            tree.set_leaf_ucs(&store, 100, index, leaf.qfhash::<PoseidonHash>()).unwrap();
+        }
+        let proofs = [1, 5].map(|index| tree.get_leaf_ucs(&store, 100, index).unwrap());
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut dpn = new_test_dpn(&mut builder);
+        for (i, value) in key.0.elements.into_iter().enumerate() {
+            let target = builder.constant(value);
+            dpn.push_external_target(i, target);
+        }
+        let second_base = builder.constant(F::from_canonical_u64(16));
+        dpn.push_external_target(1002, second_base);
+        let root = builder.constant_hash(proofs[0].root.0);
+        let zero = builder.constant_hash(HashOut::ZERO);
+        let stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut reader = StateReaderGadget::new(roots, zero, zero, root, TEST_TREE_HEIGHT, zero, TEST_TREE_HEIGHT, false, stats, zero);
+        for base in [1000, 1002] {
+            let key = core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i));
+            let base_offset = encode_indexed_op_id(DPNBuiltInDataType::Target, base);
+            let capacity = encode_indexed_op_id(DPNBuiltInDataType::Target, 1001);
+            let cmd = DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(psy_vm::dpn::ops::state_cmd::data::DPNStateCmdGetSelfUserCurrentIMTContractStateValue { base_offset, capacity, key });
+            let value = reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+            builder.register_public_inputs(&value);
+            let cmd = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue { base_offset, capacity, key });
+            reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        }
+        assert_eq!(reader.imt_read_requests.len(), 2);
+        assert_eq!(reader.imt_contains_proofs.len(), 2);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for i in 0..2 {
+            reader.imt_read_requests[i].leaf.set_witness(&mut pw, &leaves[i]).unwrap();
+            reader.imt_read_requests[i].merkle_proof.set_witness_core_proof_q(&mut pw, &proofs[i]).unwrap();
+            reader.imt_contains_leaf_requests[i].set_witness(&mut pw, &leaves[i]).unwrap();
+            reader.imt_contains_proofs[i].set_witness_core_proof_q(&mut pw, &proofs[i]).unwrap();
+            pw.set_target(reader.imt_contains_exists_targets[i], F::ONE).unwrap();
+        }
+        let proof = data.prove(pw).unwrap();
+        assert_eq!(proof.public_inputs[0], F::from_canonical_u64(11));
+        assert_eq!(proof.public_inputs[4], F::from_canonical_u64(22));
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_contains_membership_cannot_claim_absence() {
         let store = Store::new();
         let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
         let key = QHashOut::from_values(10, 0, 0, 0);
-        let value = QHashOut::from_values(100, 200, 300, 400);
+        imt.insert(&store, key, key).unwrap();
+        let proof = imt.get_membership_proof(&store, &key).unwrap();
+        assert!(prove_imt_absence(key, proof.leaf, proof.merkle_proof, 0).is_err());
+    }
 
-        let update = imt.insert(&store, key, value).unwrap();
-        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
-            IMTContractStateUpdate::Insert {
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            } => (
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            ),
-            _ => panic!("expected insert"),
-        };
+    #[test]
+    fn state_reader_imt_contains_bracketing_absence_proves() {
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        for key in [10, 30] {
+            let key = QHashOut::from_values(key, 0, 0, 0);
+            imt.insert(&store, key, key).unwrap();
+        }
+        let key = QHashOut::from_values(20, 0, 0, 0);
+        let (index, leaf) = imt.find_predecessor(&key).unwrap();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        prove_imt_absence(key, leaf, tree.get_leaf_ucs(&store, 100, index).unwrap(), 0).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_contains_wrong_empty_slot_rejected() {
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        imt.insert(&store, key, key).unwrap();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let mp = tree.get_leaf_ucs(&store, 100, 2).unwrap();
+        assert_eq!(mp.value, QHashOut::ZERO);
+        assert!(prove_imt_absence(key, IMTContractStateLeaf::default(), mp, 0).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_contains_virgin_base_slot_proves() {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        for key in [0, 10] {
+            let mp = tree.get_leaf_ucs(&store, 100, 3).unwrap();
+            assert_eq!(mp.value, QHashOut::ZERO);
+            prove_imt_absence(QHashOut::from_values(key, 0, 0, 0), IMTContractStateLeaf::default(), mp, 3).unwrap();
+        }
+    }
+
+    fn prove_imt_sentinel_insert(next_key: u64, has_predecessor: bool, predecessor_index: u64, new_index: u64, virgin: bool) -> anyhow::Result<()> {
+        prove_imt_insert_key(QHashOut::from_values(10, 0, 0, 0), next_key, has_predecessor, predecessor_index, new_index, virgin)
+    }
+
+    fn prove_imt_insert_key(key: QHashOut<F>, next_key: u64, has_predecessor: bool, predecessor_index: u64, new_index: u64, virgin: bool) -> anyhow::Result<()> {
+        prove_imt_write_key(key, next_key, has_predecessor, predecessor_index, new_index, virgin, false)
+    }
+
+    fn prove_imt_write_key(key: QHashOut<F>, next_key: u64, has_predecessor: bool, predecessor_index: u64, new_index: u64, virgin: bool, update: bool) -> anyhow::Result<()> {
+        prove_imt_write_predecessor(key, next_key, has_predecessor, predecessor_index, new_index, virgin, update, false)
+    }
+
+    fn prove_imt_write_predecessor(key: QHashOut<F>, next_key: u64, has_predecessor: bool, predecessor_index: u64, new_index: u64, virgin: bool, update: bool, malformed_tail: bool) -> anyhow::Result<()> {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let value = QHashOut::from_values(100, 200, 300, 400);
+        let mut predecessor_old_leaf = IMTContractStateLeaf::default();
+        if next_key != 0 {
+            predecessor_old_leaf.next_key = QHashOut::from_values(next_key, 0, 0, 0);
+            predecessor_old_leaf.next_index = F::ONE;
+            let old_minimum = IMTContractStateLeaf::new(predecessor_old_leaf.next_key, value, QHashOut::ZERO, F::ZERO);
+            tree.set_leaf_ucs(&store, 100, 1, old_minimum.qfhash::<PoseidonHash>()).unwrap();
+            tree.set_leaf_ucs(&store, 100, predecessor_index, predecessor_old_leaf.qfhash::<PoseidonHash>()).unwrap();
+        }
+        if malformed_tail {
+            predecessor_old_leaf.next_index = F::ONE;
+            tree.set_leaf_ucs(&store, 100, predecessor_index, predecessor_old_leaf.qfhash::<PoseidonHash>()).unwrap();
+        }
+        if virgin {
+            let sentinel = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::ZERO, key, F::ONE);
+            tree.set_leaf_ucs(&store, 100, 0, sentinel.qfhash::<PoseidonHash>()).unwrap();
+            let existing = IMTContractStateLeaf::new(key, value, QHashOut::ZERO, F::ZERO);
+            tree.set_leaf_ucs(&store, 100, 1, existing.qfhash::<PoseidonHash>()).unwrap();
+            predecessor_old_leaf = IMTContractStateLeaf::default();
+        }
+        let new_leaf = IMTContractStateLeaf::new(key, value, predecessor_old_leaf.next_key, predecessor_old_leaf.next_index);
+        let predecessor_new_leaf = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::ZERO, key, F::from_canonical_u64(new_index));
+        let predecessor_delta_proof = tree.set_leaf_ucs(&store, 100, predecessor_index, predecessor_new_leaf.qfhash::<PoseidonHash>()).unwrap();
+        let new_leaf_delta_proof = tree.set_leaf_ucs(&store, 100, new_index, new_leaf.qfhash::<PoseidonHash>()).unwrap();
+        let update_old_leaf = IMTContractStateLeaf::new(key, QHashOut::ZERO, QHashOut::ZERO, F::ZERO);
+        let update_new_leaf = IMTContractStateLeaf::new(key, value, QHashOut::ZERO, F::ZERO);
+        tree.set_leaf_ucs(&store, 101, predecessor_index, update_old_leaf.qfhash::<PoseidonHash>()).unwrap();
+        let update_proof = tree.set_leaf_ucs(&store, 101, predecessor_index, update_new_leaf.qfhash::<PoseidonHash>()).unwrap();
 
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -2434,7 +2713,7 @@ mod tests {
             dpn.push_external_target(i + 5, target);
         }
 
-        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
+        let start_root = builder.constant_hash(if update { update_proof.old_root.0 } else { predecessor_delta_proof.old_root.0 });
         let zero_hash = builder.constant_hash(HashOut::ZERO);
         let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
         let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
@@ -2455,8 +2734,8 @@ mod tests {
 
         let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
             condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
-            base_offset: 0,
-            capacity: 0,
+            base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 1000),
+            capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
             key: [
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 2),
@@ -2486,13 +2765,13 @@ mod tests {
         }
 
         let gadget = &state_reader.imt_set_requests[0];
-        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
-        pw.set_target(gadget.insert_has_predecessor.target, F::ONE).unwrap();
-        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
-        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        pw.set_bool_target(gadget.is_insert, !update).unwrap();
+        pw.set_bool_target(gadget.insert_has_predecessor, has_predecessor).unwrap();
+        gadget.update_old_leaf.set_witness(&mut pw, &if update { update_old_leaf } else { IMTContractStateLeaf::default() }).unwrap();
+        gadget.update_new_leaf.set_witness(&mut pw, &if update { update_new_leaf } else { new_leaf }).unwrap();
         gadget
             .update_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .set_witness_core_proof_q(&mut pw, if update { &update_proof } else { &predecessor_delta_proof })
             .unwrap();
         gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
         gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
@@ -2506,11 +2785,101 @@ mod tests {
             .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
             .unwrap();
 
-        let proof = data.prove(pw).expect("state reader IMT first insert should prove");
-        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
+        let proof = data.prove(pw)?;
+        assert_eq!(proof.public_inputs[0], if update { update_proof.new_root.0.elements[0] } else { new_leaf_delta_proof.new_root.0.elements[0] });
         assert_eq!(proof.public_inputs[4], F::ZERO);
         assert_eq!(proof.public_inputs[8], new_leaf.value.0.elements[0]);
-        data.verify(proof).expect("state reader IMT first insert should verify");
+        data.verify(proof)
+    }
+
+    #[test]
+    fn state_reader_imt_zero_key_update_rejected() {
+        assert!(prove_imt_write_key(QHashOut::ZERO, 0, false, 0, 2, false, true).is_err());
+        prove_imt_write_key(QHashOut::from_values(10, 0, 0, 0), 0, false, 0, 2, false, true).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_malformed_insert_tail_rejected() {
+        assert!(prove_imt_write_predecessor(QHashOut::from_values(10, 0, 0, 0), 0, true, 0, 2, false, false, true).is_err());
+        prove_imt_write_predecessor(QHashOut::from_values(10, 0, 0, 0), 0, true, 0, 2, false, false, false).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_foreign_map_update_rejected() {
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        assert!(prove_imt_write_key(key, 0, false, 5, 2, false, true).is_err());
+        prove_imt_write_key(key, 0, false, 3, 2, false, true).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_set_first_insert_proves() {
+        prove_imt_sentinel_insert(0, false, 0, 2, false).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_set_new_minimum_proves() {
+        prove_imt_sentinel_insert(20, false, 0, 2, false).unwrap();
+    }
+
+    #[test]
+    fn state_reader_imt_set_unordered_sentinel_insert_rejected() {
+        assert!(prove_imt_sentinel_insert(5, false, 0, 2, false).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_delta_index_alias_rejected() {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let mut mp = tree.set_leaf_ucs(&store, 100, 2, QHashOut::ZERO).unwrap();
+        mp.index = 0xbfffffff40000003;
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let gadget = DeltaMerkleProofGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, TEST_TREE_HEIGHT);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        gadget.set_witness_core_proof_q(&mut pw, &mp).unwrap();
+        assert!(data.prove(pw).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_zero_key_rejected() {
+        assert!(prove_imt_insert_key(QHashOut::ZERO, 0, false, 0, 2, false).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_contains_malformed_tail_rejected() {
+        let store = Store::new();
+        let tree = UserContractStateTreeId::<Store, F, PoseidonHash>::new(1, 1, TEST_TREE_HEIGHT as u8);
+        let leaf = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::ZERO, QHashOut::ZERO, F::ONE);
+        tree.set_leaf_ucs(&store, 100, 0, leaf.qfhash::<PoseidonHash>()).unwrap();
+        let mp = tree.get_leaf_ucs(&store, 100, 0).unwrap();
+        assert!(prove_imt_absence(QHashOut::from_values(10, 0, 0, 0), leaf, mp, 0).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_virgin_decoy_rejected() {
+        assert!(prove_imt_sentinel_insert(0, false, 2, 3, true).is_err());
+        assert!(prove_imt_sentinel_insert(0, true, 2, 3, true).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_wrong_written_sentinel_rejected() {
+        assert!(prove_imt_sentinel_insert(20, false, 2, 3, false).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_out_of_range_predecessor_rejected() {
+        assert!(prove_imt_sentinel_insert(20, true, 4, 2, false).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_out_of_range_new_leaf_rejected() {
+        assert!(prove_imt_sentinel_insert(20, true, 0, 4, false).is_err());
+        assert!(prove_imt_sentinel_insert(0, false, 0, 4, false).is_err());
+    }
+
+    #[test]
+    fn state_reader_imt_set_written_sentinel_predecessor_proves() {
+        prove_imt_sentinel_insert(20, true, 0, 3, false).unwrap();
     }
 
     #[test]
@@ -2666,8 +3035,8 @@ mod tests {
 
         let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
             condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
-            base_offset: 0,
-            capacity: 0,
+            base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 1000),
+            capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
             key: [
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 200),
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 201),
@@ -2912,8 +3281,8 @@ mod tests {
 
         let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
             condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
-            base_offset: 0,
-            capacity: 0,
+            base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 1000),
+            capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
             key: [
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 220),
                 encode_indexed_op_id(DPNBuiltInDataType::Target, 221),

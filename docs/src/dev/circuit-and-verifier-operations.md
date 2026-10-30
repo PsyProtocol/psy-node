@@ -2,11 +2,13 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-20. Status: Review.
+> Updated: 2026-10-28. Status: Review.
 
 ## Overview
 
-This runbook is the release procedure for EndCap verifier metadata generated and completely validated only with `PSY_NETWORK=localhost`, Plonky2 caches, real peer-to-peer transaction acceptance, cross-repository delivery, and the four independent Bridge Groth16 cohorts. `config_gen_v2` is hardcoded to local-devnet constants, while every network enum arm currently reads one shared verifier JSON. Replacing that JSON is therefore a global runtime verifier mutation generated and validated only against localhost; non-local operation must fail closed until source implements and validates distinct per-network verifier metadata selection. Bridge publication is a separate, explicitly authorized operation: package offline, hash the twelve uncompressed files and four full compressed objects in a sixteen-entry version-1 manifest, upload the two single objects and required parts first, read them back and validate them, then upload the manifest last.
+This runbook is the release procedure for EndCap verifier metadata generated and completely validated only with `PSY_NETWORK=localhost`, Plonky2 caches, real peer-to-peer transaction acceptance, cross-repository delivery, and the four independent Bridge Groth16 cohorts. `config_gen_v2` is hardcoded to local-devnet constants. The verifier selector returns the checked-in metadata only for `LocalDevnet`; every non-local arm fails closed with an error. Replacing that JSON changes only the localhost runtime path; every non-local arm returns an error, and distinct per-network verifier metadata is not implemented. Localhost generation is not evidence for another network. Bridge publication is a separate, explicitly authorized operation: package offline, hash the twelve uncompressed files and four full compressed objects in a sixteen-entry version-1 manifest, upload the two single objects and required parts first, read them back and validate them, then upload the manifest last.
+
+A local restart is not part of that release flow. [Section 16](#16-pre-restart-gate) is mandatory before `make restart` or `make run-all`. Changing a fingerprint pin is not permission to restart or to treat the constant as a measurement. Regenerate trusted setup only when section 3 selects that cohort.
 
 ## Background
 
@@ -32,6 +34,7 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 - [13. File Impact](#13-file-impact)
 - [14. Rationale](#14-rationale)
 - [15. Security Considerations](#15-security-considerations)
+- [16. Pre-Restart Gate](#16-pre-restart-gate)
 
 ## Terminology
 
@@ -57,8 +60,8 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 
 1. Run node commands from `<repo-root>`, sibling commands from `<workspace>/<repo>`, local keystore commands against `<home>/.psy/keystore`, and disposable operations under `<tmp>`. Repository documentation must not contain workstation paths.
 2. Current Audit source is the governing reference. Relevant release policy and repository topology are at `AGENTS.md:75-93,95-137`.
-3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, display fingerprint, exact `[u64; 4]`, verifier JSON, and the separate `zk_fingerprint` and `secp_fingerprint` lines (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:26-35`). The EndCap fingerprint constant is localhost-specific, but the checked-in real verifier JSON is shared by every network selector arm.
-4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes runtime verifier input for all eight networks, even though current generation and cache validation cover only LocalDevnet. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,448-449`), while the verifier selector maps every network enum arm to the same JSON constant (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`). Block all non-local use of the changed blob until a reviewed implementation selects and validates distinct per-network verifier metadata throughout the CLI, cache generator, checked-in verifier data, and network constants.
+3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, display fingerprint, exact `[u64; 4]`, verifier JSON, and the separate zk, secp, eth-personal, and multisig display/limb lines (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:26-47`). The EndCap fingerprint constant is localhost-specific. The checked-in real verifier JSON is selected only for `LocalDevnet`; every other network selector arm returns an error.
+4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes the localhost runtime verifier input. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,448-449`), and the verifier selector returns that JSON only for `LocalDevnet` while every non-local arm fails closed (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-37`). Distinct per-network verifier metadata remains unimplemented; localhost validation is not evidence for another network.
 5. Generation, repository delivery, artifact upload, package publication, contract deployment, and Git push are separate actions. Authorization for one does not authorize another (`AGENTS.md:59-70`).
 
 ## 2. Dependency Model
@@ -130,9 +133,21 @@ psy-contracts/src/
 └── RewardClaimVerifier.sol
 ```
 
-With no cohort flags, `regenerate-groth16-keystore` regenerates `bridge_agg`, `deposit_append`, `withdrawal_claim`, and `reward_claim`. `--skip-bridge-agg`, `--skip-deposit-append`, `--skip-withdrawal-claim`, and `--skip-reward-claim` omit one cohort each (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:105-139`). Each selected directory owns exactly `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:95,777-783`). All four verifier exports write the nested `./psy-contracts/src` checkout used by the launcher.
+With no cohort flags, `regenerate-groth16-keystore` regenerates `bridge_agg`, `deposit_append`, `withdrawal_claim`, and `reward_claim`. `--skip-bridge-agg`, `--skip-deposit-append`, `--skip-withdrawal-claim`, and `--skip-reward-claim` omit one cohort each (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:105-139`). Each selected directory owns exactly `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:95,777-783`). All four verifier exports write the `psy-contracts` checkout used by the launcher — the sibling repository next to `psy-node` (Make `CONTRACTS_DIR` resolves the sibling first and falls back to the legacy nested `./psy-contracts`).
 
-The reward cohort changes when `RewardClaimWrapCircuit` changes its public commitment. The wrapper exports 256 bits of the full token-domain message's Keccak commitment, and the generic gnark path keccak-hashes those bits exactly as it does for deposit and withdrawal, binding the result as two 128-bit halves. `PsyToken.claimReward` computes the identical double hash, matching the deposit/withdrawal cohorts (`psy_plonky2_circuits/src/bridge/circuits/reward_claim_wrap.rs:207-221`; `psy-contracts/src/PsyToken.sol:104-121`). The checkpoint aggregate remains 147 fields at capacity 64. This invalidates only the reward setup and `RewardClaimVerifier.sol`, not the other three cohorts.
+The reward cohort changes when `RewardClaimWrapCircuit` changes its public commitment. The wrapper exports 256 bits of the full token-domain message's Keccak commitment, and the generic gnark path keccak-hashes those bits and binds the result as two 128-bit halves. `PsyToken.claimReward` computes the identical double hash (`psy_plonky2_circuits/src/bridge/circuits/reward_claim_wrap.rs:207-221`; `psy-contracts/src/PsyToken.sol:106-123`). That double hash matches the deposit cohort, whose EVM public-inputs hash is `keccak256(abi.encodePacked(keccak256(buf)))` (`<workspace>/psy-contracts/src/Bridge.sol:1159-1171`), but not the withdrawal cohort: its EVM public-inputs binding is a single Keccak of the 72-byte packed 18-word buffer (`<workspace>/psy-contracts/src/Bridge.sol:1068-1085`), with the wrapper registering the words as 32-bit limbs for that single hash (`psy_plonky2_circuits/src/bridge/circuits/bridge_wrap.rs:381-404`). The checkpoint aggregate remains 147 fields at capacity 64. This invalidates only the reward setup and `RewardClaimVerifier.sol`, not the other three cohorts.
+
+### 2.4 Crate entry-point map
+
+| Crate entry | Verified dependent consumers | Trigger / generation step |
+|---|---|---|
+| COMMON `psy_plonky2_common_circuits`: generic gadgets plus the inner deposit/withdrawal batch circuits (`src/bridge/deposit_batch_append_circuit.rs:243`, `withdrawal_batch_claim_circuit.rs:67`); no dependency on any other circuit-family crate (local deps `psy_plonky2_common_circuits/Cargo.toml:38-43`) | `psy_plonky2_circuits` (`psy_plonky2_circuits/Cargo.toml:45`), `psy_common_circuit` (`client_prover/psy_circuit/psy_common_circuit/Cargo.toml:27`), `psy_dpn_circuit` (`psy_dpn_circuit/Cargo.toml:31`), `psy_prover` (`client_prover/psy_prover/Cargo.toml:36`), `psy_relayer_cli` (`psy_cli/psy_relayer_cli/Cargo.toml:47`), `guardian_common` (`psy_cli/guardian_common/Cargo.toml:22`), `psy_plonky2_proof` (`psy_plonky2_proof/Cargo.toml:41`; not a root workspace member); `psy_ups_circuit`/`psy_network_circuit` consume it transitively through `psy_common_circuit` | Per-consumer impact only: GUTA/coordinator shape → §3.1; inner batch circuit → §3.2 and the §9.2 cohort commands |
+| NETWORK `psy_network_circuit`: owns `UPSStandardEndCapCircuit` (`src/ups/circuits/end_cap.rs:28`) and other network circuits | `psy_ups_circuit` (`psy_ups_circuit/Cargo.toml:28`; constructor call `circuit_manager/core.rs:130`), `psy_dpn_circuit` (`:27`), `psy_plonky2_circuits` (`psy_plonky2_circuits/Cargo.toml:54`), `psy_prover` (`:26`), `psy_provider` (`psy_provider/Cargo.toml:27`) | EndCap constraints → §3.1 row 1 (EndCap metadata §4, caches §5); other network circuits → §3.1 by actual constructed-circuit change. Coordinator/GUTA circuits are not here; they live in `psy_plonky2_circuits` |
+| UPS `psy_ups_circuit`: `PsyUPSStepCircuitManager::new_with_config` builds the real EndCap from the real UPS set (`circuit_manager/core.rs:97,130`) | `psy_plonky2_circuits` (`Cargo.toml:56,71`), `psy_prover` (`:32`), `psy_user_cli` (`psy_cli/psy_user_cli/Cargo.toml:17`), `psy_cli_common` (`psy_cli/psy_cli_common/Cargo.toml:15`), `psy_dev_cli` (`psy_cli/psy_dev_cli/Cargo.toml:86`), `psy_relayer_cli` (`:61`) | §3.1 EndCap metadata plus cache pair; Genesis only when a §6.1 input changed |
+| Bridge `psy_plonky2_circuits/src/bridge`: wrappers `DepositBatchWrapCircuit`/`WithdrawalClaimWrapCircuit` (`bridge/circuits/bridge_wrap.rs:262,361`) and `RewardClaimWrapCircuit` (`reward_claim_wrap.rs:68`) wrap the COMMON inner circuits | Setup owner `psy_relayer_cli` (`Cargo.toml:46`, `gnark-wrap`); deployment consumers per §8.1 | Four independent cohorts, reward independent: §3.2 selects, §9.2 commands, §9.1 reward cut-over |
+| DPN `psy_dpn_circuit`: function-VM circuits and privacy circuits `PrivateNoteInclusionCircuit` (`src/circuits/privacy/private_note_inclusion.rs:237`), `DepositInclusionCircuit` (`deposit_inclusion.rs:212`) | `psy_ups_circuit` (`Cargo.toml:29`), `psy_prover` (`:27`), `psy_user_cli` (`:16`), `psy-mcp-server` (`client_prover/psy_mcp_server/Cargo.toml:23`) | The two burned privacy fingerprints: §3.3 plus [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md); wallet bundle §6.2; function-VM changes per §3.1 actual impact |
+
+Any row whose constructed circuit changed recompiles node/compiler/SDK/services from one source revision as one cohort (§8.2). The token-precompile constants update only when a burned constant changes (§3.3). Genesis runs only when a §6.1 input changed; no row in this table alone forces Genesis or trusted setup.
 
 ## 3. Trigger Matrices
 
@@ -142,17 +157,22 @@ The reward cohort changes when `RewardClaimWrapCircuit` changes its public commi
 |---|---:|---:|---:|---:|
 | UPS or EndCap constraints, gates, ordered PI, whitelist inputs, minifier, verifier shape, or `PSY_NETWORK_MAGIC` supplied to the EndCap constructor | Yes | Yes | No | No unless an embedded bundle circuit also changed |
 | EndCap verifier JSON or fingerprint correction | Re-derive and promote as one set | Yes | No | No |
+| Runtime Realm validator membership selected by `PSY_CONFIG_PATH` | No unless an EndCap input changed | Yes; validator count is a cache input | No | No |
 | GUTA or coordinator constraints, verifier shape, ordered PI, registered circuit triplet, common data, or library composition | No unless EndCap changed | Yes | No | No |
 | P2P/storage `chain_id` migration that changes RealmFinalizeGUTA `H(chain_id)` while the EndCap constructor magic stays unchanged | No | Yes; also regenerate `bridge_agg` under §3.2 | No | No |
+| `checkpoints_per_epoch` or RealmFinalizeGUTA rotation constants change, including the active validator count used by the rotation schedule | No | Yes; regenerate and stabilize per §5.1/§5.3. Measure the constructed circuit 63; do not echo a fingerprint constant. Cascade: circuit 63 → GUTA whitelist → circuit 40 → circuit 32 → `bridge_agg`; common-data bytes may stay identical, so compare rather than assume. Also regenerate the `bridge_agg` cohort per §9.2 | No | No |
 | Cache encoding or serialization with identical reconstructed circuits | No | Yes | No | No |
 | Ordinary EndCap, GUTA, cache, verifier, transport, witness, logging, retry, or storage change | No extra action | As rows above | No | No |
+| Realm or Coordinator block-scheduling cadence constants only (4.5 s / 8.5 s processing windows) | No | No | No | No |
 | `psy-genesis/genesis_contracts.json` content changes | Apply separate Genesis trigger | Only if circuit inputs changed | Yes | Yes only if embedded bundle circuit sources/version/heights changed |
 | Genesis setup constants used by `local_devnet.rs` change | No unless EndCap input changed | Only if network circuits changed | Yes | Yes only if embedded bundle circuit sources/version/heights changed |
 | Serialized `genesis.json` format or serializer changes | No | No unless network circuits changed | Yes | No |
 | Adopted `psy-genesis` gitlink changes to Genesis inputs | No unless EndCap input changed | Only if network circuits changed | Yes | Yes only if embedded bundle circuit sources/version/heights changed |
 | Embedded zk-sign, private-note-inclusion, or shield-deposit-claim circuit source, serialization version, or circuit-defining height changes | No unless EndCap input changed | Only if network library changed | No | Yes |
 
-A transport-only or DTO-only field is a non-trigger only while constraints, ordered PI count and meaning, verifier data, fingerprints, common data, cap heights, and tree heights remain identical.
+Epoch/rotation impact is a circuit-63 change, not a withdrawal change. The epoch and validator list enter `RealmFinalizeGUTACircuit` through `psy_plonky2_circuits/src/guta/guta_helper.rs:232-291` and `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs:309-352,379-395,743-754`; the changed fingerprint is a leaf of the GUTA whitelist. The root is embedded by circuit 40 (`psy_plonky2_circuits/src/coordinator/gadgets/verify_agg_user_registration_deploy_guta.rs:226-227`), and circuit 32 embeds circuit 40's fingerprint (`psy_plonky2_circuits/src/coordinator/coordinator_helper.rs:200-226`). `bridge_agg` embeds the checkpoint fingerprint (`psy_plonky2_circuits/src/bridge/circuits/bridge_agg_final.rs:181,217-218`). Regenerate the cache pair with §5.1 and require §5.3; the writer replaces only `psy_plonky2_circuits/src/generated/cached_circuit_library.rs` and `psy_plonky2_circuits/src/generated/cached_common_data.rs` (`psy_plonky2_circuits/examples/config_gen_v2.rs:448-474`). Common-data bytes may be identical; compare actual output instead of assuming a change. For `bridge_agg`, regenerate only that Groth16 cohort with §9.2 and require its three files `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` under `<home>/.psy/keystore` plus `<workspace>/psy-contracts/src/GnarkGroth16Verifier.sol`; cohort selection is at `psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:123-139`. Epoch alone does not trigger EndCap metadata (§4), the wallet bundle (§6.2), root `genesis.json` (§6.1), or `withdrawal_claim`. The separate 35-word withdrawal cutover owns its own `withdrawal_claim/` cohort and `<workspace>/psy-contracts/src/WithdrawalClaimVerifier.sol` (paragraph above); do not mix it with this row.
+
+A transport-only or DTO-only field is a non-trigger only while constraints, ordered PI count and meaning, verifier data, fingerprints, common data, cap heights, and tree heights remain identical. A runtime scheduling-only change is a non-trigger for EndCap metadata, caches, trusted setup, and Genesis: the 4.5 s realm and 8.5 s coordinator processing cadences are wall-clock loops (`current_slot % 45 == 0` at `psy_node_common/src/realm/processor/core/runner.rs:99`; `current_slot % 85 == 0` at `psy_node_common/src/coordinator/processor/core/runner.rs:62`) that feed no circuit input, unless another §3.1 or §3.2 input also changed.
 
 The PSY chain-identity migration replaces former `u32` chain IDs with the per-network `u64` magic from `psy-genesis/config.json` (`PSY_CONFIG_PATH` selects the same build-time override as client_prover). `PsyChainNetworkType` remains a selector: LocalDevnet maps to localhost, PsyPublicTestnet to sepolia, and PsyMainnet to ethereum; other selectors fail closed. Localhost magic is `1384803358401154921`.
 
@@ -173,6 +193,8 @@ The finalizer's `H(chain_id)` circuit constant changes, cascading through the GU
 
 Deposit append exposes its batch commitment as PI and owns its own frontier, leaf, batch, and tree targets (`psy_plonky2_common_circuits/src/bridge/deposit_batch_append_circuit.rs:242-259,267-374`). Withdrawal claim independently owns root, count, fixed slots, Merkle checks, padding, and batch commitment PI (`psy_plonky2_common_circuits/src/bridge/withdrawal_batch_claim_circuit.rs:59-69,78-175`).
 
+The withdrawal identity cutover in the current audit worktree is Bridge V6: `VERSION = 6` and 35 slot words at `<workspace>/psy-contracts/src/Bridge.sol:55,63`, with `token_contract_id` in word 34 and `uint256[1120]` for a 32-slot batch. The batch commitment includes that word. Registered public inputs stay 18 words (`withdrawal_root` u32×8, `real_count`, `bridge_user_id`, `batch_commit` u32×8). The per-withdrawal L1 key is a separate keccak256 of that slot's 35 big-endian u32 words (140 bytes), not a hash of the Poseidon leaf and not the raw nonce. The working V6 source requires a fresh L1 chain, a fresh L2 chain, and a new genesis; clearing the services database does not upgrade a committed-V5 raw-nonce claim, same-root replay, or pending orphan, and there is no in-place upgrade or pending compatibility path. This note does not record that purge or restart as executed. This changes only the `withdrawal_claim` verifier. Regenerate that cohort and its Solidity verifier; do not regenerate EndCap metadata, the Plonky2 cache pair, or the `bridge_agg`, `deposit_append`, or `reward_claim` cohorts for this change. The required fresh genesis is the chain cutover, not an EndCap or cache trigger. That `withdrawal_claim` regeneration has not been run. An existing keystore, and the 2026-10-28 bridge PASS, are not this cohort.
+
 ### 3.3 Token privacy circuit fingerprints
 
 `private_note_inclusion_fingerprint` and `shield_claim_fingerprint` are four-limb constants in the PSY and USDT token precompiles. They bind `private_claim` / `claim_deposit` to the minifier fingerprints of `PrivateNoteInclusionCircuit` and `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). They are not EndCap metadata, coordinator-library fingerprints, or Groth16 keys. A change that updates the last row of §3.1 for those two embedded circuits also requires the token-precompile procedure in [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md). Cache generation does not copy those limbs.
@@ -183,7 +205,7 @@ Deposit append exposes its batch commitment as PI and owns its own frontier, lea
 
 1. Use the exact source revision intended for the release.
 2. Require `<repo-root>/psy-genesis/config.json` to contain the intended localhost configuration. The current localhost magic and realm-0 edge list are at `psy-genesis/config.json:3-19`.
-3. Preserve the previous shared verifier JSON, localhost fingerprint constant, and both caches as one rollback unit. Inventory every deployment built from the shared JSON because replacing it is not isolated to localhost in current source.
+3. Preserve the previous localhost verifier JSON, localhost fingerprint constant, and both caches as one rollback unit. Inventory every localhost deployment built from that JSON; every non-local selector arm now fails closed.
 4. Do not run this section for a non-local target and do not treat localhost validation as evidence for another network.
 
 ### 4.2 Generate
@@ -197,7 +219,7 @@ cargo run --release -p psy_user_cli --no-default-features -- \
   get-user-end-cap-common-data
 ```
 
-Require these records from the same successful invocation. The EndCap promotion set is network, magic, `endcap_fingerprint_u64x4`, and `alt_verify_data`. The same invocation also prints `endcap_fingerprint`, `zk_fingerprint`, and `secp_fingerprint`; those three are not EndCap verifier metadata:
+Require these records from the same successful invocation. The EndCap promotion set is network, magic, `endcap_fingerprint_u64x4`, and `alt_verify_data`. It also prints `endcap_fingerprint` plus the zk, secp, eth-personal, and multisig display and limb lines; none of those are EndCap verifier metadata:
 
 ```text
 psy_network: localhost
@@ -207,26 +229,48 @@ endcap_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
 alt_verify_data: {complete JSON object}
 zk_fingerprint: <display fingerprint>
 secp_fingerprint: <display fingerprint>
+eth_personal_fingerprint: <display fingerprint>
+multisig_fingerprint: <display fingerprint>
+zk_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
+secp_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
+eth_personal_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
+multisig_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
 ```
 
-The command constructs `PsyUPSStepCircuitManager` with the compiled network magic and converts its real verifier-only data (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:16-35`). Copy only `alt_verify_data` and `endcap_fingerprint_u64x4` into the EndCap artifacts. Do not promote `zk_fingerprint` or `secp_fingerprint` as EndCap metadata.
+The command constructs `PsyUPSStepCircuitManager` with the compiled network magic and converts its real verifier-only data (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:16-47`). Copy only `alt_verify_data` and `endcap_fingerprint_u64x4` into the EndCap artifacts. Do not promote zk, secp, eth-personal, or multisig display/limb lines as EndCap metadata.
 
 ### 4.3 Promote atomically
 
 1. Require `psy_network: localhost`. Parse the printed magic and `networks.localhost.magic` in `<repo-root>/psy-genesis/config.json` as hexadecimal integers and require equality (`psy-genesis/config.json:3-5`). The CLI prints lowercase hex while the configuration may use uppercase; case-sensitive string comparison is invalid. A numeric mismatch is a hard failure.
-2. Copy the complete value after `alt_verify_data:` verbatim into `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` at `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:27`. This single blob is returned for all network selector arms, so the edit has global runtime scope even though its generation and validation evidence is localhost-only.
+2. Copy the complete value after `alt_verify_data:` verbatim into `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` at `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:27`. The selector returns this blob only for `LocalDevnet`; every other network arm returns an error, so the edit changes the localhost runtime path only.
 3. Copy the printed `endcap_fingerprint_u64x4` limbs verbatim, in printed order, into the localhost `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4`. Do not convert from the display fingerprint and do not reorder, reinterpret, or recalculate limbs. The CLI obtains the four canonical limbs directly from the fingerprint elements (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:19-29`).
 4. Do not copy the dummy verifier constant at `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:5-25`.
-5. Do not update a non-local network fingerprint constant from localhost output. Current one-JSON-for-all-networks source is not evidence that the new shared verifier is valid for another network (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`).
-6. Treat the shared verifier JSON, localhost `[u64; 4]`, and both generated caches as one atomic rollback unit. A partial update is invalid.
+5. Do not update a non-local network fingerprint constant from localhost output. The selector now fails closed for every non-local arm, and localhost validation is not evidence that this verifier is valid for another network (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-37`).
+6. Treat the localhost verifier JSON, localhost `[u64; 4]`, and both generated caches as one atomic rollback unit. A partial update is invalid.
 
 ## 5. Cache Generation
 
 ### 5.1 Cache-only command
 
-Run exactly from `<repo-root>` after Section 4 promotion or any cache trigger:
+Cache loading calls `load_realm_rotation_config(LocalDevnet)`, which requires a runtime config whose `realm_configs[].validators` are nonempty. The official prerequisite is the existing `init-realm-p2p-keys` command; it reads `PSY_CONFIG_PATH=psy-genesis/config.json` and writes `local_checkpoints/realm_p2p/config.json` plus the real identity keys. It does not read or require `genesis.json`/`private_keys.json`. Genesis `validators` injection is a separate later step and is not a cache prerequisite. Run from `<repo-root>`:
 
 ```bash
+PSY_CONFIG_PATH=psy-genesis/config.json \
+PSY_NETWORK=localhost \
+PSY_REALM_P2P_PUBLIC_HOST=127.0.0.1 \
+./target/release/psy_node_cli init-realm-p2p-keys \
+  --out-dir local_checkpoints/realm_p2p \
+  --realm-ids 0,1 \
+  --validators-per-realm 2 \
+  --validator-user-ids 0,262144,1048576,1572864 \
+  --edges-per-validator 1
+```
+
+This writes runtime membership and identity keys only. Then run the cache-only command with the runtime config selected:
+
+```bash
+PSY_CONFIG_PATH=<repo-root>/local_checkpoints/realm_p2p/config.json \
+PSY_NETWORK=localhost \
 RUST_MIN_STACK=134217728 \
 cargo run --release -p psy_plonky2_circuits \
   --example config_gen_v2 \
@@ -240,6 +284,8 @@ This command writes only:
 psy_plonky2_circuits/src/generated/cached_circuit_library.rs
 psy_plonky2_circuits/src/generated/cached_common_data.rs
 ```
+
+Generate the pair only with the membership created above (two validators per Realm 0 and 1, four reserved ids); a different validator count changes the generated pair even though the second-run stability loop still passes.
 
 The writer compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:448-474`).
 
@@ -279,6 +325,8 @@ Run Genesis generation only when at least one of these inputs changed:
 4. an intentionally adopted `psy-genesis` gitlink revision whose changed content affects Genesis construction.
 
 EndCap metadata, GUTA, cache, verifier JSON, network fingerprint, ordinary circuit witness, Bridge cohort, transport, DTO, logging, or retry changes do not trigger Genesis generation.
+
+That non-trigger does not cover an identity pin. `STAGE_CF69_MULTISIG_FINGERPRINT_U64` and the default faucet SD-key pin change the registration-2 account and the faucet-operator identities. Those pin edits still do not trigger EndCap promotion, cache generation, `local_circuits.json`, or any Groth16 cohort. Regenerate Genesis through [section 16](#16-pre-restart-gate) on the authorized fresh path. Do not load the new pins with `make restart`.
 
 When triggered, the current target is:
 
@@ -430,7 +478,7 @@ git -C <workspace>/psy-node merge-base --is-ancestor "$R_NODE" "origin/$destinat
 
 The later parent integration commit may add generated outputs and gitlinks, but consumers stay on `R_node` unless that later commit changes a consumed crate. Apply the same user-only SSH publication and reachability proof to every changed child before its gitlink moves. Parent gitlinks are last.
 
-A root checkout does not update nested gitlinks. `psy-node/.gitmodules:8-12` sets `psy-dapp` to `update = none`; SDK and Wallet each have their own `psy-genesis` gitlink, and DApp separately links both `psy-genesis` and `psy-contracts`. On a clean checkout, first run `git submodule update --init --checkout -- psy-dapp`, then check out the already-pushed child SHA inside each affected repository and stage that repository's gitlink. Do not use `--remote` or move a tracking branch. Do not assume the node parent, DApp, SDK, or Wallet links move together.
+`psy-node` now records only `psy-genesis` as a submodule; `psy-contracts` and `psy-dapp` are sibling repositories checked out next to `psy-node`. SDK and Wallet each have their own `psy-genesis` gitlink, and DApp separately links both `psy-genesis` and `psy-contracts`. On a clean checkout, first clone or verify the sibling `psy-contracts` and `psy-dapp` checkouts and run `git submodule update --init --checkout -- psy-genesis`, then check out the already-pushed child SHA inside each affected repository and stage that repository's gitlink. Do not use `--remote` or move a tracking branch. Do not assume the node parent, DApp, SDK, or Wallet links move together.
 
 Keep the existing `[patch."https://github.com/PsyProtocol/plonky2-hwa"]` sections in node, compiler, SDK, and services. They replace the proving backend across the dependency graph; do not add a second patch or a `[replace]` override for the pinned `psy-node` revision, and do not expect a root patch to be inherited by a git-pinned consumer.
 
@@ -491,7 +539,7 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 | Bridge aggregation and deposit | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-deposit` |
 | Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
 
-`make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the nested `./psy-contracts/src/` checkout. The Make targets and exact verifier destinations are at `Makefile:162-181`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
+`make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the `psy-contracts` checkout (`CONTRACTS_DIR`, resolved sibling-first: `../psy-contracts` when present, else the legacy nested `./psy-contracts`). The Make targets and exact verifier destinations are at `Makefile:162-181`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
 
 For isolated reward generation, use the reward-only command above with `--keystore-dir <isolated-keystore-root>`, then run `<repo-root>/target/release/psy_relayer_cli export-solidity-verifier <isolated-keystore-root>/reward_claim <isolated-contracts-checkout>/src/RewardClaimVerifier.sol`. Do not use a Make target pointing at the active keystore during that run. Before freezing, record measured circuit/proving-key/verifying-key sizes, portable wrapper and Groth16 proving time/peak memory, and cold preload time/peak memory. A smaller public commitment is not evidence of a particular setup size or completed verification.
 
@@ -576,7 +624,9 @@ Consumer verification is separate from publisher verification. Use an empty disp
 
 ### 12.1 Release checks
 
-1. Rerun Section 4.2 with identical environment. Require identical network, magic, display fingerprint, `endcap_fingerprint_u64x4`, and verifier JSON. `zk_fingerprint` and `secp_fingerprint` are printed but are not part of the EndCap promotion set.
+Section 12 does not clear a restart. [Section 16](#16-pre-restart-gate) must already have passed, including its evidence split. Do not mark a row below as passed because a pin constant was edited.
+
+1. Rerun Section 4.2 with identical environment. Require identical network, magic, display fingerprint, `endcap_fingerprint_u64x4`, and verifier JSON. The zk, secp, eth-personal, and multisig display/limb lines are printed but are not part of the EndCap promotion set.
 2. Rerun Section 5.1. Require both cache files to report up to date.
 3. Complete Section 7 through dual-sub root equality.
 4. For each triggered Bridge cohort, require three nonempty files, export the matching Solidity verifier, generate a proof through the matching wrapper, and verify it with that newly exported verifier before deployment. The system prove provider constructs separate withdrawal, deposit, Bridge aggregation, and reward-claim wrappers (`client_prover/psy_prover/src/local/native/prove_proxy/system.rs:119-222`).
@@ -588,7 +638,7 @@ Consumer verification is separate from publisher verification. Use an empty disp
 | Failure | Required response |
 |---|---|
 | Metadata prints a network other than `localhost` or a numerically different magic | Stop; do not promote any output |
-| Non-local generation, promotion, runtime use, or validation claim requested | Stop until distinct per-network verifier metadata selection is implemented and reviewed; the current JSON edit has global runtime scope but only localhost validation evidence |
+| Non-local generation, promotion, runtime use, or validation claim requested | Stop; the selector returns an error for every non-local arm, and distinct per-network verifier metadata remains unimplemented |
 | Fingerprint constant differs | Rerun metadata generation; copy printed `[u64; 4]` verbatim; never weaken the check |
 | One cache changes on the second run | Restore the previous pair; identify unstable input; restart Section 5 |
 | Cache command enters Groth16 setup | Stop; restore affected cohort from its complete preserved copy; rerun the exact cache-only command |
@@ -603,8 +653,15 @@ Consumer verification is separate from publisher verification. Use an empty disp
 | Any object readback differs or fails uncompressed manifest validation | Stop publication; abandon the partial prefix and use a separately authorized fresh prefix, never replace its objects |
 | Manifest fetch falls back to existence checks | Fail publication verification |
 | Upload lacks exact authorization | Do not upload |
+| Restart from a checkout other than the recorded cohort, or from a revision other than the recorded revision | Stop. Do not build, generate, or start |
+| `PSY_NETWORK`, `PSY_CONFIG_PATH`, `VITE_NETWORK`, or `networks.localhost.magic` disagree, or the network was taken from Make `?=`, `.env`, or `defaultNetwork` alone | Stop. Do not build or start |
+| The six release bins were not all rebuilt from the recorded revision and the section 16.2 environment, or only `psy_dev_cli`, `buildProject`, or `ensureAllBinariesBuilt` ran | Rebuild once with the section 16.3 locked command. Do not start |
+| A pin was printed from its constant, or a measurement was skipped because the constant "looks current" | Measure the constructed circuit. Do not start |
+| A pin-only edit is followed by cache generation, `regen-groth16-keystore`, or trusted-setup publication | Stop. Restore any cohort that command touched. The pin assignment itself is not that trigger; section 3 still selects its own generators |
+| New multisig or faucet identity is applied with `make restart`, retained journals, or an uncleared registration-2 leaf | Stop. Use the authorized fresh path; retained identities are not migrated by the pin edit |
+| `make run-all` starts before the pre-launch rows pass | Stop the start. Pre-launch rows are worktree and dirty scope, network and config, both constructed-circuit measurements, the EndCap and wallet fingerprint compare, the one six-bin build, the selected trusted-setup row, and fresh authorization. Genesis generation, operator reload, verifier wiring, and E2E are produced inside that start; their absence is not a reason to withhold it. Do not repair a withheld start with another restart |
 
-Rollback units are: the globally shared verifier JSON plus localhost fingerprint plus both caches, with every deployment built from that shared JSON accounted for; or one complete Groth16 cohort plus its matching Solidity verifier. Partial rollback is forbidden.
+Rollback units are: the localhost verifier JSON plus localhost fingerprint plus both caches, with every localhost deployment built from that JSON accounted for; or one complete Groth16 cohort plus its matching Solidity verifier. Partial rollback is forbidden.
 
 ## 13. File Impact
 
@@ -621,6 +678,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) |
 | Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
 | Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
+| Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |
 | Selected verifier replace | `psy-contracts/src/RewardClaimVerifier.sol` | `reward_claim` trigger |
 
 ```diff
@@ -675,7 +733,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 
 ## 14. Rationale
 
-1. **Localhost-generated, globally shared metadata:** the current cache generator is local-devnet-specific, but the verifier selector returns one real JSON for every network arm. Only localhost has complete generation and validation evidence; replacing the blob still changes verifier input globally, so all non-local operation remains blocked until per-network selection exists.
+1. **Localhost-generated, localhost-selected metadata:** the cache generator is local-devnet-specific, and the verifier selector returns the real JSON only for `LocalDevnet` while every non-local arm fails closed. Only localhost has complete generation and validation evidence; distinct per-network verifier metadata remains unimplemented, so non-local use is not authorized.
 2. **Verbatim limbs:** the CLI already prints canonical fingerprint limbs. Copying those limbs removes error-prone display-hash conversion.
 3. **Atomic metadata and caches:** verifier JSON, fingerprint, and generated libraries jointly define compatibility. A mixed generation can reject real proofs.
 4. **Narrow Genesis and bundle triggers:** these generators write unrelated, large, or secret-bearing artifacts. Circuit metadata regeneration does not authorize their churn.
@@ -683,10 +741,11 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 6. **Independent Bridge cohorts:** each cohort has distinct constraints, key files, and Solidity verifier. Regenerating an unaffected cohort increases custody and deployment risk without improving correctness.
 7. **Manifest-last publication:** consumers never observe a manifest that advertises objects which have not passed storage readback and uncompressed hash validation.
 8. **Applicability-gated DAG:** immutable producer revisions and conditional downstream delivery prevent needless package, WASM, Genesis, DApp, Wallet, and gitlink changes.
+9. **Restart gate:** identity pins, release binaries, and retained chain state are different cohorts. Measuring a constructed circuit, rebuilding every release bin from that same source, and an explicit fresh authorization are not implied by a constant edit.
 
 ## 15. Security Considerations
 
-1. **Fail-closed network boundary:** never use localhost validation as evidence for another network. The current verifier JSON is globally shared, so a localhost-generated replacement requires every non-local consumer to remain blocked until distinct per-network verifier metadata is implemented and validated.
+1. **Fail-closed network boundary:** never use localhost validation as evidence for another network. The selector returns localhost verifier metadata only for `LocalDevnet` and returns an error for every non-local arm; distinct per-network verifier metadata must be implemented and validated before non-local use.
 2. **Private-key exclusion:** root `private_keys.json` and faucet operator private keys are secrets. Never package, upload, commit, paste, or publish them.
 3. **Public proving artifacts:** the authorized R2 bucket `psy-proving-keystores` serves this localhost proving-artifact release publicly. Publish only the two single compressed objects, the required parts of the four large compressed objects, and the sixteen-entry manifest defined in Section 10: fourteen data object keys plus the manifest for the current cohort, representing twelve uncompressed circuit/proving/verifying files. Exclude signing keys, passwords, validator secrets, and setup randomness. Public availability does not authorize use on an unvalidated network.
 4. **Separate authorization:** source delivery, package publication, artifact upload, and deployment each require their own authorization. Upload commands must not embed credentials or profile names.
@@ -696,6 +755,158 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 8. **Least deletion:** remove only selected cohort files and disposable verification directories. Never recursively delete the active keystore root.
 9. **Objects before manifest:** upload, read back, decompress, and validate every data object before publishing the version-1 manifest.
 10. **Immutable provenance:** record exact source revisions, selected network and magic, commands, manifest, object URI, and package versions without recording secrets or relying on branch names.
+11. **Retained identity and secrets:** a new multisig or faucet fingerprint does not migrate registration 2, faucet users, or guardian/relayer journals. Do not bypass those checks, delete a keystore to force a match, or print `private_keys.json`, faucet `privateKey` fields, `.env`, keystore files, or passwords. L1 keystores are not the L2 identity and stay in place.
+
+## 16. Pre-Restart Gate
+
+Run the pre-launch rows before every local `make restart` and before every `make run-all`. Those rows are sections 16.1 through 16.4, the selected trusted-setup check, and the fresh authorization in section 16.7: worktree and dirty scope, network and config, both constructed-circuit measurements, the EndCap and wallet fingerprint compare, the one six-bin build, and that authorization record. Genesis generation, faucet-operator reload, startup logs, verifier wiring, and E2E cannot exist before the first start; they are post-launch acceptance in section 16.8 and do not decide whether that start may begin. Record the selected cohort worktree and its revision. Repository text does not record an absolute path and does not freeze one commit: a later legitimate commit is valid once the record names it. This section does not change the launcher and does not add a second runbook.
+
+Passing sections 4 through 12 is not this gate. A previous six-bin build, a later `psy_dev_cli`-only build, root `make build`, `buildProject`, or `ensureAllBinariesBuilt` is not this gate. `PSY_SKIP_BUILD` defaults to `1` (`Makefile:18`), so `make run-all` will keep whatever binaries are already on disk.
+
+Record each check outside this runbook. The record names the command, revision, input scope, and result. This section gives the criteria only. It does not store a campaign's pass, fail, or pending state, because that state expires on the next commit.
+
+### 16.1 Worktree and revision
+
+From the directory that will own the build:
+
+```bash
+pwd -P
+git rev-parse --show-toplevel
+git rev-parse --git-common-dir
+git rev-parse HEAD
+git status --porcelain
+git hash-object <each-dirty-path>
+```
+
+Require all of the following:
+
+1. Record `pwd -P`, the toplevel, and `HEAD`. The toplevel is the selected cohort worktree for this campaign. A linked worktree's `--git-common-dir` is not that worktree's own `.git`. Another checkout with the same repository name does not pass by having the same pins. Do not hard-code one historical commit into this runbook. A later commit is the target revision once the record names it.
+2. Record every `git status --porcelain` line, its reviewed diff, and the blob hash of each dirty path. Dirty files and dirty gitlinks do not fail the gate. The record must state that the dirty diff was reviewed and is part of the cohort. Do not drop, stash, or format it. Do not infer the revision from a binary built elsewhere.
+
+### 16.2 Explicit network and config
+
+Set `PSY_NETWORK` and `PSY_CONFIG_PATH` on the one Cargo release command in section 16.3. Make command-line assignments are how a later Make target can override `.env`; they do not make `make build` that release command. Do not accept the Make default, and do not read or print `.env`: `Makefile:5-9` applies `PSY_NETWORK ?= localhost` and then includes `.env`, which can override that default and can contain secrets. An environment prefix before `make` does not win over `.env`. A recorded `psy_node_cli` wall time of 174.53s, on a run that recompiled, and a later 0.88s wall (Cargo 0.81s) is a measurement baseline only. It is not evidence of a build-input change in this tree, and it is not a build-time improvement.
+
+```text
+PSY_NETWORK=localhost
+PSY_CONFIG_PATH=<repo-root>/psy-genesis/config.json
+VITE_NETWORK=localhost
+VITE_FORK=false
+```
+
+`<repo-root>` is the toplevel from section 16.1. Require all of the following before Cargo runs:
+
+1. `PSY_CONFIG_PATH` is that worktree's `psy-genesis/config.json`, not another checkout's copy and not `local_checkpoints/realm_p2p/config.json`.
+2. `VITE_NETWORK` is `localhost` and `VITE_FORK` is `false`. Full fresh startup rejects any other stage, L1 network, fork, daemon mode, or non-canonical Genesis path (`dev/locSetupV4.ts:6411-6415`).
+3. The build script reads `PSY_NETWORK` and that same config. It rejects a missing key and a magic that is not the stage magic, then compiles `CURRENT_NETWORK` from that key (`client_prover/psy_core/psy_config/build.rs:43-90,186-206`). There is no implicit localhost default at that step.
+4. Launcher child processes for the node network `local-devnet` set `PSY_NETWORK` to `localhost` (`dev/locSetupV4.ts:1439-1440,6235-6236`). Realm-config generation sets `defaultNetwork` to that key, and both the resume and fresh branches put the same key into child `PSY_NETWORK` (`dev/locSetupV4.ts:1653,6462,6467`). A binary whose compiled magic differs from the loaded network fails `verify_chain_identity` (`client_prover/psy_core/psy_config/src/lib.rs:686-695`).
+5. Localhost and testnet share `0x1337CF514544CF69`. Mainnet is `0x1337CF514544C069` and is a different multisig circuit. This gate does not measure or start mainnet. Building with `PSY_NETWORK=testnet` is not a localhost cohort.
+
+### 16.3 One release build
+
+After sections 16.1 and 16.2, and after the measurements in section 16.4, rebuild the six node bins once from the recorded target revision. The only passing input is the section 16.2 environment on the locked Cargo command below. Do not run a second release build. Later Cargo use is allowed; what fails is starting from a partial or older bin cohort.
+
+```bash
+PSY_NETWORK=localhost PSY_CONFIG_PATH=<repo-root>/psy-genesis/config.json \
+cargo build --release --locked \
+  --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli \
+  --bin psy_relayer_cli --bin psy_user_cli --bin psy-mcp-server
+```
+
+The six bins are `psy_worker_cli`, `psy_node_cli`, `psy_dev_cli`, `psy_relayer_cli`, `psy_user_cli`, and `psy-mcp-server` (`Makefile:26-27`). The Make recipe also builds `realm_repl` and `coordinator_repl`. Those examples are not substitutes for a missing bin. A build of `psy_dev_cli` alone, or `buildProject`, or `ensureAllBinariesBuilt`, does not pass. `make build` omits `--locked` and can rewrite `Cargo.lock`. It is not equivalent, it does not pass this gate, and it must not be run in addition to the locked command.
+
+`buildProject` builds exactly three bins — `psy_node_cli`, `psy_worker_cli`, and `psy_relayer_cli` — with `--locked` (`dev/locSetupV4.ts:3369-3395`). It sets `PSY_CONFIG_PATH` to `<cwd>/psy-genesis/config.json` without `realpath`, and `PSY_NETWORK` from `resolveStage()` (`VITE_PSY_STAGE`, default `localhost`; `dev/locSetupV4.ts:418-421,3371-3376`). `ensureAllBinariesBuilt` builds five node bins — those three plus `psy_user_cli` and `psy_dev_cli` — and, when `PSY_SKIP_BUILD` is exact `0`, also builds sibling `psy-services` and `psy-indexer` (`dev/locSetupV4.ts:2329-2377`). Its Cargo invocation does not set that config or network. It still omits `psy-mcp-server`. Neither path passes this gate. Do not call `buildProject` the five-bin path, and do not call `ensureAllBinariesBuilt` the six-bin path.
+
+`make run-all` with the default `PSY_SKIP_BUILD=1` does not repair a partial node cohort (`dev/locSetupV4.ts:2343-2346`). Exact `0` is not this command: it runs `ensureAllBinariesBuilt` and rebuilds the sibling from the manifest currently checked in. Sibling presence is a launcher existence check, not evidence that these six bins are current, and not permission to overwrite the tested services binaries. The restored-pin exception is in [devnet lifecycle §2](devnet_lifecycle.md#2-artifact-gate). This is the only six-bin command. Lifecycle cites this section and does not copy it.
+
+### 16.4 Measure the circuit; do not echo the pin
+
+Classify the diff with section 3 first. Then measure every affected fingerprint by constructing the circuit under the section 16.2 environment. Printing `STAGE_CF69_MULTISIG_FINGERPRINT_U64`, `get_multisig_fingerprint()`, `DEFAULT_SD_KEY_FINGERPRINT`, or `client_prover/Makefile`'s `SD_KEY_FINGERPRINT` is an echo, not a measurement. Those constants are the values under test.
+
+The filter must be the full Rust test name. A short function name with `--exact` matches nothing, because the test name includes the module path. The executable itself is the package test binary. Require exactly `1 passed` and `0 failed`.
+
+Multisig, from `<repo-root>`:
+
+```bash
+PSY_NETWORK=localhost PSY_CONFIG_PATH=<repo-root>/psy-genesis/config.json \
+cargo test --release --locked -p psy_prover --lib \
+  wallet::memory_wallet::tests::multisig_fingerprint_matches_signature_circuit_or_rejects_unmeasured_magic \
+  -- --exact --nocapture
+```
+
+The test constructs `MultisigSignatureCircuit::new()` and requires `get_multisig_fingerprint()` to equal that fingerprint (`client_prover/psy_prover/src/wallet/memory_wallet.rs:1361-1367`). A stale pin fails. The getter itself only copies the constant (`memory_wallet.rs:97-108`).
+
+Then run section 4.2 with `--locked` added. The command already constructs the multisig circuit at `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:35` and prints `multisig_fingerprint` and `multisig_fingerprint_u64x4`. It must not be replaced with a printf of the constant. From the same invocation, require `psy_network: localhost` and numeric magic equality with `networks.localhost.magic`. Compare the printed `endcap_fingerprint_u64x4`, `alt_verify_data`, `zk_fingerprint_u64x4`, `secp_fingerprint_u64x4`, `eth_personal_fingerprint_u64x4`, and `multisig_fingerprint_u64x4` with the constants compiled into that same source. Equality authorizes no EndCap promotion. An EndCap inequality is a section 3.1 EndCap and cache trigger and returns to sections 4 and 5. It is still not, by itself, a Groth16 trigger. Do not paste verifier JSON or a current fingerprint value into this runbook.
+
+Default faucet SD-key policy, same environment:
+
+```bash
+PSY_NETWORK=localhost PSY_CONFIG_PATH=<repo-root>/psy-genesis/config.json \
+cargo test --release --locked -p psy_dev_cli --lib \
+  subcommand::generate_genesis::tests::default_faucet_policy_circuit_matches_genesis_and_exported_identity \
+  -- --exact --nocapture
+```
+
+This builds `get_allow_method_sd_key_fingerprint` for transaction count `3`, contract IDs `[5, 0, 0]`, and method IDs `[3375543263, 2789897329, 3998182541]` (`generate_genesis.rs:819-842`; `memory_wallet.rs:232-237`). It uses in-memory fixture keys only. Require the printed fingerprint to equal both `DEFAULT_SD_KEY_FINGERPRINT` (`generate_genesis.rs:42`) and `SD_KEY_FINGERPRINT` (`client_prover/Makefile:99`). Do not copy the expected hex into this runbook: the constructed value and the two constants are the comparison. Do not pass `--sd-key-fingerprint` into this measurement. A custom policy is a different circuit and needs its own constructed fingerprint. The test passing does not prove process startup or a faucet claim.
+
+### 16.5 What a pin-only change does not regenerate
+
+Apply section 3 to the recorded diff. A pin-only correction is the narrow case where the constructed circuit now matches its checked-in constant and no circuit constraint, ordered public input, or verifier input changed:
+
+| Input actually changed | EndCap JSON and caches | Genesis identities | Groth16 / trusted setup | `make restart` |
+|---|---|---|---|---|
+| Multisig pin corrected to the constructed `MultisigSignatureCircuit` fingerprint | No, while section 16.4's EndCap compare matches | Registration 2 changes only on an authorized fresh Genesis. Member hashes can stay unchanged | No | No. Journals and the occupied slot stay on the old account |
+| Default faucet SD-key pin corrected to the constructed allow-method circuit | No, while that same EndCap compare matches | Yes, but only with a fresh Genesis and all 10 faucet operators together | No | No. Replacing only an exported fingerprint leaves users and operators split |
+
+
+For that pin-only case, do not run cache generation, `make generate-local-circuits`, `regen-groth16-keystore`, `generate-groth16`, or trusted-setup pack/publish merely because the constant changed. This is not a permanent ban. A real section 3.1 or section 3.2 trigger still runs its own generator, including trusted setup when that matrix row says yes. After a local Groth16 regeneration, keep `PSY_SKIP_KEYSTORE=1` so startup uses that local cohort. Exact `0` downloads the published prefix and is valid only after section 11 publication, not as a way to load unpublished local keys.
+
+`make restart` keeps the database and the three Anvil processes and does not generate Genesis (`devnet_lifecycle.md` startup and restart rules). It cannot load a new registration-2 or faucet identity. Use the authorized fresh path in section 16.7 for that change.
+
+
+### 16.6 Artifact, identity, and config order
+
+Measurement does not write `genesis.json`, `private_keys.json`, or `faucetOperators.json`. After the pre-launch rows pass, the only start path is the fresh command in [devnet lifecycle](devnet_lifecycle.md#startup-sequence). Its load order is fixed. Skipping or reordering it fails post-launch acceptance; it does not add a second command, and it is not a condition that must already be true before the first start.
+
+1. Canonical input stays `psy-genesis/config.json`, selected by the explicit `PSY_NETWORK=localhost` from section 16.2. The file is read-only for generation and for the fresh helper. Guardian member hashes must already be present. No account file, keystore password, or policy artifact selects registration 2.
+2. Preflight calls `ensureGenesisFiles(..., preflight=true)`. Before the preflight return it checks that `psy-genesis/genesis_contracts.json` is usable and, when the sibling stamp exists, that the stamp matches the compiler identity and those contract bytes. The preflight return itself then checks that `target/release/psy_dev_cli` is executable and that `planGenesisGeneration` can see `networks.localhost.guardian_initial_member_hashes` (`dev/locSetupV4.ts:3272-3275,3177-3203`). It must not write Genesis. The later "genesis artifacts already exist" return is not this preflight.
+3. The fresh helper runs `psy_dev_cli fresh-devnet-state` with secret-bearing enrollment variables removed. The launcher calls its reset after preparation (`dev/locSetupV4.ts:6429`). Reset clears the databases and then deletes `genesis.json` through the helper target list (`fresh_devnet_state.rs:37-41,91`). This is destructive. The current campaign's fresh clear is authorized. A later campaign still records its own fresh authorization.
+4. `ensureGenesisFiles` then runs `target/release/psy_dev_cli generate-genesis-data --repo-root <repo-root>` because `genesis.json` is gone (`Makefile:150-151`). Require the log `[AutoSetup] Generating genesis.json`. The log `[AutoSetup] genesis artifacts already exist` means the new binary did not generate identities; stop. Registration 2 is derived from `multisig_fingerprint()` and the public member hashes. All 10 faucet users and operators are derived from the constructed SD-key pin (`faucet-operator-count` default 10, registrations `5..14`). Do not pass `--skip-faucet-operators` or a hand-copied fingerprint.
+5. The generator serializes every body before opening an output (`generate_genesis.rs:530-538`). `genesis.json` uses `write_exclusive`: create-only, `O_NOFOLLOW|O_EXCL`, one owner link, mode `0600` (`generate_genesis.rs:566-582`). Fresh reset has already removed it, so this create is the supported path. `private_keys.json` and `faucetOperators.json` use `write_owned_regular`: metadata preflight, then a same-directory temporary and `renameat` (`generate_genesis.rs:592-695`). Preflight does not read file bytes. A missing file is first generation. An existing destination that is one regular owner link in mode `0600` is atomically replaced. A symlink, extra link, wrong owner, or other mode is refused and the old bytes stay. A failed temporary write deletes only the temporary. Do not archive, remove, pre-create, or print either file to force success. Keep the stack stopped and let the operator resolve ownership, mode, or path. Do not delete L1 keystores, including the bridge-relayer keystore, and do not try guardian keystore passwords as this L2 identity. Public checks are exit status 0 and a `genesis.json` user array that parses. Do not dump secret files to confirm them.
+
+6. The launcher reloads operators from the fresh `psy-dapp/apps/bridge/src/config/faucetOperators.json` and must log `Loaded faucet operators from freshly generated artifact`. A pre-generation copy is stale.
+7. Infrastructure starts only after that reload (`start_db.sh --fresh`).
+8. Realm configuration is generated from `PSY_CONFIG_PATH=psy-genesis/config.json` and `PSY_NETWORK=localhost`, written under `local_checkpoints/realm_p2p/`, then injected into `genesis.json`'s `validators`. Child `PSY_CONFIG_PATH` switches to `local_checkpoints/realm_p2p/config.json` only after that injection (`dev/locSetupV4.ts:6464-6467`). Prove-proxy is the exception: its `--rpc-config` remains `psy-genesis/config.json` (`dev/locSetupV4.ts:6481-6486`).
+9. Guardians start after fresh reset and Genesis preparation, not after every UI (`dev/locSetupV4.ts:7133`, UI from `7174`). They enroll with `multisig_fingerprint()` from this same binary. Old journals remain bound to the previous registration-2 identity. The fresh reset must already have cleared them. Do not reuse a journal, occupied slot, or faucet user from the previous pin, and do not weaken the identity check.
+
+Standalone `make generate-genesis-data` before `make run-all` is optional inspection, not a substitute for steps 3-6. It follows the same split: create-only `genesis.json`, and metadata-checked atomic replacement of the two secret outputs. `make run-all` deletes `genesis.json` on the fresh path and generates again. If inspection generation is used, it must be the section 16.3 binary, it must include all 10 operators, and it must not be followed by `make restart`.
+
+### 16.7 Authorization, then the lifecycle fresh command
+
+The pre-launch rows must succeed before the first start: sections 16.1-16.4, the selected trusted-setup check, and this section's fresh authorization. That is worktree and dirty scope, network and config, both constructed-circuit measurements, the EndCap and wallet fingerprint compare, the one six-bin build, and the authorization record. A new registration-2 or faucet identity is incompatible with retained journals and faucet users. `make restart` cannot change that. `make run-all` always starts a fresh chain and destroys retained local chain state. The current campaign has explicit authorization for that fresh clear. A green fingerprint result does not replace the authorization record: the record still names the worktree, target revision, reviewed dirty diff, and identities being discarded. Start only through the fresh sequence in [devnet lifecycle](devnet_lifecycle.md#startup-sequence). Do not keep a second startup command here. Generator exit, the fresh-generation log, and the operator reload log are evidence that this start produced, not evidence required before it is allowed.
+
+`PSY_SKIP_BUILD=1` is valid only because section 16.3 just built this node cohort. That command does not build sibling services; do not follow it with `make build` or exact `PSY_SKIP_BUILD=0`. The restored services pin is the [devnet lifecycle §2](devnet_lifecycle.md#2-artifact-gate) exception. `PSY_SKIP_KEYSTORE=1` keeps the local proving-keystore cohort, including keys regenerated by a selected section 3.2 row. Exact `PSY_SKIP_KEYSTORE=0` downloads the published prefix and requires section 11 publication first. Keep the supervisor in the foreground. A failed gate is not fixed by restarting the same supervisor.
+
+### 16.8 Check record
+
+Copy this template into the campaign record. Leave a cell blank until that command has been run against the recorded revision. Do not paste an older campaign's result into this file, and do not treat a blank cell as a pass. The first nine rows are the pre-launch rows. They are the only rows that can release the first `make run-all`. The last two rows are post-launch acceptance: they are filled from evidence that start produces, and they decide whether this campaign is complete. A blank post-launch row does not withhold the first start.
+
+| Check | Record |
+|---|---|
+| Worktree toplevel and target revision | Path and the selected `HEAD`; no historical SHA is frozen here |
+| Dirty scope | Every porcelain path, its blob hash, and confirmation that its diff was reviewed; dirty is not a failure |
+| Network and config | Explicit `PSY_NETWORK`, `PSY_CONFIG_PATH`, `VITE_NETWORK`, `VITE_FORK`, and numeric magic |
+| Multisig constructed-circuit test | Full filter and `1 passed; 0 failed` |
+| EndCap and wallet fingerprint compare | Same-invocation network, magic, EndCap limbs, verifier JSON compare, and zk/secp/eth/multisig limbs; no pasted secret or verifier body |
+| SD-key constructed-circuit test | Full filter, printed fingerprint equal to both pins, and `1 passed; 0 failed` |
+| Six-bin release build | The one locked Cargo command from section 16.3, canonical `PSY_NETWORK` and `PSY_CONFIG_PATH`, target revision, and all six bins rebuilt. `make build` is not a substitute |
+| Trusted setup | The section 3 row that selected it, or `not selected` for a pin-only change |
+| Fresh authorization | Blank until this campaign records the worktree, target revision, reviewed dirty diff, and discarded identities. Authorization applies only to that named campaign |
+| Genesis and faucet operators | Post-launch acceptance, not a pre-launch row. Generator exit, fresh-generation log, and operator reload log decide campaign completion after startup; they cannot exist before the first start. No secret dump |
+| Startup and E2E | Post-launch acceptance, not a pre-launch row. Lifecycle command result, verifier wiring, and end-to-end evidence decide campaign completion. Blank means not run; it does not withhold the first start |
+
+The first start is allowed only when every pre-launch row has a current pass: worktree and dirty scope, network and config, both constructed-circuit measurements, the EndCap and wallet fingerprint compare, the one six-bin build, the selected trusted-setup row, and fresh authorization. Genesis generation, operator reload, startup, verifier wiring, and E2E do not belong to that decision. The campaign is complete only when those post-launch rows also have a current pass. A historical pass does not carry forward to another revision or dirty scope.
+
 
 ## Related Documents
 

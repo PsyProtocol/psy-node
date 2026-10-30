@@ -31,6 +31,14 @@ set -euo pipefail
 # All deposit claim material is persisted under RESULT_DIR/deposit-note.json.
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+
+# ─── Repository roots ─────────────────────────────────────────────────────────
+# psy-contracts and psy-dapp are sibling repositories of psy-node; fall back
+# to the legacy nested checkouts when the siblings are absent.
+CONTRACTS_ROOT="psy-contracts"
+DAPP_ROOT="psy-dapp"
+[[ -f "../psy-contracts/package.json" ]] && CONTRACTS_ROOT="../psy-contracts"
+[[ -f "../psy-dapp/package.json" ]] && DAPP_ROOT="../psy-dapp"
 RPC_URL="${L1_RPC_URL:-http://127.0.0.1:8545}"
 RPC_CONFIG="psy-genesis/config.json"
 USER_PK="${USER_PK:?USER_PK is required; use a non-relayer devnet wallet such as anvil account #1}"
@@ -61,17 +69,26 @@ R1="${R1:-$(rand_limb)}"
 NOTE_SECRET="${NOTE_SECRET:-$(rand_limbs4)}"
 NULLIFIER_SECRET="${NULLIFIER_SECRET:-$(rand_limbs4)}"
 WITHDRAW_NONCE="0x$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+# L1 key is keccak256 of the 140-byte preimage: 35 big-endian u32 words
+# (sender_user_id, recipient[8], token[8], amount[8], nonce[8],
+# destination_chain_index, token_contract_id). The burn still sends the raw
+# WITHDRAW_NONCE. Do not use that nonce, and do not use the services Poseidon
+# leaf hash, as claimedNullifiers / pendingWithdrawals / claimPendingWithdrawal.
+# The token contract id comes from Router.l1ToL2Token; a missing id fails.
+L2_TOKEN_CONTRACT_ID=""
+WITHDRAW_L1_KEY=""
 
 # Nostr delivery target for the deposit backup (psy_deposit_proof + psy_deposit_secrets).
 # A fresh throwaway keypair (secret key persisted in deposit-note.json) unless
 # the caller pins one via RECIPIENT_NPUB.
 if [[ -z "${RECIPIENT_NPUB:-}" ]]; then
-  read -r RECIPIENT_NPUB NOSTR_SK < <(cd psy-dapp/apps/bridge && bun -e "
+  read -r RECIPIENT_NPUB NOSTR_SK < <(cd "$DAPP_ROOT/apps/bridge" && bun -e "
 const { generateSecretKey, getPublicKey } = require('nostr-tools/pure');
 const { nip19 } = require('nostr-tools');
 const sk = generateSecretKey();
 console.log(nip19.npubEncode(getPublicKey(sk)), Buffer.from(sk).toString('hex'));
 ")
+  [ -n "${RECIPIENT_NPUB:-}" ] && [ -n "${NOSTR_SK:-}" ] || fail "nostr keypair generation failed"
 else
   NOSTR_SK=""
 fi
@@ -110,15 +127,85 @@ wait_for() {
   fail "timeout waiting for $desc (${max_secs}s)"
 }
 
+resolve_l2_token_contract_id() {
+  local raw
+  raw=$(cast_call "$ROUTER" "l1ToL2Token(address)(bytes32)" "$USDT" | awk 'NF { print; exit }')
+  [ -n "$raw" ] || fail "Router.l1ToL2Token($USDT) returned no L2 token contract id; refusing to guess"
+  L2_TOKEN_CONTRACT_ID=$(python3 -c '
+import sys
+raw = sys.argv[1].strip().lower()
+if raw.startswith("0x"):
+    raw = raw[2:]
+if not raw or any(c not in "0123456789abcdef" for c in raw):
+    raise SystemExit("Router.l1ToL2Token is not hex; refusing to guess")
+value = int(raw, 16)
+if value == 0:
+    raise SystemExit("this USDT run resolved Router.l1ToL2Token to 0, the native PSY contract id; refusing to substitute it")
+if value > 0xFFFFFFFF:
+    raise SystemExit("Router.l1ToL2Token does not fit one u32; refusing to guess")
+print(value)
+' "$raw") || fail "cannot obtain a one-u32 L2 token contract id from Router.l1ToL2Token($USDT); refusing to guess"
+}
+
+derive_withdrawal_l1_key() {
+  [ -n "${USER_ID:-}" ] || fail "USER_ID is required to derive the withdrawal L1 key"
+  [ -n "${L2_TOKEN_CONTRACT_ID:-}" ] || fail "L2 token contract id was not resolved; refusing to guess"
+  WITHDRAW_L1_KEY=$(python3 - "$USER_ID" "$USER_ADDR" "$USDT" "$WITHDRAW_AMOUNT" "$WITHDRAW_NONCE" "$L2_TOKEN_CONTRACT_ID" <<'PY'
+import sys
+from Crypto.Hash import keccak
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+def u32(name, value):
+    if value < 0 or value > 0xFFFFFFFF:
+        fail(f"{name} does not fit one u32; refusing to guess")
+    return value.to_bytes(4, "big")
+
+def bytes32(name, raw):
+    text = raw.strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    if len(text) == 40:
+        text = text.rjust(64, "0")
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        fail(f"{name} is not a 20-byte address or 32-byte word")
+    return bytes.fromhex(text)
+
+sender, recipient, token, amount, nonce, token_contract_id = sys.argv[1:]
+preimage = b"".join([
+    u32("sender_user_id", int(sender)),
+    bytes32("recipient", recipient),
+    bytes32("token", token),
+    int(amount).to_bytes(32, "big"),
+    bytes32("nonce", nonce),
+    u32("destination_chain_index", 0),
+    u32("token_contract_id", int(token_contract_id)),
+])
+if len(preimage) != 140:
+    fail(f"withdrawal preimage is {len(preimage)} bytes, expected 140")
+digest = keccak.new(digest_bits=256)
+digest.update(preimage)
+print("0x" + digest.hexdigest())
+PY
+) || fail "could not derive the withdrawal L1 key from the 35-field preimage"
+  case "$WITHDRAW_L1_KEY" in
+    0x????????????????????????????????????????????????????????????????) ;;
+    *) fail "withdrawal L1 key derivation did not return a bytes32" ;;
+  esac
+}
+
 # ─── Read deployed addresses ──────────────────────────────────────────────────
 read_addresses() {
-  local deploy_file="psy-contracts/deployments/localhost/deployed-contracts.json"
+  local deploy_file="$CONTRACTS_ROOT/deployments/localhost/deployed-contracts.json"
   [ -f "$deploy_file" ] || fail "deploy file not found: $deploy_file"
   BRIDGE=$(python3 -c "import json; print(json.load(open('$deploy_file'))['contracts']['Bridge'])")
   ROUTER=$(python3 -c "import json; print(json.load(open('$deploy_file'))['contracts']['Router'])")
   GATEWAY=$(python3 -c "import json; print(json.load(open('$deploy_file'))['contracts']['ERC20Gateway'])")
   USDT=$(python3 -c "import json; print(json.load(open('$deploy_file'))['protocol']['tokens']['USDT']['l1Address'])")
   STATE_MANAGER=$(python3 -c "import json; print(json.load(open('$deploy_file'))['core']['StateManager'])")
+  resolve_l2_token_contract_id
   log "Bridge=$BRIDGE USDT=$USDT Gateway=$GATEWAY"
 }
 
@@ -355,6 +442,8 @@ claim_deposit() {
 l2_withdraw() {
   log "Step 6: L2 withdraw USDT ($WITHDRAW_AMOUNT)"
   log "  nonce=$WITHDRAW_NONCE"
+  derive_withdrawal_l1_key
+  log "  l1_key=$WITHDRAW_L1_KEY"
   # Capture the L1 balance BEFORE the deposit-side effect baseline is used:
   # the deposit is already settled on L1 funds (locked in Bridge), so the
   # exact identity check in final_verify uses this pre-withdraw value.
@@ -400,17 +489,18 @@ l2_withdraw() {
 # happens in claimPendingWithdrawal, which the relayer never sends.
 wait_l1_claim() {
   log "Step 7: Wait for relayer batchClaimWithdrawal, then claimPendingWithdrawal"
+  [ -n "$WITHDRAW_L1_KEY" ] || fail "withdrawal L1 key was not derived"
 
-  wait_for "withdrawal nullifier claimed" \
-    "[ \"\$(cast_call '$BRIDGE' 'claimedNullifiers(bytes32)(bool)' '$WITHDRAW_NONCE')\" = \"true\" ]"
+  wait_for "withdrawal L1 key claimed" \
+    "[ \"\$(cast_call '$BRIDGE' 'claimedNullifiers(bytes32)(bool)' '$WITHDRAW_L1_KEY')\" = \"true\" ]"
   ok "relayer registered pending withdrawal"
 
   local pending claimable
   wait_for "pending withdrawal registered" "
-    pending=\$(cast_call '$BRIDGE' 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' '$WITHDRAW_NONCE' 2>/dev/null | tail -n 2 | head -1 | tr -d '[:space:]')
+    pending=\$(cast_call '$BRIDGE' 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' '$WITHDRAW_L1_KEY' 2>/dev/null | tail -n 2 | head -1 | tr -d '[:space:]')
     [ \"\${pending:-0}\" -gt 0 ]
   "
-  pending=$(cast_call "$BRIDGE" "pendingWithdrawals(bytes32)(address,address,uint256,uint64)" "$WITHDRAW_NONCE")
+  pending=$(cast_call "$BRIDGE" "pendingWithdrawals(bytes32)(address,address,uint256,uint64)" "$WITHDRAW_L1_KEY")
   claimable=$(echo "$pending" | tail -n 1 | tr -d '[:space:]' | cut -d'[' -f1)
   log "  pending amount=$(echo "$pending" | sed -n 3p) claimableAt=$claimable"
 
@@ -420,7 +510,7 @@ wait_l1_claim() {
     wait_for "claimableAt reached ($claimable)" "[ \"\$(cast block latest --field timestamp --rpc-url '$RPC_URL' 2>/dev/null | python3 -c 'import sys; print(int(sys.stdin.read().strip(), 16))')\" -ge $claimable ]" 300
   fi
 
-  cast_send_user "$BRIDGE" "claimPendingWithdrawal(bytes32)" "$WITHDRAW_NONCE" --gas-limit 200000 > /dev/null
+  cast_send_user "$BRIDGE" "claimPendingWithdrawal(bytes32)" "$WITHDRAW_L1_KEY" --gas-limit 200000 > /dev/null
   ok "claimPendingWithdrawal sent"
 
   # L1_BAL_INITIAL was captured after the deposit locked its funds in the
@@ -428,7 +518,7 @@ wait_l1_claim() {
   # side already moved out of the free balance).
   local expected=$((L1_BAL_INITIAL + WITHDRAW_AMOUNT))
   wait_for "pending cleared and L1 USDT balance == $expected" "
-    [ \"\$(cast_call '$BRIDGE' 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' '$WITHDRAW_NONCE' 2>/dev/null | tail -n +3 | head -1 | tr -d '[:space:]')\" -eq 0 ] \
+    [ \"\$(cast_call '$BRIDGE' 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' '$WITHDRAW_L1_KEY' 2>/dev/null | tail -n +3 | head -1 | tr -d '[:space:]')\" -eq 0 ] \\
     && [ \"\$(cast_call '$USDT' 'balanceOf(address)(uint256)' '$USER_ADDR' | awk '{print \$1}')\" -eq $expected ]
   "
   ok "L1 settlement complete"

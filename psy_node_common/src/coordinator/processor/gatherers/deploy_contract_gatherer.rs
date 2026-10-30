@@ -874,7 +874,7 @@ mod gatherer_builder_tests {
     };
     use psy_node_store_memory::temp_store::InMemoryTempStore;
 
-    use crate::test_common::TestNetworkConfig;
+    use crate::test_common::{fixture_validator_tree_root, TestNetworkConfig};
 
     use super::*;
 
@@ -951,7 +951,7 @@ mod gatherer_builder_tests {
                 user_tree_root: zh(3),
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: zh(3),
-                validator_tree_root: zh(2),
+                validator_tree_root: fixture_validator_tree_root(REALM_ID as u32, REALM_SUB_ID as u16),
             },
             should_revert_last_changes: should_revert,
             block_state: block_state(),

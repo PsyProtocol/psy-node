@@ -1,4 +1,5 @@
 import { parseArgs, isDeepStrictEqual } from "util";
+import { createRequire } from "node:module";
 import { rm, exists, mkdir, writeFile } from "fs/promises";
 import fs from "fs";
 import path from "path";
@@ -10,7 +11,7 @@ import { execFile, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { frozenDepsEnabled, frozenDepsCommandRunner, guardedEnvioCodegen } from "./frozenDeps";
 import allConfig from "../psy-genesis/config.json";
-import { protocolConfig } from "../psy-contracts/protocol-config";
+import { protocolConfig } from "./psyContractsProtocolConfig";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     DEFAULT_WORKER_BATCH_SIZE,
@@ -45,6 +46,7 @@ import {
     resolvePositiveIntegerSetting,
     resolveRayonThreadCount,
     resolveRealmWorkerCount,
+    retainedServicesDatabaseCommands,
     resolveWalletPasswordPolicy,
     resolveScyllaMemory,
     selectNonEmptyEnv,
@@ -72,6 +74,26 @@ import type {
     PsyDappNestedSubmodule,
     RestartStreak,
 } from "./locSetupPolicy";
+
+/**
+ * psy-contracts and psy-dapp are sibling repositories checked out next to
+ * psy-node (their psy-node gitlinks were removed); the sibling checkout wins
+ * when present and the legacy nested path stays as the fallback so existing
+ * checkouts keep working. Resolution is per call because callers pass
+ * different roots (REPO_ROOT, repoCwd, and test-supervised temporary cwds).
+ */
+function psySiblingRepoRoot(name: string, cwd: string): string | null {
+    const sibling = path.join(cwd, "..", name);
+    return fs.existsSync(path.join(sibling, "package.json")) ? sibling : null;
+}
+
+function psyContractsRoot(cwd: string): string {
+    return psySiblingRepoRoot("psy-contracts", cwd) ?? path.join(cwd, "psy-contracts");
+}
+
+function psyDappRoot(cwd: string): string {
+    return psySiblingRepoRoot("psy-dapp", cwd) ?? path.join(cwd, "psy-dapp");
+}
 
 /**
  * Retry processor creation only for the known transient Scylla schema family.
@@ -364,7 +386,7 @@ export function resolveActiveL1Chains(l1Network: L1NetworkName, l1Fork: boolean,
 export async function resolveL1ConfigArgs(cwd: string, chains: readonly ActiveL1Chain[]): Promise<string[]> {
     const args: string[] = [];
     for (const chain of chains) {
-        const documentPath = path.join(cwd, "psy-contracts", "deployments", chain.deploymentsNetwork, "deployed-contracts.json");
+        const documentPath = path.join(psyContractsRoot(cwd), "deployments", chain.deploymentsNetwork, "deployed-contracts.json");
         const stat = await fs.promises.lstat(documentPath).catch(() => null);
         if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
             throw new Error(`[DevNet] selected L1 chain ${chain.networkId} has no deployment document at ${documentPath}`);
@@ -525,7 +547,7 @@ async function loadBridgeRelayerSigner(repoCwd: string): Promise<L1SignerInfo> {
         throw new Error(`[DevNet] bridge relayer keystore not found: ${keystorePath}`);
     }
     const password = await resolveWalletPassword();
-    const contractsDir = path.join(repoCwd, "psy-contracts");
+    const contractsDir = psyContractsRoot(repoCwd);
     const decodeScript = `
 const { Wallet } = require("ethers");
 const fs = require("fs");
@@ -2172,7 +2194,7 @@ async function ensureRepoCloned(repoName: string, repoUrl: string, branch: strin
 }
 
 async function ensureRequiredSubmodules(cwd: string): Promise<void> {
-    const requiredSubmodules = ["psy-genesis", "psy-contracts", "psy-dapp"];
+    const requiredSubmodules = ["psy-genesis"];
     const missingSubmodules: string[] = [];
     for (const submodule of requiredSubmodules) {
         if (!(await exists(path.join(cwd, submodule, ".git")))) {
@@ -2255,7 +2277,8 @@ async function ensurePsyDappNestedSubmodules(dappRoot: string): Promise<void> {
     if (!(await exists(path.join(dappRoot, ".git")))) {
         throw new Error(
             `[AutoSetup] psy-dapp checkout is missing at ${dappRoot}. ` +
-            "Run `git submodule update --init -- psy-dapp` from the psy-node repository.",
+            "Clone psy-dapp as a sibling repository next to psy-node " +
+            "(or restore the legacy nested psy-dapp checkout).",
         );
     }
     const dappRelPath = path.relative(REPO_ROOT, dappRoot) || "psy-dapp";
@@ -2416,8 +2439,8 @@ async function ensureNpmDeps(dir: string, name: string, opts?: { force?: boolean
 
 async function ensureAllUiDeps(cwd: string, opts?: { force?: boolean }): Promise<void> {
     const uiDirs = [
-        { dir: path.join(cwd, "psy-dapp"), name: "psy-dapp" },
-        { dir: path.join(cwd, "psy-contracts"), name: "psy-contracts" },
+        { dir: psyDappRoot(cwd), name: "psy-dapp" },
+        { dir: psyContractsRoot(cwd), name: "psy-contracts" },
     ];
     for (const { dir, name } of uiDirs) {
         if (await exists(path.join(dir, "package.json"))) {
@@ -3200,6 +3223,16 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
     return { args: [path.resolve(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", path.resolve(cwd)], env: childEnv };
 }
 
+/** Reload this run's freshly generated faucet artifact into the auto-loaded env slot; explicit operator env wins; unreadable artifact fails setup. */
+export function loadFreshGenesisFaucetOperators(
+    envVars: { [key: string]: string },
+    faucetOpsPath: string,
+    explicitOperatorConfig: boolean,
+): void {
+    if (explicitOperatorConfig) return;
+    envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
+}
+
 export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env, preflight = false): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
@@ -3299,6 +3332,7 @@ async function ensureDevEnvironment(
         requireAnvil?: boolean;
         requireBun?: boolean;
         selectedUi?: boolean;
+        skipBridgeCustody?: boolean;
         env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
@@ -3326,27 +3360,32 @@ async function ensureDevEnvironment(
     }
 
     await ensureRequiredSubmodules(cwd);
-    if (opts?.selectedUi && !(await exists(path.join(cwd, "psy-dapp", "apps", "account", "package.json")))) {
+    if (opts?.selectedUi && !(await exists(path.join(psyDappRoot(cwd), "apps", "account", "package.json")))) {
         throw new Error("[DevNet] Mode A web wallet bridge package is missing at psy-dapp/apps/account/package.json");
     }
     // psy-dapp ships nested psy-genesis/psy-contracts gitlinks that the UI
     // apps alias into (config.json, protocol-config, deployments); initialize
-    // them before any UI dependency install or dev-server startup.
-    if (opts?.selectedUi) await ensurePsyDappNestedSubmodules(path.join(cwd, "psy-dapp"));
+    // them before any UI dependency install or dev-server startup, but only
+    // when the legacy nested psy-dapp checkout is in use and still carries
+    // gitlinks — a sibling checkout manages its own nested gitlinks.
+    if (opts?.selectedUi && psySiblingRepoRoot("psy-dapp", cwd) === null && fs.existsSync(path.join(psyDappRoot(cwd), ".gitmodules"))) {
+        await ensurePsyDappNestedSubmodules(psyDappRoot(cwd));
+    }
     // Proven order from parth-generic-v1: clone/find siblings (and init
     // psy-sdk's psy-genesis) before ensurePsySdkArtifacts reads config.json.
     await ensureAllReposCloned();
-    const contractsDir = path.join(cwd, "psy-contracts");
+    const contractsDir = psyContractsRoot(cwd);
     if (opts?.selectedUi) {
         const sdk = await ensurePsySdkArtifacts(cwd);
         await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     }
-    const { generated } = await ensureKeystoreFiles(contractsDir);
-    // Only set default WALLET_PASSWORD when we generated the L1 keystore this run.
-    if (generated && !process.env.WALLET_PASSWORD) {
-        process.env.WALLET_PASSWORD = "devnet";
-        bridgeRelayerKeystoreGeneratedThisRun = true;
-        console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
+    if (!opts?.skipBridgeCustody) {
+        const { generated } = await ensureKeystoreFiles(contractsDir);
+        if (generated && !process.env.WALLET_PASSWORD) {
+            process.env.WALLET_PASSWORD = "devnet";
+            bridgeRelayerKeystoreGeneratedThisRun = true;
+            console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
+        }
     }
     await ensureAllBinariesBuilt(cwd);
     console.log("[AutoSetup] Dev environment ready.");
@@ -3492,6 +3531,7 @@ export async function ensurePsyContractsDependencies(contractsDir: string) {
         stderr: "inherit",
     });
     const code = await proc.exited;
+
     if (code !== 0) {
         throw new Error(`${installCmd.join(" ")} failed in ${contractsDir} (exit=${code})`);
     }
@@ -3502,6 +3542,19 @@ export function localAnvilStatePath(repoCwd: string, network: L1DeploymentNetwor
     return path.join(repoCwd, network === "localhost" ? ANVIL_STATE_PATH : path.join("db", "anvil", network, "state.json"));
 }
 
+/** Monotonic per-entry normalization over a managed tree: strips forbidden bits (directories against dirMode, files against fileMode) without granting any missing bit, and never follows symlinks; an absent root still rejects. */
+export async function chmodTree(root: string, dirMode: number, fileMode: number): Promise<void> {
+    const stats = await fs.promises.lstat(root);
+    if (stats.isSymbolicLink()) return;
+    if (!stats.isDirectory()) {
+        await fs.promises.chmod(root, stats.mode & fileMode);
+        return;
+    }
+    await fs.promises.chmod(root, stats.mode & dirMode);
+    for (const entry of await fs.promises.readdir(root)) {
+        await chmodTree(path.join(root, entry), dirMode, fileMode);
+    }
+}
 
 export interface PreservedAnvilGenesis {
     timestamp: string;
@@ -3699,6 +3752,172 @@ export async function resolveLocalAnvilStatePlan(
     }
     return { statePath, hasState: false, shouldResetEnvio: true };
 }
+export interface RetainedResumeSelectionInput {
+    resume: boolean;
+    skipBridge: boolean;
+    all: boolean;
+    host: string;
+    daemonlize: boolean;
+    purge: boolean;
+    teardown: boolean;
+    control?: string;
+    stage: string;
+    l1Network: string;
+    l1Fork: boolean;
+    genesisDataPath: string;
+    coordinatorWorkersCount: number;
+    workerRealmCount: number;
+    proveProxyCount: number | undefined;
+    relayer: boolean;
+    bridgeProposerDaemon: boolean;
+    psyPrivacyBridge: boolean;
+}
+
+export interface RetainedResumeSelection {
+    resume: boolean;
+    skipBridge: boolean;
+    coordinatorWorkersCount: number;
+    workerRealmCount: number;
+    proveProxyCount: number | undefined;
+    relayer: boolean;
+    bridgeProposerDaemon: boolean;
+    startBridgeCustody: boolean;
+    psyPrivacyBridge: boolean;
+}
+
+
+/** Reject every selector that would reset, regenerate, or load bridge custody before startup mutates anything. */
+export function resolveRetainedResumeSelection(input: RetainedResumeSelectionInput): RetainedResumeSelection {
+    const selected: RetainedResumeSelection = {
+        resume: input.resume,
+        skipBridge: input.skipBridge,
+        coordinatorWorkersCount: input.coordinatorWorkersCount,
+        workerRealmCount: input.workerRealmCount,
+        proveProxyCount: input.proveProxyCount,
+        relayer: input.relayer,
+        bridgeProposerDaemon: input.bridgeProposerDaemon,
+        startBridgeCustody: input.all || input.relayer || input.bridgeProposerDaemon,
+        psyPrivacyBridge: input.psyPrivacyBridge,
+    };
+    if (!input.resume) {
+        if (input.skipBridge) throw new Error("[DevNet] --skip-bridge requires --resume");
+        return selected;
+    }
+    const violations: string[] = [];
+    if (!input.skipBridge) violations.push("--skip-bridge");
+    if (!input.all) violations.push("--all");
+    if (input.host !== "127.0.0.1" && input.host !== "localhost") violations.push(`host ${input.host}`);
+    if (input.daemonlize) violations.push("--daemonlize");
+    if (input.purge) violations.push("--purge");
+    if (input.teardown) violations.push("--teardown");
+    if (input.control) violations.push("--control");
+    if (input.stage !== "localhost" || input.l1Network !== "localhost" || input.l1Fork) violations.push("non-localhost or fork L1");
+    if (input.genesisDataPath !== "genesis.json") violations.push(`genesis ${input.genesisDataPath}`);
+    if (input.coordinatorWorkersCount !== 0 || input.workerRealmCount !== 0 || input.proveProxyCount !== 0) {
+        violations.push("local worker or proxy count");
+    }
+    if (violations.length > 0) throw new Error(`[DevNet] retained resume refuses ${violations.join(", ")}`);
+    return { ...selected, relayer: false, bridgeProposerDaemon: false, startBridgeCustody: false };
+}
+
+async function requireRegularFile(filePath: string): Promise<void> {
+    const stat = await fs.promises.lstat(filePath).catch(() => null);
+    if (!stat?.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`[DevNet] retained resume requires a regular file at ${filePath}`);
+    }
+}
+
+/** Metadata gate. It never spawns chain processes, reads passwords, or writes state. */
+export async function assertRetainedDevnet(
+    cwd: string,
+    names: DevnetDbNames,
+    realmIds: readonly number[],
+    edgeCount: number,
+    host: string,
+): Promise<void> {
+    const files = [
+        path.join(cwd, "genesis.json"),
+        localAnvilStatePath(cwd, "localhost"),
+        localAnvilStatePath(cwd, "localhostBsc"),
+        localAnvilStatePath(cwd, "localhostBase"),
+        ...["localhost", "localhostBsc", "localhostBase"].map((network) => path.join(psyContractsRoot(cwd), "deployments", network, "deployed-contracts.json")),
+        path.join(cwd, REALM_P2P_OUT_DIR, "config.json"),
+        ...realmP2pSecretPaths(realmIds, edgeCount).map((relative) => path.join(cwd, relative)),
+    ];
+    for (const filePath of files) await requireRegularFile(filePath);
+    if (!(await isUsableGenesisData(path.join(cwd, "genesis.json")))) throw new Error("[DevNet] retained genesis.json is unusable");
+    const config = JSON.parse(await fs.promises.readFile(path.join(cwd, REALM_P2P_OUT_DIR, "config.json"), "utf-8")) as FullNetworkConfig;
+    const validatorUserIds = await genesisValidatorUserIds(cwd, realmIds);
+    if (!planRealmP2pConfig(config, realmIds, edgeCount, host, validatorUserIds, "", "local-devnet").reuse) {
+        throw new Error("[DevNet] retained Realm P2P config cannot be reused");
+    }
+    const genesis = JSON.parse(await fs.promises.readFile(path.join(cwd, "genesis.json"), "utf-8")) as { validators?: unknown };
+    const expected = realmGenesisValidators({ ...config, defaultNetwork: selectedRuntimeConfigKey("local-devnet") });
+    validateGenesisValidators(genesis.validators, expected);
+    if (!Array.isArray(genesis.validators) || genesis.validators.length !== expected.length) {
+        throw new Error("[DevNet] retained genesis validator membership is incomplete");
+    }
+    for (const network of ["localhost", "localhostBsc", "localhostBase"] as const) {
+        const plan = await resolveRetainedAnvilStatePlan(cwd, network);
+        await readDeploymentChainId(cwd, network);
+        if (!plan.genesis.header.number || !plan.genesis.header.timestamp) {
+            throw new Error(`[DevNet] ${network} retained snapshot has no genesis header`);
+        }
+        for (const contractName of ["Bridge", "StateManager"] as const) {
+            if (!/^0x[0-9a-fA-F]{40}$/.test(await readDeploymentAddress(cwd, network, contractName) ?? "")) {
+                throw new Error(`[DevNet] retained ${network} ${contractName} address is missing`);
+            }
+        }
+    }
+    for (const volume of [...devnetDbVolumeNames(names), names.envioDataVolume]) {
+        const listed = await runTeardownCommand(["docker", "volume", "inspect", volume], undefined, PURGE_DOCKER_TIMEOUT_MS);
+        if (listed.timedOut || listed.code !== 0 || !listed.stdoutComplete) {
+            throw new Error(`[DevNet] retained resume requires Docker volume ${volume}`);
+        }
+    }
+}
+export async function assertRetainedDependencies(cwd: string, proxyRequest: (url: string) => Promise<unknown>): Promise<void> {
+    await frozenEnvioStartCommand(path.join(cwd, "psy_cli", "psy_relayer_cli", "indexer", "envio"));
+    for (const name of ["bridge", "ide", "explorer"]) {
+        const appDir = path.join(psyDappRoot(cwd), "apps", name);
+        let executable: string;
+        try {
+            const pkg = createRequire(path.join(appDir, "package.json")).resolve("vite/package.json");
+            const parsed: unknown = JSON.parse(await fs.promises.readFile(pkg, "utf8"));
+            const bin = parsed && typeof parsed === "object" && "bin" in parsed ? parsed.bin : undefined;
+            const relative = typeof bin === "string" ? bin : bin && typeof bin === "object" && "vite" in bin && typeof bin.vite === "string" ? bin.vite : undefined;
+            if (!relative) throw new Error("missing vite bin");
+            executable = path.join(path.dirname(pkg), relative);
+        } catch (error) {
+            throw new Error(`[DevNet] retained resume cannot resolve the ${name} UI executable from ${appDir}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!(await fs.promises.stat(executable).then((stat) => stat.isFile()).catch(() => false))) {
+            throw new Error(`[DevNet] retained resume requires the ${name} UI executable at ${executable}`);
+        }
+    }
+    const accountExecutable = path.join(psyDappRoot(cwd), "apps", "account", "node_modules", "vite", "bin", "vite.js");
+    if (!(await fs.promises.stat(accountExecutable).then((stat) => stat.isFile()).catch(() => false))) {
+        throw new Error(`[DevNet] retained resume requires the account UI executable at ${accountExecutable}`);
+    }
+    const proxyConfig = JSON.parse(await fs.promises.readFile(path.join(cwd, "psy-genesis", "config.json"), "utf-8")) as FullNetworkConfig;
+    const proxyUrl = proxyConfig.networks.localhost?.prove_proxy_url?.[0];
+    const role = proxyUrl ? await proxyRequest(proxyUrl).catch(() => undefined) : undefined;
+    const info = role && typeof role === "object" ? role as { role?: unknown; user_methods?: unknown; system_methods?: unknown } : {};
+    if (info.role !== "all" || info.user_methods !== true || info.system_methods !== true) {
+        throw new Error(`[DevNet] retained resume requires psy_get_prove_proxy_role all with user and system methods at ${proxyUrl ?? "localhost.prove_proxy_url"}`);
+    }
+}
+
+export async function resolveRetainedAnvilStatePlan(
+    repoCwd: string,
+    network: L1DeploymentNetwork = "localhost",
+): Promise<{ statePath: string; hasState: true; shouldResetEnvio: false; genesis: PreservedAnvilGenesis }> {
+    const statePath = localAnvilStatePath(repoCwd, network);
+    await requireRegularFile(statePath);
+    const genesis = await inspectLocalAnvilState(statePath, false);
+    if (!genesis) throw new Error(`[DevNet] retained resume cannot read Anvil genesis from ${statePath}`);
+    return { statePath, hasState: true, shouldResetEnvio: false, genesis };
+}
 
 async function deployPsyContracts(
     repoCwd: string,
@@ -3706,7 +3925,7 @@ async function deployPsyContracts(
     deploymentsNetwork: L1DeploymentNetwork,
     opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string },
 ) {
-    const contractsDir = path.join(repoCwd, "psy-contracts");
+    const contractsDir = psyContractsRoot(repoCwd);
     if (!(await exists(contractsDir))) {
         throw new Error(`psy-contracts directory not found: ${contractsDir}`);
     }
@@ -3715,8 +3934,7 @@ async function deployPsyContracts(
         throw new Error("HOME is required to resolve Groth16 keystore paths");
     }
     const deploymentSummaryPath = path.join(
-        repoCwd,
-        "psy-contracts",
+        psyContractsRoot(repoCwd),
         "deployments",
         deploymentsNetwork,
         "deployed-contracts.json",
@@ -3797,7 +4015,7 @@ async function deployPsyContracts(
 }
 
 async function readDeploymentAddress(repoCwd: string, deploymentsNetwork: string, contractName: string): Promise<string | null> {
-    const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", deploymentsNetwork, "deployed-contracts.json");
+    const deploymentPath = path.join(psyContractsRoot(repoCwd), "deployments", deploymentsNetwork, "deployed-contracts.json");
     if (!(await exists(deploymentPath))) {
         return null;
     }
@@ -3806,7 +4024,7 @@ async function readDeploymentAddress(repoCwd: string, deploymentsNetwork: string
 }
 
 async function readDeploymentChainId(repoCwd: string, network: L1DeploymentNetwork): Promise<number> {
-    const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", network, "deployed-contracts.json");
+    const deploymentPath = path.join(psyContractsRoot(repoCwd), "deployments", network, "deployed-contracts.json");
     const deployed = await Bun.file(deploymentPath).json();
     const chainId = Number(deployed?.chainId ?? deployed?.protocol?.chain?.l1ChainId);
     const expected = protocolConfig.chains[network].l1ChainId;
@@ -4077,7 +4295,7 @@ export async function prepareGuardianService(cmds: readonly string[], cwd: strin
     });
     const root = path.resolve(cwd, cmds[rootIndex + 1]);
     const databaseDir = path.join(root, "db");
-    await validateDaemonPath(databaseDir, "directory", DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)), "guardian db metadata");
+    await validateDaemonPath(databaseDir, "directory", devnetPurgeTargets(cwd), "guardian db metadata");
     const stat = await fs.promises.lstat(databaseDir);
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
         throw new Error("[DevNet] guardian db directory must be an existing owner-only directory");
@@ -4090,6 +4308,17 @@ const DEVNET_PURGE_PATHS = [
     "local_checkpoints", "db/anvil", "logs",
     ...["localhost", "localhostBsc", "localhostBase", "sepolia", "ethereum"].map((network) => `psy-contracts/deployments/${network}`),
 ];
+
+/**
+ * Absolute purge targets for DEVNET_PURGE_PATHS: the psy-contracts deployment
+ * entries follow the sibling-first resolver, everything else stays inside the
+ * psy-node checkout.
+ */
+function devnetPurgeTargets(cwd: string): string[] {
+    return DEVNET_PURGE_PATHS.map((entry) => entry.startsWith("psy-contracts/")
+        ? path.join(psyContractsRoot(cwd), entry.slice("psy-contracts/".length))
+        : path.resolve(cwd, entry));
+}
 
 export interface FreshDevnetState {
     abort(): Promise<void>;
@@ -4135,6 +4364,10 @@ function appendFreshHelperDiagnostic(error: unknown, stderrTail: Buffer): unknow
 
 /** One helper owns every database inode from prepare through finish. Config is read-only and is not snapshotted. */
 export async function prepareFreshDevnetState(cwd: string, guardianRoot: string, env: NodeJS.ProcessEnv): Promise<FreshDevnetState> {
+    for (const target of ["db", "local_checkpoints", "logs"]) {
+        await chmodTree(path.join(cwd, target), 0o755, 0o644).catch(() => { });
+    }
+    await chmodTree(path.join(psyContractsRoot(cwd), "deployments"), 0o755, 0o644).catch(() => { });
     const generation = await planGenesisGeneration(cwd, env);
     const child = spawn(generation.args[0], ["fresh-devnet-state", "--repo-root", path.resolve(cwd),
         "--guardians-root", guardianRoot],
@@ -4236,6 +4469,31 @@ async function resetScopedDevnetState(cwd: string, targets: ScopedDevnetReset): 
     if (targets.volumes.length > 0) await runBoundedTeardown("fresh-volume-rm", ["docker", "volume", "rm", "-f", ...targets.volumes], undefined, failures);
     if (failures.length > 0) throw new Error(`[DevNet] fresh startup namespace cleanup failed: ${failures.join(" | ")}`);
 }
+/** Supplied path must already be a non-symlink regular file; the returned path is canonical. */
+export async function resolveScyllaIoProperties(value: string | undefined): Promise<string | undefined> {
+    const supplied = value?.trim();
+    if (!supplied) return undefined;
+    let suppliedStat: fs.Stats;
+    try {
+        suppliedStat = await fs.promises.lstat(supplied);
+    } catch {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    if (!suppliedStat.isFile() || suppliedStat.isSymbolicLink()) {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    let canonical: string;
+    try {
+        canonical = await fs.promises.realpath(path.resolve(supplied));
+    } catch {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    if (canonical.includes(":")) {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES absolute path must not contain ':', received '${supplied}'`);
+    }
+    return canonical;
+}
+
 
 function daemonConfigError(field: string): Error {
     return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
@@ -4293,7 +4551,7 @@ export async function resolveBridgeDaemonConfigPath(
         if (n < 0n || n >= (1n << BigInt(bits))) throw daemonConfigError(field);
     };
     const configPath = path.resolve(cwd, textField(env.PSY_BRIDGE_DAEMON_CONFIG, "config path"));
-    const purgeTargets = purge ? DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)) : [];
+    const purgeTargets = purge ? devnetPurgeTargets(cwd) : [];
     await validateDaemonPath(configPath, "file", purgeTargets, "config path metadata");
     let config: Record<string, unknown>;
     try {
@@ -4420,6 +4678,7 @@ async function startEnvioIndexerForRelayer(
     env?: { [key: string]: string },
     resetStorage: boolean = false,
     runtimeCpuSet?: string,
+    resume = false,
 ): Promise<RunningProcess | null> {
     const cfgPath = path.isAbsolute(relayerConfigPath) ? relayerConfigPath : path.join(repoCwd, relayerConfigPath);
     if (!(await exists(cfgPath))) return null;
@@ -4451,7 +4710,7 @@ async function startEnvioIndexerForRelayer(
         return undefined;
     };
     const targets = await Promise.all(cohort.map(async (target) => {
-        const deployedPath = path.join(repoCwd, "psy-contracts", "deployments", target.deploymentsNetwork, "deployed-contracts.json");
+        const deployedPath = path.join(psyContractsRoot(repoCwd), "deployments", target.deploymentsNetwork, "deployed-contracts.json");
         if (!(await exists(deployedPath))) throw new Error(`missing deployed contracts summary: ${deployedPath}`);
         const deployed = JSON.parse(await Bun.file(deployedPath).text()) as any;
         const chainId = await readDeploymentChainId(repoCwd, target.deploymentsNetwork);
@@ -4502,10 +4761,10 @@ async function startEnvioIndexerForRelayer(
             `LOG_LEVEL=info`,
         ].join("\n") + "\n",
     );
-    const frozen = frozenDepsEnabled((env ?? process.env).PSY_FROZEN_DEPS);
-    if (frozen) {
-        // Always run real codegen; its guarded children install/build from the
-        // reviewed lock. Do not rewrite manifests or trust a config hash.
+    const frozen = resume || frozenDepsEnabled((env ?? process.env).PSY_FROZEN_DEPS);
+    if (frozen && resume) {
+        await frozenEnvioStartCommand(envioDir);
+    } else if (frozen) {
         await runFrozenEnvioCodegen(envioDir, env ?? process.env);
     } else {
         const pkgPath = path.join(envioDir, "package.json");
@@ -4917,6 +5176,7 @@ async function runBoundedTeardown(phase: string, argv: string[], cwd: string | u
 }
 /** Explicit purge/fresh only: bounded stop, then force-remove the exact owned names.
  * A stop timeout is ignored only when that stop client was reaped and `docker rm -f` succeeded.
+ * A completed nonzero force-remove is classified by current post-state: it is a failure only when an owned name is still listed, and an unusable post-state snapshot fails closed.
  * An unreaped stop client is fatal even if force-remove reports success. */
 export async function removeOwnedContainersForPurge(
     containers: readonly string[],
@@ -4933,7 +5193,20 @@ export async function removeOwnedContainersForPurge(
     );
     try {
         const removed = await run(["docker", "rm", "-f", ...containers], undefined, PURGE_DOCKER_TIMEOUT_MS);
-        if (removed.timedOut || removed.code !== 0 || !removed.stdoutComplete) failures.push(formatTeardownFailure(`${phase}-rm`, removed));
+        if (removed.timedOut || removed.code !== 0 || !removed.stdoutComplete) {
+            let residual: readonly string[] | null = null;
+            if (!removed.timedOut && removed.stdoutComplete) {
+                try {
+                    const after = await run(["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, PURGE_DOCKER_TIMEOUT_MS);
+                    if (!after.timedOut && after.code === 0 && after.stdoutComplete) {
+                        const listed = exactSnapshotNames(after.stdout);
+                        residual = containers.filter((name) => listed.has(name));
+                    }
+                } catch { failures.push(`${phase}-rm post-state snapshot failed`); }
+            }
+            if (residual === null) failures.push(formatTeardownFailure(`${phase}-rm`, removed));
+            else if (residual.length > 0) failures.push(`${formatTeardownFailure(`${phase}-rm`, removed)} still present: ${residual.join(", ")}`);
+        }
     } catch (error) {
         failures.push(`${phase}-rm docker spawn failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -5004,10 +5277,14 @@ async function purgeDevnet(cwd: string): Promise<void> {
     const dockerClean = await purgeDockerCleanup(cwd, failures);
     const applicationsGone = await knownApplicationsGone(failures);
     console.log("[DevNet] Purging local checkpoints, Anvil state, logs, deployments, and Docker volumes...");
-    const purgePaths = ["./local_checkpoints", "./db/anvil", "./logs", ...DEVNET_PURGE_PATHS.filter((entry) => entry.startsWith("psy-contracts/"))];
+    const checkoutPurgePaths = ["./local_checkpoints", "./db/anvil", "./logs"];
+    const deploymentPurgeTargets = DEVNET_PURGE_PATHS
+        .filter((entry) => entry.startsWith("psy-contracts/"))
+        .map((entry) => path.join(psyContractsRoot(cwd), entry.slice("psy-contracts/".length)));
     if (anvilStopped && dockerClean && applicationsGone) {
         const root = await fs.promises.realpath(cwd);
-        for (const relative of purgePaths) {
+        const contractsRoot = await fs.promises.realpath(psyContractsRoot(cwd)).catch(() => null);
+        for (const relative of checkoutPurgePaths) {
             const target = path.resolve(root, relative);
             try {
                 const parent = await canonicalExistingAncestor(path.dirname(target));
@@ -5019,16 +5296,28 @@ async function purgeDevnet(cwd: string): Promise<void> {
                 failures.push(`delete ${relative}: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
+        for (const target of deploymentPurgeTargets) {
+            if (!contractsRoot) continue;
+            try {
+                const parent = await canonicalExistingAncestor(path.dirname(target));
+                if (!parent || (parent !== contractsRoot && !parent.startsWith(`${contractsRoot}${path.sep}`))) {
+                    throw new Error("parent resolves outside the psy-contracts checkout");
+                }
+                await rm(target, { recursive: true, force: true });
+            } catch (error) {
+                failures.push(`delete ${target}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
     } else failures.push("skipped deleting purge paths: cleanup was not proven");
     for (const chain of LOCAL_ANVIL_RPCS) {
         if (await tcpPortOpen(chain.port)) failures.push(`residual port ${chain.port}`);
     }
-    for (const relative of purgePaths) {
+    for (const target of [...checkoutPurgePaths, ...deploymentPurgeTargets]) {
         try {
-            await fs.promises.lstat(path.resolve(cwd, relative));
-            failures.push(`residual path ${relative}`);
+            await fs.promises.lstat(path.resolve(cwd, target));
+            failures.push(`residual path ${target}`);
         } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(`cannot inspect residual path ${relative}`);
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(`cannot inspect residual path ${target}`);
         }
     }
     if (failures.length > 0) throw new Error(`[DevNet] purge failed without startup: ${failures.join(" | ")}`);
@@ -5101,8 +5390,8 @@ function ownedDevnetUiLeader(leader: AnvilProcessIdentity, listener: AnvilProces
 
 /** SIGTERM then SIGKILL only an owned node listener whose group leader is that node or the exact bun dev wrapper. */
 export async function stopOwnedDevnetUiListeners(repoRoot: string, control: DevnetUiListenerControl = {}): Promise<void> {
-    const canonical = await fs.promises.realpath(repoRoot);
-    const appsRoot = `${canonical}${path.sep}psy-dapp${path.sep}apps${path.sep}`;
+    const dappRoot = await fs.promises.realpath(psyDappRoot(repoRoot)).catch(() => path.resolve(psyDappRoot(repoRoot)));
+    const appsRoot = `${dappRoot}${path.sep}apps${path.sep}`;
     const self = process.getuid?.() ?? null;
     const portOpen = control.portOpen ?? tcpPortOpen;
     const ownerOf = control.listenerOwner ?? tcpListenerOwner;
@@ -5467,6 +5756,7 @@ interface ProcessOptions {
     explorer?: boolean;
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
+    resume?: boolean;
 }
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
@@ -5633,6 +5923,7 @@ export class DevNetProcessManager {
     private genesisDataPath: string = "genesis.json";
     private envVars: { [key: string]: string } | undefined;
     private provingBackend: string | undefined;
+    private readonly faucetOperatorConfigExplicit: boolean;
 
     constructor(host: string = "127.0.0.1", envVars?: { [key: string]: string }, provingBackend?: string) {
         this.host = host;
@@ -5641,6 +5932,7 @@ export class DevNetProcessManager {
         this.REDIS_URL = `redis://${host}:6379`;
         this.COORD_API_URL = `http://${host}:1337`;
         this.envVars = envVars;
+        this.faucetOperatorConfigExplicit = hasFaucetOperatorConfig(envVars ?? {}, process.env);
         this.provingBackend = provingBackend;
     }
 
@@ -6075,7 +6367,8 @@ export class DevNetProcessManager {
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
         const skipBuild = skipBuildEnabled();
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
-        const startBridgeProposerDaemon = shouldRequireGuardianRoot(startAll, options);
+        const resume = !!options.resume;
+        const startBridgeProposerDaemon = !resume && shouldRequireGuardianRoot(startAll, options);
         const daemonConfigPath = startBridgeProposerDaemon
             ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), startAll || !!options.purge)
             : undefined;
@@ -6094,7 +6387,7 @@ export class DevNetProcessManager {
         const provingProcessCount = coordinatorWorkersCount
             + workerRealmCount
             + (options.dummyProvers || 0)
-            + (options.proveProxyCount ?? (startAll ? 1 : 0));
+            + (options.proveProxyCount ?? (startAll && !resume ? 1 : 0));
         const runtimeResources = await resolveRuntimeResourceSettings(
             this.getEnv() || { ...process.env } as { [key: string]: string },
             provingProcessCount,
@@ -6130,6 +6423,36 @@ export class DevNetProcessManager {
         };
 
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
+        const names = resume
+            ? await resolveBoundDevnetNames(cwd, this.getEnv())
+            : await this.admitNamespace(cwd);
+        if (resume) {
+            this.admittedNames = names;
+            const realmIds = Array.from({ length: realmsCount }, (_, index) => startRealmId + index);
+            await assertRetainedDevnet(cwd, names, realmIds, realmEdgeCount, this.host);
+            process.env.PSY_FROZEN_DEPS = "1";
+            this.envVars = { ...(this.envVars || {}), PSY_FROZEN_DEPS: "1" };
+            await assertRetainedDependencies(cwd, async (url) => {
+                const response = await fetch(url, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "psy_get_prove_proxy_role", params: [] }),
+                    signal: AbortSignal.timeout(1500),
+                });
+                const body = await response.json() as { result?: unknown };
+                return body.result;
+            });
+            const servicesRoot = path.resolve(resolveProjectsDir(), "psy-services");
+            await requireReleaseBinaries([
+                { name: "psy_node_cli", path: path.join(cwd, "target", "release", "psy_node_cli") },
+                { name: "psy_worker_cli", path: path.join(cwd, "target", "release", "psy_worker_cli") },
+                { name: "psy_relayer_cli", path: path.join(cwd, "target", "release", "psy_relayer_cli") },
+                { name: "psy_user_cli", path: path.join(cwd, "target", "release", "psy_user_cli") },
+                { name: "psy_dev_cli", path: path.join(cwd, "target", "release", "psy_dev_cli") },
+                { name: "psy-services", path: path.join(servicesRoot, "target", "release", "psy-services") },
+                { name: "psy-indexer", path: path.join(servicesRoot, "target", "release", "psy-indexer") },
+            ]);
+        }
 
         // 1. Build (skip if binaries exist)
         const psyNodeCliPath = path.join(cwd || '.', 'target/release/psy_node_cli');
@@ -6145,28 +6468,25 @@ export class DevNetProcessManager {
             || !(await exists(psyWorkerCliPath))
             || !(await exists(psyRelayerCliPath))
         );
-        if (missingParthRuntimeBinary) {
-            if (skipBuild) {
-                await requireReleaseBinaries(parthRuntimeBinaries);
-            } else {
-                await buildProject(cwd);
-            }
-        } else {
+        if (!resume && missingParthRuntimeBinary) {
+            if (skipBuild) await requireReleaseBinaries(parthRuntimeBinaries);
+            else await buildProject(cwd);
+        } else if (!resume) {
             console.log("Binaries already exist, skipping build...");
         }
-        if (startAll) {
+        if (startAll && !resume) {
             if (stage !== "localhost" || l1Network !== "localhost" || l1Fork || options.daemonlize
                 || path.resolve(cwd, this.genesisDataPath) !== path.resolve(cwd, "genesis.json")) {
                 throw new Error("[DevNet] full fresh startup requires foreground localhost, no fork, and the canonical genesis.json");
             }
             await ensureGenesisFiles(cwd, this.getEnv(), true);
-            await ensurePsyContractsDependencies(path.join(cwd, "psy-contracts"));
+            await ensurePsyContractsDependencies(psyContractsRoot(cwd));
             await assertCheckoutProducersStopped(cwd, {});
             await discoverRepoAnvils(cwd);
             await loadBridgeRelayerSigner(cwd);
         }
-        const names = await this.admitNamespace(cwd);
-        if (startAll && daemonConfigPath) {
+        if (this.needsStartDb) await resolveScyllaIoProperties(this.getEnv().SCYLLA_IO_PROPERTIES);
+        if (startAll && daemonConfigPath && !resume) {
             const daemon = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
             const guardianRoot = await resolveGuardianRoot(cwd, daemon.guardian_root as string);
             const reset = await planScopedDevnetReset(names);
@@ -6174,10 +6494,16 @@ export class DevNetProcessManager {
             await resetScopedDevnetState(cwd, reset);
             await this.freshState.reset();
             await ensureGenesisFiles(cwd, this.getEnv());
+            // Faucet/prove-proxy children spawn later with this.getEnv(); refresh the auto source to this run's artifact.
+            if (!this.faucetOperatorConfigExplicit) {
+                const faucetOpsPath = path.join(psyDappRoot(cwd), "apps", "bridge", "src", "config", "faucetOperators.json");
+                this.envVars ??= {};
+                loadFreshGenesisFaucetOperators(this.envVars, faucetOpsPath, this.faucetOperatorConfigExplicit);
+                console.log(`[DevNet] Loaded faucet operators from freshly generated artifact ${faucetOpsPath}`);
+            }
         }
-
         if (this.needsStartDb) {
-            const startDbCmd = ['./dev/start_db.sh', '--fresh'];
+            const startDbCmd = resume ? ['./dev/start_db.sh', '--persist'] : ['./dev/start_db.sh', '--fresh'];
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -6197,16 +6523,21 @@ export class DevNetProcessManager {
         let realmP2pConfig: FullNetworkConfig | null = null;
         if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host, path.join(cwd, this.genesisDataPath));
+            if (resume) {
+                const config = JSON.parse(await fs.promises.readFile(path.join(cwd, REALM_P2P_OUT_DIR, "config.json"), "utf-8")) as FullNetworkConfig;
+                realmP2pConfig = { ...config, defaultNetwork: selectedRuntimeConfigKey("local-devnet") };
+            } else {
+                realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host, path.join(cwd, this.genesisDataPath));
+                await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
+            }
             this.envVars = { ...this.envVars, PSY_CONFIG_PATH: `${REALM_P2P_OUT_DIR}/config.json`, PSY_NETWORK: realmP2pConfig.defaultNetwork };
-            await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
         }
 
         // Prove proxy Groth16 preload is independent of Coordinator RPC.
         // Spawn immediately after realm/genesis prep, then wait for :9999
         // before core so processor startup is not concurrent with preload.
         const proveProxyReady: Promise<void>[] = [];
-        const proveProxyCount = options.proveProxyCount ?? (startAll ? 1 : 0);
+        const proveProxyCount = options.proveProxyCount ?? (startAll && !resume ? 1 : 0);
         if (proveProxyCount > 0) {
             const count = proveProxyCount;
             for (let i = 0; i < count; i++) {
@@ -6552,22 +6883,29 @@ export class DevNetProcessManager {
         }
 
 
-        // 10. L1 (Anvil). Local chains always start empty and deploy fresh.
+        // 10. L1 (Anvil). Fresh chains start empty; resume loads the saved snapshots.
         let resetEnvioStorage = false;
         if (options.l1 || startAll) {
             const local = l1Network === "localhost" || l1Fork;
             const statePlans = local
-                ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork, l1Fork, { rpcUrl: chain.rpcUrl })))
+                ? await Promise.all(relayerChains.map((chain) => resume
+                    ? resolveRetainedAnvilStatePlan(cwd, chain.deploymentsNetwork)
+                    : resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork, l1Fork, { rpcUrl: chain.rpcUrl })))
                 : [];
-            resetEnvioStorage = statePlans.length > 0;
-            const contractsDir = path.join(cwd, "psy-contracts");
-            const deploys = relayerChains.some((chain) => chain.deploymentsNetwork.startsWith("localhost") || shouldRedeployL1());
+            resetEnvioStorage = !resume && statePlans.length > 0;
+            const contractsDir = psyContractsRoot(cwd);
+            const deploys = !resume && relayerChains.some((chain) => chain.deploymentsNetwork.startsWith("localhost") || shouldRedeployL1());
             if (deploys) {
                 await ensurePsyContractsDependencies(contractsDir);
                 const compile = Bun.spawn(["npx", "hardhat", "compile"], { cwd: contractsDir, stdout: "inherit", stderr: "inherit" });
                 const compileCode = await compile.exited;
                 if (compileCode !== 0) throw new Error(`[DevNet] psy-contracts compile failed (exit=${compileCode})`);
             }
+            const anvilStateTmp = path.join(cwd, "db", "anvil", "tmp");
+            const anvilFoundryDir = path.join(cwd, "db", "foundry");
+            await mkdir(anvilStateTmp, { recursive: true, mode: 0o755 });
+            await mkdir(anvilFoundryDir, { recursive: true, mode: 0o755 });
+            await chmodTree(path.join(cwd, "db"), 0o755, 0o644);
             const l1Deployments = await Promise.allSettled(relayerChains.map(async (chain, index) => {
                 const chainMeta = protocolConfig.chains[chain.deploymentsNetwork];
                 const statePlan = statePlans[index];
@@ -6576,7 +6914,7 @@ export class DevNetProcessManager {
                     await mkdir(path.dirname(statePlan.statePath), { recursive: true });
                     const rpc = new URL(chain.rpcUrl);
                     const port = Number(rpc.port || (rpc.protocol === "https:" ? 443 : 80));
-                    const args = localAnvilLaunchArgs(port, String(chainMeta.l1ChainId), statePlan.statePath);
+                    const args = localAnvilLaunchArgs(port, String(chainMeta.l1ChainId), statePlan.statePath, "genesis" in statePlan ? statePlan.genesis : undefined);
                     if (l1Fork) {
                         const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry, stage);
                         const forkRpcUrl = process.env[forkEnvKey];
@@ -6587,7 +6925,7 @@ export class DevNetProcessManager {
                     }
                     this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                         args, l1StartedDetector,
-                        { cwd, ...getLogPaths(logName, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() },
+                        { cwd, ...getLogPaths(logName, false), maxRetries: 3, retryDelayMs: 2000, env: { ...this.getEnv(), FOUNDRY_DIR: anvilFoundryDir, TMPDIR: anvilStateTmp } },
                     ), logName);
                 } else {
                     console.log(`[DevNet] Using external L1 network ${chain.networkId} via ${chain.rpcUrl}`);
@@ -6595,11 +6933,26 @@ export class DevNetProcessManager {
                 await waitForHttpUrl(chain.rpcUrl, {
                     attempts: 30, delayMs: local ? 500 : 1000, timeoutMs: local ? 1500 : 3000, name: `${chainMeta.name} RPC`,
                 });
+                if (statePlan && "genesis" in statePlan) {
+                    await assertPreservedAnvilGenesis(chain.rpcUrl, statePlan.genesis, `${chain.networkId} retained Anvil`);
+                    const observed = hexQuantityToBigInt(await anvilRpc(chain.rpcUrl, "eth_chainId", []), `${chain.networkId} eth_chainId`);
+                    const expected = BigInt(await readDeploymentChainId(cwd, chain.deploymentsNetwork));
+                    if (observed !== expected) throw new Error(`[DevNet] ${chain.networkId} chain id ${observed} does not match deployment ${expected}`);
+                    for (const contractName of ["Bridge", "StateManager"] as const) {
+                        const address = await readDeploymentAddress(cwd, chain.deploymentsNetwork, contractName);
+                        const code = await anvilRpc(chain.rpcUrl, "eth_getCode", [address, "latest"]);
+                        if (typeof code !== "string" || !/^0x[0-9a-fA-F]*$/.test(code) || code.length <= 2) {
+                            throw new Error(`[DevNet] ${chain.networkId} ${contractName} has no deployed code`);
+                        }
+                    }
+                }
                 if (statePlan) await setLocalAnvilIntervalMining(chain.rpcUrl);
-                await deployPsyContracts(cwd, chain.rpcUrl, chain.deploymentsNetwork, {
-                    fundDevAccounts: local,
-                    localAnvilRpcUrl: local ? chain.rpcUrl : undefined,
-                });
+                if (!resume) {
+                    await deployPsyContracts(cwd, chain.rpcUrl, chain.deploymentsNetwork, {
+                        fundDevAccounts: local,
+                        localAnvilRpcUrl: local ? chain.rpcUrl : undefined,
+                    });
+                }
             }));
             const l1Failure = l1Deployments.find((result): result is PromiseRejectedResult => result.status === "rejected");
             if (l1Failure) throw l1Failure.reason;
@@ -6630,6 +6983,7 @@ export class DevNetProcessManager {
                 this.getEnv(),
                 resetEnvioStorage,
                 runtimeResources.runtimeCpuSet,
+                resume,
             );
             if (envioProc) {
                 this.track(envioProc);
@@ -6710,7 +7064,13 @@ export class DevNetProcessManager {
             }));
 
             const names = resolveDevnetDbNamesFromEnv(this.getEnv());
-            for (const command of psyServicesDatabaseCommands(true, false, names.envioPostgresContainer)) {
+            const databaseCommands = resume
+                ? retainedServicesDatabaseCommands(
+                    (await runAndCapture(envioServicesDatabaseProbeCommand(names.envioPostgresContainer))).stdout.trim() === "1",
+                    names.envioPostgresContainer,
+                )
+                : psyServicesDatabaseCommands(true, false, names.envioPostgresContainer);
+            for (const command of databaseCommands) {
                 const code = await Bun.spawn(command, { stdio: ['ignore', 'ignore', 'inherit'] }).exited;
                 if (code !== 0) throw new Error(`[DevNet] psy_services database setup failed: ${command[3]}`);
             }
@@ -6846,7 +7206,10 @@ export class DevNetProcessManager {
                 {
                     cwd,
                     ...getLogPaths('bridge_relayer', false),
-                    env: this.getEnvWithRustLogDirective('psy_relayer_cli=info'),
+                    env: {
+                        ...this.getEnvWithRustLogDirective('psy_relayer_cli=info'),
+                        KEYSTORE_PATH: resolveBridgeRelayerKeystorePath(),
+                    },
                     maxRetries: 3,
                     retryDelayMs: 2000
                 }
@@ -6866,7 +7229,7 @@ export class DevNetProcessManager {
 
         // 12. Privacy Bridge shell
         if (options.psyPrivacyBridge || startAll) {
-            const privacyBridgeDir = path.join(cwd, 'psy-dapp', 'apps', 'bridge');
+            const privacyBridgeDir = path.join(psyDappRoot(cwd), 'apps', 'bridge');
             await ensureUiDependencies(privacyBridgeDir);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 ['bun', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '5177', '--strictPort'],
@@ -6882,7 +7245,7 @@ export class DevNetProcessManager {
                         // Point @deployments at the root psy-contracts deployments the
                         // L1 deploy flow actually writes; the nested psy-dapp copy is
                         // only for standalone dapp runs and is not synced by devnet.
-                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
+                        PSY_DEPLOYMENTS_DIR: path.resolve(psyContractsRoot(cwd), 'deployments'),
                     },
                     maxRetries: 3,
                     retryDelayMs: 2000
@@ -6893,7 +7256,7 @@ export class DevNetProcessManager {
 
         // 16. IDE
         if (options.ide || startAll) {
-            const ideDir = path.join(cwd, 'psy-dapp', 'apps', 'ide');
+            const ideDir = path.join(psyDappRoot(cwd), 'apps', 'ide');
             await ensureUiDependencies(ideDir);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 ['bun', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '5176', '--strictPort'],
@@ -6916,7 +7279,7 @@ export class DevNetProcessManager {
 
         // 17. Explorer
         if (options.explorer || startAll) {
-            const explorerDir = path.join(cwd, 'psy-dapp', 'apps', 'explorer');
+            const explorerDir = path.join(psyDappRoot(cwd), 'apps', 'explorer');
             await ensureUiDependencies(explorerDir);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 ['pnpm', 'exec', 'vite', '--host', '0.0.0.0', '--port', '5178', '--strictPort'],
@@ -6932,7 +7295,7 @@ export class DevNetProcessManager {
                         // Same as the bridge shell: read the root psy-contracts
                         // deployments the L1 deploy flow writes, not the
                         // unsynced nested psy-dapp copy.
-                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
+                        PSY_DEPLOYMENTS_DIR: path.resolve(psyContractsRoot(cwd), 'deployments'),
                     },
                     maxRetries: 3,
                     retryDelayMs: 2000
@@ -6943,7 +7306,7 @@ export class DevNetProcessManager {
 
         // 18. Mode A Web Wallet Bridge
         if (options.modeAWebWalletBridge || startAll) {
-            const modeAWebWalletBridgeDir = path.join(cwd, 'psy-dapp', 'apps', 'account');
+            const modeAWebWalletBridgeDir = path.join(psyDappRoot(cwd), 'apps', 'account');
             // The app uses `link:` deps to `@psy-protocol/psy-sdk` and `@psy-protocol/evm-wallet`.
             // Those packages are not part of this repo (client_prover/psy_sdk only has generated
             // types), so we can only start the dev server if the linked workspace is present.
@@ -6985,7 +7348,7 @@ export class DevNetProcessManager {
                         VITE_PSY_STAGE: stage,
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
-                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
+                        PSY_DEPLOYMENTS_DIR: path.resolve(psyContractsRoot(cwd), 'deployments'),
                     },
                     maxRetries: 3,
                     retryDelayMs: 2000
@@ -7062,6 +7425,8 @@ export class DevNetProcessManager {
             "--write-request-timeout-in-ms", scyllaWriteTimeout,
             "--memory", resolveScyllaMemory(env.SCYLLA_MEMORY),
         ];
+        const scyllaIoProperties = await resolveScyllaIoProperties(env.SCYLLA_IO_PROPERTIES);
+        if (scyllaIoProperties) scyllaCommand.push("--io-properties-file", "/etc/scylla.d/io_properties.yaml");
         if (!runtimeResources.scyllaCpuSet) {
             scyllaCommand.push("--overprovisioned", "1");
         }
@@ -7111,14 +7476,15 @@ export class DevNetProcessManager {
             };
 
             services["scylla-server"] = {
-                image: "scylladb/scylla:latest",
+                image: "scylladb/scylla@sha256:43a600f5291e55f1239dd94680c95d2b8a8be11bc0d73ced062031c978c155ca",
                 container_name: names.containers.scylla,
                 ports: ["9042:9042"],
                 cap_add: ["PERFMON"],
                 ...(runtimeResources.scyllaCpuSet ? { cpuset: runtimeResources.scyllaCpuSet } : {}),
                 volumes: [
                     `${names.volumes.scylla}:/var/lib/scylla`,
-                    `${names.volumes.scyllaData}:/run/udev/data`
+                    `${names.volumes.scyllaData}:/run/udev/data`,
+                    ...(scyllaIoProperties ? [`${scyllaIoProperties}:/etc/scylla.d/io_properties.yaml:ro`] : []),
                 ],
                 command: scyllaCommand,
                 healthcheck: {
@@ -7665,6 +8031,8 @@ async function runMain() {
             "explorer": { type: "boolean" },
             "mode-a-web-wallet-bridge": { type: "boolean" },
             "daemonlize": { type: "boolean" },
+            resume: { type: "boolean" },
+            "skip-bridge": { type: "boolean" },
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
             control: { type: "string" },
@@ -7676,15 +8044,14 @@ async function runMain() {
 
 
 
+    const resumeRequested = !!values.resume;
+    const skipBridge = !!values["skip-bridge"];
     const proveProxyCount = values["prove-proxy"] !== undefined ? parseInt(values["prove-proxy"], 10) : undefined;
     const hasOnlyOptions = !values.all && (!!values["db"] || !!values["coordinator"] || (proveProxyCount !== undefined && proveProxyCount !== 0) || !!values["faucet-server"] || !!values["dummy-provers"] || !!values["l1"] || !!values["relayer"] || !!values["bridge-proposer-daemon"] || !!values["psy-privacy-bridge"] || !!values["ide"] || !!values["explorer"] || !!values["mode-a-web-wallet-bridge"]);
-    const workerRealmCount = resolveRealmWorkerCount(
-        values["realm-workers"],
-        hasOnlyOptions,
-    );
+    const workerRealmCount = resolveRealmWorkerCount(values["realm-workers"], hasOnlyOptions || resumeRequested);
     const realmEdgeCount = parseInt(values["realm-edge-nodes"] || "1", 10);
     const coordinatorEdgeCount = parseInt(values["coordinator-edge-nodes"] || "1", 10);
-    const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : (!hasOnlyOptions ? 1 : 0);
+    const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : (!hasOnlyOptions && !resumeRequested ? 1 : 0);
     const startRealmId = parseInt(values["start-realm-id"] || "0", 10);
     const realmsCount = parseInt(values["realms-count"] || "1", 10);
     if (!hasOnlyOptions || !!values["coordinator"]) validateRealmP2pPorts(startRealmId, realmsCount, realmEdgeCount);
@@ -7722,21 +8089,6 @@ async function runMain() {
 
     const envVars: { [key: string]: string } = envString ? parseEnvAssignments(envString) : {};
 
-    // Load faucet operators for prove-proxy (localhost devnet)
-    // NOTE: this is done BEFORE auto-setup. If genesis generation creates the
-    // file, it will be reloaded after ensureDevEnvironment() below.
-    if (!hasFaucetOperatorConfig(envVars, process.env)) {
-        try {
-            const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
-            if (fs.existsSync(faucetOpsPath)) {
-                envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
-                console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
-            }
-        } catch (err) {
-            console.warn(`[DevNet] Failed to load faucet operators: ${err}`);
-        }
-    }
-
     // Show help if requested
     if (help) {
         console.log(`
@@ -7746,6 +8098,8 @@ Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
     --all                          Full fresh local startup (component counts remain configurable)
+    --resume                       Retain existing localhost volumes, genesis, deployments, and Anvil state
+    --skip-bridge                  With --resume, keep the bridge UI without loading relayer or guardian keys
     --control <command>             Send restart, rollback-stop, rollback-resume, shutdown, or shutdown-purge to the running supervisor
     --host <ip>                     Target host IP (default: 127.0.0.1)
     --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
@@ -7834,6 +8188,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    - SCYLLA_MEMORY=<size>      Scylla Seastar memory budget, for example 8G
    - SCYLLA_CAS_CONTENTION_TIMEOUT_MS=<ms>  LWT contention timeout (default: 10000)
    - SCYLLA_WRITE_REQUEST_TIMEOUT_MS=<ms>   write timeout (default: 10000)
+   - SCYLLA_IO_PROPERTIES=<file> optional regular file; resolved to an absolute path before launch and mounted read-only at /etc/scylla.d/io_properties.yaml (unset: unchanged; ':' rejected)
    - PSY_WORKER_BATCH_SIZE=<n> Concurrent jobs per worker (default: 2)
    - RAYON_NUM_THREADS=<n>     Rayon threads per proving process (default: auto, max 4)
    - Linux full-devnet/--db launches auto-partition complete physical cores; macOS uses concurrency limits without affinity
@@ -7842,8 +8197,12 @@ Usage: bun run dev/locSetupV4.ts [options]
         process.exit(0);
     }
     if (!teardown && daemonlize && (values.all || !hasOnlyOptions)) throw new Error("[DevNet] full fresh startup requires the foreground launcher");
-
-    if (!teardown && !daemonlize && shouldRequireGuardianRoot(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
+    const retained = resolveRetainedResumeSelection({
+        resume: resumeRequested, skipBridge, all: !hasOnlyOptions, host, daemonlize, purge, teardown, control,
+        stage, l1Network, l1Fork, genesisDataPath, coordinatorWorkersCount, workerRealmCount, proveProxyCount,
+        relayer, bridgeProposerDaemon, psyPrivacyBridge,
+    });
+    if (!teardown && !daemonlize && retained.startBridgeCustody) {
         envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(process.cwd(), { ...process.env, ...envVars }, purge);
     }
 
@@ -7895,7 +8254,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     process.on('SIGINT', () => void shutdown());
     process.on('SIGTERM', () => void shutdown());
     try {
-    if (!teardown) {
+    if (!teardown && !retained.resume) {
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
@@ -7905,11 +8264,10 @@ Usage: bun run dev/locSetupV4.ts [options]
         });
     }
 
-    // (Re)load faucet operators AFTER auto-setup so genesis-generated files exist.
-    // Explicit JSON or B64 from either the CLI or parent environment remains authoritative.
+    // Auto file source for runs without fresh regeneration; fresh startup reloads post-generation (setupProcesses); explicit env wins.
     if (!hasFaucetOperatorConfig(envVars, process.env)) {
         try {
-            const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
+            const faucetOpsPath = path.join(psyDappRoot(REPO_ROOT), "apps", "bridge", "src", "config", "faucetOperators.json");
             if (fs.existsSync(faucetOpsPath)) {
                 envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
                 console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
@@ -7940,10 +8298,10 @@ Usage: bun run dev/locSetupV4.ts [options]
             purge,
             jtmb: !!values.jtmb,
             l1Port,
-            workerRealmCount,
+            workerRealmCount: retained.workerRealmCount,
             realmEdgeCount,
             coordinatorEdgeCount,
-            coordinatorWorkersCount,
+            coordinatorWorkersCount: retained.coordinatorWorkersCount,
             disableWorkerEdgeLogs: !!values["disable-worker-edge-logs"],
             startRealmId,
             realmsCount,
@@ -7951,18 +8309,19 @@ Usage: bun run dev/locSetupV4.ts [options]
             db,
             dummyProvers,
             genesisDataPath,
-            proveProxyCount,
+            proveProxyCount: retained.proveProxyCount,
             faucetServer,
             l1,
 
-            relayer,
+            relayer: retained.relayer,
             relayerConfig,
-            bridgeProposerDaemon,
+            bridgeProposerDaemon: retained.bridgeProposerDaemon,
             psyPrivacyBridge,
             ide,
             explorer,
             modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
+            resume: retained.resume,
         };
 
         if (daemonlize) {

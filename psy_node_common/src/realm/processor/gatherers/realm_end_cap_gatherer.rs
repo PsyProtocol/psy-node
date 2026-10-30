@@ -1045,9 +1045,6 @@ impl<
                 self.status.gathering_unique_pending_id,
                 reverted_root
             );
-            self.config.status.write()
-                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
-                .gathering_realm_start_root = reverted_root;
             return Ok(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],
@@ -1068,7 +1065,7 @@ impl<
                 self.start_global_user_tree_root
             );
         }
-        let planner_checkpoint_id = self.guta_planner.current_checkpoint_id;
+        let planner_checkpoint_id = authenticated.gathering_checkpoint_id;
         let (_, planner_realm_root_proof) = validator_user_tree_proofs::<N, _>(
             self.config.tree_store.as_ref(),
             planner_checkpoint_id,
@@ -1076,36 +1073,13 @@ impl<
             self.config.realm_id_u64,
         )
         .await?;
-        if planner_realm_root_proof.value != self.start_global_user_tree_root {
-            tracing::warn!(
-                "Discarding EndCap generation whose proof base {} does not authenticate cycle start {:?}",
-                planner_checkpoint_id,
-                self.start_global_user_tree_root
-            );
-            tree.revert_changes();
-            self.guta_planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
-            *self.config.current_validator_user_leaf.lock()
-                .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
-                self.gathering_start_validator_user_leaf.clone();
-            let reverted_root = tree.get_root();
-            self.config.status.write()
-                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
-                .gathering_realm_start_root = reverted_root;
-            return Ok(RealmGUTAEndCapGathererOutput {
-                db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
-                job_ids: vec![],
-            });
-        }
-        let proof_checkpoint_root = self
-            .config
-            .tree_store
-            .checkpoint_tree_get_root_hash(planner_checkpoint_id)
-            .await?;
+        anyhow::ensure!(planner_realm_root_proof.value == self.start_global_user_tree_root,
+            "checkpoint {} does not authenticate gathering cycle start {:?}",
+            planner_checkpoint_id, self.start_global_user_tree_root);
         let proofs = self
             .config
             .load_realm_guta_validator_proofs(&authenticated, planner_checkpoint_id)
             .await?;
-        self.guta_planner.current_checkpoint_root = proof_checkpoint_root;
         self.guta_planner.set_validator_proofs(proofs)?;
         tracing::info!(
             "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
@@ -1147,14 +1121,17 @@ impl<
                 "GUTA updates gatherer for pending id {} finalized with changes.",
                 self.status.gathering_unique_pending_id
             );
+            // The owner publishes the sealed baseline before constructing the next
+            // gatherer. Its speculative work must remain based on this end root.
             tree.commit_changes();
-            self.config.status.write()
-                .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
-                .gathering_realm_start_root = tree.get_root();
             *self.config.current_validator_user_leaf.lock()
                 .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
                 self.guta_planner.current_validator_user_leaf.clone()
-                    .ok_or_else(|| anyhow::anyhow!("missing current validator leaf after finalize"))?;
+                    .context("missing finalized validator leaf")?;
+            let mut shared = self.config.status.write()
+                .map_err(|_| anyhow::anyhow!("error publishing sealed gathering baseline"))?;
+            shared.processing_realm_end_root = result.db_output.new_realm_root;
+            shared.gathering_realm_start_root = result.db_output.new_realm_root;
             return Ok(result);
         }
 
@@ -1181,9 +1158,11 @@ impl<
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
+        tree.revert_changes();
+        let committed_root = tree.get_root();
         self.new_realm_end_cap_gatherer_file.seek(tokio::io::SeekFrom::Start(4 + 32)).await?;
         self.new_realm_end_cap_gatherer_file
-            .write_all(&tree.get_root().into_owned_32bytes())
+            .write_all(&committed_root.into_owned_32bytes())
             .await?;
         self.new_realm_end_cap_gatherer_file.write_u64_le(total_end_caps_processed as u64).await?;
         self.config
@@ -1194,15 +1173,11 @@ impl<
             .file_system
             .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
-        self.config.status.write()
-            .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
-            .gathering_realm_start_root = tree.get_root();
         *self.config.current_validator_user_leaf.lock()
             .map_err(|_| anyhow::anyhow!("error writing current validator leaf"))? =
-            self.guta_planner.current_validator_user_leaf.clone()
-                .ok_or_else(|| anyhow::anyhow!("missing current validator leaf after finalize"))?;
+            self.gathering_start_validator_user_leaf.clone();
         Ok(RealmGUTAEndCapGathererOutput {
-            db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
+            db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(committed_root),
             job_ids: vec![],
         })
     }
@@ -1872,7 +1847,8 @@ mod gatherer_builder_tests {
             checkpoint_tree: Arc::new(chain_state.checkpoint_tree.clone()),
             future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
             current_validator_user_leaf: Arc::new(std::sync::Mutex::new(chain_state.finalizer_user.user_leaf.clone())),
-            tree_store: chain_state.db.clone(),
+            tree_store: Arc::clone(&chain_state.db)
+                as Arc<dyn psy_node_core::psy_core_db::traits::full::PsyRealmProcessorStore<PF, PHash> + Send + Sync>,
             _phantom_n: std::marker::PhantomData,
         };
 

@@ -33,7 +33,6 @@ const REALM_PEER_REDIAL_BACKOFF_SECS: u64 = 15;
 struct VoteWaiter {
     proposal_id: [u8; 32],
     threshold: usize,
-    deadline: Instant,
     votes: Vec<Vote>,
     seen: HashSet<u16>,
     response: oneshot::Sender<Result<Vec<Vote>, NetworkError>>,
@@ -262,7 +261,6 @@ impl RealmNetwork {
             RealmNetworkCommand::WaitVotes {
                 proposal_id,
                 threshold,
-                timeout,
                 response,
             } => {
                 if let Err(error) = validate_wait_votes_threshold(threshold) {
@@ -285,7 +283,6 @@ impl RealmNetwork {
                 state.vote_waiters.push(VoteWaiter {
                     proposal_id,
                     threshold,
-                    deadline: Instant::now() + timeout,
                     votes,
                     seen,
                     response,
@@ -761,22 +758,7 @@ impl RealmNetwork {
         expire_reassembly(state, &mut self.reassembly, now);
         expire_idle_vote_auth(state, now);
 
-        let mut expired = Vec::new();
-        state.vote_waiters.retain_mut(|waiter| {
-            if now >= waiter.deadline {
-                expired.push((
-                    waiter.proposal_id,
-                    std::mem::replace(&mut waiter.response, oneshot::channel().0),
-                ));
-                false
-            } else {
-                true
-            }
-        });
-        for (proposal_id, response) in expired {
-            let _ = response.send(Err(NetworkError::Timeout("wait_votes".into())));
-            clear_vote_auth_if_idle(state, proposal_id);
-        }
+        reap_closed_vote_waiters(state);
 
         let retry = Duration::from_secs(RANGE_REQUEST_RETRY_INTERVAL_SECS);
         let proposal_ids: Vec<[u8; 32]> = self.reassembly.proposal_ids().collect();
@@ -1086,6 +1068,28 @@ fn vote_is_authenticated(state: &DriveState, vote: &Vote) -> bool {
     vote.signature.verify_vote(&auth.vote_message, public_key).is_ok()
 }
 
+/// Drop vote waiters whose caller is gone. Nothing is sent: the receiver is
+/// already dropped. Releasing auth here is what keeps a cancelled wait from
+/// pinning `MAX_VOTE_AUTH`.
+fn reap_closed_vote_waiters(state: &mut DriveState) {
+    let mut cancelled = Vec::new();
+    state.vote_waiters.retain(|waiter| {
+        if waiter.response.is_closed() {
+            cancelled.push(waiter.proposal_id);
+            false
+        } else {
+            true
+        }
+    });
+    for proposal_id in cancelled {
+        tracing::debug!(
+            proposal = %hex::encode(proposal_id),
+            "dropped Realm vote waiter: caller cancelled"
+        );
+        clear_vote_auth_if_idle(state, proposal_id);
+    }
+}
+
 fn clear_vote_auth_if_idle(state: &mut DriveState, proposal_id: [u8; 32]) {
     if state.vote_waiters.iter().any(|waiter| waiter.proposal_id == proposal_id) {
         return;
@@ -1269,7 +1273,6 @@ mod tests {
         state.vote_waiters.push(VoteWaiter {
             proposal_id: proposal.proposal_id,
             threshold: 1,
-            deadline: Instant::now() + Duration::from_secs(60),
             votes: Vec::new(),
             seen: HashSet::new(),
             response,
@@ -1309,7 +1312,6 @@ mod tests {
         state.vote_waiters.push(VoteWaiter {
             proposal_id: proposal.proposal_id,
             threshold: 1,
-            deadline: Instant::now() + Duration::from_secs(60),
             votes: Vec::new(),
             seen: HashSet::new(),
             response,
@@ -1355,7 +1357,6 @@ mod tests {
         state.vote_waiters.push(VoteWaiter {
             proposal_id: proposal.proposal_id,
             threshold: 1,
-            deadline: Instant::now() + Duration::from_secs(60),
             votes: Vec::new(),
             seen: HashSet::new(),
             response,
@@ -1435,5 +1436,91 @@ mod tests {
         assert!(has_validator_leaf(&state, &node));
         let other = NodeId::from_keypair(&Keypair::generate_ed25519()).expect("ed25519");
         assert!(!has_validator_leaf(&state, &other));
+    }
+
+    #[test]
+    fn cancelled_vote_waiter_releases_auth_capacity() {
+        let mut state = DriveState::new();
+        let now = Instant::now();
+        let mut receivers = Vec::new();
+        for index in 0..MAX_VOTE_AUTH {
+            let mut proposal_id = [0xB0; 32];
+            proposal_id[0] = index as u8;
+            let proposal = test_proposal(proposal_id);
+            register_proposal_vote_auth(&mut state, &proposal, Vec::new(), now);
+            let (response, receiver) = oneshot::channel();
+            receivers.push(receiver);
+            state.vote_backlog.insert(proposal_id, Vec::new());
+            state.vote_waiters.push(VoteWaiter {
+                proposal_id,
+                threshold: 2,
+                votes: Vec::new(),
+                seen: HashSet::new(),
+                response,
+            });
+        }
+        assert_eq!(state.vote_auth.len(), MAX_VOTE_AUTH);
+
+        drop(receivers);
+        let blocked = test_proposal([0xCE; 32]);
+        register_proposal_vote_auth(&mut state, &blocked, Vec::new(), now);
+        assert!(
+            !state.vote_auth.contains_key(&blocked.proposal_id),
+            "unreaped cancellation must keep both vote-auth slots"
+        );
+
+        reap_closed_vote_waiters(&mut state);
+        assert!(state.vote_waiters.is_empty());
+        assert!(state.vote_auth.is_empty());
+        assert!(state.vote_backlog.is_empty());
+        register_proposal_vote_auth(&mut state, &blocked, Vec::new(), now);
+        assert!(state.vote_auth.contains_key(&blocked.proposal_id));
+    }
+
+    #[test]
+    fn live_vote_waiter_keeps_partial_votes_past_former_deadline() {
+        let mut state = DriveState::new();
+        let now = Instant::now();
+        let proposal = test_proposal([0xD1; 32]);
+        let secret = bls_secret(9);
+        let remote_sub_id = 4u16;
+        register_proposal_vote_auth(
+            &mut state,
+            &proposal,
+            vec![(remote_sub_id, secret.public_key())],
+            now,
+        );
+        let canonical = vote_message(
+            proposal.chain_id,
+            proposal.realm_id,
+            &proposal.validator_tree_root,
+            &proposal.proposal_id,
+        );
+        let (response, mut result) = oneshot::channel();
+        state.vote_waiters.push(VoteWaiter {
+            proposal_id: proposal.proposal_id,
+            threshold: 2,
+            votes: Vec::new(),
+            seen: HashSet::new(),
+            response,
+        });
+        let vote = signed_vote(&secret, &proposal, remote_sub_id, &canonical);
+        assert!(feed_vote_waiters(&mut state, &vote));
+        assert_eq!(state.vote_waiters[0].votes.len(), 1);
+        assert!(!state.vote_waiters[0].response.is_closed());
+
+        reap_closed_vote_waiters(&mut state);
+        expire_idle_vote_auth(&mut state, now + Duration::from_secs(VOTE_AUTH_TTL_SECS + 120));
+        assert_eq!(state.vote_waiters.len(), 1, "live wait survives the old deadline and auth TTL");
+        assert_eq!(state.vote_waiters[0].votes, vec![vote]);
+        assert!(state.vote_auth.contains_key(&proposal.proposal_id));
+        assert!(result.try_recv().is_err(), "partial votes stay on the live waiter");
+
+        drop(result);
+        assert!(state.vote_waiters[0].response.is_closed());
+        reap_closed_vote_waiters(&mut state);
+        assert!(state.vote_waiters.is_empty(), "shutdown cancel reaps the waiter");
+        assert!(!state.vote_auth.contains_key(&proposal.proposal_id));
+        assert!(state.vote_backlog.get(&proposal.proposal_id).is_none());
     }
 }

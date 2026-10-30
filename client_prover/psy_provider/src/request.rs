@@ -18,7 +18,7 @@ use psy_client_common::{
 };
 use psy_client_data::{
     guta::{api::SubmitGUTARealmResultAPINoProofInput, end_cap_input::SubmitUserEndCapNonProofInput},
-    qblock::cmds::deploy_contract::{QBCDeployContractV2, QBCUpdateContract},
+    qblock::cmds::deploy_contract::{PContractUpdateAuthorization, QBCDeployContractV2, QBCUpdateContract},
     qdata::{
         checkpoint::{PsyBlockState, PsyCheckpointLeaf},
         contract::{ContractCodeDefinition, PsyContractLeaf},
@@ -590,6 +590,8 @@ pub struct QDeployContractRPCRequest<F: RichField> {
 #[serde(bound = "")]
 pub struct QUpdateContractRPCRequest<F: RichField> {
     pub update_contract: QBCUpdateContract<F>,
+    // no serde default: old clients that cannot authorize updates fail closed
+    pub authorization: PContractUpdateAuthorization,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1749,6 +1751,72 @@ mod tests {
             RequestParams::EthPersonalSECPSignatureProof(decoded_request) => assert_eq!(decoded_request.signature, signature),
             _ => panic!("wrong request variant after round trip"),
         }
+    }
+
+    #[test]
+    fn update_contract_request_requires_authorization_to_deserialize() {
+        let request = QUpdateContractRPCRequest::<GoldilocksField> {
+            update_contract: QBCUpdateContract::new(
+                1,
+                1,
+                ContractCodeDefinition { state_tree_height: 8, functions: vec![] },
+                vec![QHashOut::ZERO],
+                QHashOut::ZERO,
+                1,
+                QHashOut::ZERO,
+                0,
+                0,
+                QHashOut::ZERO,
+                vec![1, 2, 3, 4],
+            ),
+            authorization: PContractUpdateAuthorization::ZkSignature { proof_json: "{}".to_string() },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: QUpdateContractRPCRequest<GoldilocksField> = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+
+        // the posted envelope must decode on the jsonrpsee server: the params
+        // object carries exactly the two named trait parameters
+        let wire = serde_json::to_value(&RpcRequest {
+            jsonrpc: Version::V2,
+            request: RequestParams::UpdateContract(request),
+            id: Id::Number(1),
+        })
+        .unwrap();
+        assert_eq!(wire["method"], "psy_update_contract");
+        assert!(wire["params"]["update_contract"].is_object());
+        assert_eq!(wire["params"]["authorization"]["scheme"], "zk_signature");
+
+        let decoded: QUpdateContractRPCRequest<GoldilocksField> = serde_json::from_str(&json).unwrap();
+        // dropping the authorization field must fail closed
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
+        stripped.as_object_mut().unwrap().remove("authorization");
+        assert!(serde_json::from_str::<QUpdateContractRPCRequest<GoldilocksField>>(&stripped.to_string()).is_err());
+    }
+
+    /// The authorization digest hashes the code definition bytes, so the
+    /// client's KVQ encoding and the node's bincode encoding must agree.
+    #[test]
+    fn client_and_node_code_definition_encodings_agree() {
+        let client = psy_client_data::qdata::contract::ContractCodeDefinition {
+            state_tree_height: 8,
+            functions: vec![psy_client_data::qdata::contract::ContractFunctionCodeDefinition {
+                method_id: 7, num_inputs: 2, num_outputs: 1, vm_type: 3,
+                code: vec![9, 9, 9],
+            }],
+        };
+        let node = psy_data::v1::qdata::contract::ContractCodeDefinition {
+            state_tree_height: 8,
+            functions: vec![psy_data::v1::qdata::contract::ContractFunctionCodeDefinition {
+                method_id: 7, num_inputs: 2, num_outputs: 1, vm_type: 3,
+                code: vec![9, 9, 9],
+            }],
+        };
+        let client_bytes = kvq::traits::KVQSerializable::to_bytes(&client).unwrap();
+        let node_bytes = bincode::serialize(&node).unwrap();
+        assert_eq!(client_bytes, node_bytes);
+        let decoded: psy_data::v1::qdata::contract::ContractCodeDefinition = bincode::deserialize(&client_bytes).unwrap();
+        assert_eq!(bincode::serialize(&decoded).unwrap(), client_bytes);
     }
 
     #[test]

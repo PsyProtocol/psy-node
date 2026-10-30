@@ -24,18 +24,14 @@ const DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#" {
   "circuit_digest": "b2947f9dc3f006c6a26242b11ea186e8443a2243955a648e53075346be800782"
 }"#;
 
-const END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#"{"constants_sigmas_cap":["51401ebb4bd26e6880f6314841c13365660e6e0ae67e368d5e710a3e8a053664","666abd3bb4929fc2b68c64f4551ad40530b0e6e6c5e55c0ae92d1577b96f16da","a16d7e0690db6eea2bab9c8d36b6e71432e3d45fddec3e6ebc1dcdf90d3c5727","70b544ed2d847f11d7a85a3e8a7f72b5e6f16ea70658da55e38140480db0bf79","a526d238bdbe64fa5251cb6a438153964abab74237ec1bc010ad2a49ecb38576","3d8c4b14e0915e31a72b6720eed20db35d1063241d84b7a0b16d9e6f9c6ab344","4e1cff3ebc53ee7acac2452947144d251326f9ae346a40b55788e98c52770f2f","364e70c5db1acfb7f16e32a6067ebce0e1f4183ec7980a3003a1efbf48e67f23","9db724f85ee6e63cb733d9c210bbafc7555736a419828fb818d5bb153c3e8769","8b7ffe318a7d9b513dc39db4913dfeeaeaa8acd1e805d41135126a2543a8b3eb","7752cc3c28e5f5ffc529492a164e72e18efa0ba8a70981887ab9a4942a4a5a2b","54c0760072c64fab1465f394521fab80c56108b6a5bf7ddca4cd901aba332523","67ab80e6a67930cfcd26021ca604e3eb68e4559d777b6904537a2871602a1e7f","e1a518d2814195977e1206e8a3310939ddb0ea1ba5e516a91d5ab546ab7204db","46d97a2f530e0b585e7a3fa8b907aa574597b184d4c03f4d04d6e3e34890daf6","d47564e84108895530e02c285928881cd02996816775129387f91895312f2681"],"circuit_digest":"6743ce7e2664987d7d2b7d16a6538c137b9e894334aa9370788b1003abece164"}"#;
+const END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#"{"constants_sigmas_cap":["93a4ee80bb07dd157eb0c40ec0463edbe04c8ff052fda12f676c418127148dc5","c9d1ab527b7964358adf41cfa617034bfab1e2ca510f7b46e5f1e8b54ecf9125","b62340c1eeab63b290bd3799ab6228e0c2c4683e354db4111795bfcf36f3a490","81996aecf51f9422118d4d4fe20b79c573fdee54bb206be4081711b47bd020ad","72d779c361b1621eca5f59432806868f8a72c007f195b5d9838bc067c2dac85a","39a9f1cc9a14a303992377bf660ec6faaae5e6000b9ddadab8374e0afd21b28a","87df53e8a7b9e7c7be9a995ec2256e971ef247ea3948582be6139cd4eeaec773","5a6e2dbedf62c635bace657f221b339c5071daa6364afdcbc8df68e792d9d542","bfed8fc4ad06ba6cfa71aeebbf925be02c6d6a0dd93d14db015948aeb693b9cf","119595cb2a7db86e5573b7313541d09484693774006a973ca414cfe6f4bc47a3","d84db7c585ff92139c6c8a149f97fa44617d4077122ef424241363e8d0ae5dba","ac56ce81eaec4a59b2237209d05dfab7a0e434069ebdb3e29e92e5b4a1944e7b","54bd016dc5833801b958fe89d39916b48c0bcce7c72b10e64c0d593cd0f7d579","a80197763776618f521aac9c0b237c2d5595784cfc0b79b1f767189a9b01a2d6","1c9890b859faeaf10792c07139c3fa9b0dcd01c3402b8bcd699c5c4140f3267f","8acc522eb517dc296e04b8772444eea9dfbb30aaa3bfd2730d98ba7ad1dc98a9"],"circuit_digest":"6934680402ad9d0521feb981c72e3990f98e8082c4dd9d758ed27d7142cbb57b"}"#;
 
 pub fn get_end_cap_alt_verifier_data_for_network<F: RichField>(network: PsyChainNetworkType) -> anyhow::Result<AltVerifierOnlyCircuitData<F>> {
     let end_cap_alt_verifier_data_serialized = match network {
         PsyChainNetworkType::LocalDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyTeamDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalTestnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalPreProduction => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyPublicCanary => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyPublicTestnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyMainnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        _ => return Err(anyhow::anyhow!(
+            "EndCap verifier metadata is not validated for network {network:?}"
+        )),
     };
     serde_json::from_str(end_cap_alt_verifier_data_serialized).map_err(|e| anyhow::anyhow!(e))
 }

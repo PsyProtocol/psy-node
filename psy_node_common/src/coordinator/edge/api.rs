@@ -17,7 +17,7 @@ use psy_data::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{ContractCodeDefinition, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
+            contract::{ContractCodeDefinition, PContractUpdateAuthorization, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
@@ -78,8 +78,12 @@ impl<
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContractV2<N::QHash>) -> QRpcResult<String> {
         res(self.deploy_contract_internal(deploy_contract).await)
     }
-    async fn update_contract(&self, update_contract: PQBCUpdateContract<N::QHash>) -> QRpcResult<String> {
-        res(self.update_contract_internal(update_contract).await)
+    async fn update_contract(
+        &self,
+        update_contract: PQBCUpdateContract<N::QHash>,
+        authorization: PContractUpdateAuthorization,
+    ) -> QRpcResult<String> {
+        res(self.update_contract_internal(update_contract, &authorization).await)
     }
 
     async fn get_public_key_for_user_id(&self, user_id: u64) -> RpcResult<PZKPublicKeyInfo<N::QHash>> {
@@ -412,7 +416,7 @@ mod tests {
         public_key::PZKPublicKeyInfo,
     };
     use parth_core::{felt::FromPrimitiveValuesFelt, PF};
-    use psy_node_core::psy_core_db::traits::full::PsyNodeCoreDatabaseContractObjectStoreWriter;
+    use psy_node_core::psy_core_db::traits::full::{PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreDatabaseUserStoreWriter};
 
     type N = TestNetworkConfig;
 
@@ -494,11 +498,22 @@ mod tests {
         let _ = handler.get_public_key_for_user_id(0).await;
 
         // genesis commits the tree roots but not the contract leaf itself;
-        // seed contract id 1 (deployer/height aligned with the update below)
+        // seed contract id 6 (non-genesis, deployer/height aligned with the
+        // update below) plus the deployer's registered key
+        env.db
+            .set_zk_public_key(
+                0,
+                1,
+                &PZKPublicKeyInfo::<PHash> {
+                    fingerprint: PHash::from_values(9, 0, 0, 0),
+                    public_key_param: PHash::from_values(10, 0, 0, 0),
+                },
+            )
+            .await?;
         env.db
             .set_contract_leaf(
                 0,
-                1,
+                6,
                 &PQEDContractLeafV2::<PF, PHash> {
                     deployer: PF::from_u64_value(1),
                     function_tree_root: PHash::from_values(12, 0, 0, 0),
@@ -511,7 +526,7 @@ mod tests {
             )
             .await?;
         let update = PQBCUpdateContract::<PHash> {
-            contract_id: 1,
+            contract_id: 6,
             deployer: 1,
             code_definition: ContractCodeDefinition {
                 state_tree_height: 8,
@@ -526,7 +541,13 @@ mod tests {
             canonical_layout_verifier_fingerprint: PHash::from_values(7, 0, 0, 0),
             canonical_layout_proof: vec![5, 6, 7, 8],
         };
-        assert_eq!(handler.update_contract(update).await?.len(), 64);
+        assert_eq!(
+            handler
+                .update_contract(update, PContractUpdateAuthorization::ZkSignature { proof_json: "{}".to_string() })
+                .await?
+                .len(),
+            64
+        );
         Ok(())
     }
 

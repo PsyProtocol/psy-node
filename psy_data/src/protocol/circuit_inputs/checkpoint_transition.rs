@@ -10,13 +10,20 @@ use crate::{guta::realm_finalize::VALIDATOR_TREE_HEIGHT, protocol::checkpoint_tr
 
 use super::agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput;
 
+pub const CHECKPOINT_RANDOM_SEED_DOMAIN: u64 = u64::from_le_bytes(*b"PSYSEED1");
+
+pub fn derive_checkpoint_random_seed<F: QFelt64, Hash: QFHashBase<F>, Hasher: FieldQHasher<F, Hash>>(old_seed: Hash, new_state_roots_hash: Hash) -> Hash {
+    let old = old_seed.to_4_felts();
+    let roots = new_state_roots_hash.to_4_felts();
+    Hasher::q_hash_many(&[F::from_u64_value(CHECKPOINT_RANDOM_SEED_DOMAIN), old[0], old[1], old[2], old[3], roots[0], roots[1], roots[2], roots[3]])
+}
+
 
 #[pderive::serialize_clone_f_hash]
 pub struct QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     pub part_1_header: QCAggUserRegistartionDeployContractsGUTAInput<F, Hash>,
     pub old_stats: PQEDCheckpointLeafStats<F, Hash>,
     pub block_time: F,
-    pub final_random_seed_contribution: Hash,
     pub pm_jobs_completed: PPMJobsCompletedStats<F>,
     pub validator_tree_root: Hash,
 }
@@ -27,7 +34,6 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTran
             part_1_header: QCAggUserRegistartionDeployContractsGUTAInput::qp_rand_gen(),
             old_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             block_time: F::qp_rand_gen(),
-            final_random_seed_contribution: Hash::qp_rand_gen(),
             pm_jobs_completed: PPMJobsCompletedStats::qp_rand_gen(),
             validator_tree_root: Hash::qp_rand_gen(),
         }
@@ -39,7 +45,6 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCQEDCheck
     const FIXED_SIZE: usize = QCAggUserRegistartionDeployContractsGUTAInput::<F, Hash>::FIXED_SIZE
         + PQEDCheckpointLeafStats::<F, Hash>::FIXED_SIZE
         + 8 // block_time
-        + 32 // final_random_seed_contribution
         + PPMJobsCompletedStats::<F>::FIXED_SIZE
         + 32; // validator_tree_root
 }
@@ -53,7 +58,6 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         self.part_1_header.pio_write_to_io(writer)?;
         self.old_stats.pio_write_to_io(writer)?;
         writer.psy_write_u64(self.block_time.to_u64_value())?;
-        writer.psy_write_bytes_fixed(&self.final_random_seed_contribution.into_owned_32bytes())?;
         self.pm_jobs_completed.pio_write_to_io(writer)?;
         writer.psy_write_bytes_fixed(&self.validator_tree_root.into_owned_32bytes())?;
         Ok(())
@@ -63,14 +67,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         let part_1_header = QCAggUserRegistartionDeployContractsGUTAInput::pio_read_from_io(reader)?;
         let old_stats = PQEDCheckpointLeafStats::pio_read_from_io(reader)?;
         let block_time = F::from_u64_value(reader.psy_read_u64()?);
-        let final_random_seed_contribution = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let pm_jobs_completed = PPMJobsCompletedStats::pio_read_from_io(reader)?;
         let validator_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
             part_1_header,
             old_stats,
             block_time,
-            final_random_seed_contribution,
             pm_jobs_completed,
             validator_tree_root,
         })
@@ -97,6 +99,37 @@ mod behavior_tests {
     use parth_core::{crypto::hash::traits::{MerkleHasher, MerkleZeroHasher}, felt::{ToU64Value, ZeroableFelt}, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
 
     type Hash = QHashOut<PF>;
+
+    #[test]
+    fn random_seed_fixed_vector_pins_domain_and_limb_order() {
+        let old = Hash::from_values(1, 2, 3, 4);
+        let roots = Hash::from_values(5, 6, 7, 8);
+        let seed = derive_checkpoint_random_seed::<PF, Hash, PoseidonHasher>(old, roots);
+        let limbs = seed.to_4_felts();
+        let expected: [u64; 4] = [
+            0x3fa86564640496eb,
+            0x6dec7f0c86d49a9b,
+            0xa25eb3f99503eaeb,
+            0xcc2289274427ca26,
+        ];
+        for (limb, value) in limbs.iter().zip(expected.iter()) {
+            assert_eq!(limb.to_u64_value(), *value);
+        }
+    }
+
+    #[test]
+    fn random_seed_is_independent_of_time_and_rewards() {
+        let mut input = QCQEDCheckpointStateTransitionInputPartial::<PF, Hash>::qp_rand_gen();
+        let original = input.get_new_checkpoint_leaf::<PoseidonHasher>(Hash::qp_rand_gen());
+        input.block_time = PF::qp_rand_gen();
+        input.pm_jobs_completed = PPMJobsCompletedStats::qp_rand_gen();
+        input.old_stats.pm_rewards_commitment = PPMRewardCommitment::qp_rand_gen();
+        input.part_1_header.guta_proof_header.stats.guta_fees_collected = PF::qp_rand_gen();
+        input.part_1_header.guta_proof_header.stats.da_fees_collected = PF::qp_rand_gen();
+        let changed = input.get_new_checkpoint_leaf::<PoseidonHasher>(Hash::qp_rand_gen());
+        assert_eq!(original.global_chain_root, changed.global_chain_root);
+        assert_eq!(original.stats.random_seed, changed.stats.random_seed);
+    }
 
     #[test]
     fn reward_root_update_refreshes_leaf_and_tree_root() {
@@ -228,7 +261,7 @@ mod behavior_tests {
         assert_eq!(leaf.stats.pm_rewards_commitment.register_users_root, reward_root);
         assert_eq!(leaf.stats.pm_rewards_commitment.gutas_root, reward_root);
         assert_eq!(leaf.stats.pm_rewards_commitment.deploy_contracts_root, reward_root);
-        assert_eq!(leaf.stats.random_seed, input.final_random_seed_contribution);
+        assert_eq!(leaf.stats.random_seed, derive_checkpoint_random_seed::<PF, Hash, PoseidonHasher>(input.old_stats.random_seed, leaf.global_chain_root));
         assert_eq!(leaf.stats.block_time.to_u64_value(), input.block_time.to_u64_value());
         assert!(leaf.stats.pm_jobs_completed == input.pm_jobs_completed);
         assert_eq!(
@@ -429,8 +462,9 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
             validator_tree_root: self.validator_tree_root,
         };
+        let new_state_roots_hash = new_state_roots.qfhash::<Hasher>();
         PQEDCheckpointLeaf {
-            global_chain_root: new_state_roots.qfhash::<Hasher>(),
+            global_chain_root: new_state_roots_hash,
             stats: PQEDCheckpointLeafStats {
                 guta_fees_collected: self.part_1_header.guta_proof_header.stats.guta_fees_collected,
                 da_fees_collected: self.part_1_header.guta_proof_header.stats.da_fees_collected,
@@ -439,7 +473,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
                 slots_modified: self.part_1_header.guta_proof_header.stats.slots_modified,
                 pm_jobs_completed: self.pm_jobs_completed,
                 block_time: self.block_time,
-                random_seed: self.final_random_seed_contribution,//Hasher::two_to_one(&self.old_stats.random_seed, &self.final_random_seed_contribution),
+                random_seed: derive_checkpoint_random_seed::<F, Hash, Hasher>(self.old_stats.random_seed, new_state_roots_hash),
                 pm_rewards_commitment: PPMRewardCommitment {
                     register_users_root: reward_tree_root,
                     gutas_root: reward_tree_root,

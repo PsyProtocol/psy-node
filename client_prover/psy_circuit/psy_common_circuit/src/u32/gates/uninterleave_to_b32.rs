@@ -142,6 +142,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
             constraints.push(computed_x_evens - x_evens);
             constraints.push(computed_x_odds - x_odds);
 
+            // Check 2b: forbid a slot holding both bits. Without this, any sum
+            // s <= 2^32 - 2 also admits the base-2 spelling of s + p (sixteen
+            // digits of 3), so a cheating prover can prove a wrong AND/XOR for
+            // honest operands - theta's xor(0, 0) in Keccak is exactly that.
+            for j in 0..Self::NUM_BITS / 2 {
+                constraints.push(bits[2 * j] * bits[2 * j + 1]);
+            }
+
             // Check 3: Range check the targets in the decomposition
             for bit in bits.iter() {
                 constraints.push((0..Self::B).map(|j| *bit - F::Extension::from_canonical_usize(j)).product())
@@ -186,6 +194,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
             }
             constraints.push(builder.sub_extension(computed_x_evens, x_evens));
             constraints.push(builder.sub_extension(computed_x_odds, x_odds));
+
+            // Check 2b: see eval_unfiltered - a slot must not hold both bits,
+            // otherwise the s + p alias of the sum is provable.
+            for j in 0..Self::NUM_BITS / 2 {
+                constraints.push(builder.mul_extension(bits[2 * j], bits[2 * j + 1]));
+            }
 
             // Check 3: Range check the targets in the decomposition
             for bit in bits {
@@ -237,7 +251,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
     }
 
     fn num_constraints(&self) -> usize {
-        self.num_ops * (Self::NUM_BITS + 1 + 2)
+        self.num_ops * (Self::NUM_BITS + 1 + 2 + Self::NUM_BITS / 2)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -290,6 +304,12 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for
 
             yield_constr.one(computed_x_evens - x_evens);
             yield_constr.one(computed_x_odds - x_odds);
+
+            // Check 2b: see eval_unfiltered - a slot must not hold both bits,
+            // otherwise the s + p alias of the sum is provable.
+            for j in 0..Self::NUM_BITS / 2 {
+                yield_constr.one(bits[2 * j] * bits[2 * j + 1]);
+            }
 
             // Check 3: Range check the targets in the decomposition
             let constraints_iter = bits

@@ -55,7 +55,7 @@ pub struct FinalizeBridgeAggArgs {
     pub bridge_address: Option<String>,
     #[arg(long)]
     pub batch_append_proof_json: Option<PathBuf>,
-    #[arg(long, env = "PRIVATE_KEY")]
+    #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: Option<String>,
     #[arg(long, env = "KEYSTORE_PATH")]
     pub keystore_path: Option<PathBuf>,

@@ -138,12 +138,6 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         let right_proving_rewards_tag_value = builder.add_virtual_hash();
         let worker_reward_tag = builder.add_virtual_hash();
 
-
-        // NOTE: this circuit only verifies the child proofs and recomputes the
-        // aggregate public input from the state transition; it does not
-        // constrain the child proofs' public input contents. Leaf circuits can
-        // therefore include extra commitments (e.g. the batch update contracts
-        // `contract_ids_root`) without changing the agg public input formula.
         let expected_left_public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<H, F, D>(
             builder,
             state_transition_gadget.allowed_circuit_hashes_root,
@@ -291,8 +285,38 @@ where
             ],
         );
 
+        assert_eq!(left_proof.public_inputs.len(), 4);
+        assert_eq!(right_proof.public_inputs.len(), 4);
+        builder.connect_hashes(
+            HashOutTarget {
+                elements: [
+                    left_proof.public_inputs[0],
+                    left_proof.public_inputs[1],
+                    left_proof.public_inputs[2],
+                    left_proof.public_inputs[3],
+                ],
+            },
+            header_gadget.expected_left_public_inputs_hash,
+        );
+        builder.connect_hashes(
+            HashOutTarget {
+                elements: [
+                    right_proof.public_inputs[0],
+                    right_proof.public_inputs[1],
+                    right_proof.public_inputs[2],
+                    right_proof.public_inputs[3],
+                ],
+            },
+            header_gadget.expected_right_public_inputs_hash,
+        );
+
         builder.register_public_inputs(&header_gadget.new_public_inputs_hash.elements);
         builder.add_qed_type_d_common_gates();
+        debug_assert!(
+            builder.num_gates() < 1 << 13,
+            "AggStateTransitionCircuitV2 gate count {} crossed 2^13; the padded degree would grow and desynchronize this circuit's common data from the circuits that bake it in (baseline 8036)",
+            builder.num_gates()
+        );
         pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 
@@ -445,5 +469,342 @@ where
         println!("got_public_inputs: {:#?}", result.public_inputs);
         Ok(result)
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agg::v2::dummy::AggStateTransitionDummyCircuitV2;
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::Field},
+        hash::hash_types::HashOut,
+        iop::generator::generate_partial_witness,
+        plonk::config::{Hasher, PoseidonGoldilocksConfig},
+    };
+    use psy_data::agg::AggStateTransitionWithStats;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+
+    fn tag(seed: u64) -> QHashOut<F> {
+        QHashOut(HashOut {
+            elements: [
+                F::from_canonical_u64(seed),
+                F::from_canonical_u64(seed + 1),
+                F::from_canonical_u64(seed + 2),
+                F::from_canonical_u64(seed + 3),
+            ],
+        })
+    }
+
+    fn poseidon_two_to_one(a: &HashOut<F>, b: &HashOut<F>) -> HashOut<F> {
+        <PoseidonHash as Hasher<F>>::two_to_one(*a, *b)
+    }
+
+    /// The leaf's reward-tag tree value: `H(H(0,0), worker_tag)`, matching the
+    /// formula baked into `AggStateTransitionDummyCircuitV2`.
+    fn leaf_tag_tree_value(worker_tag: &HashOut<F>) -> HashOut<F> {
+        let zero = HashOut::ZERO;
+        poseidon_two_to_one(&poseidon_two_to_one(&zero, &zero), worker_tag)
+    }
+
+    /// Native replica of `compute_agg_state_trackable_final_public_inputs_leaf`
+    /// as built into `AggStateTransitionDummyCircuitV2` (total proofs = 1).
+    fn expected_leaf_public_inputs(
+        whitelist: &HashOut<F>,
+        state_root: &HashOut<F>,
+        worker_tag: &HashOut<F>,
+    ) -> HashOut<F> {
+        let transition_hash = poseidon_two_to_one(state_root, state_root);
+        let allowed_and_transition = poseidon_two_to_one(whitelist, &transition_hash);
+        let pi_without_reward_tag = <PoseidonHash as Hasher<F>>::hash_no_pad(&[
+            allowed_and_transition.elements[0],
+            allowed_and_transition.elements[1],
+            allowed_and_transition.elements[2],
+            allowed_and_transition.elements[3],
+            F::ONE,
+        ]);
+        poseidon_two_to_one(
+            &pi_without_reward_tag,
+            &leaf_tag_tree_value(worker_tag),
+        )
+    }
+
+    fn build_circuits() -> (
+        AggStateTransitionDummyCircuitV2<C, D>,
+        AggStateTransitionCircuitV2<C, D>,
+    ) {
+        let leaf = AggStateTransitionDummyCircuitV2::<C, D>::new();
+        let agg = AggStateTransitionCircuitV2::<C, D>::new(
+            &leaf.circuit_data.common,
+            leaf.circuit_data
+                .verifier_only
+                .constants_sigmas_cap
+                .height(),
+        );
+        // The circuit builds at 8036 gates and lands on a 2^13 degree; if the
+        // count ever crossed 2^13 the degree would grow and desynchronize this
+        // circuit's common data from the child common data it verifies against.
+        assert_eq!(agg.circuit_data.common.degree(), 1 << 13);
+        (leaf, agg)
+    }
+
+    fn two_leaf_transitions(state_root: QHashOut<F>) -> AggStateTransitionInputV2<QHashOut<F>> {
+        AggStateTransitionInputV2 {
+            left_input: AggStateTransitionWithStats {
+                state_transition_start: state_root,
+                state_transition_end: state_root,
+                total_proofs_generated: 1,
+            },
+            right_input: AggStateTransitionWithStats {
+                state_transition_start: state_root,
+                state_transition_end: state_root,
+                total_proofs_generated: 1,
+            },
+            left_proof_is_leaf: true,
+            right_proof_is_leaf: true,
+        }
+    }
+
+    #[test]
+    fn honest_aggregation_with_two_leaf_proofs_proves() -> anyhow::Result<()> {
+        let (leaf, agg) = build_circuits();
+        let whitelist = QHashOut(poseidon_two_to_one(&leaf.fingerprint.0, &agg.fingerprint.0));
+        let state_root = tag(100);
+        let left_worker_tag = tag(200);
+        let right_worker_tag = tag(300);
+        let worker_reward_tag = tag(400);
+
+        let left_leaf_proof = leaf.prove_base(whitelist, state_root, left_worker_tag)?;
+        let right_leaf_proof = leaf.prove_base(whitelist, state_root, right_worker_tag)?;
+        assert_eq!(left_leaf_proof.public_inputs.len(), 4);
+        assert_eq!(right_leaf_proof.public_inputs.len(), 4);
+        assert_ne!(
+            left_leaf_proof.public_inputs, right_leaf_proof.public_inputs,
+            "tags must differ so the two children are distinguishable"
+        );
+
+        // Harness cross-check: the leaf's actual public inputs equal the
+        // natively recomputed leaf formula.
+        assert_eq!(
+            left_leaf_proof.public_inputs.as_slice(),
+            expected_leaf_public_inputs(&whitelist.0, &state_root.0, &left_worker_tag.0).elements,
+            "harness must agree with the leaf circuit formula"
+        );
+
+        let input = two_leaf_transitions(state_root);
+        let agg_proof = agg.prove_base(
+            agg.fingerprint,
+            &agg.circuit_data.verifier_only,
+            leaf.fingerprint,
+            &leaf.circuit_data.verifier_only,
+            &left_leaf_proof,
+            &right_leaf_proof,
+            &input,
+            QHashOut(leaf_tag_tree_value(&left_worker_tag.0)),
+            QHashOut(leaf_tag_tree_value(&right_worker_tag.0)),
+            worker_reward_tag,
+        )?;
+        assert_eq!(agg_proof.public_inputs.len(), 4);
+        agg.circuit_data.verify(agg_proof)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_public_inputs_replacement_rejected_by_binding() -> anyhow::Result<()> {
+        let (leaf, agg) = build_circuits();
+        let whitelist = QHashOut(poseidon_two_to_one(&leaf.fingerprint.0, &agg.fingerprint.0));
+        let state_root = tag(100);
+        let left_worker_tag = tag(200);
+        let right_worker_tag = tag(300);
+        let worker_reward_tag = tag(400);
+
+        let left_leaf_proof = leaf.prove_base(whitelist, state_root, left_worker_tag)?;
+        let right_leaf_proof = leaf.prove_base(whitelist, state_root, right_worker_tag)?;
+        assert_ne!(
+            left_leaf_proof.public_inputs, right_leaf_proof.public_inputs,
+            "the substituted public inputs must differ from the expected ones"
+        );
+        let input = two_leaf_transitions(state_root);
+        let left_tag_tree = QHashOut(leaf_tag_tree_value(&left_worker_tag.0));
+        let right_tag_tree = QHashOut(leaf_tag_tree_value(&right_worker_tag.0));
+
+        let make_witness = |replace_left_pis: bool| -> anyhow::Result<PartialWitness<F>> {
+            let mut pw = PartialWitness::<F>::new();
+            agg.header_gadget.set_witness(
+                &mut pw,
+                agg.fingerprint,
+                leaf.fingerprint,
+                &input,
+                left_tag_tree,
+                right_tag_tree,
+                worker_reward_tag,
+            )?;
+            pw.set_verifier_data_target(&agg.left_verifier_data, &leaf.circuit_data.verifier_only)?;
+            pw.set_verifier_data_target(
+                &agg.right_verifier_data,
+                &leaf.circuit_data.verifier_only,
+            )?;
+            if replace_left_pis {
+                // Attack: the left child's public inputs are replaced by a
+                // different valid proof's (the right child's) public inputs.
+                pw.set_proof_target(&agg.left_proof.proof, &left_leaf_proof.proof)?;
+                for (&target, &value) in agg
+                    .left_proof
+                    .public_inputs
+                    .iter()
+                    .zip(&right_leaf_proof.public_inputs)
+                {
+                    pw.set_target(target, value)?;
+                }
+            } else {
+                pw.set_proof_with_pis_target(&agg.left_proof, &left_leaf_proof)?;
+            }
+            pw.set_proof_with_pis_target(&agg.right_proof, &right_leaf_proof)?;
+            Ok(pw)
+        };
+
+        // Honest witness: every connected pair agrees in the partition witness.
+        let honest = generate_partial_witness(
+            make_witness(false)?,
+            &agg.circuit_data.prover_only,
+            &agg.circuit_data.common,
+        )?;
+        for i in 0..4 {
+            assert_eq!(
+                honest.get_target(agg.left_proof.public_inputs[i]),
+                honest.get_target(agg.header_gadget.expected_left_public_inputs_hash.elements[i]),
+                "left child PI wire {} must equal the expected hash wire",
+                i
+            );
+            assert_eq!(
+                honest.get_target(agg.right_proof.public_inputs[i]),
+                honest.get_target(
+                    agg.header_gadget.expected_right_public_inputs_hash.elements[i]
+                ),
+                "right child PI wire {} must equal the expected hash wire",
+                i
+            );
+        }
+
+        // Mutated witness: the binding fires at witness generation.
+        let err = agg
+            .circuit_data
+            .prove(make_witness(true)?)
+            .expect_err("replaced child public inputs must be rejected");
+        assert!(
+            err.to_string().contains("set twice with different values"),
+            "unexpected error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_level_aggregation_proves_with_condensed_totals() -> anyhow::Result<()> {
+        let (leaf, agg_left) = build_circuits();
+        let agg_right = AggStateTransitionCircuitV2::<C, D>::new(
+            &leaf.circuit_data.common,
+            leaf.circuit_data
+                .verifier_only
+                .constants_sigmas_cap
+                .height(),
+        );
+        let agg_top = AggStateTransitionCircuitV2::<C, D>::new(
+            &agg_left.circuit_data.common,
+            agg_left.circuit_data
+                .verifier_only
+                .constants_sigmas_cap
+                .height(),
+        );
+
+        // One global whitelist threaded through every level, exactly as
+        // `plan_jobs_for_tree_agg` does: the level-1 agg and the leaf circuit
+        // are the two child types allowed under the top node.
+        let whitelist = QHashOut(poseidon_two_to_one(&leaf.fingerprint.0, &agg_left.fingerprint.0));
+        let state_root = tag(100);
+        let worker_a = tag(500);
+        let worker_b = tag(501);
+        let worker_top = tag(502);
+        let leaf_tags = [tag(200), tag(300), tag(600), tag(601)];
+
+        let leaf_proof = |worker_tag: QHashOut<F>| -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+            leaf.prove_base(whitelist, state_root, worker_tag)
+        };
+        let level_one_input = two_leaf_transitions(state_root);
+
+        let proof_a = agg_left.prove_base(
+            agg_left.fingerprint,
+            &agg_left.circuit_data.verifier_only,
+            leaf.fingerprint,
+            &leaf.circuit_data.verifier_only,
+            &leaf_proof(leaf_tags[0])?,
+            &leaf_proof(leaf_tags[1])?,
+            &level_one_input,
+            QHashOut(leaf_tag_tree_value(&leaf_tags[0].0)),
+            QHashOut(leaf_tag_tree_value(&leaf_tags[1].0)),
+            worker_a,
+        )?;
+        let proof_b = agg_right.prove_base(
+            agg_right.fingerprint,
+            &agg_right.circuit_data.verifier_only,
+            leaf.fingerprint,
+            &leaf.circuit_data.verifier_only,
+            &leaf_proof(leaf_tags[2])?,
+            &leaf_proof(leaf_tags[3])?,
+            &level_one_input,
+            QHashOut(leaf_tag_tree_value(&leaf_tags[2].0)),
+            QHashOut(leaf_tag_tree_value(&leaf_tags[3].0)),
+            worker_b,
+        )?;
+
+        // Each level-1 job reports its condensed stats (left + right + 1) to
+        // the parent, matching the corrected gatherer convention for agg
+        // children; a stale count would trip the binding at witness generation.
+        let level_two_input = AggStateTransitionInputV2 {
+            left_input: AggStateTransitionWithStats {
+                state_transition_start: state_root,
+                state_transition_end: state_root,
+                total_proofs_generated: 3,
+            },
+            right_input: AggStateTransitionWithStats {
+                state_transition_start: state_root,
+                state_transition_end: state_root,
+                total_proofs_generated: 3,
+            },
+            left_proof_is_leaf: false,
+            right_proof_is_leaf: false,
+        };
+        let a_tag_tree = poseidon_two_to_one(
+            &poseidon_two_to_one(
+                &leaf_tag_tree_value(&leaf_tags[0].0),
+                &leaf_tag_tree_value(&leaf_tags[1].0),
+            ),
+            &worker_a.0,
+        );
+        let b_tag_tree = poseidon_two_to_one(
+            &poseidon_two_to_one(
+                &leaf_tag_tree_value(&leaf_tags[2].0),
+                &leaf_tag_tree_value(&leaf_tags[3].0),
+            ),
+            &worker_b.0,
+        );
+
+        let proof_top = agg_top.prove_base(
+            agg_left.fingerprint,
+            &agg_left.circuit_data.verifier_only,
+            leaf.fingerprint,
+            &leaf.circuit_data.verifier_only,
+            &proof_a,
+            &proof_b,
+            &level_two_input,
+            QHashOut(a_tag_tree),
+            QHashOut(b_tag_tree),
+            worker_top,
+        )?;
+        assert_eq!(proof_top.public_inputs.len(), 4);
+        agg_top.circuit_data.verify(proof_top)?;
+        Ok(())
     }
 }

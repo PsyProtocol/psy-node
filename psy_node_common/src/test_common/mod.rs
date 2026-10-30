@@ -202,6 +202,34 @@ pub async fn setup_test_unified_db(store: Arc<TestInMemoryCoreStore>) -> anyhow:
     Ok(psy_db)
 }
 
+/// Real validator-tree root fixture for coordinator tests: a genuine Poseidon
+/// merkle root over one validator leaf (protocol `realm_validator_leaf_hash`
+/// preimage) committed at the protocol validator-tree height in the realm's
+/// `(realm_id, realm_sub_id)` slot — the same single-validator tree the realm
+/// GUTA planner test env builds. Deterministic and non-zero, so state-roots
+/// fixtures carry a committed validator-set root instead of a zero or random
+/// stand-in.
+pub fn fixture_validator_tree_root(realm_id: u32, realm_sub_id: u16) -> parth_core::PHash {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use psy_data::guta::realm_finalize::{realm_validator_leaf_hash, validator_tree_index, VALIDATOR_TREE_HEIGHT};
+
+    // Fixed fixture preimage (validator user id, node-id hash limbs, BLS hash
+    // limbs). Any deterministic non-zero values work; they only need to be
+    // stable so the root is reproducible across test runs.
+    const VALIDATOR_USER_ID: u64 = 1;
+    const NODE_ID_HASH_LIMBS: [u64; 4] = [0x10, 0x32, 0x54, 0x76];
+    const BLS_HASH_LIMBS: [u64; 4] = [0x98, 0xBA, 0xDC, 0xFE];
+
+    let index = validator_tree_index(realm_id, realm_sub_id);
+    let leaf = realm_validator_leaf_hash::<parth_core::PF, parth_core::PHash, PoseidonHasher>(
+        VALIDATOR_USER_ID,
+        NODE_ID_HASH_LIMBS,
+        BLS_HASH_LIMBS,
+    );
+    let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, parth_core::PHash>::new(VALIDATOR_TREE_HEIGHT as u8);
+    tree.set_leaf_no_proof(index, leaf)
+}
+
 /// In-memory fake for ephemeral queue subscribers: per-unique_id FIFOs plus
 /// logs of consumer lifecycle calls so tests can assert queue orchestration.
 #[derive(Default)]

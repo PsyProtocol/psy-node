@@ -135,13 +135,10 @@ mod tests {
         let error = session.deploy_contract(deployer, output.circuit_definitions.clone()).await.unwrap_err();
         assert!(error.to_string().contains("requires ABI"));
 
-        // update commands are built locally; the chain submission then fails
-        // on the dead RPC
-        let update_cmd = session.get_update_contract_cmd(42, deployer, output.circuit_definitions.clone()).unwrap();
+        // the local builder emits the plain pre-layout command: the chain
+        // shape gate rejects it until the canonical layout proof is attached
+        let update_cmd = session.get_update_contract_cmd(42, deployer, output.circuit_definitions).unwrap();
         assert_eq!(update_cmd.contract_id, 42);
-
-        let error = session.update_contract(42, deployer, output.circuit_definitions).await.unwrap_err();
-        assert!(!error.to_string().is_empty());
 
         // the JSON-ABI deploy variant validates its input and reuses the
         // local layout-aware builder

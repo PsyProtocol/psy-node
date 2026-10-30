@@ -50,7 +50,7 @@ Each network contains:
 
 ```json
 {
-  "p2p": { "checkpoints_per_epoch": 10 },
+  "p2p": { "checkpoints_per_epoch": 32 },
   "realm_configs": [{
     "id": 0,
     "validators": [{
@@ -82,7 +82,7 @@ The validator sub-id is not stored. It is the validator's one-based array positi
 
 The exact reserved mapping is `(realm 0, sub 1) -> registration 0 -> user 0`, `(realm 0, sub 2) -> registration 4 -> user 262144`, `(realm 1, sub 1) -> registration 1 -> user 1048576`, and `(realm 1, sub 2) -> registration 3 -> user 1572864` (`dev/locSetupV4.ts`, `reservedValidatorRegistrationId` and `reservedValidatorUserId`). The structural example above intentionally uses descriptive placeholders for public keys and PeerIds; obtain real values from key generation, not by copying the example.
 
-`checkpoints_per_epoch` is build-time circuit input. Runtime rotation uses `psy_config::CHECKPOINTS_PER_EPOCH`, not a mutable runtime JSON override (`psy_data/src/config/network_config.rs:61-81`; `psy_cli/psy_node_cli/src/node/realm_p2p.rs:325,354`). Localhost currently configures 10 (`psy-genesis/config.json:9-10`). Active Realms must have identical validator counts. Changing the source configuration requires the matching compiled artifacts; editing only the injected runtime configuration cannot change the rotation constant.
+`checkpoints_per_epoch` is build-time circuit input. Runtime rotation uses `psy_config::CHECKPOINTS_PER_EPOCH`, not a mutable runtime JSON override (`psy_data/src/config/network_config.rs:61-81`; `psy_cli/psy_node_cli/src/node/realm_p2p.rs:325,354`). Localhost currently configures 32 (`psy-genesis/config.json:9-10`). Active Realms must have identical validator counts. Changing the source configuration requires the matching compiled artifacts; editing only the injected runtime configuration cannot change the rotation constant.
 
 ## Fail-Closed Startup
 

@@ -203,17 +203,27 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// Genesis `p2p.checkpoints_per_epoch`. Boundary checks use this period,
+    /// not an arbitrary sample length.
+    const EPOCH_LEN: u64 = 32;
+
     #[test]
     fn test_epoch_boundaries_share_schedule() {
-        let rotation = config(256, 10);
+        let rotation = config(256, EPOCH_LEN);
         let anchor_seed = seed([5, 8, 13, 21]);
+        let last_of_previous = EPOCH_LEN - 1;
+        let first_of_epoch = EPOCH_LEN;
+        let last_of_epoch = EPOCH_LEN * 2 - 1;
+        assert_eq!(last_of_previous, 31);
+        assert_eq!(first_of_epoch, 32);
+        assert_eq!(last_of_epoch, 63);
         assert_eq!(
-            rotation.proposer_sub_id(7, 10, anchor_seed).unwrap(),
-            rotation.proposer_sub_id(7, 19, anchor_seed).unwrap(),
+            rotation.proposer_sub_id(7, first_of_epoch, anchor_seed).unwrap(),
+            rotation.proposer_sub_id(7, last_of_epoch, anchor_seed).unwrap(),
         );
         assert_ne!(
-            rotation.proposer_sub_id(7, 9, anchor_seed).unwrap(),
-            rotation.proposer_sub_id(7, 10, anchor_seed).unwrap(),
+            rotation.proposer_sub_id(7, last_of_previous, anchor_seed).unwrap(),
+            rotation.proposer_sub_id(7, first_of_epoch, anchor_seed).unwrap(),
         );
     }
 
@@ -229,15 +239,16 @@ mod tests {
 
     #[test]
     fn test_epoch_and_anchor() {
-        assert_eq!(epoch(0, 10), 0);
-        assert_eq!(epoch(9, 10), 0);
-        assert_eq!(epoch(10, 10), 1);
-        assert_eq!(epoch(19, 10), 1);
-        assert_eq!(epoch(20, 10), 2);
+        let period = EPOCH_LEN;
+        assert_eq!(epoch(0, period), 0);
+        assert_eq!(epoch(31, period), 0);
+        assert_eq!(epoch(32, period), 1);
+        assert_eq!(epoch(63, period), 1);
+        assert_eq!(epoch(64, period), 2);
 
-        assert_eq!(anchor_checkpoint_id(0, 10), 0);
-        assert_eq!(anchor_checkpoint_id(1, 10), 9);
-        assert_eq!(anchor_checkpoint_id(2, 10), 19);
+        assert_eq!(anchor_checkpoint_id(0, period), 0);
+        assert_eq!(anchor_checkpoint_id(1, period), 31);
+        assert_eq!(anchor_checkpoint_id(2, period), 63);
     }
 
     #[test]

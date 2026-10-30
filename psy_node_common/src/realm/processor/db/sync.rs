@@ -209,7 +209,8 @@ where
         self.state.last_committed_realm_start_root = realm_root_state.value;
         self.state.processing_realm_start_root = realm_root_state.value;
         self.state.processing_realm_end_root = realm_root_state.value;
-        self.state.gathering_realm_start_root = realm_root_state.value;
+        // The tree owner advances the gathering baseline at seal. Metadata sync
+        // must not replace a live speculative cycle's start with the durable tip.
 
         // Also update checkpoint root
         let checkpoint_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_synced_checkpoint_id);
@@ -900,14 +901,46 @@ mod sync_tests {
 
     #[tokio::test]
     async fn sync_to_coordinator_fetches_checkpoint_one_metadata() -> anyhow::Result<()> {
-        let mut env = RealmDbTestEnv::create().await?;
+        use parth_core::crypto::hash::merkle_proof::MerkleProofCore;
+        use parth_core::protocol::core_types::QNetworkTreeConstants;
+        use psy_data::{genesis::genesis_block_setup::GenesisValidator, p2p::{BlsSecretKey, NodeId}};
+        let mut genesis_data = genesis_setup_data(1, 4);
+        for position in 1..=TEST_REALM_SUB_ID {
+            let seed = position as u8;
+            let mut secret = [seed; 32];
+            let node = NodeId::from_keypair(&libp2p_identity::Keypair::ed25519_from_bytes(&mut secret)?)?;
+            genesis_data.validators.push(GenesisValidator {
+                realm_id: TEST_REALM_ID as u32,
+                validator_user_id: psy_core::user_id::get_user_id_from_user_registration_id(
+                    position * 2 - 1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT),
+                node_id: node.to_raw(),
+                bls_public_key: BlsSecretKey::key_gen(&[seed; 32])?.public_key().to_bytes(),
+            });
+        }
+        let mut env = RealmDbTestEnv::create_with_genesis_data(genesis_data).await?;
+        env.genesis.prepared_updates.new_realm_root = env.genesis.coordinator_update.merkle_proof_to_realm_root.value;
         env.commit_genesis().await?;
         env.processor.set_new_unique_ids(None).await?;
         env.seed_consistent_coordinator_head().await?;
 
-        let update = env.make_checkpoint_one_update();
-        let root_at_one = zh(71);
-        env.seed_checkpoint_one(update.clone(), root_at_one);
+        let root_at_one = env.local_realm_root().await?;
+        let mut update = env.genesis.coordinator_update.clone();
+        update.checkpoint_sync_info.checkpoint_id = 1;
+        update.checkpoint_sync_info.block_state.checkpoint_id = 1;
+        update.checkpoint_sync_info.block_state.next_contract_id = 2;
+        let mut siblings = vec![env.genesis_leaf_hash()];
+        siblings.extend((1..N::CHECKPOINT_TREE_HEIGHT_USIZE).map(zh));
+        let membership = MerkleProofCore::new_from_params::<parth_core::pgoldilocks::PoseidonHasher>(
+            1, update.checkpoint_sync_info.checkpoint_leaf_hash, siblings);
+        update.checkpoint_sync_info.checkpoint_tree_root = membership.root;
+        env.coordinator.seed_checkpoint_tree_proof(1, membership);
+        env.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+        env.coordinator.seed_realm_sync_info(update.clone());
+        // Metadata-only advancement retains the realm's last-modified checkpoint.
+        env.coordinator.set_latest_checkpoint_id(1);
+        let gathering_start = zh(72);
+        env.processor.state.gathering_realm_start_root = gathering_start;
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
 
         env.processor.sync_to_coordinator_set_checkpoint_id().await?;
@@ -925,9 +958,9 @@ mod sync_tests {
             env.db.checkpoint_tree_get_root_hash(1).await?,
             update.checkpoint_sync_info.checkpoint_tree_root
         );
-
-        // the new contract introduced at checkpoint 1 got its tree height fetched
+        // Coordinator contract registration advances independently of this realm.
         assert_eq!(env.db.get_contract_tree_heights(1, &[1]).await?, vec![8u8]);
+
 
         // in-memory state moved to the new head
         let state = &env.processor.state;
@@ -937,7 +970,8 @@ mod sync_tests {
         assert_eq!(state.gathering_checkpoint_id, 1);
         assert_eq!(state.last_committed_realm_end_root, root_at_one);
         assert_eq!(state.processing_realm_start_root, root_at_one);
-        assert_eq!(state.gathering_realm_start_root, root_at_one);
+        assert_eq!(state.gathering_realm_start_root, gathering_start,
+            "metadata sync must preserve the tree owner's gathering baseline");
         assert_eq!(state.processing_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
         Ok(())
     }

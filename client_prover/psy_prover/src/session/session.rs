@@ -4339,13 +4339,14 @@ impl WalletSession {
         contract_id: u64,
         deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
+        authorization: psy_client_data::qblock::cmds::deploy_contract::PContractUpdateAuthorization,
     ) -> anyhow::Result<String> {
         let update_cmd = self.get_update_contract_cmd(contract_id, deployer, circuit_defs)?;
         update_cmd.validate_shape()?;
 
         let update_content_hash = self
             .st_provider
-            .update_contract::<F>(QUpdateContractRPCRequest { update_contract: update_cmd })
+            .update_contract::<F>(QUpdateContractRPCRequest { update_contract: update_cmd, authorization })
             .await?;
         Ok(update_content_hash)
     }
@@ -7883,14 +7884,18 @@ pub(crate) mod offline_trace_pipeline_tests {
             .await?;
         assert_eq!(deployed, "offline-deploy-ok");
 
-        let updated = wallet_session
-            .update_contract(9002, deployer, output.circuit_definitions)
-            .await
+        // The plain update command carries no canonical layout proof: it is
+        // rejected by the shape gate before any submission or authorization
+        // is consulted.
+        let update_cmd = wallet_session
+            .get_update_contract_cmd(9002, deployer, output.circuit_definitions)
+            .expect("the plain update command builds locally");
+        let error = update_cmd
+            .validate_shape()
             .expect_err("the plain update command lacks the canonical layout proof");
         assert!(
-            format!("{:#}", updated).contains("layout protocol version must be non-zero"),
-            "unexpected update rejection: {:#}",
-            updated
+            error.to_string().contains("layout protocol version must be non-zero"),
+            "unexpected update rejection: {error:#}"
         );
         Ok(())
     }

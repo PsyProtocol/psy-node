@@ -100,18 +100,17 @@ This document describes the gadgets used by Coordinator circuits to batch regist
     -   `part_1_header`: Output from the Part 1 aggregation gadget.
     -   `old_stats`: `PsyCheckpointLeafStatsGadget` witness for the previous block's stats.
     -   `block_time`: Target witness for the current block's timestamp.
-    -   `final_random_seed_contribution`: Hash witness for randomness.
 -   **Key Outputs/Computed Values:**
     -   `old_state_roots`, `new_state_roots`: Derived directly from `part_1_header`.
-    -   `new_stats`: Computed by combining GUTA stats with time, randomness, etc.
+    -   `new_stats`: Current-block totals plus the derived random seed (section below); time and rewards are recorded but do not feed the seed.
     -   `old_checkpoint_leaf`: Constructed from `old_state_roots` and `old_stats`.
     -   `new_checkpoint_leaf`: Constructed from `new_state_roots` and `new_stats`.
 -   **Core Logic/Constraints:**
     -   Constructs `old_state_roots` and `new_state_roots` gadgets.
-    -   Computes `new_stats` based on inputs (copying GUTA stats, hashing random seed, setting time, zeroing PM/DA stats for now).
+    -   Derives `random_seed = PoseidonHashNoPad([u64::from_le_bytes(*b"PSYSEED1"), old_stats.random_seed[0..4], new_state_roots_hash[0..4]])`. The nine field elements use the hashes' native limb order; time, rewards, and coordinator entropy are excluded.
     -   Constructs `old_checkpoint_leaf` and `new_checkpoint_leaf` gadgets.
     -   Asserts `block_time` > `old_stats.block_time`.
--   **Assumptions:** Assumes `part_1_header` is correctly verified. Assumes `old_stats`, `block_time`, `final_random_seed_contribution` witnesses are correct.
+-   **Authentication:** The enclosing checkpoint transition circuit connects the hashed `old_checkpoint_leaf` (including its seed) to the previous checkpoint Merkle proof. The new seed is computed, not supplied as a witness.
 -   **Role:** Calculates the state transition specifically for the Checkpoint Leaf data based on the aggregated results from the rest of the block's activities.
 
 ## 6. `CheckpointStateTransitionChildProofsGadget`
@@ -121,7 +120,7 @@ This document describes the gadgets used by Coordinator circuits to batch regist
 -   **Key Inputs/Witness:**
     -   Parameters for verifying the Part 1 proof (common data, cap height, known fingerprint).
     -   Part 1 proof object and verifier data.
-    -   Witnesses needed by `PsyPart1StateDeltaResultGadget` (`old_stats`, `block_time`, `random_seed`).
+    -   Witnesses needed by `PsyPart1StateDeltaResultGadget` (`old_stats`, `block_time`, `validator_tree_root`); the new `random_seed` is derived, not a witness.
 -   **Key Outputs/Computed Values:**
     -   `state_delta_gadget`: The instantiated `PsyPart1StateDeltaResultGadget`.
 -   **Core Logic/Constraints:**
