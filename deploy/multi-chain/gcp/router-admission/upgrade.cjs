@@ -3,12 +3,13 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const ethers = require('/opt/psy-l1-bundles/5ba12a36-20261026-r1/contracts/node_modules/ethers');
-const PACKAGE = '/opt/psy-router-admission-20261030';
-const ROOT = '/var/lib/psy-router-admission-20261030';
+const PACKAGE = '/opt/psy-router-admission-20261030-r2';
+const ROOT = '/var/lib/psy-router-admission-20261030-r2';
 const ADMIN = '0x490f8192725255C2C3dE0CbCE66312335Ca019Ad';
 const IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 const ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
 const PORTS = {sepolia:18545,bscTestnet:18645,baseSepolia:18945};
+const DEPLOY_GAS = Object.freeze({sepolia:8000000,bscTestnet:2000000,baseSepolia:2000000});
 const CONFIRMATIONS = 10;
 const ABI = new ethers.utils.Interface([
   'function owner() view returns(address)', 'function addressesProvider() view returns(address)',
@@ -51,6 +52,7 @@ function verifyReceipt(intent,tx,receipt,canonicalHash,head) {
 async function run(request) {
   assert.equal(process.getuid(),0);
   assert(Object.hasOwn(PORTS,request.chain));
+  const deployGasLimit=DEPLOY_GAS[request.chain];
   assert(['audit','queue','reconcile','activate','idle'].includes(request.mode));
   const writing=['queue','activate'].includes(request.mode);
   assert(!writing || request.relayerQuiesced===true);
@@ -119,9 +121,14 @@ async function run(request) {
     stage='gas-preflight';
     const gasPrice=await provider.getGasPrice();
     assert(gasPrice.lte(ethers.utils.parseUnits('1','gwei')));
-    assert((await provider.getBalance(ADMIN)).gte(gasPrice.mul(proposal?500000:2400000)));
-    return {...await status(),fixedGasLimits:{deploy:2000000,queue:400000,activate:500000},
-      gasPrice:gasPrice.toString(),confirmationPolicy:{blocks:CONFIRMATIONS,finalized:false}};
+    assert((await provider.getBalance(ADMIN)).gte(gasPrice.mul(proposal?500000:deployGasLimit+400000)));
+    if(!proposal) {
+      stage='bounded-creation-simulation';
+      const runtime=await provider.call({from:ADMIN,data:artifact.bytecode,value:0,gasLimit:deployGasLimit});
+      assert.equal(runtime.toLowerCase(),artifact.deployedBytecode.toLowerCase());
+    }
+    return {...await status(),fixedGasLimits:{deploy:deployGasLimit,queue:400000,activate:500000},
+      boundedCreationSimulation:!proposal,gasPrice:gasPrice.toString(),confirmationPolicy:{blocks:CONFIRMATIONS,finalized:false}};
   }
   if(request.mode==='reconcile') {
     const transactions=[];
@@ -192,7 +199,7 @@ async function run(request) {
   }
   if(request.mode==='queue') {
     assert(oldActive,'Already activated; no replacement proposal');
-    const deployment=await send('deploy',null,artifact.bytecode,2000000);
+    const deployment=await send('deploy',null,artifact.bytecode,deployGasLimit);
     let next=proposal;
     if(!next) {
       const block=await provider.getBlock('latest');
@@ -237,4 +244,4 @@ if(require.main===module) (async()=>{
 })().then(result=>console.log(JSON.stringify(result)),()=>{
   console.log(JSON.stringify({ok:false,stage,noRetry:true,preserveEvidence:true}));process.exitCode=1;
 });
-module.exports={actionHash,buildUpgradeCalldata,verifyReceipt};
+module.exports={actionHash,buildUpgradeCalldata,verifyReceipt,DEPLOY_GAS};

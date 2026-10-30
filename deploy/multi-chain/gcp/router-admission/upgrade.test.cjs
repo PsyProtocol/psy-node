@@ -10,7 +10,7 @@ const importModule = id => id.startsWith('/opt/psy-l1-bundles/') ? ethers : requ
 vm.runInNewContext(fs.readFileSync(path.join(__dirname,'upgrade.cjs'),'utf8'), {
   module:exported, require:importModule, process, console,
 });
-const {actionHash,buildUpgradeCalldata,verifyReceipt} = exported.exports;
+const {actionHash,buildUpgradeCalldata,verifyReceipt,DEPLOY_GAS} = exported.exports;
 const router='0x1111111111111111111111111111111111111111';
 const implementation='0x2222222222222222222222222222222222222222';
 const admin='0x3333333333333333333333333333333333333333';
@@ -24,6 +24,12 @@ test('uses the live ProxyAdmin upgrade entry, without an empty initialization de
 test('refuses a zero proxy or implementation',()=>{
   assert.throws(()=>buildUpgradeCalldata(ethers.constants.AddressZero,implementation));
   assert.throws(()=>buildUpgradeCalldata(router,ethers.constants.AddressZero));
+});
+test('deployment budget follows the verified chain-specific creation simulations',()=>{
+  assert.equal(DEPLOY_GAS.sepolia,8000000);
+  assert.equal(DEPLOY_GAS.bscTestnet,2000000);
+  assert.equal(DEPLOY_GAS.baseSepolia,2000000);
+  assert.equal(Object.isFrozen(DEPLOY_GAS),true);
 });
 test('governance hash matches the Timelock ABI and binds target, bytes and execution time',()=>{
   const data=buildUpgradeCalldata(router,implementation),eta=2000000000;

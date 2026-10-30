@@ -52,9 +52,9 @@ node deploy/multi-chain/gcp/router-admission/package.cjs \
 ```
 
 Install the generated four package files as root-owned, non-writable-by-others files
-under `/opt/psy-router-admission-20261030` on `gcp-faucet` (`10.148.0.33`). Verify
+under `/opt/psy-router-admission-20261030-r2` on `gcp-faucet` (`10.148.0.33`). Verify
 their SHA256SUMS after transfer. Create root-only evidence directory
-`/var/lib/psy-router-admission-20261030` with mode0700. Do not overwrite a prior package
+`/var/lib/psy-router-admission-20261030-r2` with mode0700. Do not overwrite a prior package
 or its evidence. The custody adapter reuses the existing encrypted keystore, trusted
 secret reader and administrator lock; it writes no plaintext keys or passwords.
 
@@ -93,13 +93,21 @@ proxy/admin/Timelock/mapping/pause state, implementation bytecode and exact call
 it cannot turn this job into a general-purpose contract upgrade. It does not change
 the Timelock delay. No automatic future execution is installed by this procedure.
 
-Gas price ceiling is1gwei; explicit fixed gas limits are2,000,000 for deployment,
-400,000 for queueing, and500,000 for activation. Candidate deployment consumed787,738
-gas in the isolated EVM; the real-state fork exercised queue and activation. Fixed
-budgets avoid relying on a private RPC that returned a5,436,007 deployment estimate
-and429 on bounded creation calls; they do not raise the original gas ceilings.
-Nonce, balance, fees, code identity and governance state are still checked online.
-A refusal is a stop condition, not permission to raise fees or blindly resend.
+Gas price ceiling is1gwei; fixed deployment gas is8,000,000 on Sepolia and2,000,000
+on BSC/Base; queueing stays400,000 and activation500,000. Before stopping Relayer,
+the audit requires an online creation `eth_call` at the exact chain budget to return
+the reviewed runtime bytes. Nonce, balance, fees, code identity and governance state
+remain checked online. A refusal stops before signing; do not blindly raise caps.
+
+The first job used2,000,000 on all chains based on an isolated-EVM deployment cost
+of787,738. Its Sepolia deployment mined status0 and consumed the full limit, while
+the real RPC had estimated5,436,007. The old Router was unchanged and no proposal was
+queued. The failed hash is075462754871665289fdd60ccf16c0a84be5b5aac1ef1a8e236e9c82eca7970b.
+Recovery verified>=10 confirmations, the consumed nonce and idle signer, then restored
+Relayer. Subsequent real-chain creation calls returned the exact reviewed runtime at
+8m on Sepolia and2m on BSC/Base. This r2 job uses new package/evidence directories;
+it never deletes, retries, or reuses the failed first job's intent/nonce. The exact
+EVM gas-schedule cause was not established; a debug trace was unavailable.
 
 ## Recovery and Acceptance
 

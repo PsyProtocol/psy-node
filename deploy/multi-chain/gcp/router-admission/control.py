@@ -32,7 +32,7 @@ def state():
 
 def admin(mode, chain):
     suffix = ' --relayer-quiesced' if mode in ('queue', 'activate') else ''
-    value = json.loads(remote('admin', 'sudo -n python3 -I -B /opt/psy-router-admission-20261030/upgrade.py '+mode+' '+chain+suffix))
+    value = json.loads(remote('admin', 'sudo -n python3 -I -B /opt/psy-router-admission-20261030-r2/upgrade.py '+mode+' '+chain+suffix))
     assert value['ok'] is True
     print(json.dumps(value), flush=True)
     return value

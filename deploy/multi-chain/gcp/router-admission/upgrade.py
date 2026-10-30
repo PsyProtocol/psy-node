@@ -11,7 +11,7 @@ import signal
 import stat
 import subprocess
 
-HERE = Path('/opt/psy-router-admission-20261030')
+HERE = Path('/opt/psy-router-admission-20261030-r2')
 KEY = Path('/var/lib/parth/.psy/keystore/bridge-relayer-dev')
 HELPER = Path('/var/tmp/psy-r3-l1-helper-20261027/fresh_l1.py')
 
