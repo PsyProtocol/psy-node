@@ -2287,12 +2287,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dpn_function_transaction_input_word_accepts_exactly_196_felts() {
-        let dpn_def = build_dpn_transaction_input_word_function(0, 195, 195);
+    async fn dpn_function_transaction_input_word_accepts_exactly_192_felts() {
+        let dpn_def = build_dpn_transaction_input_word_function(0, 191, 191);
         let sd_config = one_transaction_sd_key_config();
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
 
-        let calldata = (0..196).collect::<Vec<_>>();
+        let calldata = (0..192).collect::<Vec<_>>();
         let (tx_info, inputs) = make_tx_info(5, 42, &calldata);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
         let proof = gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
@@ -2313,16 +2313,16 @@ mod tests {
         let data = builder.build::<C>();
 
         // Write raw targets, bypassing set_tx_introspection_witness's length guard.
-        for declared_length in [196, 197] {
+        for declared_length in [192, 193] {
             let mut witness = PartialWitness::new();
             let length_value = GF::from_canonical_u64(declared_length);
             witness.set_target(length, length_value).unwrap();
             for input in &inputs {
                 witness.set_target(*input, GF::from_canonical_u64(11)).unwrap();
             }
-            let hash = if declared_length == 196 {
+            let hash = if declared_length == 192 {
                 let mut preimage = vec![length_value];
-                preimage.extend(vec![GF::from_canonical_u64(11); 196]);
+                preimage.extend(vec![GF::from_canonical_u64(11); 192]);
                 preimage.push(length_value);
                 PoseidonHash::hash_no_pad(&preimage)
             } else {
@@ -2331,10 +2331,10 @@ mod tests {
             };
             witness.set_hash_target(inputs_hash, hash).unwrap();
             let proof = data.prove(witness);
-            if declared_length == 196 {
+            if declared_length == 192 {
                 data.verify(proof.unwrap()).unwrap();
             } else {
-                assert!(proof.is_err(), "the circuit accepted 197 calldata words");
+                assert!(proof.is_err(), "the circuit accepted 193 calldata words");
             }
         }
     }
