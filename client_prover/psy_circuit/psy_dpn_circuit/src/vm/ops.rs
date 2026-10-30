@@ -1240,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_input_word_enforces_196_word_capacity() {
+    fn transaction_input_word_enforces_192_word_capacity() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let zero = builder.zero();
         let zero_hash = builder.constant_hash(plonky2::hash::hash_types::HashOut::ZERO);
@@ -1259,13 +1259,13 @@ mod tests {
                 method_id: zero,
                 inputs_length: length,
                 inputs_hash: zero_hash,
-                inputs: vec![value; 196],
+                inputs: vec![value; 192],
             }],
         });
         executor.select_transaction_input_word(&mut builder, zero, word);
         let data = builder.build::<C>();
 
-        for (word_value, length_value, accepted) in [(195, 196, true), (196, 197, false), (128, 128, false)] {
+        for (word_value, length_value, accepted) in [(191, 192, true), (192, 193, false), (128, 128, false)] {
             let mut witness = PartialWitness::new();
             witness.set_target(word, F::from_canonical_u64(word_value)).unwrap();
             witness.set_target(length, F::from_canonical_u64(length_value)).unwrap();

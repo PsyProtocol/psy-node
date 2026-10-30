@@ -1171,8 +1171,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_introspection_accepts_196_word_capacity() {
-        for length in [128, 176, 196] {
+    fn transaction_introspection_accepts_192_word_capacity() {
+        for length in [128, 176, 192] {
             let mut exec = mk_exec(vec![]);
             exec.set_transaction_context(
                 vec![DPNTransactionEntry {
@@ -1212,9 +1212,9 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "calldata word index out of bounds")]
-    fn transaction_introspection_rejects_word_196() {
+    fn transaction_introspection_rejects_word_192() {
         let mut exec = mk_exec(vec![]);
-        for (index, value) in [0, 196].into_iter().enumerate() {
+        for (index, value) in [0, 192].into_iter().enumerate() {
             exec.process_var_def(&DPNIndexedVarDef {
                 data_type: DPNBuiltInDataType::Target,
                 index,

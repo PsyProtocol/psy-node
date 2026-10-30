@@ -1294,10 +1294,17 @@ mod tests {
 
     #[test]
     fn default_faucet_policy_circuit_matches_genesis_and_exported_identity() {
+        use plonky2::field::types::PrimeField64;
         use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
         use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
 
-        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--relayer-registration-id", "2", "--relayer-user-id", "524288",
+            "--validator-slot", "0,1,0", "--validator-slot", "1,1,1",
+            "--validator-slot", "1,2,3", "--validator-slot", "0,2,4",
+            "--validator-slot", "1,3,5", "--validator-slot", "0,3,6",
+        ]).unwrap();
         let relayer = PsyCompactUserDefinition {
             public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account_fixture().public_key_param().unwrap().0) },
             balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
@@ -1322,10 +1329,14 @@ mod tests {
         let (function, policy) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
             &callers, &contracts, &methods, min_count, max_count,
         ).unwrap();
-        let fingerprint = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &policy).unwrap().get_fingerprint();
+        let circuit = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &policy).unwrap();
+        let fingerprint = circuit.get_fingerprint();
         println!("default faucet policy circuit fingerprint: {fingerprint}");
-        assert_eq!(first_operator, 5);
-        assert_eq!(user_id_for(&args, first_operator as u64), 1_310_720);
+        println!("default faucet policy circuit fingerprint_u64x4: {:?}", fingerprint.0.elements.map(|value| value.to_canonical_u64()));
+        println!("default faucet policy base degree_bits: {}", circuit.circuit_data.as_ref().unwrap().common.degree_bits());
+        assert_eq!(users.len(), 107);
+        assert_eq!(first_operator, 7);
+        assert_eq!(user_id_for(&args, first_operator as u64), 1_835_008);
         let operators = config["operators"].as_array().unwrap();
         assert_eq!(operators.len(), args.faucet_operator_count);
         for (index, operator) in operators.iter().enumerate() {
