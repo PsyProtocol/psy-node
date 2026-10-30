@@ -27,22 +27,24 @@ pub const GUARDIAN_TABLES: [&str; 8] = [
     "deposit_tree_states", "guardian_account", "guardian_schema", "guardian_session",
     "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns",
 ];
-pub const RELAYER_TABLES: [&str; 8] = [
+pub const RELAYER_TABLES: [&str; 9] = [
     "chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account",
     "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request",
+    "withdrawal_quarantine",
 ];
 const GUARDIAN_TABLES_WITHOUT_SCHEMA: [&str; 7] = [
     "deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed",
     "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns",
 ];
-pub const RELAYER_TABLES_WITHOUT_SCHEMA: [&str; 7] = [
+pub const RELAYER_TABLES_WITHOUT_SCHEMA: [&str; 8] = [
     "chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account",
     "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request",
+    "withdrawal_quarantine",
 ];
 pub const GUARDIAN_SCHEMA: TableDefinition<(), u32> = TableDefinition::new("guardian_schema");
 pub const JOURNAL_SCHEMA: TableDefinition<(), u64> = TableDefinition::new("journal_schema");
 pub const GUARDIAN_SCHEMA_VERSION: u32 = 3;
-pub const JOURNAL_SCHEMA_VERSION: u64 = 3;
+pub const JOURNAL_SCHEMA_VERSION: u64 = 4;
 pub const LEGACY_JOURNAL: &str = "incompatible legacy journal schema; explicit operator-controlled migration is required";
 
 pub const GUARDIAN_SIGNER: TableDefinition<(), [u8; 33]> = TableDefinition::new("guardian_signer");
@@ -51,6 +53,7 @@ pub const GUARDIAN_SIGNED: TableDefinition<(u64, u64, u64), &[u8]> = TableDefini
 pub const GUARDIAN_SESSION: TableDefinition<(u64, u64, u64), &[u8]> = TableDefinition::new("guardian_session");
 pub const RELAYER_REQUEST: TableDefinition<u64, &[u8]> = TableDefinition::new("relayer_request");
 pub const CHAIN_CLAIMS: TableDefinition<u8, &[u8]> = TableDefinition::new("chain_claims");
+pub const WITHDRAWAL_QUARANTINE: TableDefinition<(u8, i64), &[u8]> = TableDefinition::new("withdrawal_quarantine");
 pub const FINALIZATION_BATCH: TableDefinition<(), &[u8]> = TableDefinition::new("finalization_batch");
 
 pub struct HeldDatabase {
@@ -262,7 +265,7 @@ pub fn open_databases(directory: &File) -> anyhow::Result<Vec<HeldDatabase>> {
 }
 
 /// Shape and schema check. An empty database (no tables) is accepted; a
-/// populated one must be exactly the schema-3 runtime set with the right
+/// populated one must be exactly the schema-4 runtime set with the right
 /// marker and key types. Legacy seven-table journals fail closed.
 pub fn validate_database(database: &Database, relayer: bool) -> anyhow::Result<()> {
     let transaction = database.begin_read()?;
@@ -286,6 +289,7 @@ pub fn validate_database(database: &Database, relayer: bool) -> anyhow::Result<(
             drop(transaction.open_table(RELAYER_DEPOSIT_TREE_STATES)?);
             drop(transaction.open_table(RELAYER_INCLUDED_WITHDRAWAL_BURNS)?);
             drop(transaction.open_table(RELAYER_WITHDRAWAL_NONCE)?);
+            drop(transaction.open_table(WITHDRAWAL_QUARANTINE)?);
         } else {
             let schema = transaction.open_table(GUARDIAN_SCHEMA)?;
             ensure!(schema.len()? == 1 && schema.get(())?.is_some_and(|row| row.value() == GUARDIAN_SCHEMA_VERSION), "{LEGACY_JOURNAL}");

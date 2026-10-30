@@ -514,7 +514,7 @@ impl StateReaderGadget {
                 wb_state.inc_write_epoch();
             }
             DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, wb_state.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, c.base_offset, c.capacity, wb_state.write_epoch);
                 let read_witness = cmd_witness.witness.get_imt_read_ref();
                 let Some(reader_ref_key) = self.gadget_map.get(&ck).copied() else {
                     anyhow::bail!("missing state reader key for imt current read witness: {:?}", ck);
@@ -534,7 +534,7 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, wb_state.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, c.base_offset, c.capacity, wb_state.write_epoch);
                 let contains_witness = cmd_witness.witness.get_imt_contains_ref();
                 self.set_witness_for_key_imt_contains_mp(witness, &ck, &contains_witness.merkle_proof)?;
                 let Some(reader_ref_key) = self.gadget_map.get(&ck).copied() else {

@@ -2,7 +2,7 @@
 
 > Repository-only routing index for `docs/src/dev`. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-10-21. Status: Review.
+> Updated: 2026-10-28. Status: Review.
 
 ## Abstract
 
@@ -20,6 +20,7 @@ Each task below names the document that owns it and the document to read next. E
 |---|---|---|
 | Create a wallet, register an account, fund PSY, query state, deploy or call a contract | `common-operations.md` | `devnet_lifecycle.md` |
 | Deposit, claim a deposit, withdraw, settle through the relayer, or review bridge architecture | `bridge-common-operations.md` | `private-transfer.md` |
+| Run or recover local bridge E2E without repeating a deposit; identify the controlled driver and its limitations | `bridge-common-operations.md` → Local E2E Entry and Stage Results (`e2e/bridge-e2e.sh` is tracked, not a secret-safe/resumable launcher) | `devnet_lifecycle.md` for gates, shutdown and staged acceptance |
 | Understand the reward-claim protocol or run the implemented claim-rewards CLI against the deployed contracts (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:50`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41`; `psy-contracts/src/PsyToken.sol:67-104`) | `reward-claim-operations.md` (protocol and runbook) | `common-operations.md` |
 | Read reward tree circuit layouts, modes, or offsets | `reward-tree-circuits.md` | `gatherers.md` |
 | Understand gatherer job modes or publication | `gatherers.md` | `processors.md` |
@@ -42,7 +43,7 @@ Each task below names the document that owns it and the document to read next. E
 | Document | Owns |
 |---|---|
 | `common-operations.md` | Wallet, registration, funding, queries, contract deployment, calls |
-| `bridge-common-operations.md` | Bridge architecture and deposit, claim, withdrawal, settlement procedures |
+| `bridge-common-operations.md` | Bridge architecture; deposit, claim, withdrawal and settlement; local E2E entry/stage evidence and transaction recovery on the original chain |
 | `reward-claim-operations.md` | Reward-claim protocol and the claim-rewards CLI (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:50`) with deployed-contract operations (`psy-contracts/src/PsyToken.sol:67-104`) |
 | `reward-tree-circuits.md` | Reward tree circuit layouts, modes, offsets |
 | `gatherers.md` | Gatherer job modes and publication |

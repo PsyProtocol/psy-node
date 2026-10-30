@@ -997,10 +997,10 @@ mod eth_personal_tests {
     fn psy_prover_fingerprint<F: plonky2::hash::hash_types::RichField>() -> QHashOut<F> {
         QHashOut(plonky2::hash::hash_types::HashOut {
             elements: [
-                F::from_canonical_u64(9963234757308381150),
-                F::from_canonical_u64(7229650793434273151),
-                F::from_canonical_u64(17904933874181536995),
-                F::from_canonical_u64(15676210893640687609),
+                F::from_canonical_u64(8910808775875266372),
+                F::from_canonical_u64(1939876395565792506),
+                F::from_canonical_u64(4400602774105039709),
+                F::from_canonical_u64(738332823617062494),
             ],
         })
     }

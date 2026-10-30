@@ -225,7 +225,6 @@ where
             witness.partial.pm_jobs_completed.register_users_completed,
             &witness.partial.old_stats,
             witness.partial.block_time,
-            witness.partial.final_random_seed_contribution,
             witness.partial.validator_tree_root,
             part_1_worker_reward_tree_value,
             part_1_proof,

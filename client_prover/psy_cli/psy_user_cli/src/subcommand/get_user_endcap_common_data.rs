@@ -31,8 +31,20 @@ pub async fn run() -> anyhow::Result<()> {
 
     let zk_fingerprint = circuit_manager.zk_signature_minifier_fingerprint().await?;
     let secp_fingerprint = circuit_manager.secp_circuit().get_fingerprint();
+    let eth_personal_fingerprint = circuit_manager.eth_personal_secp_circuit().get_fingerprint();
+    let multisig_fingerprint = psy_ups_circuit::signature::multisig::MultisigSignatureCircuit::new()?.get_fingerprint();
     println!("zk_fingerprint: {}", zk_fingerprint);
     println!("secp_fingerprint: {}", secp_fingerprint);
+    println!("eth_personal_fingerprint: {}", eth_personal_fingerprint);
+    println!("multisig_fingerprint: {}", multisig_fingerprint);
+    let show = |name: &str, fp: &psy_client_common::data::qhashout::QHashOut<plonky2::field::goldilocks_field::GoldilocksField>| {
+        let limbs: Vec<u64> = fp.0.elements.iter().map(|e| e.to_canonical_u64()).collect();
+        println!("{name}_u64x4: {limbs:?}");
+    };
+    show("zk_fingerprint", &zk_fingerprint);
+    show("secp_fingerprint", &secp_fingerprint);
+    show("eth_personal_fingerprint", &eth_personal_fingerprint);
+    show("multisig_fingerprint", &multisig_fingerprint);
 
     Ok(())
 }

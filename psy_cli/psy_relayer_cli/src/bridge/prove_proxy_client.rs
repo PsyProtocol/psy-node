@@ -19,6 +19,7 @@ pub struct BridgeWithdrawalWitnessInput {
     pub amount: [u32; 8],
     pub nonce: [u32; 8],
     pub destination_chain_index: u32,
+    pub token_contract_id: u32,
     pub leaf_index: u32,
     pub bridge_user_id: u32,
     pub siblings: Vec<String>,

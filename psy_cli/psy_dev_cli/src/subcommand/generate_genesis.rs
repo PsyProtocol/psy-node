@@ -1293,6 +1293,61 @@ mod tests {
     }
 
     #[test]
+    fn default_faucet_policy_circuit_matches_genesis_and_exported_identity() {
+        use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
+        use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
+
+        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        let relayer = PsyCompactUserDefinition {
+            public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account_fixture().public_key_param().unwrap().0) },
+            balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
+        };
+        let sd_key_fingerprint = faucet_sd_key_fingerprint(&args).unwrap();
+        let (users, keys) = genesis_users(&args, relayer, sd_key_fingerprint, &mut KeyBytesRng(Default::default())).unwrap();
+        let first_operator = users.len() - args.faucet_operator_count;
+        let config: serde_json::Value = serde_json::from_slice(&faucet_operators_body(
+            &args, &keys, first_operator, sd_key_fingerprint,
+        ).unwrap()).unwrap();
+        let contracts: Vec<u64> = serde_json::from_value(config["sdKeyAllowedContractIds"].clone()).unwrap();
+        let methods: Vec<u32> = serde_json::from_value(config["sdKeyAllowedMethodIds"].clone()).unwrap();
+        let callers: Vec<u64> = serde_json::from_value(config["sdKeyAllowedCallerContractIds"].clone()).unwrap();
+        let min_count = config["sdKeyMinTxCount"].as_u64().unwrap();
+        let max_count = config["sdKeyMaxTxCount"].as_u64().unwrap();
+        assert_eq!(contracts, [5, 0, 0]);
+        assert_eq!(methods, [3375543263, 2789897329, 3998182541]);
+        assert_eq!(min_count, 1);
+        assert_eq!(max_count, 64);
+        assert_eq!(callers, [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64, 5, psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64]);
+        // Build the same policy circuit as faucet runtime, not another copy of its pin.
+        let (function, policy) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            &callers, &contracts, &methods, min_count, max_count,
+        ).unwrap();
+        let fingerprint = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &policy).unwrap().get_fingerprint();
+        println!("default faucet policy circuit fingerprint: {fingerprint}");
+        assert_eq!(first_operator, 5);
+        assert_eq!(user_id_for(&args, first_operator as u64), 1_310_720);
+        let operators = config["operators"].as_array().unwrap();
+        assert_eq!(operators.len(), args.faucet_operator_count);
+        for (index, operator) in operators.iter().enumerate() {
+            let registration = first_operator + index;
+            let private_key = ClientHash(keys[registration].unwrap().0);
+            let info = ZKPublicKeyInfo {
+                fingerprint,
+                public_key_param: get_sd_key_public_key_param(&private_key),
+            };
+            let address = info.qfhash::<PoseidonHash>();
+            assert_eq!(users[registration].public_key_info.fingerprint.0, fingerprint.0,
+                "genesis faucet fingerprint must match the constructed policy circuit");
+            assert_eq!(users[registration].public_key_info.public_key_param.0, info.public_key_param.0);
+            assert_eq!(users[registration].public_key_info.to_hash::<PoseidonHasher>().0, address.0);
+            assert_eq!(parse_qhash(operator["fingerprint"].as_str().unwrap()).unwrap().0, fingerprint.0);
+            assert_eq!(parse_qhash(operator["address"].as_str().unwrap()).unwrap().0, address.0);
+            assert_eq!(operator["userId"].as_str().unwrap(), user_id_for(&args, registration as u64).to_string());
+            assert_eq!(operator["signType"], "sd-key");
+        }
+    }
+
+    #[test]
     #[ignore = "requires approved PSY_GENESIS_CONTRACTS and the sibling compiler checkout; run explicitly in QA"]
     fn initialized_genesis_roots_authorize_first_ordinary_nonce_one() {
         use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};

@@ -130,6 +130,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
             constraints.push(computed_x_evens - x_evens);
             constraints.push(computed_x_odds - x_odds);
 
+            // Check 2b: forbid a slot holding both bits. Without this, any sum
+            // s <= 2^32 - 2 also admits the base-2 spelling of s + p (sixteen
+            // digits of 3), so a cheating prover can prove a wrong AND/XOR for
+            // honest operands - theta's xor(0, 0) in Keccak is exactly that.
+            for j in 0..Self::NUM_BITS / 2 {
+                constraints.push(bits[2 * j] * bits[2 * j + 1]);
+            }
+
             // Check 3: Range check the targets in the decomposition
             for bit in bits.iter() {
                 constraints.push(
@@ -183,6 +191,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
             constraints.push(builder.sub_extension(computed_x_evens, x_evens));
             constraints.push(builder.sub_extension(computed_x_odds, x_odds));
 
+            // Check 2b: see eval_unfiltered - a slot must not hold both bits,
+            // otherwise the s + p alias of the sum is provable.
+            for j in 0..Self::NUM_BITS / 2 {
+                constraints.push(builder.mul_extension(bits[2 * j], bits[2 * j + 1]));
+            }
             // Check 3: Range check the targets in the decomposition
             for bit in bits {
                 constraints.push({
@@ -244,7 +257,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
     }
 
     fn num_constraints(&self) -> usize {
-        self.num_ops * (Self::NUM_BITS + 1 + 2)
+        self.num_ops * (Self::NUM_BITS + 1 + 2 + Self::NUM_BITS / 2)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()>{
@@ -297,6 +310,12 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
 
             yield_constr.one(computed_x_evens - x_evens);
             yield_constr.one(computed_x_odds - x_odds);
+
+            // Check 2b: see eval_unfiltered - a slot must not hold both bits,
+            // otherwise the s + p alias of the sum is provable.
+            for j in 0..Self::NUM_BITS / 2 {
+                yield_constr.one(bits[2 * j] * bits[2 * j + 1]);
+            }
 
             // Check 3: Range check the targets in the decomposition
             let constraints_iter = bits.iter().map(|&bit| {
@@ -411,5 +430,40 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(UninterleaveToU32Gate { num_ops: 2 })
+    }
+    /// The sum wire of `xor(0, 0)` is the field element zero, and the base-2
+    /// spelling of `p` (`0xFFFFFFFF00000001`) reduces to zero as well. Without
+    /// the slot-pair constraint the gate accepts that spelling and yields
+    /// AND = 0xFFFF0000, XOR = 0xFFFF0001 for an all-zero input. A proof-based
+    /// test cannot catch this - the witness generator always writes the honest
+    /// bits - so the constraint is evaluated directly on the forged wires.
+    #[test]
+    fn rejects_the_field_alias_of_zero() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as plonky2::field::extension::Extendable<D>>::Extension;
+
+        let gate = UninterleaveToU32Gate { num_ops: 1 };
+        let mut wires = vec![FE::ZERO; Gate::<F, D>::num_wires(&gate)];
+        wires[gate.wire_ith_x_interleaved(0)] = FE::ZERO;
+
+        let p = 0xFFFFFFFF00000001u64;
+        let bits_start = gate.wires_ith_bit_decomposition(0).start;
+        for j in 0..64 {
+            wires[bits_start + j] = FE::from_bool((p >> (63 - j)) & 1 == 1);
+        }
+        wires[gate.wire_ith_x_evens(0)] = FE::from_canonical_u64(0xFFFF0000);
+        wires[gate.wire_ith_x_odds(0)] = FE::from_canonical_u64(0xFFFF0001);
+
+        let vars = EvaluationVars::<F, D> {
+            local_constants: &[],
+            local_wires: &wires,
+            public_inputs_hash: &Default::default(),
+        };
+        let constraints = gate.eval_unfiltered(vars);
+        assert!(
+            constraints.iter().any(|c| !c.is_zero()),
+            "the s + p alias of xor(0, 0) must violate a constraint"
+        );
     }
 }

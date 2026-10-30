@@ -36,14 +36,14 @@ type C = PoseidonGoldilocksConfig;
 type F = GoldilocksField;
 
 sol! {
-    // Return values were added without touching the input types, so the
-    // selector stays keccak256("batchClaimWithdrawal(uint256[8],uint256[18],uint256[1088])").
-    // eth_call sees the arrays; a mined transaction is accounted from its
-    // receipt events, which are the only outcome record a receipt carries.
+    // Slot arrays are the audited 35-word-per-slot layout, so the selector is
+    // pinned to uint256[1120]. eth_call sees the arrays; a mined transaction is
+    // accounted from its receipt events, which are the only outcome record a
+    // receipt carries.
     function batchClaimWithdrawal(
         uint256[8] proof,
         uint256[18] publicInputs,
-        uint256[1088] slotData
+        uint256[1120] slotData
     ) returns (uint8[] failedSlotIndexes, uint8[] failureReasons);
 
     event WithdrawalClaimItemFailed(bytes32 indexed nonce, uint8 indexed slotIndex, uint8 reason);
@@ -53,6 +53,7 @@ sol! {
         uint8 succeededCount,
         uint8 failedCount
     );
+    event WithdrawalClaimed(bytes32 indexed nonce, address indexed recipient, address indexed token, uint256 amount);
     event WithdrawalPendingCreated(
         bytes32 indexed nonce,
         address indexed token,
@@ -60,7 +61,6 @@ sol! {
         uint256 amount,
         uint64 claimableAt
     );
-
 
     struct TokenFlowConfig {
         uint128 minDepositAmount;
@@ -99,8 +99,9 @@ const REASON_REGISTRATION_PAUSED: u8 = 7;
 const REASON_AMOUNT_OUT_OF_RANGE: u8 = 8;
 const REASON_TOTAL_OVERFLOW: u8 = 9;
 const REASON_CLAIMABLE_TIME_OVERFLOW: u8 = 10;
+const REASON_TOKEN_MAPPING_MISMATCH: u8 = 11;
 const CLAIM_FAILURE_REASON_MIN: u8 = REASON_HIGH_ADDRESS;
-const CLAIM_FAILURE_REASON_MAX: u8 = REASON_CLAIMABLE_TIME_OVERFLOW;
+const CLAIM_FAILURE_REASON_MAX: u8 = REASON_TOKEN_MAPPING_MISMATCH;
 
 #[derive(Debug, Deserialize)]
 struct WithdrawalClaimProofResult {
@@ -149,7 +150,7 @@ pub struct ClaimOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClaimOutcomeKind {
-    /// Registered as a pending withdrawal this round.
+    /// Successfully paid directly or registered as pending this round.
     Registered,
     /// Not resolved; the code explains why and [`ClaimCode::action`] decides.
     Failed(ClaimCode),
@@ -166,7 +167,7 @@ impl ClaimOutcomeKind {
 
 /// Why a leaf's claim attempt ended the way it did.
 ///
-/// Contract variants mirror the on-chain `CLAIM_REASON_*` values 1..=10; the
+/// Contract variants mirror the on-chain `CLAIM_REASON_*` values 1..=11; the
 /// numbers live only in `contract_reason`. Relayer-side variants are named
 /// facts with no external numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -187,9 +188,13 @@ pub enum ClaimCode {
     TotalOverflow,
     /// Claimable timestamp would overflow. Recheck: the claimable window.
     ClaimableOverflow,
-    /// The nonce is consumed or registered by a withdrawal with a different
-    /// tuple. A consumed nonce is consumed forever, so this payload can never
-    /// claim through it.
+    /// The Router does not dual-bind the slot's token to an L2 contract id.
+    /// Recheck: the Router token mapping on L1; an admin can map the token and
+    /// the permissionless claim then registers the withdrawal.
+    TokenMappingMismatch,
+    /// The L1 claim-identity `claimedNullifiers` key is consumed or registered
+    /// for different content. Keep the serialized variant name so durable holds
+    /// remain readable.
     NonceConflict,
     /// Services proof missing; the L1 root is not finalized yet.
     ProofNotReady,
@@ -249,7 +254,8 @@ impl ClaimCode {
             Self::TokenNotConfigured
             | Self::RegistrationPaused
             | Self::TotalOverflow
-            | Self::ClaimableOverflow => ClaimAction::OperatorPending,
+            | Self::ClaimableOverflow
+            | Self::TokenMappingMismatch => ClaimAction::OperatorPending,
             | Self::MalformedReceipt
             | Self::RootUnauthorized
             | Self::ProofDataInvalid
@@ -277,7 +283,8 @@ impl ClaimCode {
             Self::AmountOutOfRange => "withdrawal amount is out of range",
             Self::TotalOverflow => "total withdrawal amount overflow",
             Self::ClaimableOverflow => "claimable time overflow",
-            Self::NonceConflict => "nonce is registered for a different withdrawal",
+            Self::TokenMappingMismatch => "Router does not dual-bind the token to an L2 contract id",
+            Self::NonceConflict => "withdrawal claim identity is consumed or registered for different content",
             Self::ProofNotReady => "withdrawal claim proof not available yet; L1 root not finalized",
             Self::RpcUnavailable => "claim state read failed",
             Self::ReceiptUnknown => "claim transaction outcome unknown; query before rebroadcast",
@@ -306,8 +313,9 @@ fn contract_reason(reason: u8) -> ClaimCode {
         8 => ClaimCode::AmountOutOfRange,
         9 => ClaimCode::TotalOverflow,
         10 => ClaimCode::ClaimableOverflow,
+        11 => ClaimCode::TokenMappingMismatch,
         other => unreachable!(
-            "reason {other} is outside the parser's 1..=10 range and not the tuple-resolved reason 5"
+            "reason {other} is outside the parser's 1..=11 range and not the tuple-resolved reason 5"
         ),
     }
 }
@@ -342,7 +350,7 @@ pub struct BatchWithdrawalsArgs {
     pub multicall3_address: Option<String>,
     #[arg(long, default_value = crate::bridge::constants::DEFAULT_DEPLOYMENTS_NETWORK)]
     pub deployments_network: String,
-    #[arg(long, env = "PRIVATE_KEY")]
+    #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: Option<String>,
     #[arg(long, env = "KEYSTORE_PATH")]
     pub keystore_path: Option<PathBuf>,
@@ -406,20 +414,16 @@ async fn fetch_claim_proof(
     services_url: &str,
     withdrawal: &PendingWithdrawal,
 ) -> Result<WithdrawalClaimProofResult> {
-    let recipient_hex = u32x8_to_hex(withdrawal.recipient);
-    let token_hex = u32x8_to_hex(withdrawal.token_address);
-    let amount_hex = u32x8_to_hex(withdrawal.amount);
-    let nonce_hex = u32x8_to_hex(withdrawal.nonce);
-
+    // The query identity is the withdrawal leaf hash bytes32 over the full
+    // 35-word preimage; the sender, nonce, and token contract are leaf
+    // fields, never separate query parameters. Recomputed from the slot
+    // words, never trusted from the stored row rendering.
+    let nullifier_hex = u32x8_to_hex(withdrawal_leaf_words(withdrawal)?);
     let url = format!(
-        "{}/api/v1/bridge/withdrawal-claim-proof?recipient={}&token_address={}&amount={}&nonce={}&destination_chain_index={}&sender_user_id={}",
+        "{}/api/v1/bridge/withdrawal-claim-proof?destination_chain_index={}&nullifier={}",
         services_url.trim_end_matches('/'),
-        recipient_hex,
-        token_hex,
-        amount_hex,
-        nonce_hex,
         withdrawal.destination_chain_index,
-        withdrawal.sender_user_id,
+        nullifier_hex,
     );
     tracing::debug!(url = %url, "fetching withdrawal claim proof");
 
@@ -533,14 +537,6 @@ async fn poll_claim_proof<P: Provider>(
     latest
 }
 
-fn withdrawal_nullifier_from_nonce(nonce: [u32; 8]) -> B256 {
-    let mut nonce_bytes = [0u8; 32];
-    for (i, word) in nonce.iter().enumerate() {
-        nonce_bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
-    }
-    B256::from(nonce_bytes)
-}
-
 
 /// keccak256 over the low 4 bytes of every slot word: the exact preimage
 /// `_computeWithdrawalBatchSlotDataCommit` hashes on-chain.
@@ -573,24 +569,44 @@ fn sent_claim_batch(call_data: &[u8], chunk_len: usize) -> Result<SentClaimBatch
     })
 }
 
-pub(crate) fn recorded_claim_batch(call_data: &[u8]) -> Result<(Vec<PendingWithdrawal>, Vec<u8>)> {
+/// Decode one recorded claim batch, resolving each slot against the relayer's
+/// own pending records (`pending`) by the full 35-word slot identity the L1
+/// claim carries: sender_user_id, recipient, token, amount, nonce (raw),
+/// destination chain, and token contract id. A slot with zero or several
+/// matching records fails closed — the batch is held, never guessed.
+pub(crate) fn recorded_claim_batch(
+    call_data: &[u8],
+    pending: &[PendingWithdrawal],
+) -> Result<(Vec<PendingWithdrawal>, Vec<u8>)> {
     let decoded = batchClaimWithdrawalCall::abi_decode(call_data).context("recorded claim input is not batchClaimWithdrawal")?;
     let count = usize::try_from(decoded.publicInputs[8]).context("recorded claim realCount does not fit")?;
     anyhow::ensure!((1..=MAX_WITHDRAWAL_CLAIM_BATCH_SIZE).contains(&count), "recorded claim realCount is outside the batch");
     let mut batch = Vec::with_capacity(count);
     for slot in 0..count {
         let offset = slot * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS;
-        let sender = u64::try_from(decoded.slotData[offset]).context("recorded sender does not fit")?;
+        let sender = u64::from(u32::try_from(decoded.slotData[offset]).context("recorded sender does not fit u32")?);
         let recipient = slot_words(&decoded.slotData, offset + 1).context("recorded recipient words")?;
         let token = slot_words(&decoded.slotData, offset + 9).context("recorded token words")?;
         let amount = slot_words(&decoded.slotData, offset + 17).context("recorded amount words")?;
         let nonce = slot_words(&decoded.slotData, offset + 25).context("recorded nonce words")?;
         let destination = u64::try_from(decoded.slotData[offset + 33]).context("recorded destination does not fit")?;
-        let leaf_hash = crate::bridge::propose_withdrawals::compute_withdrawal_leaf_hash(sender, recipient, token, amount, nonce, destination)?;
-        batch.push(PendingWithdrawal {
-            event_id: 0, checkpoint_id: 0, user_id: sender, sender_user_id: sender, contract_id: 0,
-            destination_chain_index: destination, token_address: token, amount, recipient, nonce, leaf_hash,
+        let contract_id = u64::from(u32::try_from(decoded.slotData[offset + 34]).context("recorded token contract id does not fit u32")?);
+        let mut matches = pending.iter().filter(|record| {
+            record.sender_user_id == sender
+                && record.recipient == recipient
+                && record.token_address == token
+                && record.amount == amount
+                && record.nonce == nonce
+                && record.destination_chain_index == destination
+                && record.contract_id == contract_id
         });
+        let (record, extra) = (matches.next(), matches.next());
+        anyhow::ensure!(
+            extra.is_none(),
+            "recorded slot {slot} matches more than one pending withdrawal identity"
+        );
+        let record = record.with_context(|| format!("recorded slot {slot} has no pending withdrawal identity"))?;
+        batch.push(record.clone());
     }
     Ok((batch, call_data.to_vec()))
 }
@@ -612,28 +628,53 @@ fn slot_words(slot_data: &[U256], offset: usize) -> Result<[u32; 8]> {
     Ok(words)
 }
 
-struct ClaimSlotIdentity {
-    nonce: B256,
+struct EvmWithdrawal {
+    sender_user_id: u32,
+    /// The L1 claim identity: keccak256 over this withdrawal's 35 slot words.
+    /// It is the `claimedNullifiers` key, the pending-withdrawal key, and the
+    /// topic1 identity of every Bridge withdrawal event.
+    claim_identity: B256,
     token: Address,
     recipient: Address,
     amount: U256,
 }
 
-fn claim_slot_identity(withdrawal: &PendingWithdrawal) -> ClaimSlotIdentity {
-    ClaimSlotIdentity {
-        nonce: withdrawal_nullifier_from_nonce(withdrawal.nonce),
+/// The withdrawal leaf hash limbs (low u32 then high u32 per Goldilocks limb)
+/// over the 35 preimage felts. This is the services/API lookup identity; it is
+/// not an L1 slot word and not the `claimedNullifiers` key.
+fn withdrawal_leaf_words(withdrawal: &PendingWithdrawal) -> Result<[u32; 8]> {
+    crate::bridge::propose_withdrawals::compute_withdrawal_leaf_words(
+        withdrawal.sender_user_id,
+        withdrawal.recipient,
+        withdrawal.token_address,
+        withdrawal.amount,
+        withdrawal.nonce,
+        withdrawal.destination_chain_index,
+        withdrawal.contract_id,
+    )
+}
+
+fn to_evm_withdrawal(withdrawal: &PendingWithdrawal) -> Result<EvmWithdrawal> {
+    let sender_user_id = u32::try_from(withdrawal.sender_user_id)
+        .context("withdrawal sender_user_id exceeds u32")?;
+    let claim_identity = B256::from(
+        u32x8_to_u256(crate::bridge::propose_withdrawals::withdrawal_claim_identity_words(withdrawal)?)
+            .to_be_bytes::<32>(),
+    );
+    Ok(EvmWithdrawal {
+        sender_user_id,
+        claim_identity,
         token: u32x8_to_address(withdrawal.token_address),
         recipient: u32x8_to_address(withdrawal.recipient),
         amount: u32x8_to_u256(withdrawal.amount),
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimSlotOutcome {
     Registered,
-    /// The receipt ties this slot's nonce to a withdrawal with a different
-    /// token, recipient, or amount. A different leaf owns that nonce, so this
-    /// slot is failed on its own and its chunk-mates stay resolvable.
+    /// This withdrawal's claim identity registered different payout content.
+    /// Only this slot fails; its chunk-mates remain resolvable.
     NonceConflict,
     Failed { reason: u8 },
 }
@@ -642,26 +683,26 @@ struct ParsedClaimReceipt {
     outcomes: Vec<ClaimSlotOutcome>,
 }
 
-/// The nonce is the map key, so identity is token, recipient, and amount.
-fn registration_matches(event: &WithdrawalPendingCreated, identity: &ClaimSlotIdentity) -> bool {
-    event.token == identity.token
-        && event.recipient == identity.recipient
-        && event.amount == identity.amount
+/// The claim identity is the map key; the payout fields are a content-binding
+/// belt-and-braces check on top of it.
+fn registration_matches(event: &WithdrawalPendingCreated, withdrawal: &EvmWithdrawal) -> bool {
+    event.token == withdrawal.token
+        && event.recipient == withdrawal.recipient
+        && event.amount == withdrawal.amount
 }
 
 /// Account one confirmed batch from its receipt.
 ///
 /// Only logs emitted by `bridge` count. The batch summary must name the commit
 /// and real count of the calldata actually sent, and the failed-slot events
-/// must reproduce that summary with each slot's own nonce; breaking any of
-/// that makes the whole receipt unusable. A succeeded slot whose registration
-/// names different content is a per-slot nonce conflict, not a chunk failure:
-/// nonces are not unique across slots, so slots are joined by index.
+/// must reproduce that summary with each slot's claim identity.
+/// A registration naming different content is a per-slot conflict, not a
+/// chunk failure. Repeated leaf pairs are joined by slot index.
 fn parse_claim_receipt(
     logs: &[alloy_rpc_types_eth::Log],
     bridge: Address,
     expected_batch_commit: B256,
-    slots: &[ClaimSlotIdentity],
+    slots: &[EvmWithdrawal],
 ) -> Result<ParsedClaimReceipt> {
     anyhow::ensure!(
         !slots.is_empty() && slots.len() <= MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
@@ -689,6 +730,14 @@ fn parse_claim_receipt(
                 WithdrawalClaimItemFailed::decode_log_data(&log.data)
                     .context("failed to decode WithdrawalClaimItemFailed")?,
             );
+        } else if topic0 == &WithdrawalClaimed::SIGNATURE_HASH {
+            let event = WithdrawalClaimed::decode_log_data(&log.data)
+                .context("failed to decode WithdrawalClaimed")?;
+            // Both direct payment and pending registration resolve this batch slot.
+            pending_created.push(WithdrawalPendingCreated {
+                nonce: event.nonce, token: event.token, recipient: event.recipient,
+                amount: event.amount, claimableAt: 0,
+            });
         } else if topic0 == &WithdrawalPendingCreated::SIGNATURE_HASH {
             pending_created.push(
                 WithdrawalPendingCreated::decode_log_data(&log.data)
@@ -722,14 +771,14 @@ fn parse_claim_receipt(
 
     let mut registrations: HashMap<B256, WithdrawalPendingCreated> = HashMap::new();
     for event in pending_created {
-        let nonce = event.nonce;
+        let identity = event.nonce;
         anyhow::ensure!(
-            slots.iter().any(|slot| slot.nonce == nonce),
-            "receipt registers nonce {nonce} which this batch did not send"
+            slots.iter().any(|slot| slot.claim_identity == identity),
+            "receipt registers claim identity {identity} which this batch did not send"
         );
         anyhow::ensure!(
-            registrations.insert(nonce, event).is_none(),
-            "receipt registers nonce {nonce} twice"
+            registrations.insert(identity, event).is_none(),
+            "receipt registers claim identity {identity} twice"
         );
     }
     anyhow::ensure!(
@@ -746,8 +795,8 @@ fn parse_claim_receipt(
         anyhow::ensure!(!seen_failed[slot], "slot {slot} failed twice in one receipt");
         seen_failed[slot] = true;
         anyhow::ensure!(
-            event.nonce == slots[slot].nonce,
-            "failed slot {slot} names nonce {}, not the nonce sent in that slot",
+            event.nonce == slots[slot].claim_identity,
+            "failed slot {slot} names claim identity {}, not the identity sent in that slot",
             event.nonce
         );
         anyhow::ensure!(
@@ -762,8 +811,8 @@ fn parse_claim_receipt(
         if seen_failed[slot_index] {
             continue;
         }
-        let event = registrations.get(&slot.nonce).with_context(|| {
-            format!("summary counts slot {slot_index} as succeeded but no WithdrawalPendingCreated carries its nonce")
+        let event = registrations.get(&slot.claim_identity).with_context(|| {
+            format!("summary counts slot {slot_index} as succeeded but no WithdrawalPendingCreated carries its claim identity")
         })?;
         if !registration_matches(event, slot) {
             outcomes[slot_index] = ClaimSlotOutcome::NonceConflict;
@@ -860,8 +909,8 @@ fn fail_chunk(chunk: &[PendingProof], outcomes: &mut OutcomeSlots, code: ClaimCo
 /// Apply one mined, status-successful claim transaction.
 ///
 /// A missing or malformed receipt fails the whole chunk closed with nothing
-/// resolved. Per-slot content conflicts — a nonce another withdrawal consumed
-/// or registered — fail only their own leaf, and the chunk's good slots stay
+/// resolved. Per-slot content conflicts — a nonce key another
+/// withdrawal consumed or registered — fail only their own leaf, and good slots stay
 /// resolved. A reverted transaction never reaches here. The result is one
 /// outcome per slot, aligned with `chunk`; the caller owns row placement.
 fn apply_confirmed_claim_receipt(
@@ -887,9 +936,17 @@ fn apply_confirmed_claim_receipt(
             return chunk_failure(ClaimCode::MalformedReceipt);
         }
     };
-    let identities: Vec<ClaimSlotIdentity> =
-        chunk.iter().map(|pending| claim_slot_identity(&pending.withdrawal)).collect();
-    let parsed = match parse_claim_receipt(logs, bridge, sent.batch_commit, &identities) {
+    let evm_withdrawals = match chunk.iter()
+        .map(|pending| to_evm_withdrawal(&pending.withdrawal))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(withdrawals) => withdrawals,
+        Err(error) => {
+            tracing::error!(error = %error, "claim sender identity is invalid");
+            return chunk_failure(ClaimCode::MalformedReceipt);
+        }
+    };
+    let parsed = match parse_claim_receipt(logs, bridge, sent.batch_commit, &evm_withdrawals) {
         Ok(parsed) => parsed,
         Err(error) => {
             tracing::error!(error = %error, "claim receipt is malformed or inconsistent");
@@ -908,15 +965,15 @@ fn apply_confirmed_claim_receipt(
                 ClaimSlotOutcome::NonceConflict => {
                     tracing::warn!(
                         leaf_hash,
-                        nonce = %identities[slot].nonce,
-                        "slot's nonce is tied to a different withdrawal"
+                        sender_user_id = evm_withdrawals[slot].sender_user_id,
+                        claim_identity = %evm_withdrawals[slot].claim_identity,
+                        "slot's claim identity is tied to a different withdrawal"
                     );
                     ClaimOutcomeKind::Failed(ClaimCode::NonceConflict)
                 }
                 ClaimSlotOutcome::Failed { reason: REASON_ALREADY_CLAIMED } => {
-                    // The nonce is consumed. L1 registration events omit the
-                    // sender, and registration history is not authoritative for
-                    // this leaf, so reason 5 is always a consumed nonce here.
+                    // The claim identity is consumed. A sibling registration
+                    // never upgrades this rejected slot to success.
                     ClaimOutcomeKind::Failed(ClaimCode::NonceConflict)
                 }
                 ClaimSlotOutcome::Failed { reason } => ClaimOutcomeKind::Failed(contract_reason(reason)),
@@ -935,7 +992,7 @@ fn flow_delay(config: &TokenFlowConfig, amount: U256, next_total: U256) -> u32 {
     } else if amount > U256::from(config.smallWithdrawalMax) {
         config.mediumWithdrawalDelay
     } else {
-        config.smallWithdrawalDelay
+        0
     }
 }
 
@@ -958,34 +1015,34 @@ pub(crate) async fn operator_condition_cleared<P: Provider>(
     withdrawal: &PendingWithdrawal,
     code: ClaimCode,
 ) -> Result<bool> {
-    let identity = claim_slot_identity(withdrawal);
+    let evm_withdrawal = to_evm_withdrawal(withdrawal)?;
     match code {
         ClaimCode::RegistrationPaused => {
-            let flags = view_call(provider, bridge, getPauseFlagsCall { token: identity.token }).await?;
+            let flags = view_call(provider, bridge, getPauseFlagsCall { token: evm_withdrawal.token }).await?;
             Ok(flags.effectiveFlags & PAUSE_WITHDRAWAL_REGISTRATION == 0)
         }
         ClaimCode::TokenNotConfigured => {
-            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: identity.token }).await?;
+            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: evm_withdrawal.token }).await?;
             Ok(config.configured)
         }
         ClaimCode::TotalOverflow => {
-            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: identity.token }).await?;
-            Ok(identity.amount <= U256::MAX - total)
+            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: evm_withdrawal.token }).await?;
+            Ok(evm_withdrawal.amount <= U256::MAX - total)
         }
         ClaimCode::ClaimableOverflow => {
-            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: identity.token }).await?;
-            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: identity.token }).await?;
-            if identity.amount > U256::MAX - total {
+            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: evm_withdrawal.token }).await?;
+            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: evm_withdrawal.token }).await?;
+            if evm_withdrawal.amount > U256::MAX - total {
                 return Ok(false);
             }
-            let next_total = total + identity.amount;
+            let next_total = total + evm_withdrawal.amount;
             let block = provider
                 .get_block(alloy_rpc_types_eth::BlockId::latest())
                 .await
                 .context("latest block read failed")?
                 .context("latest block missing")?;
             let timestamp = U256::from(block.header.timestamp);
-            let delay = U256::from(flow_delay(&config, identity.amount, next_total));
+            let delay = U256::from(flow_delay(&config, evm_withdrawal.amount, next_total));
             Ok(timestamp <= U256::from(u64::MAX) - delay)
         }
         _ => Ok(false),
@@ -1013,7 +1070,7 @@ pub(crate) fn reverted_claim_report(withdrawal: &PendingWithdrawal) -> BatchWith
 /// Account one leaf from a transaction whose receipt came back later.
 ///
 /// `batch` is the chunk that was signed, in submitted order, so the receipt is
-/// classified by the same commit, counts, failed-slot nonce, and registration
+/// classified by the same commit, counts, failed-slot nullifier, and registration
 /// tuple as an immediate receipt. `withdrawal` is one leaf of that batch. The
 /// returned report covers the whole batch: every slot keeps its own leaf and
 /// typed reason, in submitted order, and this leaf's unresolved slots carry
@@ -1169,6 +1226,8 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
                 amount: p.withdrawal.amount,
                 nonce: p.withdrawal.nonce,
                 destination_chain_index: dest_chain_u32,
+                token_contract_id: u32::try_from(p.withdrawal.contract_id)
+                    .map_err(|_| anyhow::anyhow!("contract_id {} exceeds u32", p.withdrawal.contract_id))?,
                 leaf_index: p.leaf_index,
                 bridge_user_id: BRIDGE_USER_ID_U32,
                 siblings: p.siblings.iter().map(|s| qhash_to_solidity_hex(*s)).collect(),
@@ -1209,13 +1268,18 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
             for (j, word) in p.withdrawal.amount.iter().enumerate() {
                 slot_data_u256[slot_offset + 17 + j] = U256::from(*word);
             }
-            // nonce occupies words 25..32 (8 words); destination_chain_index at 33.
+            // nonce occupies words 25..32 (8 words); destination_chain_index at
+            // 33 and token_contract_id at 34 close out the 35-word slot; the
+            // leaf hash stays a Merkle-leaf-only field.
             for (j, word) in p.withdrawal.nonce.iter().enumerate() {
                 slot_data_u256[slot_offset + 25 + j] = U256::from(*word);
             }
             let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_index)
                 .map_err(|_| anyhow::anyhow!("destination_chain_index {} exceeds u32", p.withdrawal.destination_chain_index))?;
             slot_data_u256[slot_offset + 33] = U256::from(dest_chain_u32);
+            let token_contract_u32 = u32::try_from(p.withdrawal.contract_id)
+                .map_err(|_| anyhow::anyhow!("contract_id {} exceeds u32", p.withdrawal.contract_id))?;
+            slot_data_u256[slot_offset + 34] = U256::from(token_contract_u32);
         }
         // ── Debug: batch commit verification ──
         {
@@ -1269,6 +1333,8 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
                     amount: p.withdrawal.amount,
                     nonce: p.withdrawal.nonce,
                     destination_chain_index: dest_chain_u32,
+                    token_contract_id: u32::try_from(p.withdrawal.contract_id)
+                        .map_err(|_| anyhow::anyhow!("contract_id {} exceeds u32", p.withdrawal.contract_id))?,
                     leaf_index: p.leaf_index,
                     siblings: p.siblings.clone(),
                 })
@@ -1344,13 +1410,18 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
         for (j, word) in pending.withdrawal.amount.iter().enumerate() {
             slot_data_u256[slot_offset + 17 + j] = U256::from(*word);
         }
-        // nonce occupies words 25..32 (8 words); destination_chain_index at 33.
+        // nonce occupies words 25..32 (8 words); destination_chain_index at
+        // 33 and token_contract_id at 34 close out the 35-word slot; the leaf
+        // hash stays a Merkle-leaf-only field.
         for (j, word) in pending.withdrawal.nonce.iter().enumerate() {
             slot_data_u256[slot_offset + 25 + j] = U256::from(*word);
         }
         let dest_chain_u32 = u32::try_from(pending.withdrawal.destination_chain_index)
             .map_err(|_| anyhow::anyhow!("destination_chain_index {} exceeds u32", pending.withdrawal.destination_chain_index))?;
         slot_data_u256[slot_offset + 33] = U256::from(dest_chain_u32);
+        let token_contract_u32 = u32::try_from(pending.withdrawal.contract_id)
+            .map_err(|_| anyhow::anyhow!("contract_id {} exceeds u32", pending.withdrawal.contract_id))?;
+        slot_data_u256[slot_offset + 34] = U256::from(token_contract_u32);
     }
 
     let call = batchClaimWithdrawalCall {
@@ -1970,21 +2041,65 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_nullifier_from_nonce_concatenates_big_endian_u32_words() {
-        let nonce = [
-            0x01020304,
-            0x11121314,
-            0x21222324,
-            0x31323334,
-            0x41424344,
-            0x51525354,
-            0x61626364,
-            0x71727374,
+    fn withdrawal_leaf_words_pack_big_endian_low_limb_first() {
+        // Frozen rendering vector shared by circuit, contracts, CLI, dapp and
+        // services: per Goldilocks limb low u32 then high u32, each word
+        // big-endian.
+        let words: [u32; 8] = [
+            0x55667788, 0x11223344, 0xeeff0011, 0xaabbccdd, 0x00000002, 0x00000001, 0x00000000,
+            0xffffffff,
         ];
         assert_eq!(
-            format!("0x{}", hex::encode(withdrawal_nullifier_from_nonce(nonce))),
-            "0x0102030411121314212223243132333441424344515253546162636471727374"
+            hex::encode(u32x8_to_u256(words).to_be_bytes::<32>()),
+            "5566778811223344eeff0011aabbccdd000000020000000100000000ffffffff"
         );
+    }
+
+    #[test]
+    fn withdrawal_leaf_words_bind_the_full_preimage_as_services_identity() {
+        let mut withdrawal = dummy_withdrawal();
+        withdrawal.sender_user_id = 1;
+        withdrawal.nonce = [0, 0, 0, 0, 0, 0, 0, 2];
+        let leaf = B256::from(u32x8_to_u256(withdrawal_leaf_words(&withdrawal).unwrap()).to_be_bytes::<32>());
+        let mut other_sender = withdrawal.clone();
+        other_sender.sender_user_id = 2;
+        assert_ne!(leaf, B256::from(u32x8_to_u256(withdrawal_leaf_words(&other_sender).unwrap()).to_be_bytes::<32>()));
+        assert_ne!(
+            leaf,
+            B256::from(u32x8_to_u256(withdrawal.nonce).to_be_bytes::<32>()),
+            "the services identity is the 35-felt leaf hash, not the raw nonce"
+        );
+        let mut other_content = withdrawal.clone();
+        other_content.amount = [0, 0, 0, 0, 0, 0, 0, 9];
+        assert_ne!(leaf, B256::from(u32x8_to_u256(withdrawal_leaf_words(&other_content).unwrap()).to_be_bytes::<32>()));
+    }
+
+    #[test]
+    fn evm_withdrawal_binds_keccak_claim_identity() {
+        let mut withdrawal = dummy_withdrawal();
+        withdrawal.sender_user_id = 1;
+        withdrawal.nonce = [0, 0, 0, 0, 0, 0, 0, 2];
+        let evm = to_evm_withdrawal(&withdrawal).unwrap();
+        assert_eq!(evm.sender_user_id, 1);
+        // The L1 key is the keccak identity over the 35 slot words: neither
+        // the raw nonce nor the Poseidon leaf hash.
+        assert_ne!(evm.claim_identity, B256::from(U256::from(2).to_be_bytes::<32>()));
+        let leaf = B256::from(u32x8_to_u256(withdrawal_leaf_words(&withdrawal).unwrap()).to_be_bytes::<32>());
+        assert_ne!(evm.claim_identity, leaf);
+        // Same nonce under a different sender: a different claim identity.
+        let mut same_nonce_other_sender = withdrawal.clone();
+        same_nonce_other_sender.sender_user_id = 2;
+        assert_ne!(
+            evm.claim_identity,
+            to_evm_withdrawal(&same_nonce_other_sender).unwrap().claim_identity
+        );
+    }
+
+    #[test]
+    fn evm_withdrawal_rejects_sender_outside_u32() {
+        let mut withdrawal = dummy_withdrawal();
+        withdrawal.sender_user_id = u64::from(u32::MAX) + 1;
+        assert!(to_evm_withdrawal(&withdrawal).is_err());
     }
 
     #[test]
@@ -2456,6 +2571,7 @@ mod tests {
             [U256::ZERO; MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS];
         for (slot, pending) in chunk.iter().enumerate() {
             let offset = slot * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS;
+            slot_data[offset] = U256::from(pending.withdrawal.sender_user_id);
             for (word, value) in pending.withdrawal.nonce.iter().enumerate() {
                 slot_data[offset + 25 + word] = U256::from(*value);
             }
@@ -2496,20 +2612,24 @@ mod tests {
         }
     }
 
+    fn claim_slot_identity(withdrawal: &PendingWithdrawal) -> EvmWithdrawal {
+        to_evm_withdrawal(withdrawal).expect("test withdrawal sender fits u32")
+    }
+
     fn registered(pending: &PendingProof) -> WithdrawalPendingCreated {
-        let identity = claim_slot_identity(&pending.withdrawal);
+        let evm_withdrawal = to_evm_withdrawal(&pending.withdrawal).unwrap();
         WithdrawalPendingCreated {
-            nonce: identity.nonce,
-            token: identity.token,
-            recipient: identity.recipient,
-            amount: identity.amount,
+            nonce: evm_withdrawal.claim_identity,
+            token: evm_withdrawal.token,
+            recipient: evm_withdrawal.recipient,
+            amount: evm_withdrawal.amount,
             claimableAt: 1_700_000_000,
         }
     }
 
     fn failed_slot(pending: &PendingProof, slot: u8, reason: u8) -> WithdrawalClaimItemFailed {
         WithdrawalClaimItemFailed {
-            nonce: withdrawal_nullifier_from_nonce(pending.withdrawal.nonce),
+            nonce: to_evm_withdrawal(&pending.withdrawal).unwrap().claim_identity,
             slotIndex: slot,
             reason,
         }
@@ -2544,7 +2664,7 @@ mod tests {
     #[test]
     fn batch_claim_abi_stays_frozen() {
         let selector = &keccak256(
-            b"batchClaimWithdrawal(uint256[8],uint256[18],uint256[1088])",
+            b"batchClaimWithdrawal(uint256[8],uint256[18],uint256[1120])",
         )[..4];
         assert_eq!(batchClaimWithdrawalCall::SELECTOR.as_slice(), selector);
         assert_eq!(
@@ -2588,6 +2708,24 @@ mod tests {
         assert_ne!(rows[2].nonce, rows[3].nonce);
     }
 
+    #[test]
+    fn direct_payment_and_pending_registration_resolve_their_own_slots() {
+        let chunk = [pending_proof(tagged_withdrawal("paid", 1)), pending_proof(tagged_withdrawal("pending", 2))];
+        let (_, commit) = claim_calldata(&chunk);
+        let identity = claim_slot_identity(&chunk[0].withdrawal);
+        let payment = WithdrawalClaimed { nonce: identity.claim_identity, recipient: identity.recipient,
+            token: identity.token, amount: identity.amount };
+        let logs = vec![bridge_log(&payment), bridge_log(&registered(&chunk[1])), bridge_log(&summary(commit, 2, 2, 0))];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 2);
+        assert_eq!(applied.kind_of("paid"), Some(ClaimOutcomeKind::Registered));
+        assert_eq!(applied.kind_of("pending"), Some(ClaimOutcomeKind::Registered));
+        let mut duplicate = logs;
+        duplicate.push(bridge_log(&registered(&chunk[0])));
+        assert!(parse_claim_receipt(&duplicate, RECEIPT_BRIDGE, commit,
+            &chunk.iter().map(|p| claim_slot_identity(&p.withdrawal)).collect::<Vec<_>>()).is_err());
+    }
+
     #[tokio::test]
     async fn partial_receipt_resolves_only_the_slots_that_registered() {
         let good = pending_proof(tagged_withdrawal("leaf-good", 1));
@@ -2608,6 +2746,31 @@ mod tests {
             applied.kind_of("leaf-bad"),
             Some(ClaimOutcomeKind::Failed(ClaimCode::TokenNotConfigured))
         );
+    }
+
+    #[tokio::test]
+    async fn a_mapping_mismatch_reason_strikes_only_its_own_slot() {
+        let good = pending_proof(tagged_withdrawal("leaf-good", 1));
+        let unbound = pending_proof(tagged_withdrawal("leaf-unbound", 2));
+        let chunk = [good, unbound];
+        let (_, commit) = claim_calldata(&chunk);
+        let logs = vec![
+            bridge_log(&summary(commit, 2, 1, 1)),
+            bridge_log(&registered(&chunk[0])),
+            bridge_log(&failed_slot(&chunk[1], 1, REASON_TOKEN_MAPPING_MISMATCH)),
+        ];
+
+        let applied = apply_receipt(&logs, &chunk);
+
+        // The honest slot stays resolved; the unbound token's slot fails alone
+        // with the operator-repairable code, never an attempt-spent strike.
+        assert_eq!(applied.submitted_count, 1);
+        assert_eq!(applied.kind_of("leaf-good"), Some(ClaimOutcomeKind::Registered));
+        assert_eq!(
+            applied.kind_of("leaf-unbound"),
+            Some(ClaimOutcomeKind::Failed(ClaimCode::TokenMappingMismatch))
+        );
+        assert_eq!(ClaimCode::TokenMappingMismatch.action(), ClaimAction::OperatorPending);
     }
 
     #[tokio::test]
@@ -2677,35 +2840,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_batch_duplicate_nonce_with_a_different_tuple_fails_only_that_slot() {
+    async fn different_identity_duplicates_register_their_own_slots() {
+        // A same-nonce withdrawal with different token/recipient/amount has a
+        // different claim identity; the Bridge registers both and the receipt
+        // resolves each slot by its own identity.
         let first = pending_proof(tagged_withdrawal("leaf-first", 7));
-        let mut duplicate_withdrawal = tagged_withdrawal("leaf-duplicate", 7);
-        duplicate_withdrawal.token_address = nonce_words(0x41);
-        duplicate_withdrawal.recipient = nonce_words(0x51);
-        duplicate_withdrawal.amount = nonce_words(0x61);
-        let duplicate = pending_proof(duplicate_withdrawal);
-        let chunk = [first, duplicate];
+        let mut duplicate = tagged_withdrawal("leaf-duplicate", 7);
+        duplicate.token_address = nonce_words(0x41);
+        duplicate.recipient = nonce_words(0x51);
+        duplicate.amount = nonce_words(0x61);
+        let chunk = [first, pending_proof(duplicate)];
+        let (_, commit) = claim_calldata(&chunk);
+        let logs = vec![
+            bridge_log(&summary(commit, 2, 2, 0)),
+            bridge_log(&registered(&chunk[0])),
+            bridge_log(&registered(&chunk[1])),
+        ];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 2);
+        assert_eq!(applied.kind_of("leaf-first"), Some(ClaimOutcomeKind::Registered));
+        assert_eq!(applied.kind_of("leaf-duplicate"), Some(ClaimOutcomeKind::Registered));
+    }
+
+    #[test]
+    fn same_nonce_from_different_senders_are_distinct_claims() {
+        // The L1 key is the keccak identity over all 35 slot words, so the
+        // same nonce under two senders is two different claims: both register.
+        let first = pending_proof(tagged_withdrawal("leaf-first", 7));
+        let mut second = tagged_withdrawal("leaf-second", 7);
+        second.sender_user_id += 1;
+        let chunk = [first, pending_proof(second)];
+        let (_, commit) = claim_calldata(&chunk);
+        let logs = vec![
+            bridge_log(&summary(commit, 2, 2, 0)),
+            bridge_log(&registered(&chunk[0])),
+            bridge_log(&registered(&chunk[1])),
+        ];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 2);
+        assert_eq!(applied.kind_of("leaf-first"), Some(ClaimOutcomeKind::Registered));
+        assert_eq!(applied.kind_of("leaf-second"), Some(ClaimOutcomeKind::Registered));
+    }
+
+    #[test]
+    fn identical_identity_duplicate_fails_only_its_own_slot() {
+        // Same sender, same nonce, same content → same claim identity. The
+        // Bridge consumes the identity once; the duplicate slot fails with
+        // reason 5 and its chunk-mates stay resolvable.
+        let first = pending_proof(tagged_withdrawal("leaf-first", 7));
+        let mut duplicate = tagged_withdrawal("leaf-duplicate", 7);
+        duplicate.nonce = first.withdrawal.nonce;
+        duplicate.token_address = first.withdrawal.token_address;
+        duplicate.recipient = first.withdrawal.recipient;
+        duplicate.amount = first.withdrawal.amount;
+        let chunk = [first, pending_proof(duplicate)];
         let (_, commit) = claim_calldata(&chunk);
         let logs = vec![
             bridge_log(&summary(commit, 2, 1, 1)),
             bridge_log(&registered(&chunk[0])),
             bridge_log(&failed_slot(&chunk[1], 1, REASON_ALREADY_CLAIMED)),
         ];
-
-        // The receipt's own registration event carries the first slot's tuple,
-        // so the conflicting leaf fails without any chain lookup.
         let applied = apply_receipt(&logs, &chunk);
-
-        assert_eq!(
-            applied.kind_of("leaf-first"),
-            Some(ClaimOutcomeKind::Registered),
-            "a different leaf must not be resolved by a nonce it does not own"
-        );
         assert_eq!(applied.submitted_count, 1);
+        assert_eq!(applied.kind_of("leaf-first"), Some(ClaimOutcomeKind::Registered));
         assert_eq!(
             applied.kind_of("leaf-duplicate"),
             Some(ClaimOutcomeKind::Failed(ClaimCode::NonceConflict))
         );
+    }
+
+    #[test]
+    fn leaf_hash_topic_registration_fails_closed() {
+        let chunk = [pending_proof(tagged_withdrawal("leaf-legacy", 7))];
+        let (_, commit) = claim_calldata(&chunk);
+        let mut event = registered(&chunk[0]);
+        // Pre-cutover transports keyed events on the raw nonce or the leaf
+        // hash; the keccak claim identity is the only key this parser accepts.
+        event.nonce = B256::from(u32x8_to_u256(chunk[0].withdrawal.nonce).to_be_bytes::<32>());
+        let logs = vec![bridge_log(&summary(commit, 1, 1, 0)), bridge_log(&event)];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 0);
+        assert_eq!(applied.outcomes[0].kind, ClaimOutcomeKind::Failed(ClaimCode::MalformedReceipt));
+    }
+
+    #[test]
+    fn leaf_hash_topic_failed_slot_fails_closed() {
+        let chunk = [pending_proof(tagged_withdrawal("leaf-legacy-failed", 7))];
+        let (_, commit) = claim_calldata(&chunk);
+        let mut event = failed_slot(&chunk[0], 0, REASON_ALREADY_CLAIMED);
+        // The pre-cutover raw-nonce topic must not resolve: this parser
+        // accepts only the keccak claim identity on topic1.
+        event.nonce = B256::from(u32x8_to_u256(chunk[0].withdrawal.nonce).to_be_bytes::<32>());
+        let logs = vec![bridge_log(&summary(commit, 1, 0, 1)), bridge_log(&event)];
+        let applied = apply_receipt(&logs, &chunk);
+        assert_eq!(applied.submitted_count, 0);
+        assert_eq!(applied.outcomes[0].kind, ClaimOutcomeKind::Failed(ClaimCode::MalformedReceipt));
+    }
+
+    #[tokio::test]
+    async fn malformed_recorded_receipt_keeps_leaf_and_known_transaction() {
+        let withdrawal = tagged_withdrawal("leaf-recorded", 7);
+        let chunk = [pending_proof(withdrawal.clone())];
+        let (call_data, _) = claim_calldata(&chunk);
+        // An empty receipt lacks the required batch summary and registrations.
+        let receipt: alloy_rpc_types_eth::TransactionReceipt = serde_json::from_value(serde_json::json!({
+            "type": "0x0", "status": "0x1", "cumulativeGasUsed": "0x0",
+            "logs": [], "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": B256::ZERO, "transactionIndex": "0x0",
+            "blockHash": B256::ZERO, "blockNumber": "0x1",
+            "gasUsed": "0x0", "effectiveGasPrice": "0x0",
+            "from": Address::ZERO, "to": RECEIPT_BRIDGE, "contractAddress": null,
+        })).unwrap();
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let known_tx = B256::repeat_byte(0x42);
+        let report = apply_recorded_claim_receipt(
+            &provider, RECEIPT_BRIDGE, &receipt, &[withdrawal.clone()], &withdrawal,
+            &call_data, 0, None, known_tx,
+        ).await;
+        assert_eq!(report.submitted_count, 0);
+        assert_eq!(report.outcomes, vec![ClaimOutcome {
+            leaf_hash: withdrawal.leaf_hash,
+            kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
+            tx_hash: Some(known_tx),
+        }]);
     }
 
     #[tokio::test]

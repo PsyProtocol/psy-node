@@ -149,13 +149,14 @@ where
             required_imt_leaves.insert((user_id, contract_id, index));
             continue;
         }
-        let previous = db
+        if let Some(previous_preimage) = db
             .contract_state_imt_get_leaf_preimage(previous_checkpoint_id, user_id, contract_id, index)
             .await
-            .with_context(|| format!("previous-checkpoint IMT preimage read failed checkpoint={previous_checkpoint_id} user={user_id} contract={contract_id} index={index}"))?;
-        // FFS may retain an unchanged leaf; its existing IMT preimage needs no rewrite.
-        if previous.is_some_and(|leaf| leaf.qfhash::<H>() != new_value) {
-            required_imt_leaves.insert((user_id, contract_id, index));
+            .with_context(|| format!("previous-checkpoint IMT preimage read failed checkpoint={previous_checkpoint_id} user={user_id} contract={contract_id} index={index}"))?
+        {
+            if previous_preimage.qfhash::<H>() != new_value {
+                required_imt_leaves.insert((user_id, contract_id, index));
+            }
         }
     }
     Ok(required_imt_leaves)
@@ -520,6 +521,23 @@ mod tests {
         let error = require_state_update_record_coverage(&updates, 8, &required)
             .expect_err("known IMT identity without a record must fail");
         assert!(error.to_string().contains("no IMT record"), "{error}");
+
+        let unchanged_hash = db.preimages[&(7, 1, 2, 0)].qfhash::<PoseidonHasher>();
+        updates.update_contract_state_tree_nodes_ffs =
+            QMerkleStoreFastDoubleNodeSerializer::serialize_double_id_node_to_vec(
+                &parth_core::data::hash::merkle_store_key::QMerkleStoreDoubleIdNode {
+                    key: parth_core::data::hash::merkle_store_key::QMerkleStoreDoubleIdKey {
+                        tree_id: 1,
+                        tree_sub_id: 2,
+                        level: 4,
+                        index: 0,
+                    },
+                    value: unchanged_hash,
+                },
+            );
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();
+        assert!(required.is_empty(), "unchanged IMT leaf needs no new record");
+        require_state_update_record_coverage(&updates, 8, &required).unwrap();
 
         updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, PGoldilocksHash::from_owned_32bytes([0; 32]));
         let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&db, 7, &updates).await.unwrap();

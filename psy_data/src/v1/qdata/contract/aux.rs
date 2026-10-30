@@ -447,6 +447,20 @@ impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
     }
 }
 
+/// Deployer authorization for layout-aware contract updates.
+///
+/// The RPC request carries it without a serde default, so clients that do not
+/// send an authorization fail deserialization (fail closed).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+#[ts(export)]
+pub enum PContractUpdateAuthorization {
+    /// JSON-serialized plonky2 ProofWithPublicInputs over the auth hash (PsyBasicZKSignatureCircuit).
+    ZkSignature { proof_json: String },
+}
+
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCUpdateContract")]
 pub struct PQBCUpdateContract<Hash> {
@@ -668,6 +682,18 @@ mod behavior_tests {
         bad = update.clone();
         bad.state_layout_slot_count = 65;
         assert!(bad.validate_shape().is_err());
+    }
+
+    #[test]
+    fn update_authorization_wire_format_round_trips() {
+        let authorization = PContractUpdateAuthorization::ZkSignature { proof_json: "{}".to_string() };
+        let json = serde_json::to_string(&authorization).unwrap();
+        assert!(json.contains("\"scheme\":\"zk_signature\""), "unexpected json: {json}");
+        let decoded: PContractUpdateAuthorization = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, authorization);
+
+        // unknown schemes fail closed
+        assert!(serde_json::from_str::<PContractUpdateAuthorization>("{\"scheme\":\"other\"}").is_err());
     }
 
     #[test]

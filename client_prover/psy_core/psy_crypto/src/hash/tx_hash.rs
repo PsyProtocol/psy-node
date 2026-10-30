@@ -49,6 +49,66 @@ pub fn compute_update_contract_content_hash(
     hash_to_bytes(&hash)
 }
 
+/// Domain separator binding a contract update authorization to this protocol.
+const UPDATE_CONTRACT_AUTH_DOMAIN: &[u8; 27] = b"PSY_UPDATE_CONTRACT_AUTH_V1";
+
+/// Binds an update authorization to the exact update it approves:
+/// poseidon(update_content, old_leaf, code_root, code_definition, layout_proof),
+/// two-to-one with poseidon(domain, network_magic).
+pub fn compute_update_contract_auth_hash(
+    network_magic: u64,
+    update_content_hash: &[u8; 32],
+    old_leaf_hash: &[u8; 32],
+    code_root: &[u8; 32],
+    code_definition_hash: &[u8; 32],
+    canonical_layout_proof_hash: &[u8; 32],
+) -> [u8; 32] {
+    let domain_bytes = {
+        let mut bytes = [0u8; 32];
+        bytes[..UPDATE_CONTRACT_AUTH_DOMAIN.len()].copy_from_slice(UPDATE_CONTRACT_AUTH_DOMAIN);
+        bytes
+    };
+    let domain_felts = bytes32_to_felts(&domain_bytes);
+    let domain_hash = PoseidonHash::q_hash_many(&[
+        domain_felts[0],
+        domain_felts[1],
+        domain_felts[2],
+        domain_felts[3],
+        u64_to_felt(network_magic),
+    ]);
+
+    let update_felts = bytes32_to_felts(update_content_hash);
+    let old_leaf_felts = bytes32_to_felts(old_leaf_hash);
+    let code_root_felts = bytes32_to_felts(code_root);
+    let code_definition_felts = bytes32_to_felts(code_definition_hash);
+    let layout_proof_felts = bytes32_to_felts(canonical_layout_proof_hash);
+
+    let content_hash = PoseidonHash::q_hash_many(&[
+        update_felts[0],
+        update_felts[1],
+        update_felts[2],
+        update_felts[3],
+        old_leaf_felts[0],
+        old_leaf_felts[1],
+        old_leaf_felts[2],
+        old_leaf_felts[3],
+        code_root_felts[0],
+        code_root_felts[1],
+        code_root_felts[2],
+        code_root_felts[3],
+        code_definition_felts[0],
+        code_definition_felts[1],
+        code_definition_felts[2],
+        code_definition_felts[3],
+        layout_proof_felts[0],
+        layout_proof_felts[1],
+        layout_proof_felts[2],
+        layout_proof_felts[3],
+    ]);
+
+    hash_to_bytes(&PoseidonHash::q_two_to_one(domain_hash, content_hash))
+}
+
 pub fn compute_register_user_content_hash(fingerprint: &[u8; 32], param: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
     // Convert bytes to Hash type and use MerkleHasher::two_to_one
     // This matches the gatherer's hash_two_from_slice function
@@ -130,4 +190,28 @@ pub fn hash_from_hex(hex_str: &str) -> Option<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Some(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the update authorization digest: client and coordinator share this
+    /// function, so any change here must regenerate the pinned vector below.
+    #[test]
+    fn update_contract_auth_hash_matches_the_pinned_vector() {
+        let digest = compute_update_contract_auth_hash(
+            1,
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 32],
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        assert_eq!(
+            hash_to_hex(&digest),
+            "deed3e83c73005ca480fb8ab646ecfb06ee6996e4b668dba4d7eb62181448593",
+            "the digest construction changed; regenerate the vector and resync every producer"
+        );
+    }
 }

@@ -32,6 +32,18 @@ In traditional blockchain systems, signature schemes are hardcoded (e.g., ECDSA,
 3. **Verification**: The network verifies proofs against the circuit's public parameters
 4. **Authentication**: Valid proofs authorize transactions without requiring traditional private keys
 
+The `sd-key` allow-method circuit binds every transaction-policy slot to the
+transaction stack and count in the EndCap session sighash. Its mandatory witness
+also includes the signed user leaves, checkpoint context, and finalization nonce;
+stateless policies do not bypass this binding. A policy satisfied by one session
+cannot authorize a different session's sighash. State-reading policies use the
+same signed user and checkpoint anchors.
+
+This binding changes SD-key circuit fingerprints. Rebuild and register the matching
+policy circuits and regenerate saved signing traces; old circuit identities and
+witness encodings must not be reused as the repaired policy. It does not change
+the signature public-input format, `hash(sig_hash, public_key_param)`.
+
 ### Programmable Features
 
 **Beyond Private Keys**: SDKeys enable a new paradigm of public, constraint-based accounts:

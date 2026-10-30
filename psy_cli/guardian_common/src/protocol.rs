@@ -179,7 +179,7 @@ pub fn parse_canonical_json<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Re
 pub enum GuardianSignError {
     MalformedRequest, UnauthorizedCaller, AccountIdentityConflict, AuthorizationMismatch,
     L1RpcUnavailable, L2RpcUnavailable, DepositLogsUnavailable, SignatureQuorumUnavailable, FinalityPending, CheckpointProofUnavailable,
-    DatabaseUnavailable, SessionHistoryUnavailable, ObserverTimeout, SigningPreparationTimeout, SigningBusy, ListenerUnavailable, SignalHandlerUnavailable,
+    DatabaseUnavailable, SessionHistoryUnavailable, ObserverTimeout, SigningBusy, ListenerUnavailable, SignalHandlerUnavailable,
     IndexCheckpointTimeout,
     ProofMismatch, TraceMismatch, DepositMismatch, WithdrawalMismatch, L1ResponseMismatch,
     StateMismatch, UnsupportedCall, PolicyMismatch,
@@ -201,14 +201,14 @@ impl GuardianSignError {
                 | Self::ProofMismatch | Self::TraceMismatch | Self::DepositMismatch | Self::WithdrawalMismatch | Self::L1ResponseMismatch => 403,
             Self::AuthorizationMismatch | Self::StateMismatch | Self::NonceConflict | Self::WithdrawalNonceConflict => 409,
             Self::L1RpcUnavailable | Self::L2RpcUnavailable | Self::DepositLogsUnavailable | Self::SignatureQuorumUnavailable | Self::FinalityPending | Self::CheckpointProofUnavailable
-                | Self::DatabaseUnavailable | Self::SessionHistoryUnavailable | Self::ObserverTimeout | Self::SigningPreparationTimeout | Self::SigningBusy
+                | Self::DatabaseUnavailable | Self::SessionHistoryUnavailable | Self::ObserverTimeout | Self::SigningBusy
                 | Self::IndexCheckpointTimeout | Self::KeyUnavailable | Self::AccountHalted | Self::ListenerUnavailable | Self::SignalHandlerUnavailable | Self::LegacyJournalSchema => 503,
         }
     }
     pub fn retry_after_ms(self) -> u32 {
         match self {
             Self::L1RpcUnavailable | Self::L2RpcUnavailable | Self::DepositLogsUnavailable | Self::SignatureQuorumUnavailable | Self::FinalityPending | Self::CheckpointProofUnavailable
-                | Self::DatabaseUnavailable | Self::SessionHistoryUnavailable | Self::ObserverTimeout | Self::SigningPreparationTimeout | Self::SigningBusy
+                | Self::DatabaseUnavailable | Self::SessionHistoryUnavailable | Self::ObserverTimeout | Self::SigningBusy
                 | Self::IndexCheckpointTimeout | Self::KeyUnavailable => 1000,
             Self::MalformedRequest | Self::UnauthorizedCaller | Self::AccountIdentityConflict | Self::AuthorizationMismatch
                 | Self::ProofMismatch | Self::TraceMismatch | Self::DepositMismatch | Self::WithdrawalMismatch | Self::L1ResponseMismatch
@@ -386,10 +386,13 @@ fn put_text(bytes: &mut Vec<u8>, text: &str) { bytes.extend_from_slice(&(text.le
 fn put_words(bytes: &mut Vec<u8>, words: &[u32; 8]) { for word in words { bytes.extend_from_slice(&word.to_le_bytes()); } }
 
 impl WithdrawalBurnRecord {
-    pub fn amount_u64(&self) -> Result<u64, GuardianSignError> {
-        let amount = ((self.amount[6] as u64) << 32) | self.amount[7] as u64;
-        if self.amount[..6] != [0; 6] || !canonical_field(amount) { return Err(GuardianSignError::WithdrawalMismatch); }
-        Ok(amount)
+    /// Canonical amount check for the full uint256 the L2 withdrawal leaf
+    /// binds and the L1 payout pays. Any nonzero 8-word amount is valid; the
+    /// L2 withdraw method already rejects zero, so a zero record here is a
+    /// mismatch, not a field-order cap.
+    pub fn validate_amount(&self) -> Result<(), GuardianSignError> {
+        if self.amount == [0; 8] { return Err(GuardianSignError::WithdrawalMismatch); }
+        Ok(())
     }
     pub fn token_address(&self) -> Result<Hex20, GuardianSignError> { Self::address(&self.token) }
     /// Canonical 160-bit conversion. High bits are rejected, not truncated.
@@ -429,7 +432,7 @@ impl GuardianSignRequest {
         if self.operation == GuardianOperation::Bridge && self.deposit_anchors.is_empty() && self.withdrawal_records.is_empty() { return Err(GuardianSignError::UnsupportedCall); }
         if self.deposit_anchors.windows(2).any(|w| w[0].chain_index >= w[1].chain_index)
             || self.deposit_anchors.iter().any(|a| a.new_count <= a.old_count || a.block_hash.0 == [0; 32]) { return Err(GuardianSignError::DepositMismatch); }
-        for record in &self.withdrawal_records { record.amount_u64()?; }
+        for record in &self.withdrawal_records { record.validate_amount()?; }
         self.decode_trace()?;
         Ok(())
     }
@@ -756,12 +759,13 @@ pub fn accumulate_deposit_leaf(frontier: &mut [Hash4; 32], occupied_partial_page
 }
 
 pub fn withdrawal_tree_leaf(record: &WithdrawalBurnRecord) -> Hash4 {
-    let mut fields = [GoldilocksField::ZERO; 34];
+    let mut fields = [GoldilocksField::ZERO; 35];
     fields[0] = GoldilocksField::from_canonical_u32(record.sender_user_id);
-    for (target, words) in fields[1..33].chunks_exact_mut(8).zip([&record.recipient, &record.token, &record.amount, &record.nonce]) {
+    for (target, words) in fields[1..34].chunks_exact_mut(8).zip([&record.recipient, &record.token, &record.amount, &record.nonce]) {
         for (target, word) in target.iter_mut().zip(words) { *target = GoldilocksField::from_canonical_u32(*word); }
     }
     fields[33] = GoldilocksField::from_canonical_u8(record.destination_chain_index);
+    fields[34] = GoldilocksField::from_canonical_u32(record.token_contract_id);
     PsyHasher::q_hash_many(&fields)
 }
 
@@ -931,10 +935,14 @@ mod tests {
     }
 
     #[test]
-    fn burn_integer_boundaries_and_address_width_do_not_reduce_modulo_field() {
-        assert_eq!(burn(GOLDILOCKS_MODULUS - 1).amount_u64().unwrap(), GOLDILOCKS_MODULUS - 1);
-        for amount in [0, GOLDILOCKS_MODULUS, GOLDILOCKS_MODULUS + 1, u64::MAX] { assert!(burn(amount).amount_u64().is_err()); }
-        let mut record = burn(1); record.amount[0] = 1; assert!(record.amount_u64().is_err());
+    fn burn_amount_accepts_full_uint256_and_rejects_only_zero() {
+        // The withdrawal amount is a full uint256: the field order is not a
+        // bound, and amounts above 2^64 or with high words set are valid.
+        assert!(burn(GOLDILOCKS_MODULUS - 1).validate_amount().is_ok());
+        assert!(burn(GOLDILOCKS_MODULUS).validate_amount().is_ok());
+        assert!(burn(u64::MAX).validate_amount().is_ok());
+        let mut record = burn(1); record.amount[0] = 1; assert!(record.validate_amount().is_ok());
+        assert!(burn(0).validate_amount().is_err());
         assert_eq!(record.token_address().unwrap().0, [0; 20]);
         record.token[2] = 1; assert!(record.token_address().is_err());
         record.recipient = [0; 8]; assert_eq!(record.recipient_address().unwrap().0, [0; 20]);

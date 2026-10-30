@@ -96,7 +96,7 @@ where
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
             let current_slot = since_epoch.as_millis() / 100;
 
-            if current_slot != last_slot && current_slot % 30 == 0 {
+            if current_slot != last_slot && current_slot % 45 == 0 {
                 last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
 
@@ -313,14 +313,14 @@ mod runner_tests {
     }
 
     /// The loop processes a block only inside the 100ms window whose slot is a
-    /// multiple of 30 (every 3s). Waiting for a slot safely inside [3, 25]
+    /// multiple of 45 (every 4.5s). Waiting for a slot safely inside [5, 38]
     /// keeps shutdown-oriented tests clear of that window, so they never race
     /// a block attempt.
     async fn wait_for_slot_away_from_processing_window() {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let slot = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() / 100;
-            if slot % 30 >= 3 && slot % 30 <= 25 {
+            if slot % 45 >= 5 && slot % 45 <= 38 {
                 return;
             }
             assert!(Instant::now() < deadline, "wall clock never left the processing window");

@@ -122,12 +122,11 @@ pub enum RealmNetworkCommand {
         request: BodyChunkRequest,
         response: oneshot::Sender<Result<BodyChunkResponse, NetworkError>>,
     },
-    /// Block until `threshold` distinct votes for `proposal_id` arrive, or
-    /// `timeout` elapses. Fail-closed: timeout or a closed waiter is an error.
+    /// Block until `threshold` distinct votes for `proposal_id` arrive, or the
+    /// caller cancels by dropping the reply. There is no total deadline.
     WaitVotes {
         proposal_id: [u8; 32],
         threshold: usize,
-        timeout: Duration,
         response: oneshot::Sender<Result<Vec<Vote>, NetworkError>>,
     },
     SetValidatorLeaves {
@@ -273,12 +272,10 @@ impl RealmNetworkCommands {
         &self,
         proposal_id: [u8; 32],
         threshold: usize,
-        timeout: Duration,
     ) -> Result<Vec<Vote>, NetworkError> {
         self.request(|response| RealmNetworkCommand::WaitVotes {
             proposal_id,
             threshold,
-            timeout,
             response,
         })
         .await?
@@ -384,11 +381,8 @@ impl RealmNetworkHandle {
         &self,
         proposal_id: [u8; 32],
         threshold: usize,
-        timeout: Duration,
     ) -> Result<Vec<Vote>, NetworkError> {
-        self.commands
-            .wait_votes(proposal_id, threshold, timeout)
-            .await
+        self.commands.wait_votes(proposal_id, threshold).await
     }
 }
 

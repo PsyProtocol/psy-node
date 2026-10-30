@@ -92,10 +92,11 @@ pub fn compute_agg_state_trackable_final_public_inputs_leaf<H:AlgebraicHasher<F>
 }
 
 /// Variant of the leaf public input hash that additionally commits to the
-/// Merkle root of the updated contract ids. The agg circuit (`AggStateTransitionCircuitV2`)
-/// treats child public inputs as opaque hashes when verifying proofs, so its
-/// own public input formula remains unchanged; only the leaf circuit needs this
-/// extra commitment.
+/// Merkle root of the updated contract ids. The agg circuit binds child public
+/// inputs to its own recomputed expected hash, so this variant stays unused by
+/// the update leaf: adopting it would change the leaf public input formula and
+/// make previously generated update proofs (and honest update leaves) fail
+/// against the agg binding.
 pub fn compute_agg_state_trackable_final_public_inputs_leaf_with_contract_ids_root<
     H: AlgebraicHasher<F>,
     F: RichField + Extendable<D>,

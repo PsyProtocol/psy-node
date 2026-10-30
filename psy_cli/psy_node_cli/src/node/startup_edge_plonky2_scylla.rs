@@ -72,6 +72,8 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
     let verify_canonical_layout_proof = Arc::new(move |proof: &[u8]| {
         canonical_layout_proof_verifier.verify_serialized_proof(proof)
     });
+    let contract_update_auth_verifier =
+        crate::node::contract_update_auth::make_contract_update_auth_verifier();
 /*
 
     pub fn new(
@@ -111,6 +113,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 fingerprint_config.genesis_checkpoint_state_transition_fingerprint,
                 canonical_layout_verifier_fingerprint,
                 verify_canonical_layout_proof,
+                contract_update_auth_verifier.clone(),
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,

@@ -150,6 +150,14 @@ export function psyServicesDatabaseCommands(
     if (purge) return [drop, create];
     return databaseExists ? [] : [create];
 }
+/** Resume probes an existing services database and never creates or drops one. */
+export function retainedServicesDatabaseCommands(
+    databaseExists: boolean,
+    postgresContainer: string = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,
+): string[][] {
+    if (!databaseExists) throw new Error("[DevNet] retained resume requires the existing psy_services database");
+    return psyServicesDatabaseCommands(false, true, postgresContainer);
+}
 
 export function envioPostgresReadinessCommand(
     postgresContainer: string = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,

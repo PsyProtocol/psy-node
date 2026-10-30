@@ -2,7 +2,7 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-07. Status: Review.
+> Updated: 2026-10-29. Status: Review.
 
 ## Terminology
 
@@ -35,6 +35,7 @@ Both processors are generic over network type `N`, durable store, temp DB, proof
 - [4. Realm `process_block`](#4-realm-process_block)
 - [5. Commit ordering](#5-commit-ordering)
 - [6. Sync and recovery](#6-sync-and-recovery)
+  - [Same-epoch forward and one pinned sync round](#same-epoch-forward-and-one-pinned-sync-round)
 - [7. Security Considerations](#7-security-considerations)
 - [Related Documents](#related-documents)
 - [File index](#file-index)
@@ -164,13 +165,80 @@ Realm sync entry points (`realm/processor/db/sync.rs`):
 
 The append-only checkpoint tree has two roots: the live root over all inserted leaves, and the historical append root over `0..=k` used as a transition's old/new checkpoint-tree root.
 
-The network passes `ProposalWithBody` through `proposal_tx`/`proposal_rx` after full validation. The processor owns distinct objects in `proposals`, keyed by proposal ID; later proposals do not overwrite earlier ones. Historical last-modified checkpoints select the next unapplied root transition. The processor derives FFS from the selected body, commits with stable retry IDs, awaits follower FastForward, and only then removes the object. No matching body means an error without marker-only catch-up.
-
-The proposal collection is process-local and has no eviction policy. Restart loses unresolved bodies; post-restart body retrieval is not implemented by this cutover. Existing DB and backup recovery does not make the in-memory proposal collection durable.
+`ProposalBackup` retains one verified proposal body per realm-root transition on disk and reloads those records when it opens (`psy_node_common/src/realm/processor/proposal_backup.rs:58-94,147-160`). Recovery selects the next unapplied root change (`psy_node_common/src/realm/processor/catchup.rs:26-46`). A missing body is fetched by `stage_transition_blocks`: one primary peer answers the window and at most one backup answers when the primary fails (`catchup.rs:49-91`; `psy_node_common/src/realm/processor/db/init.rs:552-580,1096-1108`). The verified object is installed before it is applied (`init.rs:646-676`). A missing verified body is `MissingHistoryProof`; recovery retries and does not advance the committed marker from metadata alone (`init.rs:1109-1131`). An uninstalled staged file is removed when its handle drops (`proposal_backup.rs:34-48`).
 
 Coordinator recovery is self-contained. Realm recovery walks coordinator checkpoints from `last_committed + 1`. Unchanged realm roots skip. Missing pending-id mappings scan backup files by `end_root`. No matching backup is data loss and fails closed.
 
 Startup on a realm also walks `latest_checkpoint_id` backward while a checkpoint has no pending-id mapping, then persists the rolled-back marker.
+
+### Same-epoch forward and one pinned sync round
+
+A forwarded EndCap whose header checkpoint differs from the local generation target (`generation.checkpoint_id + 1`) is stored on that local generation only when the header target and the local target are in the same epoch (`checkpoint_id / CHECKPOINTS_PER_EPOCH`) and the sender base `header_target - 1` seals the same realm root as the local base. When peer-to-peer is enabled, this edge must also be the scheduled primary for both targets; with no peer-to-peer handle those primary checks are skipped (`psy_node_common/src/realm/edge/handler.rs:346-347`). Each root is the value of the top proof at that exact checkpoint: realm index, sibling length `COORDINATOR_GLOBAL_USER_TREE_HEIGHT`, `proof.root` equal to that checkpoint's `user_tree_root`, and a verifying proof. An unknown checkpoint is not filled from a max-checkpoint node read. A different root, a different epoch, the wrong primary while peer-to-peer is enabled, the wrong top height, an unbound top root, or a start leaf that does not match the local leaf is rejected and not queued (`handler.rs:341-405,682-697,840-863,934-937`).
+
+`sync_and_verify` keeps `coordinator_head_synced_checkpoint_id`, the checkpoint the tree sync just persisted, and passes that id to `apply_proposal_ffs` and `ensure_db_matches_coordinator_checkpoint`. A newer head published during the round is the next round's input. `ensure_db_matches_coordinator_head` still reads the coordinator's latest id and is not the end of this round. `wait_for_realm_update_sync_with_coordinator` still tracks the newest synced coordinator head and waits until that head reports the submitted realm root. The pin applies only to `sync_and_verify` (`psy_node_common/src/realm/processor/core/process_block.rs:220-242`; `psy_node_common/src/realm/processor/db/init.rs:471-476`; `psy_node_common/src/realm/processor/db/sync.rs:225-257,300-312`). `require_checkpoint_metadata` accepts one genesis proof and one historical proof, and rejects an altered binding (`sync.rs:28-86,750-801`). Header prefetch does not advance the checkpoint this round verifies.
+
+Run the commands below from the repository root. They use the release profile and the canonical localhost file selected by `PSY_CONFIG_PATH`. They are not a gate on a git HEAD.
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release --locked -p psy_node_common --lib forwarded_end_cap_ -- --nocapture
+```
+
+17 passed. The filter `forwarded_end_cap_` selects the forward admission tests, including `forwarded_end_cap_old_and_new_targets_use_local_generation`.
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release --locked -p psy_node_common --lib pinned_sync_round_ -- --nocapture
+```
+
+3 passed: `pinned_sync_round_defers_published_head_until_next_round`, `pinned_sync_round_rejects_unauthenticated_next_checkpoint`, and `pinned_sync_round_still_rejects_pinned_realm_root_mismatch`.
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release --locked -p psy_node_common --lib require_checkpoint_metadata_
+```
+
+2 passed: `require_checkpoint_metadata_accepts_genesis_and_historical_proofs` and `require_checkpoint_metadata_rejects_altered_bindings`.
+
+The mutation changes only the named production call, then uses the same release profile and config from the repository root.
+
+Replace the cross-target branch in `ensure_local_is_scheduled_end_cap_receiver` with strict equality of the header checkpoint and the local target, then run:
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release -p psy_node_common --lib \
+  realm::edge::handler::tests::forwarded_end_cap_old_and_new_targets_use_local_generation -- --exact
+```
+
+This command fails. Restore that branch. End `sync_and_verify` with `ensure_db_matches_coordinator_head()` instead of `ensure_db_matches_coordinator_checkpoint(pinned_checkpoint_id)`, then run:
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release -p psy_node_common --lib \
+  realm::processor::core::process_block::process_block_tests::pinned_sync_round_defers_published_head_until_next_round -- --exact
+```
+
+This command fails. Restore both production hunks, then run:
+
+```sh
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release -p psy_node_common --lib forwarded_end_cap
+PSY_NETWORK=localhost \
+PSY_CONFIG_PATH="$PWD/psy-genesis/config.json" \
+cargo test --release -p psy_node_common --lib pinned_sync_round
+```
+
+Those commands pass 17 and 3.
+
+`EndCapEchoVerifier` treats the proof bytes as the public-inputs hash and echoes that hash (`handler.rs:2349-2377`). The forward tests cover routing, deduplication, primary selection, and leaf mismatch. They do not establish a real zero-knowledge proof.
+
+`635ab0a2` (`fix(realm): hold an EndCap generation until its start root is certified`) is not in this tree. There is no hold that keeps a nonempty generation until a same-epoch checkpoint certifies its start root and then replays it. A nonempty gather whose proof base does not schedule this sub-id still fails closed after the gatherer tree commit (`psy_node_common/src/realm/processor/core/process_block.rs:475-490`). Cross-epoch input handoff is unsolved: generation pending id 32991, which owned two EndCaps at base 8728, was discarded after its start was authenticated at 8730. These passes do not mean every proposer-1 rejection or every dropped batch is fixed. A forward that crosses the epoch boundary stays rejected (`forwarded_end_cap_epoch_nine_to_ten_rejected`).
 
 ## 7. Security Considerations
 

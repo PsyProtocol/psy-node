@@ -248,6 +248,7 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
 // ── WithdrawalClaimed handler ───────────────────────────────────────────────────
 // Records raw on-chain withdrawal claims so the API can list claimable state
 // without re-scanning the chain. ID = "{chainId}-{nullifier}".
+// The event key is the proof-bound withdrawal leaf hash.
 Bridge.WithdrawalClaimed.handler(async ({ event, context }) => {
   const chainId = Number(event.chainId);
   const blockNumber = Number(event.block.number);

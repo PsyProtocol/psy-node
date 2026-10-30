@@ -1,7 +1,10 @@
 # Real Genesis Deposit Claim Regression
 
-Status: PASS. The main thread reported successful no-run compilation and test
-execution in 10.41 seconds, with Banach independent review APPROVE. The run
+Status for the SDK 2.1.0 preparation: PENDING. This test has not been accepted
+against the final Genesis of this cohort.
+
+Historical result at `e6693c8723932ab80c3d90e282800c2a42cd6c27`: the main thread
+reported successful no-run compilation and execution in 10.41 seconds. That run
 confirmed the exact old-fingerprint failure, new production claim VM/CFC
 success, and tampering rejection. This is the bounded token4 regression result,
 not full E2E or deployment acceptance. This fixture adds no production code,
@@ -43,10 +46,9 @@ remain separate gates. No overall deployment-ready claim follows from a pass.
 
 ## Main-Thread Invocation
 
-Only the owner of the build cache may compile/run this test. Apply the single
-new `.rs` file to the prepared, dependency-complete build cohort if necessary;
-this isolated review worktree does not initialize submodules or retarget Cargo.
-Build against the unified Node/config/Genesis inputs, never localhost defaults
+Only the owner of the build cache may compile/run this test. Use the checked-in
+test from the prepared, dependency-complete build cohort. Build against the
+unified Node/config/Genesis inputs, never localhost defaults
 or `is_sync`. The test also checks the compiled testnet network magic.
 
 Set these paths/hashes explicitly; do not point to private_keys.json:
@@ -74,7 +76,7 @@ Retained old public Genesis hash:
 `a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8`.
 Use the newly measured unified Genesis hash instead of the R1 value when ready.
 
-Observed test execution time was 10.41 seconds; compilation time and peak memory
+Historical test execution time was 10.41 seconds; compilation time and peak memory
 were not reported. It builds one inclusion circuit and one full production
 claim CFC plus their minifiers. Run serially with resource monitoring. A
 timeout/OOM/compile failure is PENDING or FAILED evidence, never an acceptance.

@@ -7,7 +7,7 @@ use parth_core::{
 use parth_core::felt::QFelt64;
 use psy_config::CHECKPOINTS_PER_EPOCH;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_content_hash, hash_to_hex};
+use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_auth_hash, compute_update_contract_content_hash, hash_to_hex};
 use psy_api_core::CheckpointJobStats;
 use psy_data::{
     guta::{
@@ -18,7 +18,7 @@ use psy_data::{
     v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
-            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2, PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem, STATE_LAYOUT_DEPLOY_CONTRACT_ID}, public_key::PZKPublicKeyInfo
+            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PContractUpdateAuthorization, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2, PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem, STATE_LAYOUT_DEPLOY_CONTRACT_ID}, public_key::PZKPublicKeyInfo
         },
     },
 };
@@ -44,6 +44,18 @@ use crate::worker_whitelist::WhiteListCache;
 
 pub type CanonicalLayoutProofVerifier =
     dyn Fn(&[u8]) -> anyhow::Result<[u64; 19]> + Send + Sync;
+
+/// Everything the verifier needs to authenticate one contract update request.
+/// `fingerprint`/`public_key_param` are the deployer's registered key material;
+/// `auth_hash` binds the authorization to the exact update payload.
+pub struct ContractUpdateAuthContext {
+    pub auth_hash: [u8; 32],
+    pub fingerprint: [u8; 32],
+    pub public_key_param: [u8; 32],
+    pub proof_json: String,
+}
+
+pub type ContractUpdateAuthVerifier = dyn Fn(&ContractUpdateAuthContext) -> anyhow::Result<()> + Send + Sync;
 
 /// Committed checkpoints during which an accepted GUTA update counts as in flight. A copy
 /// accepted at committed checkpoint c commits as c + 1 or c + 2, or never; one is margin.
@@ -192,6 +204,7 @@ pub struct CoordinatorEdgeHandler<
     pub genesis_checkpoint_state_transition_fingerprint: N::QHash,
     pub canonical_layout_verifier_fingerprint: N::QHash,
     pub canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
+    pub contract_update_auth_verifier: Arc<ContractUpdateAuthVerifier>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -237,6 +250,7 @@ impl<
             genesis_checkpoint_state_transition_fingerprint: self.genesis_checkpoint_state_transition_fingerprint.clone(),
             canonical_layout_verifier_fingerprint: self.canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier: self.canonical_layout_proof_verifier.clone(),
+            contract_update_auth_verifier: self.contract_update_auth_verifier.clone(),
         }
     }
 }
@@ -280,6 +294,7 @@ impl<
         genesis_checkpoint_state_transition_fingerprint: N::QHash,
         canonical_layout_verifier_fingerprint: N::QHash,
         canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
+        contract_update_auth_verifier: Arc<ContractUpdateAuthVerifier>,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
@@ -303,6 +318,7 @@ impl<
             genesis_checkpoint_state_transition_fingerprint,
             canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier,
+            contract_update_auth_verifier,
         }
     }
 
@@ -656,7 +672,11 @@ impl<
         Ok(hash_to_hex(&deploy_content_hash))
     }
 
-    pub async fn update_contract_internal(&self, update_contract: PQBCUpdateContract<N::QHash>) -> anyhow::Result<String> {
+    pub async fn update_contract_internal(
+        &self,
+        update_contract: PQBCUpdateContract<N::QHash>,
+        authorization: &PContractUpdateAuthorization,
+    ) -> anyhow::Result<String> {
         update_contract.validate_shape()?;
         if update_contract.code_definition.functions.len() == 0 {
             anyhow::bail!("contracts with no functions are not supported");
@@ -671,8 +691,8 @@ impl<
         // Auth check: the contract must already exist on chain and the caller must
         // be the original deployer. NOTE: db_reader reflects the last committed
         // checkpoint state; updates gathered in the current pending block are not
-        // visible here, so the gatherer must re-validate against its in-memory
-        // global contract tree (TODO in the update contract gatherer phase).
+        // visible here, so the gatherer re-validates against its in-memory
+        // global contract tree.
         let latest_checkpoint_id =
             self.get_latest_checkpoint_id_internal().await?;
         let existing_leaf = self
@@ -696,11 +716,16 @@ impl<
             "contract state tree height is immutable"
         );
 
-        let layout_public_inputs = self.validate_canonical_layout_proof(
-            update_contract.canonical_layout_verifier_fingerprint,
-            &update_contract.canonical_layout_proof,
-        )
-        .await?;
+        let genesis_next = self.db_reader.get_l2_block_state(0).await?.next_contract_id as u64;
+        if update_contract.contract_id < genesis_next {
+            anyhow::bail!("genesis contracts are immutable through this RPC");
+        }
+
+        let registered_key = self
+            .db_reader
+            .get_zk_public_key(latest_checkpoint_id, existing_leaf.deployer.to_u64_value())
+            .await
+            .map_err(|_| anyhow::anyhow!("deployer key is not registered"))?;
 
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_update_contract_queue_key().await?;
 
@@ -732,13 +757,6 @@ impl<
             code_root,
             N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
         )?;
-        validate_update_layout_endpoints(
-            &layout_public_inputs,
-            contract_id,
-            layout_protocol_version,
-            &existing_leaf,
-            &queue_item.contract_leaf,
-        )?;
         let update_content_hash = compute_update_contract_content_hash(
             contract_id,
             queue_item.contract_leaf.deployer.to_u64_value(),
@@ -746,6 +764,44 @@ impl<
             queue_item.contract_leaf.state_tree_height.to_u64_value(),
         );
         let update_content_hash_hex = hash_to_hex(&update_content_hash);
+
+        // The authorization is proven over a digest of every committed piece
+        // of the update, so the verifier call must sit before any DB write.
+        let code_definition_bytes = bincode::serialize(&code_definition)
+            .map_err(|error| anyhow::anyhow!("code definition serialization failed: {error}"))?;
+        let auth_hash = compute_update_contract_auth_hash(
+            psy_config::PSY_NETWORK_MAGIC,
+            &update_content_hash,
+            &existing_leaf.qfhash::<N::HasherBase>().into_owned_32bytes(),
+            &queue_item.contract_leaf.code_root.into_owned_32bytes(),
+            &sha256(&code_definition_bytes),
+            &sha256(&queue_item.canonical_layout_proof),
+        );
+        let context = ContractUpdateAuthContext {
+            auth_hash,
+            fingerprint: registered_key.fingerprint.into_owned_32bytes(),
+            public_key_param: registered_key.public_key_param.into_owned_32bytes(),
+            proof_json: match authorization {
+                PContractUpdateAuthorization::ZkSignature { proof_json } => proof_json.clone(),
+            },
+        };
+        let verifier = self.contract_update_auth_verifier.clone();
+        let verification = task::spawn_blocking(move || verifier(&context))
+            .await
+            .map_err(|error| anyhow::anyhow!("contract update authorization failed: {error}"))?;
+        verification.map_err(|error| anyhow::anyhow!("contract update authorization failed: {error}"))?;
+        let layout_public_inputs = self.validate_canonical_layout_proof(
+            canonical_layout_verifier_fingerprint,
+            &queue_item.canonical_layout_proof,
+        )
+        .await?;
+        validate_update_layout_endpoints(
+            &layout_public_inputs,
+            contract_id,
+            layout_protocol_version,
+            &existing_leaf,
+            &queue_item.contract_leaf,
+        )?;
 
         // reuse the deploy contract code definition temp db storage (keyed by
         // realm + unique_pending_id + rand_key_id) to keep changes minimal
@@ -1136,10 +1192,10 @@ pub(crate) mod tests {
         },
         p2p::{bitmap_set, encode_proposal_body, proposal_from_parts, vote_message, ProtocolEncode},
         v1::qdata::{
-            checkpoint::PQEDCheckpointLeafStats,
+            checkpoint::{PQEDCheckpointLeafStats, QEDL2BlockState},
             contract::{
-                ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCDeployContract,
-                PQEDContractLeafV2,
+                ContractCodeDefinition, ContractFunctionCodeDefinition, PContractUpdateAuthorization,
+                PQBCDeployContract, PQEDContractLeafV2,
             },
         },
     };
@@ -1148,7 +1204,8 @@ pub(crate) mod tests {
         genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
         psy_core_db::traits::full::{
             PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreDatabaseContractObjectStoreReader,
-            PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreRewardsTagTreeStoreWriter,
+            PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
+            PsyNodeCoreRewardsTagTreeStoreWriter,
             PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
         },
         psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseWriter,
@@ -1158,6 +1215,7 @@ pub(crate) mod tests {
         store::traits::proof_store::QParthProofStoreReader,
     };
     use psy_node_store_memory::temp_store::InMemoryTempStore;
+    use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
 
     type N = TestNetworkConfig;
 
@@ -1234,6 +1292,14 @@ pub(crate) mod tests {
 
     impl EdgeTestEnv {
         pub(crate) async fn create() -> anyhow::Result<Self> {
+            Self::create_with_auth_verifier(Arc::new(|_| Ok(()))).await
+        }
+
+        /// `auth_verifier` replaces the contract update authorization stub;
+        /// the default accepts everything.
+        pub(crate) async fn create_with_auth_verifier(
+            auth_verifier: Arc<ContractUpdateAuthVerifier>,
+        ) -> anyhow::Result<Self> {
             let db = Arc::new(create_test_unified_db().await?);
             let tag_tree = Arc::clone(&db);
             let temp_db = Arc::new(InMemoryTempStore::new("coord_edge_test".to_string(), 1, 2));
@@ -1290,7 +1356,7 @@ pub(crate) mod tests {
                     } else {
                         // update proof: seeded contract leaf -> layout declared
                         // by `valid_update_contract`.
-                        inputs[0] = 1;
+                        inputs[0] = 6;
                         inputs[1] = 1;
                         inputs[2..6].copy_from_slice(&[14, 0, 0, 0]);
                         inputs[6] = 1;
@@ -1301,6 +1367,7 @@ pub(crate) mod tests {
                     }
                     Ok(inputs)
                 }),
+                auth_verifier,
             );
             // A fresh InMemoryTempStore errors on pending-id reads ("Unique
             // pending ids not found") while the unified db answers (0, 0);
@@ -1491,6 +1558,11 @@ pub(crate) mod tests {
         let handler = &env.handler;
 
         assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
+        let gathering = env.temp_db.get_gathering_generation(&QRealmIdentifier::new(1, 2)).await?;
+        assert_eq!(
+            (gathering.unique_pending_id, gathering.proc_checkpoint_unique_id),
+            (0, 0)
+        );
         // no pending-id mapping exists on a fresh database
         assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, None);
         // genesis commit records pending id 0 -> checkpoint 0
@@ -1606,24 +1678,57 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    async fn seed_contract(db: &TestUnifiedDatabaseStore) -> anyhow::Result<()> {
-        let leaf = PQEDContractLeafV2::<PF, PHash> {
-            deployer: PF::from_u64_value(11),
+    fn contract_leaf_for(deployer: u64) -> PQEDContractLeafV2<PF, PHash> {
+        PQEDContractLeafV2::<PF, PHash> {
+            deployer: PF::from_u64_value(deployer),
             function_tree_root: PHash::from_values(12, 0, 0, 0),
             code_root: PHash::from_values(13, 0, 0, 0),
             state_tree_height: PF::from_u64_value(8),
             state_layout_root: PHash::from_values(14, 0, 0, 0),
             state_layout_field_count: PF::from_u64_value(1),
             state_layout_slot_count: PF::from_u64_value(4),
-        };
-        db.set_contract_leaf(0, 1, &leaf).await?;
+        }
+    }
+
+    fn registered_key_for(deployer: u64) -> PZKPublicKeyInfo<PHash> {
+        PZKPublicKeyInfo::<PHash> {
+            fingerprint: PHash::from_values(90, deployer, 0, 0),
+            public_key_param: PHash::from_values(80, deployer, 0, 0),
+        }
+    }
+
+    /// Contract ids 0..2 are genesis (`next_contract_id = 2`). Contract 1 keeps
+    /// a leaf so the genesis-immutability rejection is exercised past the
+    /// existence check; contracts 6/7 are updatable (deployers 0 and 11).
+    async fn seed_contracts(db: &TestUnifiedDatabaseStore) -> anyhow::Result<()> {
+        db.set_l2_block_state(
+            0,
+            &QEDL2BlockState {
+                checkpoint_id: 0,
+                next_add_withdrawal_id: 0,
+                next_process_withdrawal_id: 0,
+                next_deposit_id: 0,
+                total_deposits_claimed_epoch: 0,
+                next_user_id: 0,
+                end_balance: 0,
+                next_contract_id: 2,
+            },
+        )
+        .await?;
+        db.set_contract_leaf(0, 1, &contract_leaf_for(11)).await?;
+        db.set_contract_leaf(0, 6, &contract_leaf_for(0)).await?;
+        db.set_contract_leaf(0, 7, &contract_leaf_for(11)).await?;
+        db.set_contract_leaf(0, 8, &contract_leaf_for(12)).await?;
+        for deployer in [0u64, 11u64] {
+            db.set_zk_public_key(0, deployer, &registered_key_for(deployer)).await?;
+        }
         Ok(())
     }
 
     fn valid_update_contract() -> PQBCUpdateContract<PHash> {
         PQBCUpdateContract {
-            contract_id: 1,
-            deployer: 11,
+            contract_id: 6,
+            deployer: 0,
             code_definition: ContractCodeDefinition {
                 state_tree_height: 8,
                 functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
@@ -1638,15 +1743,50 @@ pub(crate) mod tests {
             canonical_layout_proof: vec![5, 6, 7, 8],
         }
     }
+    fn auth_stub() -> PContractUpdateAuthorization {
+        PContractUpdateAuthorization::ZkSignature { proof_json: "{}".to_string() }
+    }
+
+    /// Recomputes the digest from the same witness pieces the handler must
+    /// hash, for the verifier-assertion test below.
+    fn expected_auth_hash_for(update: &PQBCUpdateContract<PHash>) -> [u8; 32] {
+        use psy_crypto::hash::tx_hash::{compute_update_contract_auth_hash, compute_update_contract_content_hash};
+
+        let mut function_tree = SimpleMemoryMerkleStore::<parth_core::pgoldilocks::PoseidonHasher, PHash>::new(
+            N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE as u8,
+        );
+        for (index, leaf) in update.function_whitelist.iter().enumerate() {
+            function_tree.set_leaf(index as u64, *leaf);
+        }
+        let update_content_hash = compute_update_contract_content_hash(
+            update.contract_id,
+            update.deployer,
+            &function_tree.get_root().into_owned_32bytes(),
+            update.code_definition.state_tree_height as u64,
+        );
+        let old_leaf_hash = contract_leaf_for(update.deployer)
+            .qfhash::<parth_core::pgoldilocks::PoseidonHasher>()
+            .into_owned_32bytes();
+        let code_definition_hash = sha256(&bincode::serialize(&update.code_definition).unwrap());
+        let layout_proof_hash = sha256(&update.canonical_layout_proof);
+        compute_update_contract_auth_hash(
+            psy_config::PSY_NETWORK_MAGIC,
+            &update_content_hash,
+            &old_leaf_hash,
+            &update.code_root.into_owned_32bytes(),
+            &code_definition_hash,
+            &layout_proof_hash,
+        )
+    }
 
     #[tokio::test]
     async fn update_contract_validates_against_committed_state() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        seed_contract(&env.db).await?;
+        seed_contracts(&env.db).await?;
         let handler = &env.handler;
 
-        // happy path: original deployer, immutable height kept as committed
-        let hex = handler.update_contract_internal(valid_update_contract()).await?;
+        // happy path: original deployer (0), immutable height kept as committed
+        let hex = handler.update_contract_internal(valid_update_contract(), &auth_stub()).await?;
         assert_eq!(hex.len(), 64);
         assert_eq!(env.contract_queue.published_count(), 1);
 
@@ -1654,7 +1794,7 @@ pub(crate) mod tests {
         bad_fingerprint.canonical_layout_verifier_fingerprint =
             PHash::from_values(18, 0, 0, 0);
         let err = handler
-            .update_contract_internal(bad_fingerprint)
+            .update_contract_internal(bad_fingerprint, &auth_stub())
             .await
             .expect_err("wrong canonical layout verifier fingerprint must fail");
         assert!(err.to_string().contains("fingerprint mismatch"), "unexpected error: {err}");
@@ -1663,28 +1803,42 @@ pub(crate) mod tests {
         let mut bad_proof = valid_update_contract();
         bad_proof.canonical_layout_proof = vec![8, 7, 6, 5];
         let err = handler
-            .update_contract_internal(bad_proof)
+            .update_contract_internal(bad_proof, &auth_stub())
             .await
             .expect_err("invalid canonical layout proof must fail");
         assert!(err.to_string().contains("proof verification failed"), "unexpected error: {err}");
         assert_eq!(env.contract_queue.published_count(), 1);
 
-        // reserved contract id 0
+        // reserved contract id 0 keeps its own message
         let mut bad = valid_update_contract();
         bad.contract_id = 0;
-        let err = handler.update_contract_internal(bad).await.expect_err("contract id 0 must be rejected");
+        let err = handler.update_contract_internal(bad, &auth_stub()).await.expect_err("contract id 0 must be rejected");
         assert!(err.to_string().contains("non-zero"), "unexpected error: {err}");
+
+        // genesis contract ids are immutable (contract 1; contract 0 above)
+        let mut genesis = valid_update_contract();
+        genesis.contract_id = 1;
+        genesis.deployer = 11;
+        let err = handler
+            .update_contract_internal(genesis, &auth_stub())
+            .await
+            .expect_err("genesis contract must be rejected");
+        assert!(err.to_string().contains("genesis contracts are immutable"), "unexpected error: {err}");
 
         // unknown contract id
         let mut unknown = valid_update_contract();
         unknown.contract_id = 9;
-        let err = handler.update_contract_internal(unknown).await.expect_err("unknown contract must be rejected");
+        let err = handler.update_contract_internal(unknown, &auth_stub()).await.expect_err("unknown contract must be rejected");
         assert!(err.to_string().contains("does not exist"), "unexpected error: {err}");
 
-        // wrong deployer
+        // leaf deployer 11 vs request deployer 12
         let mut other_deployer = valid_update_contract();
-        other_deployer.deployer = 99;
-        let err = handler.update_contract_internal(other_deployer).await.expect_err("wrong deployer must be rejected");
+        other_deployer.contract_id = 7;
+        other_deployer.deployer = 12;
+        let err = handler
+            .update_contract_internal(other_deployer, &auth_stub())
+            .await
+            .expect_err("wrong deployer must be rejected");
         assert!(err.to_string().contains("only the original deployer"), "unexpected error: {err}");
 
         // state tree height is immutable
@@ -1693,14 +1847,94 @@ pub(crate) mod tests {
             state_tree_height: 9,
             functions: vec![ContractFunctionCodeDefinition::qp_rand_gen()],
         };
-        let err = handler.update_contract_internal(other_height).await.expect_err("height change must be rejected");
-        assert!(err.to_string().contains("immutable"), "unexpected error: {err}");
+        let err = handler
+            .update_contract_internal(other_height, &auth_stub())
+            .await
+            .expect_err("height change must be rejected");
+        assert!(err.to_string().contains("state tree height is immutable"), "unexpected error: {err}");
 
         // no functions
         let mut no_functions = valid_update_contract();
         no_functions.code_definition.functions = vec![];
-        let err = handler.update_contract_internal(no_functions).await.expect_err("empty contract must be rejected");
+        let err = handler
+            .update_contract_internal(no_functions, &auth_stub())
+            .await
+            .expect_err("empty contract must be rejected");
         assert!(err.to_string().contains("no functions"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_rejects_an_unregistered_deployer_key() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        seed_contracts(&env.db).await?;
+
+        // contract 8 is seeded with deployer 12, which has no registered key
+        let mut update = valid_update_contract();
+        update.contract_id = 8;
+        update.deployer = 12;
+        let err = env
+            .handler
+            .update_contract_internal(update, &auth_stub())
+            .await
+            .expect_err("unregistered deployer key must fail");
+        assert!(err.to_string().contains("deployer key is not registered"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_rejects_a_failed_authorization_without_publishing() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create_with_auth_verifier(Arc::new(|_| anyhow::bail!("no valid signature"))).await?;
+        seed_contracts(&env.db).await?;
+
+        let err = env
+            .handler
+            .update_contract_internal(valid_update_contract(), &auth_stub())
+            .await
+            .expect_err("a failing verifier must reject the update");
+        assert!(err.to_string().contains("contract update authorization failed"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_rejects_a_malformed_authorization() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create_with_auth_verifier(Arc::new(|context| {
+            let parsed: serde_json::Value = serde_json::from_str(&context.proof_json)
+                .map_err(|error| anyhow::anyhow!("malformed authorization proof json: {error}"))?;
+            anyhow::ensure!(parsed.get("proof").is_some(), "authorization proof json is missing the proof field");
+            Ok(())
+        }))
+        .await?;
+        seed_contracts(&env.db).await?;
+
+        let err = env
+            .handler
+            .update_contract_internal(valid_update_contract(), &auth_stub())
+            .await
+            .expect_err("a malformed authorization must be rejected");
+        assert!(err.to_string().contains("contract update authorization failed"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_passes_the_recomputed_auth_hash_to_the_verifier() -> anyhow::Result<()> {
+        let update = valid_update_contract();
+        let expected_auth_hash = expected_auth_hash_for(&update);
+        let env = EdgeTestEnv::create_with_auth_verifier(Arc::new(move |context| {
+            anyhow::ensure!(
+                context.auth_hash == expected_auth_hash,
+                "auth hash mismatch: got {:?}",
+                context.auth_hash
+            );
+            Ok(())
+        }))
+        .await?;
+        seed_contracts(&env.db).await?;
+
+        env.handler.update_contract_internal(update, &auth_stub()).await?;
         Ok(())
     }
 

@@ -169,7 +169,7 @@ pub struct DeployContractArgs {
 pub struct UpdateContractArgs {
     #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
-    #[clap(long, env)]
+    #[clap(long, env, hide_env_values = true)]
     pub private_key: String,
     #[clap(long, short, default_value = "zk")]
     pub sign_type: SignType,
@@ -642,11 +642,11 @@ pub struct ClaimRewardsArgs {
     pub proof_cache_dir: String,
     #[clap(long, env, help = "Ethereum JSON-RPC used to read recognized roots and token claimed pairs")]
     pub l1_rpc_url: String,
-    #[clap(long, env = "L1_PRIVATE_KEY", help = "EVM private key signing the L1 claimReward transaction; distinct from the ZK wallet source")]
+    #[clap(long, env = "L1_PRIVATE_KEY", hide_env_values = true, help = "EVM private key signing the L1 claimReward transaction; distinct from the ZK wallet source")]
     pub l1_private_key: String,
     #[clap(long, env, help = "Prove-proxy JSON-RPC URL for the Groth16 reward claim wrap")]
     pub prove_proxy_url: String,
-    #[clap(long, env, help = "Prove-proxy bearer token")]
+    #[clap(long, env, hide_env_values = true, help = "Prove-proxy bearer token")]
     pub prove_proxy_token: Option<String>,
 }
 
@@ -690,7 +690,7 @@ pub struct CompileAndDeployArgs {
     #[clap(env, long, default_value = "config.json")]
     pub rpc_config: String,
 
-    #[clap(long, env)]
+    #[clap(long, env, hide_env_values = true)]
     pub private_key: String,
 
     #[clap(long, short, default_value = "zk")]
@@ -768,7 +768,7 @@ pub struct SimulateArgs {
 pub struct PrivateClaimArgs {
     #[clap(env, long, default_value = "config.json")]
     pub rpc_config: String,
-    #[clap(long, short = 'p')]
+    #[clap(long, short = 'p', env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
     #[clap(long, default_value = "0")]
     pub contract_id: u64,
@@ -790,7 +790,7 @@ pub struct PrivateClaimArgs {
 pub struct PrivateTransferArgs {
     #[clap(env, long, default_value = "config.json")]
     pub rpc_config: String,
-    #[clap(long, short = 'p')]
+    #[clap(long, short = 'p', env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
     #[clap(long, default_value = "0")]
     pub contract_id: u64,
@@ -843,11 +843,11 @@ pub struct ClaimDepositArgs {
     /// Optional per-deposit note secret for local sanity-check only. The claim
     /// path consumes the sender-generated deposit proof and does not require
     /// raw secrets to submit.
-    #[arg(long = "note-secret", env)]
+    #[arg(long = "note-secret", env, hide_env_values = true)]
     pub note_secret: Option<String>,
     /// Optional per-deposit nullifier secret for local sanity-check only. Must
     /// be passed together with --note-secret when used.
-    #[arg(long, env)]
+    #[arg(long, env, hide_env_values = true)]
     pub nullifier_secret: Option<String>,
     /// Sender-generated DepositInclusion proof JSON file.
     #[arg(long = "deposit-proof", env)]
@@ -961,10 +961,10 @@ pub struct DepositArgs {
     /// Per-deposit note secret as four comma-separated u64 limbs, e.g.
     /// "1,2,3,4". Used to derive note_commitment and publish the optional
     /// recipient Nostr backup.
-    #[clap(long = "note-secret", env = "NOTE_SECRET")]
+    #[clap(long = "note-secret", env = "NOTE_SECRET", hide_env_values = true)]
     pub note_secret: Option<String>,
     /// Per-deposit nullifier secret as four comma-separated u64 limbs.
-    #[clap(long = "nullifier-secret", env = "NULLIFIER_SECRET")]
+    #[clap(long = "nullifier-secret", env = "NULLIFIER_SECRET", hide_env_values = true)]
     pub nullifier_secret: Option<String>,
     /// Recipient Nostr npub for publishing the deposit backup. Requires both
     /// --note-secret and --nullifier-secret.
@@ -1035,14 +1035,21 @@ pub struct ClaimWithdrawalArgs {
     /// chainId)
     #[clap(long = "destination-chain-index", alias = "destination-chain-id", env = "DESTINATION_CHAIN_INDEX")]
     pub destination_chain_index: u64,
-    /// Sender user id on L2; pass this to disambiguate identical withdrawals.
+    /// L2 user id that burned this withdrawal. Required: it is not inferred
+    /// from the L1 signer. Must fit in uint32. The nonce itself stays the
+    /// proof and slotData field.
     #[clap(long, env)]
-    pub sender_user_id: Option<u64>,
+    pub sender_user_id: u64,
+    /// Token contract id proven in the burn (withdrawal leaf felt 34, slot
+    /// word 34). Required: the withdrawal leaf hash nullifier needs the full
+    /// 35-word preimage; there is no default and no lookup guess.
+    #[clap(long = "token-contract-id", env)]
+    pub token_contract_id: u64,
     /// Prove-proxy URL for Groth16 proof generation (optional; if omitted, just
     /// prints the proof)
     #[clap(long, env)]
     pub prove_proxy_url: Option<String>,
     /// Prove-proxy bearer token (optional)
-    #[clap(long, env)]
+    #[clap(long, env, hide_env_values = true)]
     pub prove_proxy_token: Option<String>,
 }

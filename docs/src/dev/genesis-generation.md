@@ -128,7 +128,7 @@ The equivalent command from the repository root is:
 ./target/release/psy_dev_cli generate-genesis-data \
   --repo-root .
 ```
-There is no `--relayer-multisig-account` flag and no `PSY_RELAYER_MULTISIG_ACCOUNT` variable (`Makefile:141-142`). The compiler artifact is `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. There is no `--multisig-policy-artifact`, `--guardians-root`, or `--max-fee` flag, and no `PSY_MULTISIG_POLICY_ARTIFACT` variable. The Make target strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. Full startup always generates a fresh Genesis after its preflight. Missing or invalid member commitments fail before any destruction. Application restart does not generate Genesis. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:71-151,479-486`; `Makefile:141-142`; `dev/locSetupV4.ts:3129-3195`. The first-workspace procedure that produces the three commitments is [§1.2.2](#122-first-workspace-guardian-provisioning).
+There is no `--relayer-multisig-account` flag and no `PSY_RELAYER_MULTISIG_ACCOUNT` variable (`Makefile:150-151`). The compiler artifact is `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. There is no `--multisig-policy-artifact`, `--guardians-root`, or `--max-fee` flag, and no `PSY_MULTISIG_POLICY_ARTIFACT` variable. The Make target strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. Full startup always generates a fresh Genesis after its preflight. Missing or invalid member commitments fail before any destruction. Application restart does not generate Genesis. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:71-151,479-486`; `Makefile:150-151`; `dev/locSetupV4.ts:3129-3195`. The first-workspace procedure that produces the three commitments is [§1.2.2](#122-first-workspace-guardian-provisioning).
 
 ### 1.2.1 Public bridge multisig account
 
@@ -137,6 +137,10 @@ Registration 2 (`user_id` 524288) is a public-only two-of-three multisig account
 The sibling compiler artifact contains the approved policy contract's ABI 2.0.0 and exactly `get_policy` and `set_policy` circuit definitions, with declared state-tree height 4. The generator checks the ABI schema, method identifiers, input and output felt counts, view or external mutability, and the visible `header` and three-`members` offsets, then derives the deployment and requires its code root and function roots to equal Genesis contract 1. The compiler JSON stays in the compiler's `target` directory; these commands never copy or regenerate it. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:194-292`.
 
 The generator derives the account identity from `multisig_fingerprint()` and the derived initial policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:167-192`.
+
+The stage-magic multisig pin (`0x1337CF514544CF69`, localhost/testnet) is measured from `MultisigSignatureCircuit::new().get_fingerprint()`. After the shared circuit security fixes its value is `4554ad0ac443b495aa1fa68443fd54ed83a59e7a9f7cbd5900bea05a1340e050`; the sole runtime constant is `STAGE_CF69_MULTISIG_FINGERPRINT_U64` in `client_prover/psy_prover/src/wallet/memory_wallet.rs`. The existing `get-user-end-cap-common-data` command constructs the multisig circuit and exports its actual fingerprint and limbs rather than echoing this pin. Validate the pin against the constructed circuit with `PSY_NETWORK=localhost cargo test --release --locked -p psy_prover --lib multisig_fingerprint_matches_signature_circuit_or_rejects_unmeasured_magic`. Mainnet remains unmeasured and the getter rejects it.
+
+A fingerprint change changes the account public key even when all member commitments stay identical. Updating the compiled pin does not migrate an existing registration-2 leaf or guardian/relayer journals: they remain bound to the previous identity, and occupied-slot and journal identity checks must not be bypassed. Existing chains require a separately authorized state lifecycle or a verified identity migration; do not register a replacement account, clear journals, or regenerate live Genesis as part of updating this pin.
 
 L1 transaction keystores and passwords remain separate operator custody inputs; they do not select this L2 identity. Do not regenerate an existing chain to rotate members. Use a current-quorum-authorized policy replacement instead. Current quality assurance for public Genesis construction, initialized-state proofs, and startup is pending; the input contract does not establish that generated artifacts are ready for use.
 
@@ -152,7 +156,7 @@ $HOME/.psy/keystore/guardian-2.keystore.json
 $HOME/.psy/keystore/guardian-3.keystore.json
 ```
 
-There is no `guardian-<id>.password` file. If a guardian's keystore already exists as this user's regular file, reuse it and do not create it again. If the name exists as a symlink or a dangling symlink, stop: do not overwrite, truncate, or recreate it. `$HOME/.psy/keystore` must already exist as this user's mode-`0700` directory, with no symlink component from `/` through `.psy`. Inspect it before creation:
+There is no `guardian-<id>.password` file, and no tool reads one. A file of that name beside the keystore is not a password source. Localhost keystores use one fixed test password for all three ids: `devnet`. It is a local-devnet test value, not an operator secret and not a credential for any shared network. Export it as `GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, and `GUARDIAN_3_KEYSTORE_PASSWORD`. Do not write it to a file. If a guardian's keystore already exists as this user's regular file and opens with `devnet`, reuse it and do not create it again. If the name exists as a symlink or a dangling symlink, stop: do not overwrite, truncate, or recreate it. `$HOME/.psy/keystore` must already exist as this user's mode-`0700` directory, with no symlink component from `/` through `.psy`. Inspect it before creation:
 
 ```bash
 namei -l "$HOME/.psy/keystore"
@@ -162,36 +166,33 @@ Stop if any component is `l`, or if the listing continues past that component in
 
 `wallet create --output <path>` writes that exact file. `Wallet::save` passes the `--output` file name to `PrivateKeySigner::encrypt_keystore`, which forwards it to `eth-keystore` 0.5.0 `encrypt_key`; with a name, that function writes `directory/name` (`client_prover/psy_provider/src/wallet/secp_wallet.rs:209-225`; `eth-keystore-0.5.0/src/lib.rs:223-255`). `wallet info` and `wallet random` print secret-bearing output and are not part of this procedure (`client_prover/psy_cli/psy_user_cli/src/subcommand/wallet.rs:65-90`).
 
-Run the binary from `<repo-root>` as the keystore owner, only after the `namei` check above passes, and only for a guardian whose final keystore name is absent. Do not pass `--password`, `--wallet-password`, or `--private-key`: those flags put the secret in argv. Omit `--password` so creation reads it with `rpassword::read_password()`, which opens `/dev/tty` (`rpassword` 7.4.0). A pipe does not answer that prompt. Repeat for guardians 2 and 3. The three `Public Key:` lines are the only values copied forward.
+Run the binary from `<repo-root>` as the keystore owner, only after the `namei` check above passes, and only for a guardian whose final keystore name is absent. Pass `--password devnet` for this localhost test key. Repeat for guardians 2 and 3 with the same password. The three `Public Key:` lines are the only values copied forward. `umask 077` makes the new keystore mode `0600`. If the destination exists, stop; do not delete it and do not retry creation over it.
 
 ```bash
-set +x
 set -euo pipefail
 umask 077
 ./target/release/psy_user_cli wallet create \
-  --output "$HOME/.psy/keystore/guardian-1.keystore.json"
+  --output "$HOME/.psy/keystore/guardian-1.keystore.json" \
+  --password devnet
 ```
 
-Type the password at `Enter password for wallet:`. `set +x` keeps it out of an xtrace. Do not `echo` it, write it to a file, or redirect the CLI transcript into a log. `umask 077` makes the new keystore mode `0600`. If the destination exists, stop; do not delete it and do not retry creation over it.
-
-When the keystore already exists, skip creation and load that exact file. `wallet load` without `--wallet-password` prompts `Enter password for keystore:` on `/dev/tty` and prints `ETH Address:` and `Public Key:` only (`wallet.rs:42-50`; `secp_wallet.rs:228-244`). The printed public key is `hash_no_pad_compressed_public_key` of the compressed secp256k1 key (`secp_wallet.rs:79-85,396-397`). Copy the `Public Key:` hex into the matching position: guardian 1 is index 0, guardian 2 is index 1, and guardian 3 is index 2. Do not sort the three hashes.
+When the keystore already exists, skip creation and load that exact file with `--wallet-password devnet`. The command prints `ETH Address:` and `Public Key:` only (`wallet.rs:42-50`; `secp_wallet.rs:228-244`). The printed public key is `hash_no_pad_compressed_public_key` of the compressed secp256k1 key (`secp_wallet.rs:79-85,396-397`). Copy the `Public Key:` hex into the matching position: guardian 1 is index 0, guardian 2 is index 1, and guardian 3 is index 2. Do not sort the three hashes. `Mac Mismatch` means this file was not created with `devnet`; stop and report that, do not read a password file and do not overwrite the keystore.
 
 ```bash
 ./target/release/psy_user_cli wallet load \
-  --keystore-path "$HOME/.psy/keystore/guardian-1.keystore.json"
+  --keystore-path "$HOME/.psy/keystore/guardian-1.keystore.json" \
+  --wallet-password devnet
 ```
 
 Write those three printed values, in that order, as the JSON array `networks.<selected>.guardian_initial_member_hashes` in `psy-genesis/config.json`. Each value is a `QHashOut` hex string of at most 64 digits; the three must be nonzero and pairwise distinct. Do not write a `guardian_authorization` object, a `guardian_root` key, an `l1_endpoints` list, a policy string, a digest, a fee ceiling, or a password. Chain id and bridge stay in the deployment documents passed later as repeatable `--l1-config` paths; this step does not write those documents or any frontend deployment config. The selected network must not carry `guardian_authorization` or `guardian_root`: launcher admission rejects them. Protocol fees are still computed and verified, with no operator limit. Do not commit the keystores or another operator's commitments as a development default. Editing the commitments of an already deployed chain is not provisioning: replace the live policy only through the current two-of-three quorum. Source: `client_prover/psy_core/psy_config/src/lib.rs:74-84`; `dev/locSetupV4.ts:358-375`.
 
-Guardian signing never reads a password file. Supply the same password later as the environment variable named by `guardian_password_env`: `GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, or `GUARDIAN_3_KEYSTORE_PASSWORD` (`psy_cli/guardian_common/src/runtime.rs:101-108,248-259`). Read it in the operator shell and export only that name. `set +x` keeps the read out of an xtrace, and `read -r -s` takes it from the terminal without echo, trimming, or a shell-history entry. Do not pass it as an argument, write it to a file, `echo` it, or capture the shell transcript.
+Guardian signing never reads a password file. Export the same `devnet` value through the names from `guardian_password_env`: `GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, and `GUARDIAN_3_KEYSTORE_PASSWORD` (`psy_cli/guardian_common/src/runtime.rs:101-108,248-259`). Do not pass those names as command arguments. The launcher inherits these three variables and never writes them (`dev/locSetupV4.ts:4073-4089`).
 
 ```bash
-set +x
-IFS= read -r -s GUARDIAN_1_KEYSTORE_PASSWORD
-export GUARDIAN_1_KEYSTORE_PASSWORD
+export GUARDIAN_1_KEYSTORE_PASSWORD=devnet
+export GUARDIAN_2_KEYSTORE_PASSWORD=devnet
+export GUARDIAN_3_KEYSTORE_PASSWORD=devnet
 ```
-
-The value must be nonempty UTF-8 with no CR, LF, NUL, or leading U+FEFF; surrounding spaces are significant (`psy_cli/guardian_common/src/runtime.rs:74-79`). Repeat with the matching variable for guardians 2 and 3. The launcher inherits these three variables and never writes them (`dev/locSetupV4.ts:4073-4089`).
 
 ### 1.3 Outputs
 
@@ -208,6 +209,35 @@ The following are required QA outcomes, not recorded passes for the current cuto
 1. The CLI exits 0; the three output files exist and are nonempty.
 2. `genesis.json` is valid JSON and its `validators` list matches the intended set (see §3).
 3. Node startup accepts it via `--genesis-data-path`.
+
+The default faucet SD-key pin in `generate_genesis.rs` and the matching
+`client_prover/Makefile` pin must be measured from the current policy circuit:
+transaction count `3`, ordered contract IDs `[5, 0, 0]`, and ordered method IDs
+`[3375543263, 2789897329, 3998182541]`. After an SD-key constraint change, verify
+the intended worktree and source revision before building; a different checkout
+can reproduce the old pin correctly without containing the constraint repair.
+Run the behavioral regression from that node repository root before restarting:
+
+```bash
+PSY_NETWORK=localhost cargo test --release -p psy_dev_cli --lib \
+  subcommand::generate_genesis::tests::default_faucet_policy_circuit_matches_genesis_and_exported_identity \
+  -- --exact --nocapture
+```
+
+This constructs the same policy circuit as faucet runtime from the exported
+policy fields and compares its fingerprint and derived addresses against every
+generated Genesis faucet user and exported operator. A stale pin must fail;
+updating both pins to the measured fingerprint must pass. This test uses only
+in-memory fixture keys, not existing secret output files. Custom policies need
+their own measured `--sd-key-fingerprint`; the default pin is not universal.
+
+A changed default pin changes Genesis faucet identities: regenerate Genesis
+and the complete faucet operator export together on the authorized fresh-reset
+path. Replacing only exported fingerprints leaves addresses and Genesis users
+inconsistent. Rebuild the release generator before fresh startup; the runtime
+fingerprint guard must remain enabled. The in-memory regression does not prove
+startup or claim execution: those still require the stopped stack's authorized
+fresh E2E run.
 
 ## 2. `psy-genesis/` Repository Artifacts
 
@@ -271,7 +301,7 @@ The committed stdin handshake is `prepared`, then `reset`, then `finish`. The he
 <guardian_root>/db/relayer.redb
 ```
 
-Those four files are runtime databases. The existing owner-only `db/` directory is a prerequisite; the helper does not create it. Missing database files are created only after `reset`, and no database file is ever unlinked. Guardian files hold `deposit_tree_states`, `guardian_account`, `guardian_schema`, `guardian_session`, `guardian_signed`, `guardian_signer`, `guardian_withdrawal_nonce`, and `included_withdrawal_burns`. The relayer file holds `chain_claims`, `deposit_tree_states`, `finalization_batch`, `guardian_account`, `guardian_withdrawal_nonce`, `included_withdrawal_burns`, `journal_schema`, and `relayer_request`. `guardian_schema` stores one `u32` marker and `journal_schema` stores one `u64` marker; both must be version 2. They store mutable nonce, signed-request, included-session, per-chain deposit-tree state, included withdrawal burns, per-chain claim, and shared finalization-batch state. A populated file must match that table set and marker exactly. A partial set, a wrong marker, or the previous 7-table journal fails closed before reset and is not wiped or migrated; explicit operator-controlled migration is deferred, not automatic. Reset commits each database separately, and a failure leaves earlier commits in place (`fresh_devnet_state.rs:27-40,57-113`).
+Those four files are runtime databases. The existing owner-only `db/` directory is a prerequisite; the helper does not create it. Missing database files are created only after `reset`, and no database file is ever unlinked. Guardian files hold `deposit_tree_states`, `guardian_account`, `guardian_schema`, `guardian_session`, `guardian_signed`, `guardian_signer`, `guardian_withdrawal_nonce`, and `included_withdrawal_burns`. The relayer file holds `chain_claims`, `deposit_tree_states`, `finalization_batch`, `guardian_account`, `guardian_withdrawal_nonce`, `included_withdrawal_burns`, `journal_schema`, `relayer_request`, and `withdrawal_quarantine`. `guardian_schema` stores one `u32` marker and `journal_schema` stores one `u64` marker; the guardian marker must be version 3 and the relayer marker version 4. They store mutable nonce, signed-request, included-session, per-chain deposit-tree state, included withdrawal burns, per-chain claim, quarantine-marker, and shared finalization-batch state. A populated file must match that table set and marker exactly. A partial set, a wrong marker, or the previous relayer 8-table journal fails closed before reset and is not wiped or migrated; explicit operator-controlled migration is deferred, not automatic. Reset commits each database separately, and a failure leaves earlier commits in place (`fresh_devnet_state.rs:27-40,57-113`).
 
 `GuardianConfig` is an in-memory value, not a serialized file. `GuardianConfig::load(rpc_config, guardian_root, local_documents)` decodes the daemon `--rpc-config` and keeps the selected network. Nonempty repeatable `--l1-config` paths replace `l1_config_url`; otherwise the runtime fetches that URL and requires `l1_chains[].deployment_block` on every entry. `from_network` then requires the three member commitments, three guardian endpoints, history, and the parsed chain documents, including `deployment_block`. Protocol fees are computed and verified there; no operator fee ceiling is configured or read. `build_runtime_config(guardian_id)` derives `<guardian_root>/db/guardian-{id}.redb` and the password variable name and copies those `ChainEndpoint` values into `GuardianRuntimeConfig.l1_rpc_urls`. The relayer reads `<guardian_root>/db/relayer.redb` (`psy_cli/guardian_common/src/runtime.rs:125-315`).
 
@@ -329,7 +359,7 @@ cd dev && bun test locSetupV4.test.ts
 
 The recorded release stack enabled the old proxy path. All four HTTP checks returned 200: guardians 1, 2, and 3, then the relayer. Guardians started together at 10:32:23 UTC and were ready before the relayer's first log at 10:35:39 UTC, about 195 seconds. That interval is not a one-minute result, and the contradictory 95 ms bound is rejected. After ready, guardian RSS was 1,428,784 / 1,400,296 / 1,400,032 KiB, with peaks 1,832,112 / 1,855,628 / 1,851,436 KiB and swap 0. The prior local-construction baseline was 15,688,444 / 16,442,988 / 16,084,444 KiB. These measurements belong to that old revision.
 
-First-signature timing, quorum, and whole-flow E2E are NOT VERIFIED. `psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs` remains ignored. Separately, Envio discovery of the existing deposit failed, so the funds flow has not reached guardian signing. Envio schema reset remains unapproved and was not run. Rotation approval remains an unresolved finding, not a guardians-root requirement.
+For that historical revision, first-signature timing, quorum, and whole-flow E2E are NOT VERIFIED; current fresh-chain readiness and its evidence limits are recorded in [devnet_lifecycle.md](devnet_lifecycle.md) §4. `psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs` remains ignored. Separately, Envio discovery of the existing deposit failed, so the funds flow has not reached guardian signing. Envio schema reset remains unapproved and was not run. Rotation approval remains an unresolved finding, not a guardians-root requirement.
 
 ## 5. Excluded Generation Tasks
 
@@ -337,9 +367,9 @@ First-signature timing, quorum, and whole-flow E2E are NOT VERIFIED. `psy_cli/ps
 |---|---|
 | Regenerate `cached_circuit_library.rs` / `cached_common_data.rs` | [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §5.1 |
 | Regenerate EndCap verifier JSON | [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §4 |
-| Regenerate `local_circuits.json` | `make generate-local-circuits` (`Makefile:120-121`) |
+| Regenerate `local_circuits.json` | `make generate-local-circuits` (`Makefile:157-158`) |
 | Regenerate token fingerprints in precompiles | [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) |
-| Regenerate Groth16 keystores | `Makefile:133-137` |
+| Regenerate Groth16 keystores | `Makefile:170-174` |
 
 ## 6. Failure Handling
 

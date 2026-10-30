@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "status": "source_preparation_for_operator_review",
+  "deployment_ready": false,
+  "live_changes_authorized": false,
+  "deployment_branch": "deploy/testnet",
+  "previous_deployment_head": "8d02d010180589c5dcb5519001dac6cd3479a983",
+  "adopted_audit_source": "7058070057c3242b5d8b29e1a31d498aaa4202c0",
+  "testnet_source_base": "671093a277f48cbf26bcb8374dbf15979a048c7e",
+  "network": "testnet",
+  "network_selector": "psy-public-testnet",
+  "network_magic": "0x1337CF514544CF69",
+  "proving_backend": "plonky2",
+  "sd_key_max_calldata_words": 128,
+  "required_faucet_operator_count": 100,
+  "sdk": {
+    "package": "@psy-protocol/psy-sdk",
+    "version": "2.1.0",
+    "integrity": "sha512-5L+y6ERwNw+gXKsMEH1ktJqt8yIrk6lH5hGvoXrt2tkY/9u/htLNi65PC9KJHJkelhOKWcGlgg2w51PHI8LH3g==",
+    "wasm_sha256": "e451571d3bc4af76641672c9c2a1b10de3bd528b7d527ce84cf09322530379e3"
+  },
+  "sibling_candidates_not_deployed": {
+    "psy-compiler": "1d1f8fe8af17f5f5cddf285577378b7b14fb0d49",
+    "psy-genesis": "9ed70c1e59f1a04818535a749ce2982049c163d1",
+    "psy-sdk": "01b8f2b0a077367a7b9879baba1a72aea8ab5510",
+    "psy-contracts": "fd170e1f7ef01fd99b3f5746b7f1d18bac3f7526",
+    "psy-services": "81b33abe56555e48bc1219ae8789a17313778370",
+    "psy-dapp": "f5e1d689e5067ac1c82975523dc4fdcb48eb33b3",
+    "psy-wallet": "7ca707f88acfffefda2b6b7a59ac66c7188a0ae1"
+  },
+  "preserved_historical_gitlinks_not_fresh_release_pins": {
+    "psy-contracts": "aee3b39ed08f4f4838b63207df3ee5fbb55c53bc",
+    "psy-dapp": "413fe7a460587ac8c6dab5362fb75e9c1b7866e9"
+  },
+  "release_holds": [
+    "operator_review_of_this_preparation",
+    "review_findings_triage_and_required_repairs",
+    "fresh_epoch32_topology_and_script_profile",
+    "final_runtime_source_and_downstream_pin_freeze",
+    "genesis_payload_and_token0_token4_proof_binding_acceptance",
+    "matching_groth16_setup_and_three_chain_l1_acceptance",
+    "services_indexer_and_client_builds_and_e2e",
+    "client_and_contract_gitlink_publication_after_their_own_acceptance"
+  ]
+}

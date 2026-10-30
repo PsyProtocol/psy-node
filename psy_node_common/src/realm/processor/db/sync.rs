@@ -218,7 +218,8 @@ where
         self.state.last_committed_realm_start_root = realm_root_state.value;
         self.state.processing_realm_start_root = realm_root_state.value;
         self.state.processing_realm_end_root = realm_root_state.value;
-        self.state.gathering_realm_start_root = realm_root_state.value;
+        // The tree owner advances the gathering baseline at seal. Metadata sync
+        // must not replace a live speculative cycle's start with the durable tip.
 
         // Also update checkpoint root
         let checkpoint_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_synced_checkpoint_id);
@@ -924,6 +925,8 @@ mod sync_tests {
         env.coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
         env.coordinator.seed_realm_sync_info(update.clone());
         env.coordinator.set_latest_checkpoint_id(1);
+        let gathering_start = zh(72);
+        env.processor.state.gathering_realm_start_root = gathering_start;
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
 
         env.processor.sync_to_coordinator_set_checkpoint_id().await?;
@@ -941,9 +944,9 @@ mod sync_tests {
             env.db.checkpoint_tree_get_root_hash(1).await?,
             update.checkpoint_sync_info.checkpoint_tree_root
         );
-
-        // the new contract introduced at checkpoint 1 got its tree height fetched
+        // Coordinator contract registration advances independently of this realm.
         assert_eq!(env.db.get_contract_tree_heights(1, &[1]).await?, vec![8u8]);
+
 
         // in-memory state moved to the new head
         let state = &env.processor.state;
@@ -953,7 +956,8 @@ mod sync_tests {
         assert_eq!(state.gathering_checkpoint_id, 1);
         assert_eq!(state.last_committed_realm_end_root, root_at_one);
         assert_eq!(state.processing_realm_start_root, root_at_one);
-        assert_eq!(state.gathering_realm_start_root, root_at_one);
+        assert_eq!(state.gathering_realm_start_root, gathering_start,
+            "metadata sync must preserve the tree owner's gathering baseline");
         assert_eq!(state.processing_checkpoint_root, state.coordinator_head_synced_checkpoint_root);
         Ok(())
     }

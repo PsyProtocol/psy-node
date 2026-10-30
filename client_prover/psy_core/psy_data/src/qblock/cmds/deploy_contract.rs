@@ -167,6 +167,19 @@ impl<F: RichField> KVQSerializable for QBCDeployContractWithRoot<F> {
     }
 }
 
+/// Deployer authorization for layout-aware contract updates.
+///
+/// Wire-format mirror of the coordinator-side type in `psy_data` (the client
+/// stack does not depend on the node crate). The RPC request carries it
+/// without a serde default, so omitting it fails deserialization.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+#[ts(export)]
+pub enum PContractUpdateAuthorization {
+    /// JSON-serialized plonky2 ProofWithPublicInputs over the auth hash (PsyBasicZKSignatureCircuit).
+    ZkSignature { proof_json: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 #[ts(export, concrete(F = GoldilocksField))]

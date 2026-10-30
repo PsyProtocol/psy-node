@@ -278,7 +278,7 @@ mod create_and_run_tests {
         let observe_guta_queue = Arc::clone(&guta_queue);
         let task = tokio::spawn(async move {
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
-                PsyChainNetworkType::LocalDevnet.get_chain_id(),
+                psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
                 &task_genesis_data,
                 fingerprint_config(),
                 Arc::clone(&file_system),

@@ -9,7 +9,7 @@ use psy_data::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{ContractCodeDefinition, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
+            contract::{ContractCodeDefinition, PContractUpdateAuthorization, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2},
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
@@ -34,7 +34,7 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContractV2<Hash>) -> RpcResult<String>;
 
     #[method(name = "update_contract")]
-    async fn update_contract(&self, update_contract: PQBCUpdateContract<Hash>) -> RpcResult<String>;
+    async fn update_contract(&self, update_contract: PQBCUpdateContract<Hash>, authorization: PContractUpdateAuthorization) -> RpcResult<String>;
 
     //#[method(name = "build_block")]
     //async fn build_block(&self) -> RpcResult<String>;
