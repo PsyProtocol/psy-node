@@ -383,7 +383,10 @@ mod tests {
 
 #[cfg(test)]
 mod commit_tests {
-    use parth_core::{QCoreProcCheckpointUniqueId, PHash};
+    use parth_core::crypto::hash::merkle_proof::MerkleProofCore;
+    use parth_core::pgoldilocks::PoseidonHasher;
+    use parth_core::protocol::core_types::QNetworkTreeConstants;
+    use parth_core::{PF, QCoreProcCheckpointUniqueId, PHash};
     use psy_core::job::job_id::ProvingJobCircuitType;
     use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
     use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
@@ -455,7 +458,7 @@ mod commit_tests {
             Err(err) => err,
             Ok(_) => panic!("tampered checkpoint tree root must fail the commit"),
         };
-        assert!(err.to_string().contains("Inconsistent checkpoint tree root"), "unexpected error: {err}");
+        assert!(err.to_string().contains("membership root does not match"), "unexpected error: {err}");
 
         // the checkpoint marker must NOT advance on a failed commit
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
@@ -491,17 +494,33 @@ mod commit_tests {
         Ok(())
     }
 
+    /// Seeds the fake coordinator with the checkpoint-tree membership proof
+    /// matching `update` (its leaf sits at index `checkpoint_id`).
+    fn seed_membership(env: &RealmDbTestEnv, update: &psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate<PF, PHash>) {
+        let checkpoint_id = update.checkpoint_sync_info.checkpoint_id;
+        let mut siblings = vec![env.genesis_leaf_hash()];
+        for level in 1..N::CHECKPOINT_TREE_HEIGHT_USIZE {
+            siblings.push(zh(level));
+        }
+        let proof = MerkleProofCore::new_from_params::<PoseidonHasher>(
+            checkpoint_id,
+            update.checkpoint_sync_info.checkpoint_leaf_hash,
+            siblings,
+        );
+        env.coordinator.seed_checkpoint_tree_proof(checkpoint_id, proof);
+    }
+
     #[tokio::test]
-    async fn commit_state_skips_root_check_when_flag_set_at_checkpoint_one() -> anyhow::Result<()> {
+    async fn commit_state_accepts_coordinator_membership_at_checkpoint_one() -> anyhow::Result<()> {
         let mut env = RealmDbTestEnv::create().await?;
         env.commit_genesis().await?;
         let local_root = env.seed_consistent_coordinator_head().await?;
 
-        // a checkpoint-1 update whose checkpoint-tree root does NOT match a
-        // local append: with skip_checkpoint_root_check = true the commit must
-        // still succeed (the backup manager was synced from the coordinator)
-        let mut update = env.make_checkpoint_one_update();
-        update.checkpoint_sync_info.checkpoint_tree_root = zh(77);
+        // a checkpoint-1 update carrying the coordinator's canonical tree
+        // root: commit must verify the membership proof served by the
+        // coordinator client and persist the checkpoint
+        let update = env.make_checkpoint_one_update();
+        seed_membership(&env, &update);
 
         let proc_id: QCoreProcCheckpointUniqueId = 7;
         env.processor.state.processing_checkpoint_id = 1;
@@ -541,7 +560,7 @@ mod commit_tests {
         assert_eq!(state.last_committed_checkpoint_id, 1);
         assert_eq!(state.last_committed_unique_pending_id, 1);
         assert_eq!(state.last_committed_proc_checkpoint_unique_id, proc_id);
-        assert_eq!(state.last_committed_checkpoint_root, zh(77));
+        assert_eq!(state.last_committed_checkpoint_root, update.checkpoint_sync_info.checkpoint_tree_root);
         Ok(())
     }
 
@@ -552,6 +571,7 @@ mod commit_tests {
         let local_root = env.seed_consistent_coordinator_head().await?;
 
         let update = env.make_checkpoint_one_update();
+        seed_membership(&env, &update);
         env.processor.state.processing_checkpoint_id = 1;
         env.processor.state.processing_checkpoint_root = update.checkpoint_sync_info.checkpoint_tree_root;
         env.processor.state.processing_realm_start_root = local_root;

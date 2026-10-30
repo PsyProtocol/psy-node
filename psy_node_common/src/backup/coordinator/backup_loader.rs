@@ -134,7 +134,7 @@ mod tests {
     use crate::coordinator::processor::gatherers::{
         coordinator_guta_update_gatherer::{
             get_new_coordinator_guta_update_gatherer_backup_file_path,
-            COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32,
+            COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_MAGIC_U32,
         },
         deploy_contract_gatherer::{get_new_deploy_contract_gatherer_backup_file_path, DEPLOY_CONTRACT_GATHERER_BACKUP_MAGIC_U32},
         register_user_gatherer::{get_new_register_user_gatherer_backup_file_path, REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32},
@@ -207,12 +207,11 @@ mod tests {
         fs.files.insert(path, bytes);
     }
 
-    /// GUTA backup with zero queue items: magic + start_root + random seed.
+    /// GUTA backup with zero queue items (CGB2): magic + start_root.
     fn guta_backup_bytes(start_root: Hash) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        bytes.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_MAGIC_U32.to_le_bytes());
         bytes.extend_from_slice(&start_root.into_owned_32bytes());
-        bytes.extend_from_slice(&h(60).into_owned_32bytes());
         bytes
     }
 

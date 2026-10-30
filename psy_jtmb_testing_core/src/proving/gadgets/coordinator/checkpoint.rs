@@ -50,10 +50,11 @@ pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
     slots_for_block: C::F,
     pm_jobs_for_block: psy_data::v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats<C::F>,
     block_time: C::F,
-    random_seed_contrib: C::Hash,
+    old_random_seed: C::Hash,
 ) -> PQEDCheckpointLeaf<C::F, C::Hash> {
     let rewards_root = hash_tag_tree_node_single::<C::Hash, C::Hasher>(&part_1_reward_root, &worker_reward_tag);
     let zero = C::F::from_u64_value(0);
+    let new_state_roots_hash = new_state_roots.qfhash::<C::Hasher>();
     
     // FIX: The circuit logic does not accumulate stats from the previous block.
     // It directly assigns the totals for the current block.
@@ -66,7 +67,7 @@ pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
         slots_modified: slots_for_block,
         pm_jobs_completed: pm_jobs_for_block, // This is also a direct assignment, not a combination.
         block_time,
-        random_seed: random_seed_contrib,
+        random_seed: psy_data::protocol::circuit_inputs::checkpoint_transition::derive_checkpoint_random_seed::<C::F, C::Hash, C::Hasher>(old_random_seed, new_state_roots_hash),
         pm_rewards_commitment: psy_data::v1::qdata::pm_rewards_commitment::PPMRewardCommitment {
             register_users_root: rewards_root,
             gutas_root: rewards_root,
@@ -76,7 +77,7 @@ pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
     };
 
     PQEDCheckpointLeaf {
-        global_chain_root: new_state_roots.qfhash::<C::Hasher>(),
+        global_chain_root: new_state_roots_hash,
         stats: new_stats,
     }
 }

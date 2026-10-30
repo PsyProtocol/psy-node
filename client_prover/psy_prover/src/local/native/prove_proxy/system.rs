@@ -8,7 +8,7 @@ use parth_core::{
 };
 use plonky2::{
     field::types::{Field, PrimeField64},
-    plonk::{circuit_data::CommonCircuitData, proof::ProofWithPublicInputs},
+    plonk::{circuit_data::CommonCircuitData, config::Hasher, proof::ProofWithPublicInputs},
 };
 use psy_config::network_constants::{DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT};
 use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
@@ -359,6 +359,9 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
                     slot_data[slot_offset + 25 + j] = *word as u64;
                 }
                 slot_data[slot_offset + 33] = withdrawal.destination_chain_index as u64;
+                slot_data[slot_offset + 34] = withdrawal.token_contract_id as u64;
+                // The slot output covers all 35 L1 words the circuit commits,
+                // with the token contract id bound at word 34.
                 withdrawals.push(WithdrawalBatchClaimSlotInputs::<F> {
                     sender_user_id: withdrawal.sender_user_id,
                     recipient: withdrawal.recipient,
@@ -366,6 +369,7 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
                     amount: withdrawal.amount,
                     nonce: withdrawal.nonce,
                     destination_chain_index: withdrawal.destination_chain_index,
+                    token_contract_id: withdrawal.token_contract_id,
                     leaf_index: withdrawal.leaf_index,
                     siblings,
                 });

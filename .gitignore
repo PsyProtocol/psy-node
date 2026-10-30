@@ -33,6 +33,10 @@ private_keys.json
 psy-contracts/deployments
 !psy-contracts/deployments/index.ts
 
+# psy-contracts and psy-dapp are sibling repositories; ignore stale nested copies.
+/psy-contracts/
+/psy-dapp/
+
 index.scip
 
 # Generated deployment bundle inputs/snapshots.

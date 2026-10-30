@@ -860,11 +860,7 @@ impl<F: Copy, Hash: Q256BitHash>
                 state_transition_end: left_state_transition.state_transition_end,
                 total_proofs_generated: 1,
             },
-            right_input: AggStateTransitionWithStats {
-                state_transition_start: right_state_transition.state_transition_start,
-                state_transition_end: right_state_transition.state_transition_end,
-                total_proofs_generated: 1,
-            },
+            right_input: right_state_transition,
             left_proof_is_leaf: true,
             right_proof_is_leaf: false,
         }
@@ -878,11 +874,7 @@ impl<F: Copy, Hash: Q256BitHash>
         let left_state_transition = left.condense_add_one();
 
         AggStateTransitionInputV2 {
-            left_input: AggStateTransitionWithStats {
-                state_transition_start: left_state_transition.state_transition_start,
-                state_transition_end: left_state_transition.state_transition_end,
-                total_proofs_generated: 1,
-            },
+            left_input: left_state_transition,
             right_input: AggStateTransitionWithStats {
                 state_transition_start: right_state_transition.state_transition_start,
                 state_transition_end: right_state_transition.state_transition_end,
@@ -898,16 +890,8 @@ impl<F: Copy, Hash: Q256BitHash>
         let right_state_transition = right.condense_add_one();
 
         AggStateTransitionInputV2 {
-            left_input: AggStateTransitionWithStats {
-                state_transition_start: left_state_transition.state_transition_start,
-                state_transition_end: left_state_transition.state_transition_end,
-                total_proofs_generated: 1,
-            },
-            right_input: AggStateTransitionWithStats {
-                state_transition_start: right_state_transition.state_transition_start,
-                state_transition_end: right_state_transition.state_transition_end,
-                total_proofs_generated: 1,
-            },
+            left_input: left_state_transition,
+            right_input: right_state_transition,
             left_proof_is_leaf: false,
             right_proof_is_leaf: false,
         }
@@ -1145,7 +1129,7 @@ mod gatherer_builder_tests {
     };
     use psy_node_store_memory::temp_store::InMemoryTempStore;
 
-    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+    use crate::test_common::{create_test_unified_db, fixture_validator_tree_root, TestNetworkConfig, TestUnifiedDatabaseStore};
 
     use super::*;
 
@@ -1223,7 +1207,7 @@ mod gatherer_builder_tests {
                 user_tree_root: zh(3),
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: zh(3),
-                validator_tree_root: zh(2),
+                validator_tree_root: fixture_validator_tree_root(REALM_ID as u32, REALM_SUB_ID as u16),
             },
             should_revert_last_changes: should_revert,
             block_state: block_state(),

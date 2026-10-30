@@ -17,10 +17,14 @@ pub(crate) fn resolve_deployments_file(deployments_network: &str, file_name: &st
     if let Ok(base) = std::env::var("PSY_DEPLOYMENTS_DIR") {
         return PathBuf::from(base).join(deployments_network).join(file_name);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../psy-contracts/deployments")
-        .join(deployments_network)
-        .join(file_name)
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // psy-contracts is a sibling repository of psy-node; fall back to the
+    // legacy nested checkout when the sibling is absent. A missing deployment
+    // file stays a hard error at the caller.
+    let sibling = manifest_dir.join("../../../../psy-contracts/deployments");
+    let nested = manifest_dir.join("../../../psy-contracts/deployments");
+    let base = if sibling.is_dir() { sibling } else { nested };
+    base.join(deployments_network).join(file_name)
 }
 
 pub(crate) fn resolve_proxy_or_core_address(

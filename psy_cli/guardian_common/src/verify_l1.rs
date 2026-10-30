@@ -173,15 +173,15 @@ async fn router_word(rpc: &CustodyRpc<'_>, router: Hex20, signature: &str, argum
 /// Both router directions at one pinned block. Contract 0 remains the PSY
 /// bridge token and contract 4 remains USDT; the router mapping is the check,
 /// not an allowlist. A pair that does not name this token and contract fails.
+/// A pair whose words are both zero is the router's empty default, not a
+/// binding: an unset token with contract id 0 would otherwise pass.
 async fn verify_token_mapping(rpc: &CustodyRpc<'_>, router: Hex20, token: Hex20, contract_id: u32, block: &Value) -> Result<()> {
     let forward = router_word(rpc, router, "l1ToL2Token(address)", address_argument(token), block).await?;
     let reverse = router_word(rpc, router, "l2ToL1Token(bytes32)", contract_id_word(contract_id), block).await?;
     if forward != contract_id_word(contract_id) || reverse != address_argument(token) { return Err(GuardianSignError::DepositMismatch); }
+    if forward == [0; 32] && reverse == [0; 32] { return Err(GuardianSignError::DepositMismatch); }
     Ok(())
 }
-/// True only when the raw token slot itself has a non-zero bit above 160.
-/// L1 rejects that exact slot before registration, so the address-only Router
-/// lookup cannot authorize it and must not be fed a truncated substitute.
 pub fn token_slot_has_high_bits(token: &[u32; 8]) -> bool { token[..3] != [0; 3] }
 pub async fn verify_withdrawal_token(chain: &ChainEndpoint, burn: &WithdrawalBurnRecord) -> Result<()> {
     if token_slot_has_high_bits(&burn.token) { return Ok(()); }
@@ -190,6 +190,15 @@ pub async fn verify_withdrawal_token(chain: &ChainEndpoint, burn: &WithdrawalBur
     let block = block_id(quantity(&finalized["number"])?);
     let derived = verify_l1_chain(&rpc, chain, &block).await?;
     verify_token_mapping(&rpc, derived.router, burn.token_address()?, burn.token_contract_id, &block).await
+}
+/// The shared token-mapping helper labels a failed pair for the deposit path.
+/// Withdrawal call sites relabel exactly that error, so a Router mismatch on a
+/// burn is a withdrawal defect; every other error keeps its meaning.
+pub fn relabel_withdrawal_mapping(error: GuardianSignError) -> GuardianSignError {
+    match error {
+        GuardianSignError::DepositMismatch => GuardianSignError::WithdrawalMismatch,
+        error => error,
+    }
 }
 async fn verify_ancestor(rpc: &CustodyRpc<'_>, number: u64, hash: [u8;32], finalized: &Value) -> Result<()> {
     if canonical_ancestor_header(rpc, number, finalized).await? != hash { return Err(GuardianSignError::DepositMismatch); }
@@ -468,6 +477,128 @@ mod tests {
         assert_ne!(&raw[..3], &[0; 3]);
     }
 
+    fn withdrawal_burn(token: [u8; 20], contract_id: u32) -> WithdrawalBurnRecord {
+        WithdrawalBurnRecord {
+            sender_user_id: 7, token_contract_id: contract_id, destination_chain_index: CHAIN_INDEX,
+            token: address_words(&token), amount: [0, 0, 0, 0, 0, 0, 0, 1],
+            recipient: [0, 0, 0, 0, 0, 0, 0, 1], nonce: [0, 0, 0, 0, 0, 0, 0, 7],
+        }
+    }
+
+    async fn withdrawable(fixture: &L1Fixture, token: [u8; 20], contract_id: u32) -> Result<(), GuardianSignError> {
+        verify_withdrawal_token(&fixture.endpoint(), &withdrawal_burn(token, contract_id)).await
+    }
+
+    fn router_eth_calls(calls: &[serde_json::Value]) -> usize {
+        calls.iter().filter(|call| method(call) == "eth_call" && call["params"][0]["to"] == hex_addr(&ROUTER)).count()
+    }
+
+    /// Canonical pairs pass both directions: PSY is contract 0 (whose forward
+    /// word is the zero word, so only the reverse read can mean "mapped") and
+    /// USDT is contract 4.
+    #[tokio::test]
+    async fn canonical_router_pairs_withdraw_for_both_token_ids() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        fixture.router().reverse.insert(contract_id_word(4), address_argument(Hex(USDT)));
+        fixture.router().forward.insert(address_argument(Hex(USDT)), contract_id_word(4));
+        assert!(withdrawable(&fixture, TOKEN, TOKEN_ID).await.is_ok());
+        assert!(withdrawable(&fixture, USDT, 4).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_word_that_names_another_contract_rejects_the_burn() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        fixture.router().reverse.insert(contract_id_word(4), address_argument(Hex(TOKEN)));
+        assert!(matches!(withdrawable(&fixture, TOKEN, 4).await, Err(GuardianSignError::DepositMismatch)));
+    }
+
+    /// Forward still binds token -> 4, but the reverse read already rebinds 4 to
+    /// another token: the pair is stale and only the forward direction agrees.
+    #[tokio::test]
+    async fn stale_pair_where_only_the_forward_direction_agrees_is_rejected() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        {
+            let mut router = fixture.router();
+            router.forward.insert(address_argument(Hex(TOKEN)), contract_id_word(4));
+            router.reverse.insert(contract_id_word(4), address_argument(Hex(OTHER)));
+        }
+        assert!(matches!(withdrawable(&fixture, TOKEN, 4).await, Err(GuardianSignError::DepositMismatch)));
+    }
+
+    /// Reverse says 4 -> token while forward says token -> 0 (PSY): the pair is
+    /// not dual-bound and the burn must not pass on the reverse entry alone.
+    #[tokio::test]
+    async fn reverse_entry_without_the_matching_forward_entry_is_rejected() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        fixture.router().reverse.insert(contract_id_word(4), address_argument(Hex(TOKEN)));
+        assert!(matches!(withdrawable(&fixture, TOKEN, 4).await, Err(GuardianSignError::DepositMismatch)));
+    }
+
+    #[tokio::test]
+    async fn zero_router_and_zero_or_wide_mapping_words_reject() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        fixture.set_router_zero(true);
+        assert!(matches!(withdrawable(&fixture, TOKEN, TOKEN_ID).await, Err(GuardianSignError::L1ResponseMismatch)));
+        fixture.set_router_zero(false);
+        // With both tables empty, forward misses to the zero word, which for
+        // contract 0 equals the expected id, so only the zero reverse word
+        // catches the unbound pair.
+        {
+            let mut router = fixture.router();
+            router.forward.clear();
+            router.reverse.clear();
+        }
+        assert!(matches!(withdrawable(&fixture, TOKEN, TOKEN_ID).await, Err(GuardianSignError::DepositMismatch)));
+        // The zero-token degenerate: token and contract id are both zero, so
+        // both words miss to zero and the empty default must not read as bound.
+        assert!(matches!(withdrawable(&fixture, [0; 20], 0).await, Err(GuardianSignError::DepositMismatch)));
+        let mut wide = [0u8; 32];
+        wide[..12].fill(0xab);
+        wide[12..].copy_from_slice(&TOKEN);
+        fixture.router().reverse.insert(contract_id_word(TOKEN_ID), wide);
+        assert!(matches!(withdrawable(&fixture, TOKEN, TOKEN_ID).await, Err(GuardianSignError::DepositMismatch)));
+    }
+
+    #[tokio::test]
+    async fn high_bit_token_slot_keeps_bypassing_the_router_lookup() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        let mut burn = withdrawal_burn(TOKEN, TOKEN_ID);
+        burn.token[0] = 1;
+        assert!(verify_withdrawal_token(&fixture.endpoint(), &burn).await.is_ok());
+        assert_eq!(router_eth_calls(&fixture.calls()), 0);
+    }
+
+    /// The guardian sign loop's shape: a burn whose Router pair does not bind
+    /// fails as WithdrawalMismatch before its append record exists.
+    #[tokio::test]
+    async fn mismatched_burn_fails_as_withdrawal_mismatch_without_an_append_record() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        fixture.router().reverse.insert(contract_id_word(4), address_argument(Hex(OTHER)));
+        let burns = [withdrawal_burn(TOKEN, TOKEN_ID), withdrawal_burn(TOKEN, 4)];
+        let mut appends: Vec<WithdrawalAppendRecord> = Vec::new();
+        let mut failure: Option<GuardianSignError> = None;
+        for burn in &burns {
+            match verify_withdrawal_token(&fixture.endpoint(), burn).await.map_err(relabel_withdrawal_mapping) {
+                Ok(()) => appends.push(WithdrawalAppendRecord { chain_index: burn.destination_chain_index, append_index: u32::try_from(appends.len()).unwrap(), burn: burn.clone() }),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(failure, Some(GuardianSignError::WithdrawalMismatch));
+        assert_eq!(appends.len(), 1);
+        assert_eq!(appends[0].append_index, 0);
+        assert_eq!(appends[0].burn, burns[0]);
+    }
+
     #[test]
     fn custody_frontier_only_reuses_contiguous_forward_interval() {
         let anchor=DepositAnchor {chain_index:0,block_number:100,block_hash:Hex([1;32]),old_count:0,new_count:2};
@@ -571,6 +702,9 @@ mod tests {
     const STATE_MANAGER: [u8; 20] = [0x22; 20];
     const PROVIDER: [u8; 20] = [0x33; 20];
     const TOKEN: [u8; 20] = [0x44; 20];
+    const ROUTER: [u8; 20] = [0x55; 20];
+    const USDT: [u8; 20] = [0x66; 20];
+    const OTHER: [u8; 20] = [0x77; 20];
 
     fn hex_word(value: u64) -> String { format!("0x{value:064x}") }
     fn hex_addr(bytes: &[u8]) -> String { format!("0x{}", hex::encode(bytes)) }
@@ -752,11 +886,32 @@ mod tests {
         (root, occupied)
     }
 
+    /// Router token bindings as raw call words: forward maps a token address
+    /// word to the L2 contract id word, reverse maps the id word back to the
+    /// token word. An EVM mapping read misses to the zero word, so an absent
+    /// entry reads zero in both tables.
+    struct RouterState {
+        forward: BTreeMap<[u8; 32], [u8; 32]>,
+        reverse: BTreeMap<[u8; 32], [u8; 32]>,
+    }
+    impl RouterState {
+        fn canonical() -> Self {
+            Self {
+                forward: BTreeMap::from([(address_argument(Hex(TOKEN)), contract_id_word(TOKEN_ID))]),
+                reverse: BTreeMap::from([(contract_id_word(TOKEN_ID), address_argument(Hex(TOKEN)))]),
+            }
+        }
+        fn forward(&self, token: &[u8; 32]) -> [u8; 32] { self.forward.get(token).copied().unwrap_or([0; 32]) }
+        fn reverse(&self, id: &[u8; 32]) -> [u8; 32] { self.reverse.get(id).copied().unwrap_or([0; 32]) }
+    }
+
     struct L1Fixture {
         url: String,
         calls: Arc<Mutex<Vec<serde_json::Value>>>,
         reorg: Arc<AtomicBool>,
         tamper_leaf: Arc<AtomicBool>,
+        router: Arc<Mutex<RouterState>>,
+        router_zero: Arc<AtomicBool>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for L1Fixture {
@@ -765,10 +920,18 @@ mod tests {
     impl L1Fixture {
         fn calls(&self) -> Vec<serde_json::Value> { self.calls.lock().unwrap().clone() }
         fn clear(&self) { self.calls.lock().unwrap().clear(); }
+        fn router(&self) -> std::sync::MutexGuard<'_, RouterState> { self.router.lock().unwrap() }
+        fn set_router_zero(&self, zero: bool) { self.router_zero.store(zero, Ordering::Relaxed); }
         fn endpoint(&self) -> ChainEndpoint { ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_url: self.url.clone() } }
     }
 
-    fn dispatch(request: &serde_json::Value, batch: &ServerBatch, reorg: bool, tamper: bool) -> Result<serde_json::Value, &'static str> {
+    fn word_arg(data: &str) -> Option<[u8; 32]> {
+        let raw = data.strip_prefix("0x")?;
+        if raw.len() != 8 + 64 { return None; }
+        hex::decode(raw).ok()?.get(4..).and_then(|bytes| bytes.try_into().ok())
+    }
+
+    fn dispatch(request: &serde_json::Value, batch: &ServerBatch, reorg: bool, tamper: bool, router: &RouterState, router_zero: bool) -> Result<serde_json::Value, &'static str> {
         let params = &request["params"];
         match request["method"].as_str().unwrap_or("") {
             "eth_chainId" => Ok(serde_json::json!(format!("0x{CHAIN_ID:x}"))),
@@ -791,10 +954,16 @@ mod tests {
                 if height != HEIGHT_B { return Err("historical eth_call is refused"); }
                 if to == hex_addr(&BRIDGE) && data == selector("addressesProvider()") { return Ok(serde_json::json!(word_addr(&PROVIDER))); }
                 if to == hex_addr(&PROVIDER) && data == provider_data(b"STATE_MANAGER") { return Ok(serde_json::json!(word_addr(&STATE_MANAGER))); }
-                if to == hex_addr(&PROVIDER) && data == provider_data(b"ROUTER") { return Ok(serde_json::json!(word_addr(&STATE_MANAGER))); }
+                if to == hex_addr(&PROVIDER) && data == provider_data(b"ROUTER") {
+                    return Ok(serde_json::json!(word_addr(if router_zero { &[0; 20] } else { &ROUTER })));
+                }
                 if to == hex_addr(&STATE_MANAGER) && data == selector("l1ChainIndex()") { return Ok(serde_json::json!(hex_word(u64::from(CHAIN_INDEX)))); }
-                if to == hex_addr(&STATE_MANAGER) && data.starts_with(&selector("l1ToL2Token(address)")) { return Ok(serde_json::json!(hex_word(u64::from(TOKEN_ID)))); }
-                if to == hex_addr(&STATE_MANAGER) && data.starts_with(&selector("l2ToL1Token(bytes32)")) { return Ok(serde_json::json!(word_addr(&TOKEN))); }
+                if to == hex_addr(&ROUTER) && data.starts_with(&selector("l1ToL2Token(address)")) {
+                    return Ok(serde_json::json!(format!("0x{}", hex::encode(router.forward(&word_arg(data).ok_or("mapping argument")?)))));
+                }
+                if to == hex_addr(&ROUTER) && data.starts_with(&selector("l2ToL1Token(bytes32)")) {
+                    return Ok(serde_json::json!(format!("0x{}", hex::encode(router.reverse(&word_arg(data).ok_or("mapping argument")?)))));
+                }
                 if to == hex_addr(&BRIDGE) && data == selector("pendingDepositCount()") { return Ok(serde_json::json!(hex_word(pending_count_at_height(height)))); }
                 if to == hex_addr(&BRIDGE) && data.starts_with(&selector("depositLeafHashes(uint256)")) {
                     let index = u32_arg(data).ok_or("leaf index")?;
@@ -829,6 +998,10 @@ mod tests {
         let recorded = calls.clone();
         let reorg_flag = reorg.clone();
         let tamper_flag = tamper_leaf.clone();
+        let router_state = Arc::new(Mutex::new(RouterState::canonical()));
+        let router_zero_flag = Arc::new(AtomicBool::new(false));
+        let router_handle = router_state.clone();
+        let router_zero_handle = router_zero_flag.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { break };
@@ -847,16 +1020,19 @@ mod tests {
                 if length > 0 { socket.read_exact(&mut body).await.unwrap(); }
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 recorded.lock().unwrap().push(request.clone());
-                let response = match dispatch(&request, &batch, reorg_flag.load(Ordering::Relaxed), tamper_flag.load(Ordering::Relaxed)) {
-                    Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
-                    Err(message) => serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":message}}),
+                let response = {
+                    let router_state = router_handle.lock().unwrap();
+                    match dispatch(&request, &batch, reorg_flag.load(Ordering::Relaxed), tamper_flag.load(Ordering::Relaxed), &router_state, router_zero_handle.load(Ordering::Relaxed)) {
+                        Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
+                        Err(message) => serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":message}}),
+                    }
                 };
                 let payload = response.to_string();
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
                 socket.into_inner().write_all(response.as_bytes()).await.unwrap();
             }
         });
-        L1Fixture { url, calls, reorg, tamper_leaf, server }
+        L1Fixture { url, calls, reorg, tamper_leaf, router: router_state, router_zero: router_zero_flag, server }
     }
 
     #[tokio::test]

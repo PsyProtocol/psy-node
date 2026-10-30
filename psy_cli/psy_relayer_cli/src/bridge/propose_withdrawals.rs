@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use alloy_primitives::keccak256;
 use clap::Args;
 use parth_core::pgoldilocks::QHashOut;
 use plonky2::{
@@ -398,6 +399,7 @@ pub(crate) fn compute_withdrawal_leaf_words(
     amount: [u32; 8],
     nonce: [u32; 8],
     destination_chain_index: u64,
+    token_contract_id: u64,
 ) -> anyhow::Result<[u32; 8]> {
     let sender_user_id_u32 = u32::try_from(sender_user_id)
         .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds uint32 bridge encoding", sender_user_id))?;
@@ -407,29 +409,66 @@ pub(crate) fn compute_withdrawal_leaf_words(
             destination_chain_index
         )
     })?;
+    let token_contract_id_u32 = u32::try_from(token_contract_id)
+        .map_err(|_| anyhow::anyhow!("token_contract_id {} exceeds uint32 bridge encoding", token_contract_id))?;
 
-    // Leaf hash preimage (34 felts), matching the withdrawal-batch-claim circuit:
+    // Leaf hash preimage (35 felts), matching the withdrawal-batch-claim circuit:
     //   sender_user_id, recipient[8], token_address[8], amount[8],
-    //   nonce[8], destination_chain_index
+    //   nonce[8], destination_chain_index, token_contract_id (word 34)
     let felts = std::iter::once(GoldilocksField::from_canonical_u32(sender_user_id_u32))
         .chain(recipient.into_iter().map(GoldilocksField::from_canonical_u32))
         .chain(token_address.into_iter().map(GoldilocksField::from_canonical_u32))
         .chain(amount.into_iter().map(GoldilocksField::from_canonical_u32))
         .chain(nonce.into_iter().map(GoldilocksField::from_canonical_u32))
         .chain(std::iter::once(GoldilocksField::from_canonical_u32(destination_chain_u32)))
+        .chain(std::iter::once(GoldilocksField::from_canonical_u32(token_contract_id_u32)))
         .collect::<Vec<_>>();
     let leaf_hash = QHashOut(PoseidonHash::hash_no_pad(&felts));
-    let elems = leaf_hash.0.elements;
-    Ok([
-        (elems[0].to_canonical_u64() & 0xffff_ffff) as u32,
-        (elems[0].to_canonical_u64() >> 32) as u32,
-        (elems[1].to_canonical_u64() & 0xffff_ffff) as u32,
-        (elems[1].to_canonical_u64() >> 32) as u32,
-        (elems[2].to_canonical_u64() & 0xffff_ffff) as u32,
-        (elems[2].to_canonical_u64() >> 32) as u32,
-        (elems[3].to_canonical_u64() & 0xffff_ffff) as u32,
-        (elems[3].to_canonical_u64() >> 32) as u32,
-    ])
+    Ok(withdrawal_leaf_hash_limbs(leaf_hash))
+}
+
+/// Digest limbs for the withdrawal leaf hash bytes32: per Goldilocks limb low
+/// u32 then high u32. This ordering is the services/API leaf_hash rendering.
+/// It is not an L1 slot word and not the claimedNullifiers key.
+pub(crate) fn withdrawal_leaf_hash_limbs(hash: QHashOut<GoldilocksField>) -> [u32; 8] {
+    let limbs = hash.0.elements.map(|elt| elt.to_canonical_u64());
+    let mut words = [0u32; 8];
+    for (index, limb) in limbs.iter().enumerate() {
+        words[index * 2] = *limb as u32;
+        words[index * 2 + 1] = (*limb >> 32) as u32;
+    }
+    words
+}
+
+/// The L1 claim identity limbs: keccak256 over the 35 slot words (sender_user_id,
+/// recipient[8], token[8], amount[8], nonce[8], destination_chain_index,
+/// token_contract_id), each word big-endian — 140 bytes. These are the exact
+/// bytes32 the audited Bridge uses as the `claimedNullifiers` key, the
+/// pending-withdrawal key, and the topic1 identity of every withdrawal event.
+/// This is not the services/API lookup identity (that is the Poseidon leaf
+/// hash limbs above) and not a slot word.
+pub(crate) fn withdrawal_claim_identity_words(withdrawal: &PendingWithdrawal) -> anyhow::Result<[u32; 8]> {
+    let sender = u32::try_from(withdrawal.sender_user_id)
+        .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds u32", withdrawal.sender_user_id))?;
+    let destination = u32::try_from(withdrawal.destination_chain_index)
+        .map_err(|_| anyhow::anyhow!("destination_chain_index {} exceeds u32", withdrawal.destination_chain_index))?;
+    let contract = u32::try_from(withdrawal.contract_id)
+        .map_err(|_| anyhow::anyhow!("contract_id {} exceeds u32", withdrawal.contract_id))?;
+    let mut buf = Vec::with_capacity(35 * 4);
+    for word in std::iter::once(sender)
+        .chain(withdrawal.recipient.iter().copied())
+        .chain(withdrawal.token_address.iter().copied())
+        .chain(withdrawal.amount.iter().copied())
+        .chain(withdrawal.nonce.iter().copied())
+        .chain(std::iter::once(destination))
+        .chain(std::iter::once(contract))
+    {
+        buf.extend_from_slice(&word.to_be_bytes());
+    }
+    let digest = keccak256(&buf);
+    Ok(std::array::from_fn(|i| {
+        u32::from_be_bytes(digest[i * 4..(i + 1) * 4].try_into().expect("four bytes"))
+    }))
 }
 
 pub(crate) fn compute_withdrawal_leaf_hash(
@@ -439,6 +478,7 @@ pub(crate) fn compute_withdrawal_leaf_hash(
     amount: [u32; 8],
     nonce: [u32; 8],
     destination_chain_index: u64,
+    token_contract_id: u64,
 ) -> anyhow::Result<String> {
     let words = compute_withdrawal_leaf_words(
         sender_user_id,
@@ -447,6 +487,7 @@ pub(crate) fn compute_withdrawal_leaf_hash(
         amount,
         nonce,
         destination_chain_index,
+        token_contract_id,
     )?;
     let mut bytes = [0u8; 32];
     for (i, &w) in words.iter().enumerate() {
@@ -554,6 +595,7 @@ pub async fn fetch_pending_bridge_withdrawals(
             amount_words,
             nonce_words,
             withdrawal.destination_chain_index,
+            withdrawal.contract_id,
         )?;
         if local_leaf != withdrawal.leaf_hash {
             anyhow::bail!(
@@ -598,6 +640,175 @@ fn select_indexed_withdrawals(mut withdrawals: Vec<PendingWithdrawal>) -> anyhow
             .then(left.event_id.cmp(&right.event_id))
     });
     Ok(withdrawals)
+}
+
+fn withdrawal_burn_record(withdrawal: &PendingWithdrawal) -> anyhow::Result<guardian_common::protocol::WithdrawalBurnRecord> {
+    let narrow = |name: &str, value: u64| {
+        u32::try_from(value).map_err(|_| anyhow::anyhow!("{name} {} exceeds uint32 bridge encoding", value))
+    };
+    Ok(guardian_common::protocol::WithdrawalBurnRecord {
+        sender_user_id: narrow("sender_user_id", withdrawal.sender_user_id)?,
+        token_contract_id: narrow("token contract id", withdrawal.contract_id)?,
+        destination_chain_index: u8::try_from(withdrawal.destination_chain_index)
+            .map_err(|_| anyhow::anyhow!("destination chain index {} exceeds uint8", withdrawal.destination_chain_index))?,
+        token: withdrawal.token_address,
+        amount: withdrawal.amount,
+        recipient: withdrawal.recipient,
+        nonce: withdrawal.nonce,
+    })
+}
+
+/// One mismatched burn used to poison every guardian session: the relayer
+/// selected every indexed withdrawal, the guardian rejected the whole signing
+/// round on the bad token binding, and the L2 withdrawal cursor never advanced.
+/// Before a round plan is built, every withdrawal runs the same Router dual
+/// mapping check the guardians apply at signing time. A record whose pair is
+/// not dual-bound gets a marker in relayer.redb keyed by (destination chain,
+/// event id); a record whose fields exceed the bridge encoding is marked too —
+/// it can never be encoded into an append, so it is skipped permanently. The
+/// check is deterministic and there is no unquarantine command.
+///
+/// A quarantined burn is stranded: it is never appended to the L2 withdrawal
+/// tree, so no pending withdrawal is ever registered on L1, and repairing the
+/// Router mapping does not make it claimable. Recovery is an operator action
+/// outside the relayer — the user re-withdraws (a fresh burn that passes the
+/// check) or the withdrawal tree is repaired manually.
+///
+/// Each chain's records are consumed only up to the first unsettled check:
+/// an unsettled record (L1 unreachable, malformed response, unconfigured
+/// chain) and its successors on that chain are excluded from this round
+/// without markers, so nothing behind it can append at a second index and
+/// the offset invariant holds exactly — the services stream position the
+/// next round starts from is `l2_withdrawal_next_index + quarantine marker
+/// count` for the chain, every event before the boundary either appended
+/// or marked, and the boundary itself re-fetches next round.
+pub(crate) async fn quarantine_unmappable_withdrawals(
+    guardian: &super::guardian_client::LoadedGuardianConfig,
+    withdrawals: Vec<PendingWithdrawal>,
+) -> anyhow::Result<Vec<PendingWithdrawal>> {
+    if withdrawals.is_empty() {
+        return Ok(withdrawals);
+    }
+    // Input order is (destination_chain_index, event_id) from
+    // `select_indexed_withdrawals`, so per-chain runs are contiguous prefixes.
+    let quarantined = guardian.db.quarantined_withdrawals()?;
+    let mut kept = Vec::with_capacity(withdrawals.len());
+    let mut markers = std::collections::BTreeMap::new();
+    let mut unsettled_chains = std::collections::BTreeSet::new();
+    let mut skipped = 0usize;
+    for withdrawal in withdrawals {
+        let chain = match u8::try_from(withdrawal.destination_chain_index) {
+            Ok(chain) => chain,
+            Err(_) => {
+                tracing::warn!(
+                    chain_index = withdrawal.destination_chain_index,
+                    event_id = withdrawal.event_id,
+                    "destination chain index exceeds uint8: token binding check cannot run; excluding the withdrawal from this round"
+                );
+                unsettled_chains.insert(withdrawal.destination_chain_index);
+                continue;
+            }
+        };
+        if quarantined.contains_key(&(chain, withdrawal.event_id)) {
+            skipped += 1;
+            tracing::debug!(chain_index = chain, event_id = withdrawal.event_id, "skipping quarantined withdrawal");
+            continue;
+        }
+        if unsettled_chains.contains(&withdrawal.destination_chain_index) {
+            // Behind the first unsettled record of this chain: consuming it
+            // would advance the offset past a never-checked event.
+            continue;
+        }
+        let Some(endpoint) = guardian.root.l1_chains.iter().find(|endpoint| endpoint.chain_index == chain) else {
+            tracing::warn!(
+                chain_index = chain,
+                event_id = withdrawal.event_id,
+                "no configured L1 endpoint: token binding check cannot run; excluding the withdrawal from this round"
+            );
+            unsettled_chains.insert(u64::from(chain));
+            continue;
+        };
+        let burn = match withdrawal_burn_record(&withdrawal) {
+            Ok(burn) => burn,
+            Err(_) => {
+                // Deterministic and permanent: the fields can never be encoded
+                // into an append, so the record is skipped like a mismatch.
+                tracing::warn!(
+                    chain_index = chain,
+                    event_id = withdrawal.event_id,
+                    leaf_hash = %withdrawal.leaf_hash,
+                    "withdrawal fields exceed the bridge encoding; quarantining the withdrawal permanently"
+                );
+                markers.insert(
+                    (chain, withdrawal.event_id),
+                    super::guardian_client::WithdrawalQuarantine {
+                        reason: "UnencodableFields".to_owned(),
+                        quarantined_at_unix: crate::bridge::claim_attempts::now_unix(),
+                    },
+                );
+                continue;
+            }
+        };
+        match guardian_common::verify_l1::verify_withdrawal_token(endpoint, &burn).await {
+            Ok(()) => kept.push(withdrawal),
+            Err(error) => {
+                let labelled = guardian_common::verify_l1::relabel_withdrawal_mapping(error);
+                if labelled != guardian_common::protocol::GuardianSignError::WithdrawalMismatch {
+                    tracing::warn!(
+                        chain_index = chain,
+                        event_id = withdrawal.event_id,
+                        leaf_hash = %withdrawal.leaf_hash,
+                        error = ?labelled,
+                        "withdrawal token binding check did not settle; excluding this record and the rest of the chain's round without a marker"
+                    );
+                    unsettled_chains.insert(u64::from(chain));
+                    continue;
+                }
+                tracing::warn!(
+                    chain_index = chain,
+                    event_id = withdrawal.event_id,
+                    leaf_hash = %withdrawal.leaf_hash,
+                    "quarantining withdrawal whose Router token mapping is not dual-bound"
+                );
+                markers.insert(
+                    (chain, withdrawal.event_id),
+                    super::guardian_client::WithdrawalQuarantine {
+                        reason: "WithdrawalMismatch".to_owned(),
+                        quarantined_at_unix: crate::bridge::claim_attempts::now_unix(),
+                    },
+                );
+            }
+        }
+    }
+    guardian.db.quarantine_withdrawals(&markers)?;
+    if skipped > 0 {
+        tracing::info!(skipped, "excluded previously quarantined withdrawals from the round");
+    }
+    if !unsettled_chains.is_empty() {
+        tracing::warn!(
+            chains = ?unsettled_chains,
+            "chains with an unsettled token binding check: their records from the first unsettled event on are re-checked next round"
+        );
+    }
+    Ok(kept)
+}
+
+/// Per-chain quarantine marker counts, for the fetch offset invariant:
+/// services offset = `l2_withdrawal_next_index + marker_count(chain)`, since
+/// every fetched event either appends (raising the L2 cursor) or is marked.
+pub(crate) fn quarantine_marker_counts(
+    db: &super::guardian_client::RelayerDb,
+    chains: &[u64],
+) -> anyhow::Result<std::collections::BTreeMap<u64, u64>> {
+    chains
+        .iter()
+        .copied()
+        .map(|chain| {
+            let chain = u8::try_from(chain)
+                .map_err(|_| anyhow::anyhow!("destination chain index {chain} exceeds uint8"))?;
+            Ok((u64::from(chain), db.quarantine_marker_count(chain)?))
+        })
+        .collect()
 }
 
 pub async fn build_withdrawal_round_plan(
@@ -694,7 +905,11 @@ pub async fn run_and_get_withdrawal_root(
         );
     }
 
-    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[], &guardian.root.network).await?;
+    let discovered = quarantine_unmappable_withdrawals(
+        guardian,
+        fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[], &guardian.root.network).await?,
+    )
+    .await?;
 
     if discovered.is_empty() {
         tracing::info!(from_checkpoint, to_checkpoint_exclusive, "no withdrawal events found in range");
@@ -791,6 +1006,7 @@ mod tests {
             amount,
             nonce,
             destination_chain_index,
+            4,
         )?;
         let sender1 = compute_withdrawal_leaf_words(
             1,
@@ -799,15 +1015,38 @@ mod tests {
             amount,
             nonce,
             destination_chain_index,
+            4,
         )?;
         assert_ne!(sender0, sender1, "sender_user_id must change withdrawal leaf hash");
         assert_eq!(
-            compute_withdrawal_leaf_hash(0, recipient, token_address, amount, nonce, destination_chain_index)?,
+            compute_withdrawal_leaf_hash(0, recipient, token_address, amount, nonce, destination_chain_index, 4)?,
             u32x8_be_to_hex(sender0),
             "hex helper must match limb helper"
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn withdrawal_leaf_hash_limbs_are_low_u32_then_high_u32_big_endian() {
+        // Shared rendering vector across circuit, contracts, CLI, dapp and
+        // services: limb 0x1122334455667788 contributes words 0x55667788 then
+        // 0x11223344; the bytes32 packs each word big-endian.
+        let hash = QHashOut::from_values(
+            0x1122334455667788,
+            0xaabbccddeeff0011,
+            0x0000000100000002,
+            0xffffffff00000000,
+        );
+        let words = withdrawal_leaf_hash_limbs(hash);
+        assert_eq!(
+            words,
+            [0x55667788, 0x11223344, 0xeeff0011, 0xaabbccdd, 0x00000002, 0x00000001, 0x00000000, 0xffffffff]
+        );
+        assert_eq!(
+            u32x8_be_to_hex(words),
+            "0x5566778811223344eeff0011aabbccdd000000020000000100000000ffffffff"
+        );
     }
 
     fn sample_withdrawal(
@@ -878,5 +1117,251 @@ mod tests {
         assert_eq!(selected[0].sender_user_id, selected[1].sender_user_id);
     }
 
+    /// The codec config's chain points at a closed port, so any L1 access in
+    /// these tests would fail the round loudly instead of passing silently.
+    fn quarantinable_guardian(root: std::path::PathBuf, db: super::super::guardian_client::RelayerDb) -> super::super::guardian_client::LoadedGuardianConfig {
+        let mut config = crate::guardian::test_fixture::codec_guardian_config();
+        config.l1_chains[0].rpc_url = "http://127.0.0.1:1".to_owned();
+        super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) }
+    }
 
+    #[tokio::test]
+    async fn quarantined_event_ids_are_filtered_without_any_l1_access() {
+        let (path, db) = super::super::guardian_client::tests_db();
+        let guardian = quarantinable_guardian(path.clone(), db);
+        let mut markers = std::collections::BTreeMap::new();
+        markers.insert((0u8, 33i64), super::super::guardian_client::WithdrawalQuarantine { reason: "WithdrawalMismatch".to_owned(), quarantined_at_unix: 1 });
+        guardian.db.quarantine_withdrawals(&markers).unwrap();
+        let kept = quarantine_unmappable_withdrawals(&guardian, vec![sample_withdrawal(0, 7, 4, [3, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 33)])
+            .await
+            .expect("a quarantined event is excluded without consulting L1");
+        assert!(kept.is_empty());
+        let saved = guardian.db.quarantined_withdrawals().unwrap();
+        assert_eq!(saved[&(0, 33)].reason, "WithdrawalMismatch");
+        drop(guardian);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn unsettled_checks_exclude_without_markers_and_keep_the_round_alive() {
+        let (path, db) = super::super::guardian_client::tests_db();
+        let guardian = quarantinable_guardian(path.clone(), db);
+        // Event 34: unreachable L1. Event 35: destination chain with no endpoint.
+        let kept = quarantine_unmappable_withdrawals(
+            &guardian,
+            vec![
+                sample_withdrawal(0, 7, 4, [3, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 34),
+                sample_withdrawal(7, 7, 4, [3, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 35),
+            ],
+        )
+        .await
+        .expect("an unsettled check must not fail the round");
+        assert!(kept.is_empty(), "unsettled records are excluded from this round");
+        assert!(
+            guardian.db.quarantined_withdrawals().unwrap().is_empty(),
+            "no marker may be written when the check did not settle"
+        );
+        assert_eq!(guardian.db.quarantine_marker_count(0).unwrap(), 0);
+        drop(guardian);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    /// A minimal L1: canonical dual binding for token A, a stale pair for token
+    /// B (forward says 4, reverse 4 rebinds elsewhere), and a connection that
+    /// breaks mid-call for token C.
+    async fn serve_mapping_l1() -> String {
+        const BRIDGE: [u8; 20] = [0x11; 20];
+        const PROVIDER: [u8; 20] = [0x33; 20];
+        const STATE_MANAGER: [u8; 20] = [0x22; 20];
+        const ROUTER: [u8; 20] = [0x55; 20];
+        const GOOD: [u8; 20] = [0x21; 20];
+        const BAD: [u8; 20] = [0x42; 20];
+        const TRANSIENT: [u8; 20] = [0x63; 20];
+        const ID_FOUR: [u8; 32] = {
+            let mut word = [0u8; 32];
+            word[31] = 4;
+            word
+        };
+        fn selector(signature: &str) -> String { format!("0x{}", hex::encode(&alloy_primitives::keccak256(signature.as_bytes())[..4])) }
+        fn provider_data(name: &[u8]) -> String {
+            let mut data = alloy_primitives::keccak256(b"getAddress(bytes32)")[..4].to_vec();
+            data.extend_from_slice(alloy_primitives::keccak256(name).as_slice());
+            format!("0x{}", hex::encode(data))
+        }
+        fn word_addr(bytes: &[u8]) -> String { format!("0x{:0>64}", hex::encode(bytes)) }
+        fn hex_word(value: u64) -> String { format!("0x{value:064x}") }
+        fn hex_addr(bytes: &[u8]) -> String { format!("0x{}", hex::encode(bytes)) }
+        fn call_argument(data: &str) -> [u8; 32] {
+            hex::decode(data.strip_prefix("0x").unwrap()[8..].to_owned()).unwrap().try_into().unwrap()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let mut reader = tokio::io::BufReader::new(&mut socket);
+                let mut line = String::new();
+                let mut length = 0usize;
+                loop {
+                    line.clear();
+                    if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await.unwrap() == 0 { break; }
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap(); }
+                    }
+                }
+                let mut body = vec![0; length];
+                if length > 0 { tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await.unwrap(); }
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let params = &request["params"];
+                let result: Result<serde_json::Value, &str> = match request["method"].as_str().unwrap_or("") {
+                    "eth_chainId" => Ok(serde_json::json!("0x1")),
+                    "eth_getBlockByNumber" => Ok(serde_json::json!({"number": "0x10", "hash": format!("0x{}", "ab".repeat(32))})),
+                    "eth_call" => {
+                        let to = params[0]["to"].as_str().unwrap_or("");
+                        let data = params[0]["data"].as_str().unwrap_or("");
+                        if to == hex_addr(&BRIDGE) && data == selector("addressesProvider()") {
+                            Ok(serde_json::json!(word_addr(&PROVIDER)))
+                        } else if to == hex_addr(&PROVIDER) && data == provider_data(b"STATE_MANAGER") {
+                            Ok(serde_json::json!(word_addr(&STATE_MANAGER)))
+                        } else if to == hex_addr(&PROVIDER) && data == provider_data(b"ROUTER") {
+                            Ok(serde_json::json!(word_addr(&ROUTER)))
+                        } else if to == hex_addr(&STATE_MANAGER) && data.starts_with(&selector("l1ChainIndex()")) {
+                            Ok(serde_json::json!(hex_word(0)))
+                        } else if to == hex_addr(&ROUTER) && data.starts_with(&selector("l1ToL2Token(address)")) {
+                            let token = call_argument(data)[12..].to_vec();
+                            if token == GOOD { Ok(serde_json::json!(hex_word(0))) }
+                            else if token == BAD { Ok(serde_json::json!(hex_word(4))) }
+                            else if token == TRANSIENT {
+                                // Break the connection: the read fails unsettled.
+                                break;
+                            }
+                            else { Ok(serde_json::json!(hex_word(0))) }
+                        } else if to == hex_addr(&ROUTER) && data.starts_with(&selector("l2ToL1Token(bytes32)")) {
+                            let id = call_argument(data);
+                            if id == [0u8; 32] { Ok(serde_json::json!(word_addr(&GOOD))) }
+                            else if id == ID_FOUR { Ok(serde_json::json!(word_addr(&[0x77; 20]))) }
+                            else { Ok(serde_json::json!(word_addr(&[0u8; 20]))) }
+                        } else {
+                            Err("unexpected call")
+                        }
+                    }
+                    _ => Err("unexpected method"),
+                };
+                let payload = match result {
+                    Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}).to_string(),
+                    Err(message) => serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":message}}).to_string(),
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
+                use tokio::io::AsyncWriteExt;
+                if socket.write_all(response.as_bytes()).await.is_err() { break; }
+            }
+        });
+        url
+    }
+
+    fn token_words(address: [u8; 20]) -> [u32; 8] {
+        let mut words = [0u32; 8];
+        for (index, chunk) in address.chunks_exact(4).enumerate() {
+            words[3 + index] = u32::from_be_bytes(chunk.try_into().unwrap());
+        }
+        words
+    }
+
+    #[tokio::test]
+    async fn mixed_round_keeps_good_marks_bad_and_excludes_transient_without_marker() {
+        const GOOD: [u8; 20] = [0x21; 20];
+        const BAD: [u8; 20] = [0x42; 20];
+        const TRANSIENT: [u8; 20] = [0x63; 20];
+        let url = serve_mapping_l1().await;
+        let (path, db) = super::super::guardian_client::tests_db();
+        let mut config = crate::guardian::test_fixture::codec_guardian_config();
+        config.l1_chains[0].rpc_url = url;
+        let guardian = super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) };
+        // GOOD is the PSY pair: token -> bytes32(0) forward, reverse resolves
+        // back to the token, and the burn claims contract id 0.
+        let withdrawal = |token: [u8; 20], contract: u64, event: i64| {
+            let mut sample = sample_withdrawal(0, 7, contract, [9, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], event);
+            sample.token_address = token_words(token);
+            sample
+        };
+        let kept = quarantine_unmappable_withdrawals(
+            &guardian,
+            vec![
+                withdrawal(GOOD, 0, 43),
+                withdrawal(BAD, 4, 41),
+                withdrawal(TRANSIENT, 4, 42),
+            ],
+        )
+        .await
+        .expect("an unsettled check never fails the round");
+        // The honest dual-bound pair stays in the round; only it appends.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event_id, 43);
+        // The stale pair is durably marked; the broken read is not.
+        let saved = guardian.db.quarantined_withdrawals().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[&(0, 41)].reason, "WithdrawalMismatch");
+        assert_eq!(guardian.db.quarantine_marker_count(0).unwrap(), 1);
+        drop(guardian);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    /// An unsettled record ends its chain's consumed prefix: the good record
+    /// after it must not append this round, or the offset invariant would
+    /// double-consume the unsettled event and its successors forever.
+    #[tokio::test]
+    async fn an_unsettled_record_stops_its_chain_from_consuming_further_records() {
+        const GOOD: [u8; 20] = [0x21; 20];
+        const TRANSIENT: [u8; 20] = [0x63; 20];
+        let url = serve_mapping_l1().await;
+        let (path, db) = super::super::guardian_client::tests_db();
+        let mut config = crate::guardian::test_fixture::codec_guardian_config();
+        config.l1_chains[0].rpc_url = url;
+        let guardian = super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) };
+        let withdrawal = |token: [u8; 20], contract: u64, event: i64| {
+            let mut sample = sample_withdrawal(0, 7, contract, [9, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], event);
+            sample.token_address = token_words(token);
+            sample
+        };
+        let kept = quarantine_unmappable_withdrawals(
+            &guardian,
+            vec![
+                withdrawal(GOOD, 0, 50),
+                withdrawal(TRANSIENT, 0, 51),
+                withdrawal(GOOD, 0, 52),
+            ],
+        )
+        .await
+        .expect("an unsettled check never fails the round");
+        // Only the settled prefix before the unsettled event is consumed.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event_id, 50);
+        assert!(guardian.db.quarantined_withdrawals().unwrap().is_empty());
+        assert_eq!(guardian.db.quarantine_marker_count(0).unwrap(), 0);
+        drop(guardian);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn marker_counts_drive_the_services_offset_invariant() {
+        let (path, db) = super::super::guardian_client::tests_db();
+        assert_eq!(db.quarantine_marker_count(1).unwrap(), 0);
+        let mut markers = std::collections::BTreeMap::new();
+        // A quarantined tail event on chain 1 and one on chain 2.
+        markers.insert((1u8, 900i64), super::super::guardian_client::WithdrawalQuarantine { reason: "WithdrawalMismatch".to_owned(), quarantined_at_unix: 1 });
+        markers.insert((2u8, 901i64), super::super::guardian_client::WithdrawalQuarantine { reason: "WithdrawalMismatch".to_owned(), quarantined_at_unix: 1 });
+        db.quarantine_withdrawals(&markers).unwrap();
+        assert_eq!(db.quarantine_marker_count(1).unwrap(), 1);
+        assert_eq!(db.quarantine_marker_count(2).unwrap(), 1);
+        assert_eq!(db.quarantine_marker_count(3).unwrap(), 0);
+        let counts = quarantine_marker_counts(&db, &[1, 2, 3]).unwrap();
+        assert_eq!(counts[&1], 1);
+        assert_eq!(counts[&2], 1);
+        assert_eq!(counts[&3], 0);
+        // offset = l2 append cursor + marker count covers the quarantined tail.
+        assert_eq!(5 + counts[&1], 6);
+        std::fs::remove_dir_all(path).ok();
+    }
 }
+

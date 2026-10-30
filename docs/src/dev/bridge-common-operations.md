@@ -119,7 +119,7 @@ GET /api/v1/bridge/withdrawal-claim-proof
     [&scan_limit=<limit>]
 ```
 
-`recipient`, `token_address`, `amount`, `nonce`, and `destination_chain_index` are required; omitting any returns HTTP 400. `destination_chain_index` is the Bridge chain index (0 through 255), not the EVM chain ID. L1 `claimedNullifiers` is keyed by the raw withdrawal nonce. The relayer may register that nonce before a manual caller: `NullifierAlreadyClaimed()` is an idempotent rejection, not evidence that settlement failed. Each deposit and withdrawal nullifier is unique. L2 rejects a repeated deposit claim; L1 rejects a repeated withdrawal nonce.
+`recipient`, `token_address`, `amount`, `nonce`, and `destination_chain_index` are required; omitting any returns HTTP 400. `destination_chain_index` is the Bridge chain index (0 through 255), not the EVM chain ID. The services match is Poseidon over the 35 canonical felts below, including the indexed token contract id; the query itself stays those fields and is not the L1 key. The L1 key is keccak256 of the same 35 values encoded as big-endian u32 words (140 bytes): `sender_user_id`, `recipient` u32×8, `token` u32×8, `amount` u32×8, `nonce` u32×8, `destination_chain_index`, and word 34 `token_contract_id`. That key is what `claimedNullifiers`, `pendingWithdrawals`, `claimPendingWithdrawal`, and the indexed id on pending, claimed, and per-item receipt events use. It is not the Poseidon digest and not the raw nonce. The relayer may register that key before a manual caller: `NullifierAlreadyClaimed()` is an idempotent rejection, not evidence that settlement failed. Each deposit nullifier and each withdrawal L1 key is unique. L2 rejects a repeated deposit claim; L1 rejects a repeated withdrawal L1 key.
 
 ### Round-trip invariants
 
@@ -127,7 +127,7 @@ GET /api/v1/bridge/withdrawal-claim-proof
 2. **Nullifier uniqueness.** Double-claims fail closed on the exact identity above, not on counts.
 3. **Proof split.** The depositor proves inclusion; the receiver proves ownership and consumes that proof.
 4. **Two-step withdrawal.** `batchClaimWithdrawal` creates the pending claim and sets `claimedNullifiers`. Only `claimPendingWithdrawal` transfers tokens, and only after `claimableAt`.
-5. **Balance identity.** After one deposit and one withdrawal, L1 token balance is `initial - deposit_amount + withdrawal_amount`, L2 token balance is `deposit_amount - withdrawal_amount`, `Bridge.claimedNullifiers(withdrawal_nonce)` is true, and the L2 IMT shows the deposit nullifier as claimed.
+5. **Balance identity.** After one deposit and one withdrawal, L1 token balance is `initial - deposit_amount + withdrawal_amount`, L2 token balance is `deposit_amount - withdrawal_amount`, `Bridge.claimedNullifiers(withdrawal_l1_key)` is true, and the L2 IMT shows the deposit nullifier as claimed.
 6. **Chain index.** Withdrawals use the bridge chain index. An EVM chain ID is rejected as `destination chain index out of range`.
 
 ## 1. State Flow
@@ -211,7 +211,7 @@ The lifecycle target owns that process. The command identifies the active `psy_r
 Local addresses change after deployment. Read the generated summary after every startup; never copy addresses from an earlier run. The deployment exporter writes this file and includes the core contracts and token metadata (`psy-contracts/deploy/008_export_deployed_contracts.ts:52-118`).
 
 ```bash
-export DEPLOYMENTS='<repo-root>/psy-contracts/deployments/localhost/deployed-contracts.json'
+export DEPLOYMENTS='<workspace>/psy-contracts/deployments/localhost/deployed-contracts.json'
 
 test -s "$DEPLOYMENTS"
 export BRIDGE="$(jq -r '.core.Bridge // .contracts.Bridge' "$DEPLOYMENTS")"
@@ -505,15 +505,70 @@ jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/
 
 The withdrawal amount must be positive and no greater than the user's withdrawn-token balance. Independently, the user must retain sufficient PSY balance to pay the EndCap fee. Use a unique nonce for every destination chain.
 
+`--nonce` is only the raw 32-byte field inside the withdrawal preimage. It is not the L1 mapping key. Section 11 derives that key; do not pass this nonce, or the services Poseidon leaf hash, to `claimedNullifiers`, `pendingWithdrawals`, or `claimPendingWithdrawal`.
+
 ## 11. Register and Settle the L1 Withdrawal
 
 Section 10 captured the finalization cursor and recipient balance before the L2 withdrawal.
 
-After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. Small withdrawals within the cap pay directly in that call; medium/governed withdrawals register `pendingWithdrawals[nonce]`. Both consume `claimedNullifiers[nonce]`. Medium claims unlock after their stored delay; large/cap-exceeding claims require governance after their stored delay. The pending-registration checks below apply only to medium/governed withdrawals (`psy-contracts/src/Bridge.sol:762-764,810-838`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:584-589,978-995`).
+After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. The batch argument is `uint256[1120]` (32 slots of 35 words). Word 34 of each slot is `token_contract_id`, and the batch commitment includes it. Public inputs stay 18 words. Small withdrawals within the cap pay directly in that call; medium/governed withdrawals register `pendingWithdrawals[withdrawal L1 key]`. Both consume `claimedNullifiers[withdrawal L1 key]`. Pending, claimed, and per-item receipt events index that same keccak. Medium claims unlock after their stored delay; large/cap-exceeding claims require governance after their stored delay. The pending-registration checks below apply only to medium/governed withdrawals (`psy-contracts/src/Bridge.sol` batch claim and pending settlement; `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs`).
+
+This is the Bridge V6 identity in the current audit worktree: `VERSION = 6` and 35 slot words at `<workspace>/psy-contracts/src/Bridge.sol:55,63`. Committed contracts HEAD `63b56a58` is still `VERSION` 5 and keys claims by the raw nonce. Do not run these V6 reads against a deployed V5 chain or any retained V5 state. Adopting the working V6 source requires a fresh L1 chain, a fresh L2 chain, and a new genesis. Clearing the services database is not sufficient, and a committed-V5 raw-nonce claim or pending entry has no in-place upgrade. This runbook does not record that the fresh chain has already been started.
 
 ```bash
+export TOKEN_CONTRACT_ID_HEX="$(cast call "$ROUTER" 'l1ToL2Token(address)(bytes32)' "$USDT" --rpc-url "$L1_RPC_URL")"
+test -n "$TOKEN_CONTRACT_ID_HEX"
+export WITHDRAWAL_L1_KEY="$(python3 - <<'PY'
+import os, sys
+from Crypto.Hash import keccak
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+def u32(name, value):
+    if value < 0 or value > 0xFFFFFFFF:
+        fail(f"{name} does not fit one u32; refusing to guess")
+    return value.to_bytes(4, "big")
+
+def bytes32(name, raw):
+    text = raw.strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    if len(text) == 40:
+        text = text.rjust(64, "0")
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        fail(f"{name} is not a 20-byte address or 32-byte word")
+    return bytes.fromhex(text)
+
+text = os.environ["TOKEN_CONTRACT_ID_HEX"].strip().lower()
+if text.startswith("0x"):
+    text = text[2:]
+if not text or any(c not in "0123456789abcdef" for c in text):
+    fail("Router.l1ToL2Token returned no hex id; refusing to guess")
+token_contract_id = int(text, 16)
+if token_contract_id == 0:
+    fail("this USDT run resolved Router.l1ToL2Token to 0, the native PSY contract id; refusing to substitute it")
+preimage = b"".join([
+    u32("sender_user_id", int(os.environ["USER_ID"])),
+    bytes32("recipient", os.environ["USER_L1_ADDRESS"]),
+    bytes32("token", os.environ["USDT"]),
+    int(os.environ["WITHDRAW_AMOUNT"]).to_bytes(32, "big"),
+    bytes32("nonce", os.environ["WITHDRAWAL_NONCE"]),
+    u32("destination_chain_index", 0),
+    u32("token_contract_id", token_contract_id),
+])
+if len(preimage) != 140:
+    fail(f"withdrawal preimage is {len(preimage)} bytes, expected 140")
+digest = keccak.new(digest_bits=256)
+digest.update(preimage)
+print("0x" + digest.hexdigest())
+PY
+)"
+test "${#WITHDRAWAL_L1_KEY}" -eq 66
+
 for attempt in $(seq 1 360); do
-  CLAIMED="$(cast call "$BRIDGE" 'claimedNullifiers(bytes32)(bool)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL")"
+  CLAIMED="$(cast call "$BRIDGE" 'claimedNullifiers(bytes32)(bool)' "$WITHDRAWAL_L1_KEY" --rpc-url "$L1_RPC_URL")"
   FINALIZED_AFTER_WITHDRAW="$(cast call "$STATE_MANAGER" 'lastFinalizedCheckpointId()(uint64)' --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
   test "$CLAIMED" = 'true' && test "$FINALIZED_AFTER_WITHDRAW" -gt "$FINALIZED_BEFORE_WITHDRAW" && break
   sleep 5
@@ -521,7 +576,7 @@ done
 
 test "${CLAIMED:-false}" = 'true'
 test "${FINALIZED_AFTER_WITHDRAW:-0}" -gt "$FINALIZED_BEFORE_WITHDRAW"
-PENDING_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL" --json)"
+PENDING_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' "$WITHDRAWAL_L1_KEY" --rpc-url "$L1_RPC_URL" --json)"
 PENDING_AMOUNT="$(jq -r '.[2]' <<<"$PENDING_JSON")"
 CLAIMABLE_AT="$(jq -r '.[3]' <<<"$PENDING_JSON")"
 test "$PENDING_AMOUNT" -eq "$WITHDRAW_AMOUNT"
@@ -529,15 +584,15 @@ test "$PENDING_AMOUNT" -eq "$WITHDRAW_AMOUNT"
 while test "$(cast block latest --field timestamp --rpc-url "$L1_RPC_URL" | awk '{print $1}')" -lt "$CLAIMABLE_AT"; do sleep 1; done
 test -n "${ETH_KEYSTORE:-}"
 test -f "${ETH_PASSWORD:-}"
-cast send "$BRIDGE" 'claimPendingWithdrawal(bytes32)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL" --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD"
+cast send "$BRIDGE" 'claimPendingWithdrawal(bytes32)' "$WITHDRAWAL_L1_KEY" --rpc-url "$L1_RPC_URL" --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD"
 
 export L1_BALANCE_AFTER="$(cast call "$USDT" 'balanceOf(address)(uint256)' "$USER_L1_ADDRESS" --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
 test "$L1_BALANCE_AFTER" -ge "$((L1_BALANCE_BEFORE + WITHDRAW_AMOUNT))"
-CLEARED_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL" --json)"
+CLEARED_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' "$WITHDRAWAL_L1_KEY" --rpc-url "$L1_RPC_URL" --json)"
 test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 ```
 
-`claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:770-776,795-805`).
+`claimedNullifiers(withdrawal L1 key) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[withdrawal L1 key]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol` pending settlement). The raw nonce and the services Poseidon leaf hash are not this key.
 
 ## 12. Observable-State Matrix
 
@@ -553,7 +608,7 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 | L2 deposit claim                    | user EndCap                                     | `claim-deposit.json.status == "confirmed"`                                                   | result file                                                |
 | Deposit indexed as claimed          | services                                        | matching item has `claimed: true`                                                            | `GET /api/v1/get/bridge/deposits?shield_address=<bytes32>` |
 | L2 withdrawal                       | user EndCap                                     | `withdraw.json.status == "confirmed"`                                                        | result file                                                |
-| Relayer withdrawal registration     | relayer L2 EndCap and L1 transaction            | finalization cursor increases; `claimedNullifiers(nonce) == true`; pending amount is nonzero | StateManager and Bridge views                              |
+| Relayer withdrawal registration     | relayer L2 EndCap and L1 transaction            | finalization cursor increases; `claimedNullifiers(withdrawal L1 key) == true`; pending amount is nonzero | StateManager and Bridge views                              |
 | User L1 settlement                  | user L1 transaction                             | recipient balance rises; pending amount becomes zero                                         | `claimPendingWithdrawal`, Bridge and token views           |
 
 Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1473-1546`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
@@ -583,7 +638,7 @@ Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-p
 | `InvalidBatchRange()`                                                                                                                                                       | Relayer attempted a non-contiguous or invalid deposit append                      | Stop manual relayer commands; let the daemon reconcile its proved cursor                                                             |
 | `InvalidProvenChainIndex()`                                                                                                                                                 | Finalize proof targets the wrong Bridge chain index                               | Correct the relayer deployment/network configuration                                                                                 |
 | `InvalidCheckpointContinuity()`                                                                                                                                             | Finalize proof does not continue from L1 finalized state                          | Discard the stale proof and let the daemon rebuild from `lastFinalizedCheckpointId + 1`                                              |
-| `NullifierAlreadyClaimed()`, or a relayer claim report whose slot outcome for the leaf is `Registered` (the report's `resolved_count` counts it and the leaf leaves the pending queue)                                                                                                          | Withdrawal registration already happened                                          | Require `claimedNullifiers(nonce) == true`, then inspect/settle the pending withdrawal                                               |
+| `NullifierAlreadyClaimed()`, or a relayer claim report whose slot outcome for the leaf is `Registered` (the report's `resolved_count` counts it and the leaf leaves the pending queue)                                                                                                          | Withdrawal registration already happened                                          | Require `claimedNullifiers(withdrawal L1 key) == true`, then inspect/settle the pending withdrawal. Do not look the entry up by the raw nonce or the Poseidon leaf hash                                               |
 | Recipient balance does not rise after a successful pending claim                                                                                                            | Settlement transfer failed or token balance is insufficient                       | Inspect the pending entry, receipt, and Bridge token balance; do not label it proof-not-ready                                        |
 
 The deposit proof response reasons are stable machine-readable values (`../psy-services/src/api/handlers/bridge.rs:1555-1721`). StateManager exposes the exact finalize errors (`psy-contracts/src/StateManager.sol:63-76`, `psy-contracts/src/StateManager.sol:173-212`).

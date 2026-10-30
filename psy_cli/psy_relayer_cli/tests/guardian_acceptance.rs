@@ -1,4 +1,4 @@
-//! Real guardian acceptance; execution PENDING the independent reviewer/QA gate.
+//! Real guardian acceptance tests.
 //!
 //! Explicit invocation (missing fixture is an error, never a successful skip):
 //! GUARDIAN_ACCEPTANCE_FIXTURE=/protected/disposable-fixture cargo test -p
@@ -7,7 +7,9 @@
 //! The runner never provisions or purges the stack. It requires the authorized
 //! disposable Plonky2 stack, services/indexer, real system proving endpoint,
 //! funded L1 depositor and claimant, nonce-zero user 524288, and three
-//! never-used guardian keys. Databases are absent; first service start creates
+//! guardian keys that have never signed. Those keys cannot open a retained
+//! operational journal, and this test never copies, resets, or migrates one.
+//! Databases are absent; first service start creates
 //! each one. There is no create-db command and no TLS.
 //!
 //! The public manifest.json stays outside guardians-root outputs. Its `l1_configs` lists the existing local deployment documents; the runner passes each unchanged and aggregates nothing. See §4.5 for the remaining field set. Secret-consuming user APIs run in the ignored
@@ -19,7 +21,7 @@ use std::{fs, io::Write, net::SocketAddr, os::unix::fs::{MetadataExt, OpenOption
 
 use anyhow::{ensure, Context};
 use bincode::Options;
-use guardian_common::{protocol::{decode_record, encode_record, parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID}};
+use guardian_common::protocol::{decode_record, encode_record, parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID};
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
@@ -29,7 +31,7 @@ use psy_provider::{provider::RpcProvider, wallet::secp_wallet::Wallet};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use tokio::{net::TcpStream, process::{Child, Command}, time::{sleep, timeout, Instant}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, process::{Child, Command}, time::{sleep, timeout, Instant}};
 
 const CLI: &str = env!("CARGO_BIN_EXE_psy_relayer_cli");
 const USER: u64 = BRIDGE_USER_ID;
@@ -326,9 +328,9 @@ impl Fixture {
         let tx = db.begin_read().map_err(|_| anyhow::anyhow!("relayer database read failed"))?;
         let mut names = tx.list_tables().map_err(|_| anyhow::anyhow!("relayer tables unavailable"))?.map(|table| table.name().to_owned()).collect::<Vec<_>>();
         names.sort();
-        ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request"], "relayer database table set mismatch");
+        ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request", "withdrawal_quarantine"], "relayer database table set mismatch");
         let schema = tx.open_table(TableDefinition::<(), u64>::new("journal_schema")).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?;
-        ensure!(schema.len().map_err(|_| anyhow::anyhow!("relayer schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?.is_some_and(|row| row.value() == 3), "incompatible legacy journal schema; explicit operator-controlled migration is required");
+        ensure!(schema.len().map_err(|_| anyhow::anyhow!("relayer schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?.is_some_and(|row| row.value() == 4), "incompatible legacy journal schema; explicit operator-controlled migration is required");
         drop(tx.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).map_err(|_| anyhow::anyhow!("relayer account unavailable"))?);
         drop(tx.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).map_err(|_| anyhow::anyhow!("chain claims table unavailable"))?);
         drop(tx.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).map_err(|_| anyhow::anyhow!("finalization batch table unavailable"))?);
@@ -361,6 +363,12 @@ impl Fixture {
         command
     }
 
+    fn piped(&self) -> Command {
+        let mut command = self.command();
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        command
+    }
+
     fn with_l1_configs(&self, command: &mut Command) {
         for path in &self.l1_configs { command.arg("--l1-config").arg(path); }
     }
@@ -379,15 +387,26 @@ impl Fixture {
         Ok(command)
     }
 
-    fn policy(&self) -> anyhow::Result<Command> {
-        let path = self.path("next_members")?;
-        protected(&path, false)?;
-        let bytes = read(&path)?;
-        let members = parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(&bytes).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
-        ensure!(members.iter().all(|member| guardian_common::protocol::validate_hash(*member).is_ok()), "replacement member is not canonical");
-        let serialized = serde_json::to_string(&members).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
-        let mut command = self.command();
-        command.arg("guardian-policy").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--intent").arg("replace").arg("--next-members-json").arg(serialized);
+    fn policy_prepare(&self) -> anyhow::Result<Command> {
+        let members = replacement_members(self)?;
+        let hashes = [members.member_hashes[0], members.member_hashes[1], members.member_hashes[2]];
+        let mut command = self.piped();
+        command.arg("guardian-policy").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--intent").arg("replace").arg("--next-members-json").arg(serde_json::to_string(&hashes).map_err(|_| anyhow::anyhow!("replacement members rejected"))?);
+        self.with_l1_configs(&mut command);
+        Ok(command)
+    }
+
+    fn policy_sign(&self, approval: &Approval) -> anyhow::Result<Command> {
+        let mut command = self.piped();
+        command.arg("guardian-policy-sign").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--guardian-id").arg(approval.guardian_id.to_string()).arg("--request-id").arg(&approval.request_id).arg("--account-public-key").arg(&approval.account).arg("--nonce").arg(approval.nonce.to_string()).arg("--operation").arg(&approval.operation);
+        for member in &approval.members { command.arg("--member-hash").arg(member); }
+        self.with_l1_configs(&mut command);
+        Ok(command)
+    }
+
+    fn policy_resume(&self, request_id: &str) -> anyhow::Result<Command> {
+        let mut command = self.piped();
+        command.arg("guardian-policy-resume").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--request-id").arg(request_id);
         self.with_l1_configs(&mut command);
         Ok(command)
     }
@@ -527,6 +546,15 @@ impl Sessions {
         let request = encode_record(request)?;
         let response = self.http.post(self.origins[index].join("v1/sign-session").map_err(|_| anyhow::anyhow!("signing URL unavailable"))?).header(reqwest::header::CONTENT_TYPE, RECORD_MEDIA).body(request).send().await;
         Ok(self.body(response, false).await?.and_then(|bytes| parse_canonical_json(&bytes).ok()))
+    }
+
+    async fn post_record(&self, index: usize, request: &[u8]) -> anyhow::Result<(u16, String, Vec<u8>)> {
+        let framed = encode_record(request).map_err(|_| anyhow::anyhow!("request record encoding failed"))?;
+        let response = self.http.post(self.origins[index].join("v1/sign-session").map_err(|_| anyhow::anyhow!("signing URL unavailable"))?).header(reqwest::header::CONTENT_TYPE, RECORD_MEDIA).body(framed).send().await.map_err(|_| anyhow::anyhow!("guardian HTTP connection failed; policy refusal was not observed"))?;
+        let status = response.status().as_u16();
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let body = response.bytes().await.map_err(|_| anyhow::anyhow!("guardian HTTP body interrupted"))?.to_vec();
+        Ok((status, content_type, body))
     }
 
     async fn durable_signature(&self, children: &mut Children, mut daemon: usize, index: usize, fixture: &Fixture, nonce: u64) -> anyhow::Result<(usize, GuardianSignResponse)> {
@@ -860,29 +888,182 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let after_erc20 = erc20_balance(&fixture.flow.l1.rpc_url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().unwrap()).await?;
     ensure!(after_erc20 == before_erc20 + u128::from(amount), "recipient ERC20 delta is not +amount");
     children.stop(burn_daemon).await?;
-    let members = replacement_members(fixture)?;
-    let rotation = children.start(fixture.policy()?)?;
-    children.success(rotation, fixture.session).await?;
-    let policy_stage = fixture.stage(burn_nonce + 1)?.context("included policy row missing")?;
-    let policy_receipt: guardian_common::protocol::GuardianSessionRecord = serde_json::from_value(policy_stage.get("Included").context("policy row is not Included")?["record"].clone()).map_err(|_| anyhow::anyhow!("included policy record rejected"))?;
-    let policy_nonce = policy_receipt.request_json.decode().map_err(|_| anyhow::anyhow!("policy request rejected"))?.session_nonce;
-    verify_inclusion(&provider, &policy_receipt, fixture, policy_nonce, GuardianOperation::ReplacePolicy).await?;
-    let policy_checkpoint = policy_receipt.included_checkpoint_id;
-    let slots = state_subslots(&provider, fixture, policy_checkpoint, USER, psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID, 0, 16).await?;
+    children.stop(guardians[0]).await?;
+    children.stop(guardians[2]).await?;
+    let prepared = run_piped(fixture.policy_prepare()?, &[], fixture.session).await?;
+    ensure!(prepared.status.success(), "policy prepare failed");
+    let request_bytes = one_line(&prepared.stdout)?;
+    let request = parse_canonical_json::<GuardianSignRequest>(&request_bytes).map_err(|_| anyhow::anyhow!("prepared policy request rejected"))?;
+    ensure!(request.schema_version == 3 && request.operation == GuardianOperation::ReplacePolicy && request.session_nonce == burn_nonce + 1, "prepared request is not the next schema-3 replacement");
+    let review = std::str::from_utf8(&prepared.stderr).map_err(|_| anyhow::anyhow!("policy review rejected"))?;
+    let approval = Approval::from_review(fixture, &request, review, replacement_members(fixture)?)?;
+    let stage = fixture.stage(approval.nonce)?.context("frozen policy request missing")?;
+    ensure!(stage.get("Included").is_none() && stage.get("Request").or_else(|| stage.get("Signed")).context("frozen request missing")?["request"].as_str() == Some(std::str::from_utf8(&request_bytes).map_err(|_| anyhow::anyhow!("prepared request is not UTF-8"))?), "prepared stdout differs from the frozen request");
+    let before = Journal::read(&databases[0], fixture.network(), &[approval.nonce])?;
+    ensure!(before.account.state == GuardianAccountState::Active && before.account.halt_reason.is_none() && before.signed(approval.nonce)?.is_empty(), "policy nonce already reserved");
+    drop(before);
+    guardians[0] = children.start(fixture.guardian(0)?)?;
+    children.ready(guardians[0], addresses[0], fixture.ready).await?;
+    assert_policy_refusal(&sessions, 0, &request_bytes, &approval.request_id).await?;
+    children.stop(guardians[0]).await?;
+    let refused = Journal::read(&databases[0], fixture.network(), &[approval.nonce])?;
+    ensure!(refused.account.state == GuardianAccountState::Active && refused.account.halt_reason.is_none() && refused.signed(approval.nonce)?.is_empty(), "fresh policy refusal reserved or halted");
+    drop(refused);
+    for wrong in approval.wrong() {
+        let failed = run_piped(fixture.policy_sign(&wrong)?, &request_bytes, fixture.ready).await?;
+        ensure!(!failed.status.success() && parse_canonical_json::<GuardianSignResponse>(&failed.stdout).is_err(), "wrong local expectation produced a signature");
+        let journal = Journal::read(&databases[0], fixture.network(), &[approval.nonce, wrong.nonce])?;
+        ensure!(journal.account.state == GuardianAccountState::Active && journal.account.halt_reason.is_none() && journal.signed(approval.nonce)?.is_empty() && journal.signed(wrong.nonce)?.is_empty(), "wrong expectation reserved a nonce");
+        drop(journal);
+    }
+    let signed = run_piped(fixture.policy_sign(&approval)?, &request_bytes, fixture.session).await?;
+    ensure!(signed.status.success(), "correct local approval failed after rejection");
+    let first = verified_response(fixture, &request, &signed.stdout, 0)?;
+    let reserved = Journal::read(&databases[0], fixture.network(), &[approval.nonce])?;
+    let rows = reserved.signed(approval.nonce)?;
+    ensure!(rows.len() == 1 && rows[0].request_bytes == request.canonical_bytes().map_err(|_| anyhow::anyhow!("prepared request rejected"))? && rows[0].signature == Some(first.signature.0) && rows[0].message == first.message.0, "durable reservation differs from local response");
+    let durable = rows[0].clone();
+    drop(reserved);
+    guardians[0] = children.start(fixture.guardian(0)?)?;
+    children.ready(guardians[0], addresses[0], fixture.ready).await?;
+    assert_policy_refusal(&sessions, 0, &request_bytes, &approval.request_id).await?;
+    children.stop(guardians[0]).await?;
+    let cached = Journal::read(&databases[0], fixture.network(), &[approval.nonce])?;
+    let cached_rows = cached.signed(approval.nonce)?;
+    ensure!(cached_rows.len() == 1 && cached_rows[0].request_bytes == durable.request_bytes && cached_rows[0].signature == durable.signature, "cached HTTP refusal changed the signed row");
+    drop(cached);
+    for wrong in approval.wrong() {
+        let failed = run_piped(fixture.policy_sign(&wrong)?, &request_bytes, fixture.ready).await?;
+        ensure!(!failed.status.success() && parse_canonical_json::<GuardianSignResponse>(&failed.stdout).is_err(), "wrong cached expectation released a signature");
+        let journal = Journal::read(&databases[0], fixture.network(), &[approval.nonce])?;
+        let row = journal.signed(approval.nonce)?;
+        ensure!(row.len() == 1 && row[0].request_bytes == durable.request_bytes && row[0].signature == durable.signature, "wrong cached expectation changed the signed row");
+        drop(journal);
+    }
+    let repeated = run_piped(fixture.policy_sign(&approval)?, &request_bytes, fixture.session).await?;
+    ensure!(repeated.status.success(), "correct cached local approval failed");
+    let repeated_response = verified_response(fixture, &request, &repeated.stdout, 0)?;
+    ensure!(repeated_response.signature == first.signature && repeated_response.message == first.message, "cached local approval changed the signature");
+    let second_run = run_piped(fixture.policy_sign(&approval.for_guardian(3))?, &request_bytes, fixture.session).await?;
+    ensure!(second_run.status.success(), "second local approval failed");
+    let second = verified_response(fixture, &request, &second_run.stdout, 2)?;
+    ensure!(second.public_key != first.public_key && second.member_index != first.member_index, "rotation responses are not distinct members");
+    authorize_pair(fixture, &request, &[&first, &second])?;
+    let responses = serde_json::to_vec(&[first.clone(), second.clone()]).map_err(|_| anyhow::anyhow!("responses rejected"))?;
+    let duplicate = run_piped(fixture.policy_resume(&approval.request_id)?, &serde_json::to_vec(&[first.clone(), first.clone()]).map_err(|_| anyhow::anyhow!("duplicate responses rejected"))?, fixture.ready).await?;
+    ensure!(!duplicate.status.success(), "duplicate response was accepted");
+    let resumed = run_piped(fixture.policy_resume(&approval.request_id)?, &responses, fixture.session).await?;
+    ensure!(resumed.status.success() && resumed.stdout.is_empty(), "policy resume failed or wrote stdout");
+    let daemon = children.start(fixture.daemon()?)?;
+    children.ready(daemon, addresses[3], fixture.ready).await?;
+    guardians[0] = children.start(fixture.guardian(0)?)?;
+    children.ready(guardians[0], addresses[0], fixture.ready).await?;
+    guardians[2] = children.start(fixture.guardian(2)?)?;
+    children.ready(guardians[2], addresses[2], fixture.ready).await?;
+    let policy_receipt = wait_receipt(children, daemon, &sessions, fixture.session, approval.nonce).await?;
+    verify_inclusion(&provider, &policy_receipt, fixture, approval.nonce, GuardianOperation::ReplacePolicy).await?;
+    let slots = state_subslots(&provider, fixture, policy_receipt.included_checkpoint_id, USER, psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID, 0, 16).await?;
     let hashes: Vec<guardian_common::protocol::Hash4> = slots.chunks_exact(4).map(|fields| {
         let fields: [u64; 4] = fields.try_into().unwrap();
         guardian_common::protocol::Hash4::try_from(&fields).map_err(|_| anyhow::anyhow!("policy slot rejected"))
     }).collect::<anyhow::Result<_>>()?;
     let ending = psy_vm::ups::multisig::StoredMultisigPolicy { header: hashes[0], members: [hashes[1], hashes[2], hashes[3]] }.policy()?;
+    let members = replacement_members(fixture)?;
     let initial = fixture.config.initial_account().map_err(|_| anyhow::anyhow!("configured initial account rejected"))?.initial_policy;
     ensure!(ending == members && ending.member_hashes != initial.member_hashes, "committed replacement policy differs or is unchanged");
-    let stopped_b = Journal::read(&databases[1], fixture.network(), &[policy_nonce])?;
-    ensure!(stopped_b.signed(policy_nonce)?.is_empty(), "offline B signed rotation");
+    sessions.wait_session(children, guardians[0], 0, fixture, approval.nonce).await?;
+    sessions.wait_session(children, guardians[2], 2, fixture, approval.nonce).await?;
+    children.stop(daemon).await?;
+    children.stop(guardians[0]).await?;
+    children.stop(guardians[2]).await?;
     for index in [0, 2] {
-        children.stop(guardians[index]).await?;
-        let journal = Journal::read(&databases[index], fixture.network(), &[policy_nonce])?;
-        ensure!(journal.signed(policy_nonce)?.len() == 1, "A+C did not sign rotation");
+        let journal = Journal::read(&databases[index], fixture.network(), &[approval.nonce])?;
+        let imported = require_imported(&journal, approval.nonce, policy_receipt.request_json.as_str().as_bytes(), policy_receipt.signatures_json.as_str().as_bytes())?;
+        ensure!(journal.signed(approval.nonce)?.is_empty() && imported.record.included_checkpoint_id == policy_receipt.included_checkpoint_id, "included rotation retained its consumed reservation or changed the receipt");
     }
+    let stopped_b = Journal::read(&databases[1], fixture.network(), &[approval.nonce])?;
+    ensure!(stopped_b.signed(approval.nonce)?.is_empty(), "offline B signed rotation");
+    Ok(())
+}
+struct Approval { guardian_id: u8, request_id: String, account: String, nonce: u64, operation: String, members: [String; 3] }
+impl Approval {
+    fn from_review(fixture: &Fixture, request: &GuardianSignRequest, stderr: &str, members: psy_vm::ups::multisig::MultisigPolicy) -> anyhow::Result<Self> {
+        let line = stderr.lines().find(|line| line.starts_with("request_id=")).context("policy review line missing")?;
+        let mut fields = std::collections::HashMap::new();
+        for field in line.split_whitespace() { let (key, value) = field.split_once('=').context("policy review field rejected")?; fields.insert(key, value.to_string()); }
+        let request_id = format!("0x{}", hex::encode(request.request_id().map_err(|_| anyhow::anyhow!("prepared request id rejected"))?.0));
+        let account = hash_text(fixture.config.account_public_key().map_err(|_| anyhow::anyhow!("configured account rejected"))?)?;
+        ensure!(request.decode_trace().map_err(|_| anyhow::anyhow!("prepared trace rejected"))?.meta.public_key == fixture.config.account_public_key().map_err(|_| anyhow::anyhow!("configured account rejected"))?, "prepared account differs from configured account");
+        ensure!(fields.get("request_id").map(String::as_str) == Some(request_id.as_str()) && fields.get("nonce").and_then(|value| value.parse::<u64>().ok()) == Some(request.session_nonce) && fields.get("operation").map(String::as_str) == Some("ReplacePolicy") && fields.get("account").map(String::as_str) == Some(account.as_str()), "policy review differs from prepared request");
+        Ok(Self { guardian_id: 1, request_id, account, nonce: request.session_nonce, operation: "replace-policy".to_string(), members: [hash_text(members.member_hashes[0])?, hash_text(members.member_hashes[1])?, hash_text(members.member_hashes[2])?] })
+    }
+    fn for_guardian(&self, guardian_id: u8) -> Self { Self { guardian_id, ..self.clone() } }
+    fn wrong(&self) -> [Self; 3] {
+        let mut wrong_id = self.clone(); wrong_id.request_id = format!("0x{:064x}", 1u8);
+        let mut member = self.clone(); member.members.swap(0, 1);
+        let mut nonce = self.clone(); nonce.nonce = self.nonce.saturating_add(1);
+        [wrong_id, member, nonce]
+    }
+}
+impl Clone for Approval { fn clone(&self) -> Self { Self { guardian_id: self.guardian_id, request_id: self.request_id.clone(), account: self.account.clone(), nonce: self.nonce, operation: self.operation.clone(), members: self.members.clone() } } }
+fn hash_text(hash: guardian_common::protocol::Hash4) -> anyhow::Result<String> { Ok(serde_json::to_value(hash).map_err(|_| anyhow::anyhow!("hash encoding rejected"))?.as_str().context("hash encoding rejected")?.to_string()) }
+fn one_line(bytes: &[u8]) -> anyhow::Result<Vec<u8>> { let line = std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!("CLI stdout rejected"))?.strip_suffix('\n').filter(|line| !line.contains('\n')).context("CLI stdout is not one payload line")?; Ok(line.as_bytes().to_vec()) }
+struct Piped { status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8> }
+async fn run_piped(mut command: Command, stdin_bytes: &[u8], bound: Duration) -> anyhow::Result<Piped> {
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| anyhow::anyhow!("CLI spawn failed (details redacted)"))?;
+    let mut input = child.stdin.take().context("CLI stdin unavailable")?;
+    let mut output = child.stdout.take().context("CLI stdout unavailable")?;
+    let mut errors = child.stderr.take().context("CLI stderr unavailable")?;
+    let copied = stdin_bytes.to_vec();
+    let finished = async move {
+        let write = async { input.write_all(&copied).await.map_err(|_| anyhow::anyhow!("CLI stdin write failed"))?; input.shutdown().await.map_err(|_| anyhow::anyhow!("CLI stdin close failed")) };
+        let read_out = async { let mut bytes = Vec::new(); output.read_to_end(&mut bytes).await.map_err(|_| anyhow::anyhow!("CLI stdout read failed"))?; Ok(bytes) };
+        let read_err = async { let mut bytes = Vec::new(); errors.read_to_end(&mut bytes).await.map_err(|_| anyhow::anyhow!("CLI stderr read failed"))?; Ok(bytes) };
+        let (written, stdout, stderr, status) = tokio::try_join!(write, read_out, read_err, async { child.wait().await.map_err(|_| anyhow::anyhow!("child wait failed")) })?;
+        let _ = written;
+        Ok::<_, anyhow::Error>(Piped { status, stdout, stderr })
+    };
+    timeout(bound, finished).await.context("CLI timed out")?
+}
+fn verified_response(fixture: &Fixture, request: &GuardianSignRequest, stdout: &[u8], index: usize) -> anyhow::Result<GuardianSignResponse> {
+    let response = parse_canonical_json::<GuardianSignResponse>(&one_line(stdout)?).map_err(|_| anyhow::anyhow!("local signature response rejected"))?;
+    response.validate_context(request).map_err(|_| anyhow::anyhow!("local signature context rejected"))?;
+    bind_response(fixture, request, &response, index)?;
+    Ok(response)
+}
+fn bind_response(fixture: &Fixture, request: &GuardianSignRequest, response: &GuardianSignResponse, index: usize) -> anyhow::Result<()> {
+    let trace = request.decode_trace().map_err(|_| anyhow::anyhow!("prepared trace rejected"))?;
+    let (current, _) = policy_pair(fixture, request)?;
+    ensure!(psy_client_common::data::base_types::hash256::Hash256::from(trace.finalization.sig_hash).0 == response.message.0, "local response message differs from trace sighash");
+    ensure!(response.policy_commitment == current.commitment().map_err(|_| anyhow::anyhow!("current policy commitment rejected"))?, "local response is not the current policy");
+    let member = psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<GoldilocksField, plonky2::hash::poseidon::PoseidonPermutation<GoldilocksField>>(psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&response.public_key.0));
+    ensure!(usize::from(response.member_index) == index && current.member_hashes.get(index) == Some(&member), "local signer is not the claimed current member");
+    Ok(())
+}
+fn authorize_pair(fixture: &Fixture, request: &GuardianSignRequest, responses: &[&GuardianSignResponse; 2]) -> anyhow::Result<()> {
+    let trace = request.decode_trace().map_err(|_| anyhow::anyhow!("prepared trace rejected"))?;
+    let (current, _) = policy_pair(fixture, request)?;
+    let mut ordered = [responses[0].clone(), responses[1].clone()];
+    ordered.sort_by_key(|response| response.member_index);
+    let signatures = psy_vm::ups::multisig::MultisigSignatures { member_indices: ordered.iter().map(|response| response.member_index).collect(), signatures: ordered.iter().map(|response| psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature { public_key: response.public_key.0, signature: response.signature.0, message: psy_client_common::data::base_types::hash256::Hash256(response.message.0) }).collect() };
+    psy_prover::signature::users::multisig_user::validate_policy_signatures(&signatures, &current, trace.finalization.sig_hash).map_err(|_| anyhow::anyhow!("A+C do not authorize the current policy"))
+}
+fn policy_pair(fixture: &Fixture, request: &GuardianSignRequest) -> anyhow::Result<(psy_vm::ups::multisig::MultisigPolicy, psy_vm::ups::multisig::MultisigPolicy)> {
+    let trace = request.decode_trace().map_err(|_| anyhow::anyhow!("prepared trace rejected"))?;
+    let mut signs = trace.steps.iter().filter_map(|step| if let psy_prover::trace::TraceStep::ZkSign(sign) = step { Some(sign) } else { None });
+    let sign = signs.next().context("prepared policy witness missing")?;
+    ensure!(signs.next().is_none() && matches!(sign.sign_circuit_source, psy_prover::trace::TraceSignCircuitSource::Multisig), "prepared request is not one multisig transition");
+    let witness = parse_canonical_json::<psy_vm::ups::multisig::MultisigSignatureWitness>(&sign.sign_witness).map_err(|_| anyhow::anyhow!("prepared policy witness rejected"))?;
+    let account = fixture.config.initial_account().map_err(|_| anyhow::anyhow!("configured account rejected"))?;
+    ensure!(witness.account.initial_policy == account.initial_policy && witness.start_session_user_leaf.public_key == fixture.config.account_public_key().map_err(|_| anyhow::anyhow!("configured account rejected"))?, "prepared witness differs from configured account");
+    witness.policies().map_err(|_| anyhow::anyhow!("prepared current policy rejected"))
+}
+async fn assert_policy_refusal(sessions: &Sessions, index: usize, request: &[u8], request_id: &str) -> anyhow::Result<()> {
+    let (status, content_type, body) = sessions.post_record(index, request).await?;
+    ensure!(status == GuardianSignError::UnauthorizedCaller.http_status() && content_type == "application/json", "policy HTTP refusal was not an explicit JSON error");
+    let error = parse_canonical_json::<GuardianSignErrorResponse>(&body).map_err(|_| anyhow::anyhow!("policy HTTP error body rejected"))?;
+    ensure!(error.request_id.map(|id| format!("0x{}", hex::encode(id.0))).as_deref() == Some(request_id) && error.code == GuardianSignError::UnauthorizedCaller && !body.windows(9).any(|window| window == b"signature"), "policy HTTP response is not an exact refusal");
     Ok(())
 }
 async fn claimant_checkpoint(provider: &RpcProvider, fixture: &Fixture, operation: &Value, user: u64, expected_nonce: u64) -> anyhow::Result<u64> {
@@ -955,12 +1136,13 @@ fn withdrawal_key(record: &guardian_common::protocol::WithdrawalBurnRecord) -> g
 }
 
 fn withdrawal_leaf(record: &guardian_common::protocol::WithdrawalBurnRecord) -> guardian_common::protocol::Hash4 {
-    let mut fields = [GoldilocksField::ZERO; 34];
+    let mut fields = [GoldilocksField::ZERO; 35];
     fields[0] = GoldilocksField::from_canonical_u32(record.sender_user_id);
-    for (target, words) in fields[1..33].chunks_exact_mut(8).zip([record.recipient, record.token, record.amount, record.nonce]) {
+    for (target, words) in fields[1..34].chunks_exact_mut(8).zip([record.recipient, record.token, record.amount, record.nonce]) {
         for (field, word) in target.iter_mut().zip(words) { *field = GoldilocksField::from_canonical_u32(word); }
     }
     fields[33] = GoldilocksField::from_canonical_u8(record.destination_chain_index);
+    fields[34] = GoldilocksField::from_canonical_u32(record.token_contract_id);
     PsyHasher::q_hash_many(&fields)
 }
 
@@ -1038,9 +1220,18 @@ async fn verify_withdrawal_append(provider: &RpcProvider, fixture: &Fixture, ses
 
 async fn wait_indexed_claim(fixture: &Fixture, provider: &RpcProvider) -> anyhow::Result<()> {
     let deadline = Instant::now() + fixture.session;
-    let amount = format!("0x{:064x}", fixture.amount()?);
-    let nonce = format!("0x{}", hex::encode(hex32(&fixture.text("withdrawal_nonce")?)?));
-    let url = format!("{}/api/v1/bridge/withdrawal-claim-proof?recipient=0x{}&token_address=0x{}&amount={}&nonce={}&destination_chain_index={}&sender_user_id={}", fixture.flow.services_url.trim_end_matches('/'), hex::encode(left_pad20(&fixture.text("recipient")?)?), hex::encode(left_pad20(&fixture.text("token")?)?), amount, nonce, fixture.flow.l1.chain_index, fixture.claimant()?);
+    let leaf = withdrawal_leaf(&expected_burn(fixture)?);
+    let nullifier = leaf
+        .0
+        .elements
+        .iter()
+        .flat_map(|felt| {
+            let value = felt.to_canonical_u64();
+            [value as u32, (value >> 32) as u32]
+        })
+        .map(|word| format!("{word:08x}"))
+        .collect::<String>();
+    let url = format!("{}/api/v1/bridge/withdrawal-claim-proof?destination_chain_index={}&nullifier=0x{}", fixture.flow.services_url.trim_end_matches('/'), fixture.flow.l1.chain_index, nullifier);
     loop {
         if let Ok(response) = reqwest::Client::new().get(&url).send().await {
             if let Ok(value) = response.json::<Value>().await {
@@ -1148,7 +1339,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
         }
         "claim-withdrawal" => {
             let result = psy_user_cli::subcommand::claim_withdrawal::run(psy_user_cli::subcommand::args::ClaimWithdrawalArgs {
-                rpc_config: rpc.display().to_string(), services_url: fixture.flow.services_url.clone(), l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: l1.private_key_hex(), recipient: fixture.text("recipient")?, token_address: fixture.text("token")?, amount: amount.to_string(), nonce: fixture.text("withdrawal_nonce")?, destination_chain_index: u64::from(fixture.flow.l1.chain_index), sender_user_id: Some(claimant), prove_proxy_url: Some(fixture.flow.prove_proxy_url.clone()), prove_proxy_token: None,
+                rpc_config: rpc.display().to_string(), services_url: fixture.flow.services_url.clone(), l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: l1.private_key_hex(), recipient: fixture.text("recipient")?, token_address: fixture.text("token")?, amount: amount.to_string(), nonce: fixture.text("withdrawal_nonce")?, destination_chain_index: u64::from(fixture.flow.l1.chain_index), sender_user_id: claimant, token_contract_id: u64::from(fixture.flow.l2_contract_id), prove_proxy_url: Some(fixture.flow.prove_proxy_url.clone()), prove_proxy_token: None,
             }).await?;
             confirmed_claim(result)
         }

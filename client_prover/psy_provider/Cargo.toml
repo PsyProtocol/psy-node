@@ -35,6 +35,9 @@ rand = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 
+[dev-dependencies]
+psy_data = { workspace = true }
+
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }

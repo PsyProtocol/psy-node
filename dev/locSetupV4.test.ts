@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn, mock } from "bun:test";
+import { describe, expect, it, spyOn, mock, type Mock } from "bun:test";
 import path from "node:path";
 import fs from "node:fs";
 import * as childProcess from "node:child_process";
@@ -27,7 +27,7 @@ import {
     TRUST_SETUP_PART_BYTES,
     ANVIL_STATE_PATH,
     assertPreservedAnvilGenesis,
-
+    chmodTree,
     localAnvilLaunchArgs,
     isRepoAnvilProcess,
     runTeardownCommand,
@@ -48,6 +48,7 @@ import {
     LOCAL_DEVNET_ZK_FINGERPRINT,
     isUsableGenesisData,
     ensureGenesisFiles,
+    loadFreshGenesisFaucetOperators,
     planGenesisGeneration,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
@@ -106,8 +107,15 @@ import {
     DevNetProcessManager,
     shouldRequireGuardianRoot,
     prepareFreshDevnetState,
+    resolveRetainedResumeSelection,
+    assertRetainedDevnet,
+    resolveRetainedAnvilStatePlan,
+    assertRetainedDependencies,
+    psyContractsRoot,
+    psyDappRoot,
 } from "./locSetupV4";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
+import { retainedServicesDatabaseCommands, LEGACY_DEVNET_DB_NAMES, devnetDbVolumeNames } from "./locSetupPolicy";
 
 describe("psy_services database preservation", () => {
     it("leaves an existing database untouched without purge", () => {
@@ -746,6 +754,51 @@ describe("public-only Genesis generation", () => {
             expect(await Bun.file(`${dir}/genesis.json`).text()).toBe("invalid");
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
+describe("loadFreshGenesisFaucetOperators", () => {
+    it("replaces the pre-generation config with the freshly generated artifact", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "faucet-ops-fresh-"));
+        try {
+            await writeFile(
+                path.join(dir, "faucetOperators.json"),
+                JSON.stringify({ operators: [{ secretKey: "fresh-operator" }], faucetPerClaimAmount: "1" }),
+            );
+            const envVars = { PSY_FAUCET_OPERATORS_JSON: JSON.stringify({ operators: [{ secretKey: "stale-operator" }] }) };
+            loadFreshGenesisFaucetOperators(envVars, path.join(dir, "faucetOperators.json"), false);
+            expect(JSON.parse(envVars.PSY_FAUCET_OPERATORS_JSON)).toEqual({
+                operators: [{ secretKey: "fresh-operator" }],
+                faucetPerClaimAmount: "1000000000000",
+            });
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps explicit operator env config authoritative", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "faucet-ops-explicit-"));
+        try {
+            await writeFile(
+                path.join(dir, "faucetOperators.json"),
+                JSON.stringify({ operators: [{ secretKey: "fresh-operator" }], faucetPerClaimAmount: "1" }),
+            );
+            const envVars = { PSY_FAUCET_OPERATORS_JSON: JSON.stringify({ operators: [{ secretKey: "explicit-operator" }] }) };
+            loadFreshGenesisFaucetOperators(envVars, path.join(dir, "faucetOperators.json"), true);
+            expect(JSON.parse(envVars.PSY_FAUCET_OPERATORS_JSON).operators[0].secretKey).toBe("explicit-operator");
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("fails closed instead of falling back when the fresh artifact is unreadable", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "faucet-ops-missing-"));
+        try {
+            const envVars = { PSY_FAUCET_OPERATORS_JSON: JSON.stringify({ operators: [{ secretKey: "stale-operator" }] }) };
+            expect(() => loadFreshGenesisFaucetOperators(envVars, path.join(dir, "faucetOperators.json"), false)).toThrow();
+        } finally {
+            await rm(dir, { recursive: true, force: true });
         }
     });
 });
@@ -2559,14 +2612,14 @@ describe("purge Anvil ownership", () => {
             }
         });
     });
-    function teardownResult(overrides: Partial<{ code: number | null; timedOut: boolean; reaped: boolean; stdoutComplete: boolean }>) {
+    function teardownResult(overrides: Partial<{ code: number | null; timedOut: boolean; reaped: boolean; stdoutComplete: boolean; stdout: string }>) {
         return {
             argv0: "docker",
             code: overrides.code === undefined ? 0 : overrides.code,
             timedOut: overrides.timedOut ?? false,
             reaped: overrides.reaped ?? true,
             stderrCategory: "empty" as const,
-            stdout: "scylla-server",
+            stdout: overrides.stdout ?? "scylla-server",
             stdoutComplete: overrides.stdoutComplete ?? true,
         };
     }
@@ -2594,6 +2647,24 @@ describe("purge Anvil ownership", () => {
     it("fails when force-remove fails", async () => {
         const failures: string[] = [];
         await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => teardownResult(argv[1] === "rm" ? { code: 1, timedOut: false, reaped: true } : {}));
+        expect(failures.some((failure) => failure.startsWith("docker-rm"))).toBe(true);
+        expect(failures.some((failure) => failure.startsWith("docker-stop"))).toBe(false);
+    });
+
+    it("accepts a nonzero force-remove when post-state proves the owned names absent", async () => {
+        const calls: string[][] = [];
+        const failures: string[] = [];
+        await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => {
+            calls.push(argv);
+            return teardownResult(argv[1] === "rm" ? { code: 1 } : { stdout: "" });
+        });
+        expect(failures).toEqual([]);
+        expect(calls[2]).toEqual(["docker", "ps", "-a", "--format", "{{.Names}}"]);
+    });
+
+    it("fails closed when force-remove fails and the post-state snapshot is unusable", async () => {
+        const failures: string[] = [];
+        await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => teardownResult(argv[1] === "rm" || argv[1] === "ps" ? { code: 1 } : {}));
         expect(failures.some((failure) => failure.startsWith("docker-rm"))).toBe(true);
         expect(failures.some((failure) => failure.startsWith("docker-stop"))).toBe(false);
     });
@@ -2798,4 +2869,563 @@ describe("fresh helper ownership release", () => {
     }, 15_000);
 });
 
+describe("launcher permission normalization", () => {
+    it("strips only forbidden bits across both fresh-state passes and never touches a symlink target", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "chmod-tree-"));
+        try {
+            const outside = path.join(dir, "outside");
+            const tree = path.join(dir, "db");
+            await mkdir(path.join(outside, "sub"), { recursive: true });
+            await writeFile(path.join(outside, "sub", "inside.txt"), "entered target");
+            await writeFile(path.join(outside, "leaked.txt"), "external target");
+            await chmod(path.join(outside, "sub"), 0o777);
+            await chmod(path.join(outside, "sub", "inside.txt"), 0o777);
+            await chmod(path.join(outside, "leaked.txt"), 0o666);
+            await mkdir(path.join(tree, "guardians", "db"), { recursive: true });
+            await mkdir(path.join(tree, "public"));
+            await writeFile(path.join(tree, "guardians", "db", "guardian-1.redb"), "retained database");
+            await writeFile(path.join(tree, "public", "script"), "tool");
+            await chmod(path.join(tree, "guardians", "db"), 0o700);
+            await chmod(path.join(tree, "guardians", "db", "guardian-1.redb"), 0o600);
+            await chmod(path.join(tree, "public"), 0o775);
+            await chmod(path.join(tree, "public", "script"), 0o775);
+            await symlink(path.join(outside, "leaked.txt"), path.join(tree, "leaked.txt.link"));
+            await symlink(path.join(outside, "sub"), path.join(tree, "sub.link"));
+            for (let pass = 1; pass <= 2; pass++) {
+                await chmodTree(tree, 0o755, 0o644);
+                expect(statSync(path.join(tree, "guardians", "db")).mode & 0o777).toBe(0o700);
+                expect(statSync(path.join(tree, "guardians", "db", "guardian-1.redb")).mode & 0o777).toBe(0o600);
+                expect(statSync(path.join(tree, "public")).mode & 0o777).toBe(0o755);
+                expect(statSync(path.join(tree, "public", "script")).mode & 0o777).toBe(0o644);
+                expect(statSync(path.join(outside, "sub")).mode & 0o777).toBe(0o777);
+                expect(statSync(path.join(outside, "sub", "inside.txt")).mode & 0o777).toBe(0o777);
+                expect(statSync(path.join(outside, "leaked.txt")).mode & 0o777).toBe(0o666);
+                expect((await fs.promises.lstat(path.join(tree, "leaked.txt.link"))).isSymbolicLink()).toBe(true);
+                expect((await fs.promises.lstat(path.join(tree, "sub.link"))).isSymbolicLink()).toBe(true);
+            }
+            await expect(chmodTree(path.join(dir, "missing"), 0o755, 0o644)).rejects.toThrow();
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+});
 
+const retainedResumeInput = {
+    resume: true,
+    skipBridge: true,
+    all: true,
+    host: "127.0.0.1",
+    daemonlize: false,
+    purge: false,
+    teardown: false,
+    stage: "localhost",
+    l1Network: "localhost",
+    l1Fork: false,
+    genesisDataPath: "genesis.json",
+    coordinatorWorkersCount: 0,
+    workerRealmCount: 0,
+    proveProxyCount: 0 as number | undefined,
+    relayer: true,
+    bridgeProposerDaemon: true,
+    psyPrivacyBridge: true,
+};
+
+describe("retained resume selection", () => {
+    it("forces remote-only counts and drops custody while keeping the privacy UI", () => {
+        expect(resolveRetainedResumeSelection(retainedResumeInput)).toEqual({
+            resume: true,
+            skipBridge: true,
+            coordinatorWorkersCount: 0,
+            workerRealmCount: 0,
+            proveProxyCount: 0,
+            relayer: false,
+            bridgeProposerDaemon: false,
+            startBridgeCustody: false,
+            psyPrivacyBridge: true,
+        });
+    });
+
+    it("rejects LOCSETUP worker and proxy defaults before any count rewrite", () => {
+        for (const counts of [
+            { coordinatorWorkersCount: 2 },
+            { workerRealmCount: 1 },
+            { proveProxyCount: 1 as number | undefined },
+            { proveProxyCount: undefined },
+        ]) {
+            expect(() => resolveRetainedResumeSelection({ ...retainedResumeInput, ...counts }))
+                .toThrow("local worker or proxy count");
+        }
+    });
+
+    it("rejects skip-bridge and every conflicting selector before rewriting counts", () => {
+        expect(() => resolveRetainedResumeSelection({ ...retainedResumeInput, resume: false }))
+            .toThrow();
+        const conflicts = [
+            { skipBridge: false },
+            { all: false },
+            { host: "0.0.0.0" },
+            { daemonlize: true },
+            { purge: true },
+            { teardown: true },
+            { control: "restart" },
+            { stage: "testnet" },
+            { l1Network: "sepolia" },
+            { l1Fork: true },
+            { genesisDataPath: "custom-genesis.json" },
+        ];
+        for (const conflict of conflicts) {
+            expect(() => resolveRetainedResumeSelection({ ...retainedResumeInput, ...conflict })).toThrow();
+        }
+    });
+
+    it("leaves a non-resume selection unchanged and still starts custody for a full launch", () => {
+        const fresh = {
+            ...retainedResumeInput,
+            resume: false,
+            skipBridge: false,
+            coordinatorWorkersCount: 2,
+            workerRealmCount: 1,
+            proveProxyCount: 1 as number | undefined,
+        };
+        expect(resolveRetainedResumeSelection(fresh)).toEqual({
+            resume: false,
+            skipBridge: false,
+            coordinatorWorkersCount: 2,
+            workerRealmCount: 1,
+            proveProxyCount: 1,
+            relayer: true,
+            bridgeProposerDaemon: true,
+            startBridgeCustody: true,
+            psyPrivacyBridge: true,
+        });
+        expect(resolveRetainedResumeSelection({
+            ...fresh, all: false, relayer: false, bridgeProposerDaemon: false, psyPrivacyBridge: false,
+        }).startBridgeCustody).toBe(false);
+    });
+});
+
+describe("retained services database", () => {
+    it("issues no drop or create when the retained database already exists", () => {
+        expect(retainedServicesDatabaseCommands(true)).toEqual([]);
+        expect(retainedServicesDatabaseCommands(true, "generated-envio-postgres-1")).toEqual([]);
+    });
+
+    it("rejects a missing database instead of creating one", () => {
+        expect(() => retainedServicesDatabaseCommands(false)).toThrow("psy_services");
+    });
+});
+
+describe("retained Anvil snapshot", () => {
+    const header = {
+        number: "0x0",
+        parentHash: ZERO_HASH,
+        stateRoot: "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+        timestamp: "0x6acdc5de",
+        gasLimit: "0x1c9c380",
+    };
+
+    it("keeps the existing snapshot and pins its genesis timestamp", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-anvil-"));
+        const execFile = spyOn(childProcess, "execFile");
+        try {
+            await mkdir(path.join(dir, "db/anvil"), { recursive: true });
+            const statePath = path.join(dir, ANVIL_STATE_PATH);
+            await writeFile(statePath, "{\"blocks\":[{\"header\":{\"number\":\"0x0\"}}]}");
+            execFile.mockImplementation(((file: string, args: readonly string[], options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+                expect(file).toBe(path.resolve("target/release/psy_dev_cli"));
+                expect(args).toEqual(["inspect-anvil-state", "--state", statePath]);
+                callback(null, JSON.stringify({ timestamp: "1791956446", header }), "");
+                return {} as childProcess.ChildProcess;
+            }) as typeof childProcess.execFile);
+            const plan = await resolveRetainedAnvilStatePlan(dir, "localhost");
+            expect(plan).toEqual({
+                statePath,
+                hasState: true,
+                shouldResetEnvio: false,
+                genesis: { timestamp: "1791956446", header },
+            });
+            expect(localAnvilLaunchArgs(8545, "31337", plan.statePath, plan.genesis)).toEqual([
+                "anvil", "--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337",
+                "--state", statePath, "--state-interval", "900", "-vvvv", "--timestamp", "1791956446",
+            ]);
+            expect(await Bun.file(statePath).text()).toContain("\"blocks\"");
+        } finally {
+            execFile.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a missing snapshot and does not inspect or delete anything", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-anvil-missing-"));
+        const execFile = spyOn(childProcess, "execFile");
+        try {
+            await expect(resolveRetainedAnvilStatePlan(dir)).rejects.toThrow(ANVIL_STATE_PATH);
+            expect(execFile).not.toHaveBeenCalled();
+        } finally {
+            execFile.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a symlink snapshot before inspection", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-anvil-link-"));
+        const execFile = spyOn(childProcess, "execFile");
+        try {
+            const outside = path.join(dir, "outside.json");
+            await writeFile(outside, "{\"blocks\":[]}");
+            await mkdir(path.join(dir, "db/anvil"), { recursive: true });
+            await symlink(outside, path.join(dir, ANVIL_STATE_PATH));
+            await expect(resolveRetainedAnvilStatePlan(dir)).rejects.toThrow();
+            expect(execFile).not.toHaveBeenCalled();
+            expect(await Bun.file(outside).text()).toBe("{\"blocks\":[]}");
+        } finally {
+            execFile.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("retained devnet pre-spawn gate", () => {
+    const names = LEGACY_DEVNET_DB_NAMES;
+    const realmIds = [0, 1];
+    const edgeCount = 1;
+    const deploymentChains = [
+        ["localhost", 31337],
+        ["localhostBsc", 31338],
+        ["localhostBase", 31339],
+    ] as const;
+    const address = "0x1111111111111111111111111111111111111111";
+    const deployment = (chainId: number) => JSON.stringify({
+        chainId,
+        core: { Bridge: address, StateManager: address },
+    });
+    const validator = (realmId: number, subId: number) => ({
+        validator_user_id: reservedValidatorUserId(realmId, subId),
+        processor_node_id: `processor-${realmId}-${subId}`,
+        bls_public_key: `bls-${realmId}-${subId}`,
+        processor_addresses: [`/ip4/127.0.0.1/tcp/${realmP2pProcessorPort(realmId, subId)}/p2p/processor-peer-${realmId}-${subId}`],
+        edge_nodes: [{
+            node_id: `edge-${realmId}-${subId}`,
+            addresses: [`/ip4/127.0.0.1/tcp/${realmP2pEdgePort(realmId, subId, 0, edgeCount)}/p2p/edge-peer-${realmId}-${subId}`],
+        }],
+    });
+    const realmConfigs = realmIds.map((realmId) => ({
+        id: realmId,
+        rpc_url: [],
+        validators: [validator(realmId, 1), validator(realmId, 2)],
+    }));
+    const genesisText = JSON.stringify({
+        checkpoint_stats: { block_time: 1764248609 },
+        users: Array.from({ length: 16 }, () => ({ public_key_info: { fingerprint: LOCAL_DEVNET_ZK_FINGERPRINT } })),
+        validators: realmConfigs.flatMap((realm) => realm.validators.map((member) => ({
+            realm_id: realm.id,
+            validator_user_id: member.validator_user_id,
+            node_id: member.processor_node_id,
+            bls_public_key: member.bls_public_key,
+        }))),
+    });
+    const runtimeConfigText = JSON.stringify({
+        defaultNetwork: "localhost",
+        networks: {
+            localhost: {
+                ...structuredClone(allConfig.networks.localhost),
+                realm_configs: realmConfigs,
+            },
+        },
+    });
+    const retainedFiles = (dir: string) => [
+        path.join(dir, "genesis.json"),
+        path.join(dir, "db/anvil/state.json"),
+        path.join(dir, "db/anvil/localhostBsc/state.json"),
+        path.join(dir, "db/anvil/localhostBase/state.json"),
+        ...deploymentChains.map(([network]) => path.join(dir, "psy-contracts/deployments", network, "deployed-contracts.json")),
+        path.join(dir, "psy-genesis/config.json"),
+        path.join(dir, "local_checkpoints/realm_p2p/config.json"),
+        ...realmP2pSecretPaths(realmIds, edgeCount).map((relative) => path.join(dir, relative)),
+    ];
+    const contentFor = (dir: string, file: string) => {
+        if (file === path.join(dir, "genesis.json")) return genesisText;
+        if (file === path.join(dir, "psy-genesis/config.json") || file === path.join(dir, "local_checkpoints/realm_p2p/config.json")) return runtimeConfigText;
+        for (const [network, chainId] of deploymentChains) {
+            if (file === path.join(dir, "psy-contracts/deployments", network, "deployed-contracts.json")) return deployment(chainId);
+        }
+        return "{\"blocks\":[]}";
+    };
+
+    const writeRetainedTree = async (dir: string) => {
+        for (const file of retainedFiles(dir)) {
+            await mkdir(path.dirname(file), { recursive: true });
+            await writeFile(file, contentFor(dir, file));
+        }
+    };
+
+    const volumeCommand = (volume: string) => ["setsid", "--wait", "docker", "volume", "inspect", volume];
+
+    const mockVolumeInspects = (spawn: Mock<typeof Bun.spawn>, code: number) => {
+        const expected = [...devnetDbVolumeNames(names), names.envioDataVolume];
+        let index = 0;
+        spawn.mockImplementation(((argv: string[], options: { cwd?: string }) => {
+            expect(options.cwd).toBeUndefined();
+            expect(argv).toEqual(volumeCommand(expected[index] ?? ""));
+            index += 1;
+            const closed = () => new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
+            return { pid: 0, exited: Promise.resolve(code), stdout: closed(), stderr: closed() };
+        }) as unknown as typeof Bun.spawn);
+        return expected;
+    };
+
+    const gate = (dir: string) => assertRetainedDevnet(dir, names, realmIds, edgeCount, "127.0.0.1");
+
+    const stubAnvilInspect = () => spyOn(childProcess, "execFile").mockImplementation(((_file: string, _args: readonly string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+        callback(null, JSON.stringify({ timestamp: "1791956446", header: genesisHeader }), "");
+        return {} as childProcess.ChildProcess;
+    }) as typeof childProcess.execFile);
+
+    it("accepts parsed retained inputs and inspects volumes only after that", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-gate-"));
+        const spawn = spyOn(Bun, "spawn");
+        const inspect = stubAnvilInspect();
+        const writes = spyOn(fs.promises, "writeFile");
+        try {
+            await writeRetainedTree(dir);
+            writes.mockClear();
+            const expected = mockVolumeInspects(spawn, 0);
+            await gate(dir);
+            expect(inspect).toHaveBeenCalledTimes(3);
+            expect(spawn).toHaveBeenCalledTimes(expected.length);
+            expect(writes).not.toHaveBeenCalled();
+            expect(await Bun.file(path.join(dir, "genesis.json")).text()).toBe(genesisText);
+        } finally {
+            inspect.mockRestore();
+            writes.mockRestore();
+            spawn.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects each missing retained input before any volume inspect", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-gate-missing-"));
+        const spawn = spyOn(Bun, "spawn");
+        try {
+            await writeRetainedTree(dir);
+            for (const file of retainedFiles(dir)) {
+                const original = await Bun.file(file).text();
+                await rm(file);
+                await expect(gate(dir)).rejects.toThrow(file);
+                expect(spawn).not.toHaveBeenCalled();
+                await mkdir(path.dirname(file), { recursive: true });
+                await writeFile(file, original);
+            }
+        } finally {
+            spawn.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects invalid retained content before the first volume inspect", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-gate-invalid-"));
+        const spawn = spyOn(Bun, "spawn");
+        const inspect = stubAnvilInspect();
+        const cases: Array<[string, string]> = [
+            ["genesis.json", "retained"],
+            ["genesis.json", JSON.stringify({ checkpoint_stats: { block_time: 1764248609000 }, validators: [] })],
+            ["local_checkpoints/realm_p2p/config.json", "retained"],
+            ["psy-contracts/deployments/localhost/deployed-contracts.json", JSON.stringify({ chainId: 1, core: { Bridge: address, StateManager: address } })],
+            ["psy-contracts/deployments/localhostBsc/deployed-contracts.json", JSON.stringify({ chainId: 31337, core: { Bridge: address, StateManager: address } })],
+            ["psy-contracts/deployments/localhostBase/deployed-contracts.json", JSON.stringify({ chainId: 31339, core: { StateManager: address } })],
+        ];
+        try {
+            await writeRetainedTree(dir);
+            const before = await Promise.all(retainedFiles(dir).map(async (file) => [file, await Bun.file(file).text()] as const));
+            for (const [relative, invalid] of cases) {
+                const file = path.join(dir, relative);
+                const original = await Bun.file(file).text();
+                await writeFile(file, invalid);
+                await expect(gate(dir)).rejects.toThrow();
+                expect(spawn).not.toHaveBeenCalled();
+                await writeFile(file, original);
+                for (const [retained, text] of before) {
+                    if (retained !== file) expect(await Bun.file(retained).text()).toBe(text);
+                }
+            }
+            const genesis = JSON.parse(genesisText) as { validators: Array<{ bls_public_key: string }> };
+            genesis.validators[0].bls_public_key = "conflict";
+            await writeFile(path.join(dir, "genesis.json"), JSON.stringify(genesis));
+            await expect(gate(dir)).rejects.toThrow("validator membership");
+            expect(spawn).not.toHaveBeenCalled();
+        } finally {
+            inspect.mockRestore();
+            spawn.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a symlink and a failed volume inspect without rewriting the tree", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-gate-link-"));
+        const spawn = spyOn(Bun, "spawn");
+        const inspect = stubAnvilInspect();
+        try {
+            await writeRetainedTree(dir);
+            const genesis = path.join(dir, "genesis.json");
+            await rm(genesis);
+            await symlink(path.join(dir, "db/anvil/state.json"), genesis);
+            await expect(gate(dir)).rejects.toThrow(genesis);
+            expect(spawn).not.toHaveBeenCalled();
+            await rm(genesis);
+            await writeFile(genesis, genesisText);
+            mockVolumeInspects(spawn, 1);
+            await expect(gate(dir)).rejects.toThrow(devnetDbVolumeNames(names)[0]);
+            expect(await Bun.file(genesis).text()).toBe(genesisText);
+        } finally {
+            inspect.mockRestore();
+            spawn.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("retained dependency preflight", () => {
+    const generated = "psy_cli/psy_relayer_cli/indexer/envio/generated";
+    const vitePackage = "psy-dapp/node_modules/vite/package.json";
+    const viteExecutable = "psy-dapp/node_modules/vite/bin/vite.js";
+    const accountVite = "psy-dapp/apps/account/node_modules/vite/bin/vite.js";
+    const files = [
+        `${generated}/package.json`,
+        `${generated}/node_modules/.bin/ts-node`,
+        `${generated}/src/Index.res.js`,
+        vitePackage,
+        viteExecutable,
+        accountVite,
+    ];
+    const contentFor = (relative: string, proxyUrl: string) => {
+        if (relative.endsWith("/envio/generated/package.json")) return JSON.stringify({ scripts: { start: "ts-node src/Index.res.js" } });
+        if (relative === vitePackage) return JSON.stringify({ bin: { vite: "bin/vite.js" } });
+        if (relative.endsWith("config.json")) return JSON.stringify({ networks: { localhost: { prove_proxy_url: [proxyUrl] } } });
+        return "#!/usr/bin/env node\n";
+    };
+    const writeDependencies = async (dir: string, proxyUrl: string) => {
+        for (const relative of [...files, "psy-genesis/config.json"]) {
+            const file = path.join(dir, relative);
+            await mkdir(path.dirname(file), { recursive: true });
+            await writeFile(file, contentFor(relative, proxyUrl));
+        }
+        for (const app of ["bridge", "ide", "explorer"]) {
+            const appDir = path.join(dir, "psy-dapp", "apps", app);
+            await mkdir(path.join(appDir, "node_modules"), { recursive: true });
+            await writeFile(path.join(appDir, "package.json"), JSON.stringify({ dependencies: { vite: "1.0.0" } }));
+            await symlink(path.join(dir, "psy-dapp", "node_modules", "vite"), path.join(appDir, "node_modules", "vite"));
+        }
+    };
+    const proxyUrl = "http://127.0.0.1:9999";
+    const proxyRole = { role: "all", user_methods: true, system_methods: true };
+
+    it("accepts the frozen Envio command and resolved Vite entrypoints before the proxy role request", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-deps-"));
+        const writes = spyOn(fs.promises, "writeFile");
+        const requested: string[] = [];
+        try {
+            await writeDependencies(dir, proxyUrl);
+            writes.mockClear();
+            await assertRetainedDependencies(dir, async (url) => {
+                requested.push(url);
+                return proxyRole;
+            });
+            expect(requested).toEqual([proxyUrl]);
+            expect(writes).not.toHaveBeenCalled();
+            expect(await Bun.file(path.join(dir, viteExecutable)).text()).toBe("#!/usr/bin/env node\n");
+        } finally {
+            writes.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects an unresolved or non-file Vite entrypoint before the proxy role request", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-deps-missing-"));
+        const proxy = mock(async () => proxyRole);
+        try {
+            await writeDependencies(dir, proxyUrl);
+            for (const relative of [`${generated}/node_modules/.bin/ts-node`, `${generated}/src/Index.res.js`, accountVite]) {
+                const file = path.join(dir, relative);
+                const original = await Bun.file(file).text();
+                await rm(file);
+                await expect(assertRetainedDependencies(dir, proxy)).rejects.toThrow(Error);
+                expect(proxy).not.toHaveBeenCalled();
+                await mkdir(path.dirname(file), { recursive: true });
+                await writeFile(file, original);
+            }
+            const unresolved = await mkdtemp(path.join(tmpdir(), "retained-deps-unresolved-"));
+            try {
+                await writeDependencies(unresolved, proxyUrl);
+                const bridge = path.join(unresolved, "psy-dapp", "apps", "bridge");
+                await rm(path.join(unresolved, "psy-dapp", "node_modules", "vite"), { recursive: true, force: true });
+                await rm(path.join(bridge, "node_modules", "vite"), { force: true });
+                await expect(assertRetainedDependencies(unresolved, proxy)).rejects.toThrow(bridge);
+                expect(proxy).not.toHaveBeenCalled();
+            } finally {
+                await rm(unresolved, { recursive: true, force: true });
+            }
+            const executable = path.join(dir, viteExecutable);
+            await rm(executable);
+            await mkdir(executable, { recursive: true });
+            await expect(assertRetainedDependencies(dir, proxy)).rejects.toThrow(executable);
+            expect(proxy).not.toHaveBeenCalled();
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects an unavailable or partial proxy role without writing dependencies", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "retained-deps-proxy-"));
+        const writes = spyOn(fs.promises, "writeFile");
+        try {
+            await writeDependencies(dir, proxyUrl);
+            writes.mockClear();
+            const before = await Bun.file(path.join(dir, "psy-genesis/config.json")).text();
+            const envelope = { jsonrpc: "2.0", id: 1, result: proxyRole };
+            const responses = [
+                async () => undefined,
+                async () => ({ role: "user", user_methods: true, system_methods: true }),
+                async () => envelope,
+                async () => { throw new Error("closed"); },
+            ];
+            for (const proxyRequest of responses) {
+                await expect(assertRetainedDependencies(dir, proxyRequest)).rejects.toThrow("psy_get_prove_proxy_role");
+            }
+            expect(writes).not.toHaveBeenCalled();
+            expect(await Bun.file(path.join(dir, "psy-genesis/config.json")).text()).toBe(before);
+        } finally {
+            writes.mockRestore();
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+
+
+
+
+describe("psyContractsRoot / psyDappRoot sibling resolution", () => {
+    it("prefers a sibling checkout with package.json over the nested path", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "psy-sibling-"));
+        try {
+            const repo = path.join(base, "repo");
+            mkdirSync(path.join(base, "psy-contracts"), { recursive: true });
+            writeFileSync(path.join(base, "psy-contracts", "package.json"), "{}\n");
+            expect(psyContractsRoot(repo)).toBe(path.join(base, "psy-contracts"));
+            expect(psyDappRoot(repo)).toBe(path.join(repo, "psy-dapp"));
+        } finally {
+            rmSync(base, { recursive: true, force: true });
+        }
+    });
+
+    it("falls back to the nested checkout when no sibling exists", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "psy-sibling-"));
+        try {
+            const repo = path.join(base, "repo");
+            mkdirSync(path.join(repo, "psy-contracts"), { recursive: true });
+            writeFileSync(path.join(repo, "psy-contracts", "package.json"), "{}\n");
+            expect(psyContractsRoot(repo)).toBe(path.join(repo, "psy-contracts"));
+            expect(psyDappRoot(repo)).toBe(path.join(repo, "psy-dapp"));
+        } finally {
+            rmSync(base, { recursive: true, force: true });
+        }
+    });
+});

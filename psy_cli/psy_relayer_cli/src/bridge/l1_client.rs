@@ -469,14 +469,17 @@ async fn recorded_claim_tx<P: alloy_provider::Provider>(
 }
 
 /// Decode the batch a recorded claim transaction carried, once its hash is the
-/// one on record.
+/// one on record. Slots are resolved against `pending` — the same in-band
+/// records the hold was created from — so each row keeps its real contract id
+/// and leaf hash instead of any slot-derived guess.
 async fn recorded_claim_batch<P: alloy_provider::Provider>(
     provider: &P,
     tx_hash: alloy_primitives::B256,
+    pending: &[propose_withdrawals::PendingWithdrawal],
 ) -> anyhow::Result<(Vec<propose_withdrawals::PendingWithdrawal>, Vec<u8>)> {
     let transaction = provider.get_transaction_by_hash(tx_hash).await?.context("recorded claim transaction is missing")?;
     anyhow::ensure!(TransactionResponse::tx_hash(&transaction) == tx_hash, "fetched transaction hash does not match the recorded claim");
-    claim_withdrawals::recorded_claim_batch(ConsensusTransaction::input(&transaction))
+    claim_withdrawals::recorded_claim_batch(ConsensusTransaction::input(&transaction), pending)
 }
 
 fn held_pending(
@@ -603,7 +606,7 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
             );
             continue;
         }
-        let (batch, call_data) = match recorded_claim_batch(provider, tx_hash).await {
+        let (batch, call_data) = match recorded_claim_batch(provider, tx_hash, &group).await {
             Ok(decoded) => decoded,
             Err(error) => {
                 tracing::warn!(

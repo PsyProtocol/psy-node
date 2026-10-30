@@ -470,21 +470,25 @@ where
 
     pub async fn ensure_db_matches_coordinator_head(&self) -> anyhow::Result<()> {
         let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        self.ensure_db_matches_coordinator_checkpoint(coordinator_latest_checkpoint_id).await
+    }
+
+    pub async fn ensure_db_matches_coordinator_checkpoint(&self, checkpoint_id: u64) -> anyhow::Result<()> {
         let local_latest_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
-        
-        if coordinator_latest_checkpoint_id < local_latest_checkpoint_id {
+
+        if checkpoint_id < local_latest_checkpoint_id {
             anyhow::bail!("Local database checkpoint ID ({}) is ahead of coordinator ({}). Inconsistency detected.",
-                local_latest_checkpoint_id, coordinator_latest_checkpoint_id);
+                local_latest_checkpoint_id, checkpoint_id);
         }
 
         let coordinator_realm_root_state = self
             .coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.state.realm_id_u64)
+            .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, self.state.realm_id_u64)
             .await?;
             
         let local_realm_root_state = self
             .db
-            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(coordinator_latest_checkpoint_id, &self.realm_root_node)
+            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(checkpoint_id, &self.realm_root_node)
             .await?;
 
         if local_latest_checkpoint_id < coordinator_realm_root_state.checkpoint_id {
@@ -837,7 +841,7 @@ where
                 target_tip = reread_tip;
                 continue;
             }
-            self.ensure_db_matches_coordinator_head().await?;
+            self.ensure_db_matches_coordinator_checkpoint(target_tip).await?;
             break;
         }
         Ok(())
@@ -1471,7 +1475,7 @@ pub(crate) mod realm_db_test_env {
         FakeRealmCoordinatorClient,
     >;
 
-    pub(crate) const TEST_CHAIN_ID: u32 = 1;
+    pub(crate) const TEST_CHAIN_ID: u64 = 1;
     pub(crate) const TEST_REALM_ID: u64 = 1;
     pub(crate) const TEST_REALM_SUB_ID: u64 = 2;
     pub(crate) const TEST_BACKUP_PATH: &str = "realm_checkpoint_tree_backup.bin";
@@ -1537,7 +1541,7 @@ pub(crate) mod realm_db_test_env {
                     PHash::from_values(200 + i as u64, 0, 0, 0),
                 )
             })
-            .collect();
+        .collect();
         let users = (0..user_count).map(|i| genesis_user((i as u64 + 1) * 1_000)).collect();
         PsyGenesisBlockSetupData {
             contracts,
@@ -1545,7 +1549,7 @@ pub(crate) mod realm_db_test_env {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: PHash::from_values(4, 0, 0, 0),
             withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
-            validators: vec![],
+            validators: Vec::new(),
         }
     }
 
@@ -1554,7 +1558,7 @@ pub(crate) mod realm_db_test_env {
     ) -> anyhow::Result<PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<PF, PHash>> {
         GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_realm::<PoseidonHasher, N>(
             genesis_data,
-            u64::from(TEST_CHAIN_ID),
+            TEST_CHAIN_ID,
             TEST_REALM_ID,
             TEST_REALM_SUB_ID,
         )
@@ -1568,6 +1572,9 @@ pub(crate) mod realm_db_test_env {
         pub latest_checkpoint_id: Mutex<u64>,
         /// checkpoint leaf hashes by checkpoint id (index == checkpoint id)
         pub checkpoint_leaves: Mutex<Vec<PHash>>,
+        /// checkpoint-tree membership proofs by checkpoint id; tests that
+        /// drive commits past genesis seed these explicitly
+        pub checkpoint_tree_proofs: Mutex<HashMap<u64, MerkleProofCore<PHash>>>,
         pub realm_sync_infos: Mutex<HashMap<u64, PsyRealmCoordinatorUpdate<PF, PHash>>>,
         /// realm-root states keyed by the checkpoint that last modified them;
         /// a query at id resolves to the largest key <= id
@@ -1587,6 +1594,9 @@ pub(crate) mod realm_db_test_env {
         /// asks for the next checkpoint (drives the wait-loop deterministically)
         pub staged_leaves: Mutex<VecDeque<PHash>>,
         pub staged_sync_infos: Mutex<VecDeque<PsyRealmCoordinatorUpdate<PF, PHash>>>,
+        /// Runs once at the first realm-state query after a test arms it. Header
+        /// synchronization does not query realm state, so this is a post-sync boundary.
+        pub after_sync_realm_query: Mutex<Option<Box<dyn FnOnce(&Self, u64) + Send>>>,
     }
 
     impl FakeRealmCoordinatorClient {
@@ -1598,6 +1608,9 @@ pub(crate) mod realm_db_test_env {
         }
         pub(crate) fn push_checkpoint_leaf(&self, leaf: PHash) {
             self.checkpoint_leaves.lock().unwrap().push(leaf);
+        }
+        pub(crate) fn seed_checkpoint_tree_proof(&self, checkpoint_id: u64, proof: MerkleProofCore<PHash>) {
+            self.checkpoint_tree_proofs.lock().unwrap().insert(checkpoint_id, proof);
         }
         pub(crate) fn seed_realm_sync_info(&self, update: PsyRealmCoordinatorUpdate<PF, PHash>) {
             let id = update.checkpoint_sync_info.checkpoint_id;
@@ -1692,14 +1705,18 @@ pub(crate) mod realm_db_test_env {
             let end = (start + count as usize).min(leaves.len());
             Ok(leaves[start..end].to_vec())
         }
-        async fn rc_get_checkpoint_tree_merkle_proof(&self, _checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<PHash>> {
-            Ok(MerkleProofCore::default())
+        async fn rc_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<PHash>> {
+            Ok(self.checkpoint_tree_proofs.lock().unwrap().get(&checkpoint_id).cloned().unwrap_or_default())
         }
         async fn rc_get_realm_root_and_last_modified_checkpoint(
             &self,
             checkpoint_id: u64,
             _realm_id: u64,
         ) -> anyhow::Result<CheckpointedMerkleHash<PHash>> {
+            let hook = self.after_sync_realm_query.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self, checkpoint_id);
+            }
             Ok(self.realm_root_at(checkpoint_id))
         }
         async fn rc_submit_guta_proof(
@@ -1743,6 +1760,10 @@ pub(crate) mod realm_db_test_env {
 
     impl RealmDbTestEnv {
         pub(crate) async fn create() -> anyhow::Result<Self> {
+            Self::create_with_genesis_data(genesis_setup_data(1, 4)).await
+        }
+
+        pub(crate) async fn create_with_genesis_data(genesis_data: PsyGenesisBlockSetupData<PF, PHash>) -> anyhow::Result<Self> {
             let db = Arc::new(create_test_unified_db().await?);
             let tag_tree_rewards_store = Arc::clone(&db);
             let temp_db = Arc::new(InMemoryTempStore::new("realm_proc_test".to_string(), 1, 2));
@@ -1750,7 +1771,6 @@ pub(crate) mod realm_db_test_env {
             let guta_queue = Arc::new(FakeEphemeralQueueSubscriber::new());
             let proof_queue = Arc::new(FakeWorkerQueue::new());
             let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
-            let genesis_data = genesis_setup_data(1, 4);
             let genesis = build_realm_genesis(&genesis_data)?;
             let proposal_backup_dir = tempfile::tempdir()?;
             let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
@@ -2153,8 +2173,9 @@ mod init_tests {
         assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
 
         let mut tree = load_global_user_tree(&env).await?;
+        let proposal_backup = crate::realm::processor::proposal_backup::ProposalBackup::open(std::env::temp_dir().join(format!("init_restore_ok_{}", std::process::id()))).await?;
         env.processor
-            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &env.proposal_backup, None)
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &proposal_backup, None)
             .await?;
 
         // the unchanged checkpoint was skipped: nothing was committed locally
@@ -2175,11 +2196,11 @@ mod init_tests {
         let update = env.make_checkpoint_one_update();
         env.seed_checkpoint_one(update, changed_root);
         assert_eq!(env.check_state().await?, DatabaseCheckState::NeedsRecovery);
-
+        let proposal_backup = crate::realm::processor::proposal_backup::ProposalBackup::open(std::env::temp_dir().join(format!("init_restore_fail_{}", std::process::id()))).await?;
         let mut tree = load_global_user_tree(&env).await?;
         let err = match env
             .processor
-            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &env.proposal_backup, None)
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &proposal_backup, None)
             .await
         {
             Err(err) => err,
@@ -2203,8 +2224,9 @@ mod init_tests {
         assert_eq!(env.check_state().await?, DatabaseCheckState::Ready);
 
         let mut tree = load_global_user_tree(&env).await?;
+        let proposal_backup = crate::realm::processor::proposal_backup::ProposalBackup::open(std::env::temp_dir().join(format!("init_with_setup_{}", std::process::id()))).await?;
         env.processor
-            .init_with_setup_and_genesis(&env.file_system, TEST_GUTA_BACKUP_DIR, env.genesis.clone(), &mut tree, &env.proposal_backup, None)
+            .init_with_setup_and_genesis(&env.file_system, TEST_GUTA_BACKUP_DIR, env.genesis.clone(), &mut tree, &proposal_backup, None)
             .await?;
 
         let state = &env.processor.state;

@@ -1211,6 +1211,52 @@ impl RGPTestResultValidator {
     }
 }
 #[tokio::test]
+async fn finalizer_upgrades_checkpoint_without_replacing_intake_graph() -> anyhow::Result<()> {
+    use psy_data::proof_input::guta::VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple;
+    let mut state = RGPTestChainState::create_for_tests().await?;
+    let intake_root = state.checkpoint_tree_root;
+    let mut planner = RealmGUTAPlanner::new(state.chain_id, state.realm_identifier,
+        intake_root, state.checkpoint_id, state.unique_pending_id,
+        state.first_realm_global_user_tree.get_root(), N::REALM_GLOBAL_USER_TREE_HEIGHT,
+        N::GLOBAL_USER_TREE_HEIGHT, state.guta_circuit_whitelist);
+    state.checkpoint_id += 1;
+    state.append_finalizer_checkpoint()?;
+    planner = state.configure_validator_proofs(planner)?;
+    let user = RGPUser::new(0, Hash::from_u64x4([301, 302, 303, 304]));
+    planner.end_cap_straggler = Some(PsyRealmUserUpdateQueueItem {
+        job_id: QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            user.user_id, N::GLOBAL_USER_TREE_HEIGHT, state.unique_pending_id)?, submission_nonce: 0,
+        old_user_leaf_hash: state.first_realm_global_user_tree.get_leaf(0).value,
+        new_user_leaf_hash: user.user_leaf.qfhash::<Hasher>(),
+        events: vec![], new_user_leaf: user.user_leaf, stats: GUTAStats::get_zero_value(),
+    });
+    planner.total_end_caps_processed = 1;
+    let output = planner.finalize_with_reward_ids(&state.checkpoint_tree,
+        &mut state.first_realm_global_user_tree, state.temp_db.clone(), 0, 0).await?.unwrap();
+    assert_eq!(planner.current_checkpoint_id, 0, "intake checkpoint remains immutable");
+    assert_eq!(output.job_ids.len(), 3);
+    let intake = &output.job_ids[0][0];
+    let upgrade = &output.job_ids[1][0];
+    let finalizer = &output.job_ids[2][0];
+    assert_eq!(upgrade.job_id.circuit_type, ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade);
+    assert_eq!(upgrade.metadata.dependencies, vec![intake.job_id]);
+    assert_eq!(finalizer.metadata.dependencies, vec![upgrade.job_id]);
+    let intake_bytes = state.temp_db.get_tdb_proof_witness_bytes(&state.realm_identifier,
+        state.unique_pending_id, intake.job_id).await?;
+    let intake_witness = VerifySingleEndCapInputV2::<F, Hash>::psy_ser_from_slice(&intake_bytes)?;
+    assert_eq!(intake_witness.core.checkpoint_historical_merkle_proof.root, intake_root);
+    let upgrade_bytes = state.temp_db.get_tdb_proof_witness_bytes(&state.realm_identifier,
+        state.unique_pending_id, upgrade.job_id).await?;
+    let upgrade_witness = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple::<F, Hash>::psy_ser_from_slice(&upgrade_bytes)?;
+    assert!(upgrade_witness.top_line_siblings.is_empty());
+    assert_eq!(upgrade_witness.guta_proof_header.checkpoint_tree_root, intake_root);
+    assert_eq!(upgrade_witness.historical_checkpoint_proof.root, state.checkpoint_tree_root);
+    assert!(upgrade_witness.historical_checkpoint_proof.verify::<Hasher>());
+    assert_eq!(output.db_output.guta_header.header.checkpoint_tree_root, state.checkpoint_tree_root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rgp_chain_state_basic() -> anyhow::Result<()> {
     cf_utils::logging::setup_logging()?;
     let guta_circuit_whitelist = Hash::from_u64x4([1337, 69, 420, 9696]);
@@ -1579,6 +1625,52 @@ mod realm_gatherer_fixture_tests {
         Ok(())
     }
 
+
+    #[tokio::test]
+    async fn successful_seal_publishes_next_cycle_baseline_before_inclusion() -> anyhow::Result<()> {
+        let (config, mut tree, status, _fs) = build_real_gatherer_fixture(false).await?;
+        let start_root = tree.get_root();
+        let mut gatherer = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config.clone()).await?;
+        let user = RGPUser::new(0, Hash::from_u64x4([201, 202, 203, 204]));
+        gatherer.guta_planner.end_cap_straggler = Some(PsyRealmUserUpdateQueueItem {
+            job_id: QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+                user.user_id, N::GLOBAL_USER_TREE_HEIGHT, gatherer.guta_planner.unique_pending_id)?, submission_nonce: 0,
+            old_user_leaf_hash: tree.get_leaf(0).value,
+            new_user_leaf_hash: user.user_leaf.qfhash::<Hasher>(),
+            events: vec![], new_user_leaf: user.user_leaf, stats: GUTAStats::get_zero_value(),
+        });
+        gatherer.guta_planner.total_end_caps_processed = 1;
+        let output = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::finalize_with_tree(
+            gatherer, &mut tree).await?;
+        let sealed_root = output.db_output.new_realm_root;
+        assert_ne!(sealed_root, start_root);
+        assert_eq!(tree.get_root(), sealed_root);
+        assert_eq!(tree.get_last_commit_root(), sealed_root);
+        {
+            let shared = status.read().unwrap();
+            assert_eq!(shared.gathering_realm_start_root, sealed_root);
+            assert_eq!(shared.processing_realm_end_root, sealed_root);
+            assert_eq!(shared.last_committed_realm_end_root, start_root);
+        }
+        let next = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(1u128), config).await?;
+        assert_eq!(next.start_global_user_tree_root, sealed_root);
+        assert!(next.guta_planner.validator_proofs.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_status_that_does_not_authenticate_owned_start() -> anyhow::Result<()> {
+        let (config, mut tree, status, _fs) = build_real_gatherer_fixture(false).await?;
+        let gatherer = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::create_new_with_tree(
+            &mut tree, QCoreProcCheckpointUniqueId::from(0u128), config).await?;
+        status.write().unwrap().gathering_realm_start_root = Hash::from_u64x4([901, 902, 903, 904]);
+        let error = <FixtureGatherer as QueueGathererItemBuilderWithTree<FixtureConfig, RecTree>>::finalize_with_tree(
+            gatherer, &mut tree).await.err().expect("mismatched cycle must fail closed");
+        assert!(error.to_string().contains("does not authenticate cycle start"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn real_gatherer_create_authenticates_persisted_checkpoint() -> anyhow::Result<()> {

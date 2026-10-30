@@ -321,7 +321,8 @@ impl<
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id(), unique_pending_id))
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id(),
+                if id.circuit_type == ProvingJobCircuitType::UserEndCap { id.goal_id } else { unique_pending_id }))
             .collect::<Vec<_>>()
             .into_iter();
         timer.lap_micros("collect get_proof_bytes_by_job_id futures");
@@ -747,9 +748,9 @@ mod tests {
         psy_core_db::traits::full::PsyNodeCoreDatabaseUserStoreWriter,
         psy_temp_db::{
             QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore,
-            QTempDBPendingIdWriter, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader,
-            QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter,
-            QTempDBWorkerReputationWriter,
+            QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessWriter,
+            QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader,
+            QTempDBRewardsTreeWriter, QTempDBWorkerReputationWriter,
         },
         store::traits::proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
     };
@@ -875,6 +876,11 @@ mod tests {
 
         // fresh pending counters read back at zero
         assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
+        let gathering = env.temp_db.get_gathering_generation(&handler.realm_identifier).await?;
+        assert_eq!(
+            (gathering.unique_pending_id, gathering.proc_checkpoint_unique_id),
+            (0, 0)
+        );
 
         assert!(!handler.has_job_id_already_been_submitted(0, job_id).await?);
         // the dedicated status probe always reports not-submitted
@@ -960,6 +966,27 @@ mod tests {
             .await
             .expect_err("missing dependency proof must fail");
         assert!(err.to_string().contains("missing child proof for job id"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_end_cap_reads_original_pending_proof() -> anyhow::Result<()> {
+        let env = standard_env().await?;
+        let handler = &env.handler;
+        let wallet = TestWallet::new()?;
+        let (signature, request) = wallet.submit_request()?;
+        env.temp_db.set_worker_reputation(&handler.realm_identifier, &wallet.public_key(), 5).await?;
+        let dependency = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(REALM_USER_ID, 32, 41)?;
+        let mut metadata = dep_metadata(dependency);
+        metadata.reward_tree_hash_mode = PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN;
+        let item = PsyProvingJobMetadataWithJobId { job_id: test_job_id(413), metadata };
+        env.temp_db.set_tdb_proof_witnesses_tuple_owned_raw(&handler.realm_identifier, 0,
+            vec![(item.job_id.get_input_witness_id(), vec![7; 24])]).await?;
+        env.temp_db.put_proof_bytes_for_job_id(dependency.get_output_id(), 41, &[8; 40]).await?;
+        env.temp_db.put_proof_bytes_for_job_id(dependency.get_output_id(), 0, &[9; 40]).await?;
+        env.work_queue.add_items(vec![item.encode_queue_item_vec()?]);
+        let response = handler.get_proving_work_with_child_proofs_internal(signature, request).await?;
+        assert_eq!(response.input_proofs, vec![vec![8; 40]]);
         Ok(())
     }
 

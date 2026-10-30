@@ -88,6 +88,22 @@ remove_stopped_owned_containers() {
     done
 }
 
+SCYLLA_IO_PROPERTIES="${SCYLLA_IO_PROPERTIES:-}"
+if [ -n "$SCYLLA_IO_PROPERTIES" ]; then
+    if [ -L "$SCYLLA_IO_PROPERTIES" ] || [ ! -f "$SCYLLA_IO_PROPERTIES" ]; then
+        echo "[SYSTEM] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file." >&2
+        exit 2
+    fi
+    if ! SCYLLA_IO_PROPERTIES="$(realpath -e -- "$SCYLLA_IO_PROPERTIES")"; then
+        echo "[SYSTEM] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file." >&2
+        exit 2
+    fi
+    if [[ "$SCYLLA_IO_PROPERTIES" == *:* ]]; then
+        echo "[SYSTEM] SCYLLA_IO_PROPERTIES absolute path must not contain ':'." >&2
+        exit 2
+    fi
+fi
+
 if [ "$FRESH" != "true" ]; then
     stop_owned_containers
     remove_stopped_owned_containers
@@ -215,6 +231,7 @@ SCYLLA_CPUSET="${SCYLLA_CPUSET:-}"
 SCYLLA_MEMORY="${SCYLLA_MEMORY:-8G}"
 SCYLLA_CAS_CONTENTION_TIMEOUT_MS="${SCYLLA_CAS_CONTENTION_TIMEOUT_MS:-10000}"
 SCYLLA_WRITE_REQUEST_TIMEOUT_MS="${SCYLLA_WRITE_REQUEST_TIMEOUT_MS:-10000}"
+SCYLLA_IMAGE="scylladb/scylla@sha256:43a600f5291e55f1239dd94680c95d2b8a8be11bc0d73ced062031c978c155ca"
 
 for integer_setting in SCYLLA_SMP SCYLLA_CAS_CONTENTION_TIMEOUT_MS SCYLLA_WRITE_REQUEST_TIMEOUT_MS; do
     if ! [[ "${!integer_setting}" =~ ^[1-9][0-9]*$ ]]; then
@@ -224,7 +241,7 @@ for integer_setting in SCYLLA_SMP SCYLLA_CAS_CONTENTION_TIMEOUT_MS SCYLLA_WRITE_
 done
 
 echo "[SYSTEM] ScyllaDB Commitlog Config: sync=$COMMITLOG_SYNC, batch_window=${COMMITLOG_BATCH_WINDOW}ms, period=${COMMITLOG_PERIOD}ms"
-echo "[SYSTEM] ScyllaDB Runtime Config: smp=$SCYLLA_SMP, cpuset=${SCYLLA_CPUSET:-shared}, memory=$SCYLLA_MEMORY, cas_timeout=${SCYLLA_CAS_CONTENTION_TIMEOUT_MS}ms, write_timeout=${SCYLLA_WRITE_REQUEST_TIMEOUT_MS}ms"
+echo "[SYSTEM] ScyllaDB Runtime Config: smp=$SCYLLA_SMP, cpuset=${SCYLLA_CPUSET:-shared}, memory=$SCYLLA_MEMORY, cas_timeout=${SCYLLA_CAS_CONTENTION_TIMEOUT_MS}ms, write_timeout=${SCYLLA_WRITE_REQUEST_TIMEOUT_MS}ms, io_properties=${SCYLLA_IO_PROPERTIES:-unset}"
 
 SCYLLA_VOLUME_ARGS=()
 if [ "$PERSIST" = "true" ]; then
@@ -250,13 +267,17 @@ else
     SCYLLA_RUNTIME_ARGS+=(--overprovisioned 1)
 fi
 SCYLLA_RUNTIME_ARGS+=(--memory "$SCYLLA_MEMORY")
+if [ -n "$SCYLLA_IO_PROPERTIES" ]; then
+    SCYLLA_VOLUME_ARGS+=(-v "$SCYLLA_IO_PROPERTIES:/etc/scylla.d/io_properties.yaml:ro")
+    SCYLLA_RUNTIME_ARGS+=(--io-properties-file /etc/scylla.d/io_properties.yaml)
+fi
 
 docker run --rm --name "$SCYLLA_NAME" \
     --cap-add=PERFMON \
     -p 9042:9042 \
     "${SCYLLA_DOCKER_RESOURCE_ARGS[@]}" \
     "${SCYLLA_VOLUME_ARGS[@]}" \
-    scylladb/scylla:latest \
+    "$SCYLLA_IMAGE" \
     "${SCYLLA_RUNTIME_ARGS[@]}" 2>&1 \
     | tee "$SCYLLA_LOGS" \
     | sed -u 's/^/[SCYLLA] /' &
@@ -302,7 +323,8 @@ docker run --rm --name "$NOSTR_NAME" \
     "${RUNTIME_DOCKER_RESOURCE_ARGS[@]}" \
     -v "$NOSTR_DATA_DIR:/usr/src/app/db" \
     -v "$PARENT_DIR/logs/nostr_config.toml:/usr/src/app/config.toml" \
-    scsibug/nostr-rs-relay:latest 2>&1 \
+    scsibug/nostr-rs-relay:latest \
+    sh -c 'exec ./nostr-rs-relay --db "$APP_DATA"' 2>&1 \
     | tee "$NOSTR_LOGS" \
     | sed -u 's/^/[NOSTR]  /' &
 NOSTR_PID=$!

@@ -32,13 +32,13 @@ pub enum Commands {
         #[arg(long = "config", help = "Path to config.yaml/config.json file")]
         config: Option<String>,
 
-        #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
+        #[arg(long = "private-key", env = "PRIVATE_KEY", hide_env_values = true, help = "Private key hex string")]
         private_key: Option<String>,
 
         #[arg(long = "keystore-path", env = "KEYSTORE_PATH", help = "Path to wallet keystore file")]
         keystore_path: Option<String>,
 
-        #[arg(long = "wallet-password", env = "WALLET_PASSWORD", help = "Wallet password")]
+        #[arg(long = "wallet-password", env = "WALLET_PASSWORD", hide_env_values = true, help = "Wallet password")]
         wallet_password: Option<String>,
 
         #[arg(long = "user", help = "The user id which receives mining rewards")]
@@ -76,13 +76,13 @@ pub enum Commands {
         #[arg(long = "config", default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
         config: String,
 
-        #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
+        #[arg(long = "private-key", env = "PRIVATE_KEY", hide_env_values = true, help = "Private key hex string")]
         private_key: Option<String>,
 
         #[arg(long = "keystore-path", env = "KEYSTORE_PATH", help = "Path to wallet keystore file")]
         keystore_path: Option<String>,
 
-        #[arg(long = "wallet-password", env = "WALLET_PASSWORD", help = "Wallet password")]
+        #[arg(long = "wallet-password", env = "WALLET_PASSWORD", hide_env_values = true, help = "Wallet password")]
         wallet_password: Option<String>,
 
         #[arg(long = "user", help = "The user id which receives mining rewards")]
@@ -139,7 +139,7 @@ pub enum Commands {
     GenerateKeypair,
     #[command(about = "Get the public key from a given private key")]
     GetPublicKey {
-        #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
+        #[arg(long = "private-key", env = "PRIVATE_KEY", hide_env_values = true, help = "Private key hex string")]
         private_key: String,
     },
 
@@ -151,7 +151,7 @@ pub enum Commands {
         #[arg(long = "public-key", help = "Worker compressed public key as hex (33 bytes = 66 hex chars)")]
         public_key: String,
 
-        #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
+        #[arg(long = "private-key", env = "PRIVATE_KEY", hide_env_values = true, help = "Private key hex string")]
         private_key: Option<String>,
     },
 

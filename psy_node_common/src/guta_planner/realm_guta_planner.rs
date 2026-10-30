@@ -22,7 +22,7 @@ use psy_data::{
     },
     proof_input::guta::{
         GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput,
-        VerifyEndCapSimpleStandardInput, VerifySingleEndCapInputV2,
+        VerifyEndCapSimpleStandardInput, VerifySingleEndCapInputV2, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple,
     },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
@@ -33,7 +33,7 @@ use psy_data::{
     worker::{
         metadata::{
             PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
-            PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
@@ -900,14 +900,50 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>,
     >(
         &mut self,
+        checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
         temp_store: Arc<TempStore>,
-        root_header: GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
+        mut root_header: GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
     ) -> anyhow::Result<(GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>, bool)> {
         let proofs = self
             .validator_proofs
             .clone()
             .ok_or_else(|| anyhow::anyhow!("RealmGUTAValidatorProofs is required to append RealmFinalizeGUTA"))?;
+        let finalization_checkpoint_id = proofs.checkpoint_tree_proof.index;
+        if root_header.header.checkpoint_tree_root != proofs.checkpoint_tree_proof.root {
+            let input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple {
+                guta_proof_header: root_header.header,
+                top_line_siblings: Vec::new(),
+                historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(
+                    root_header.header.checkpoint_tree_root, finalization_checkpoint_id)?,
+                total_aggregation_proofs_generated: root_header.header.total_aggregation_proofs_generated,
+            };
+            anyhow::ensure!(input.historical_checkpoint_proof.root == proofs.checkpoint_tree_proof.root,
+                "checkpoint upgrade does not reach authenticated finalization root");
+            let level = self.planned_jobs.iter().rposition(|jobs| !jobs.is_empty())
+                .map(|level| level + 1).unwrap_or(0);
+            anyhow::ensure!(level + 1 < MAX_REALM_PROVING_LEVELS,
+                "checkpoint upgrade and finalizer exceed planner capacity");
+            let job_id = QProvingJobDataID::new_proof_job_id(self.unique_pending_id, 0,
+                ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade, level as u32, 0);
+            let header = input.get_new_guta_header::<Hasher>();
+            temp_store.set_tdb_proof_witnesses_tuple_owned_raw(&self.realm_identifier,
+                self.unique_pending_id, vec![(job_id, input.psy_ser_into_bytes_vec()?)]).await?;
+            self.job_level_map.insert(job_id, (level, 0));
+            self.planned_jobs[level].push(PsyProvingJobMetadataWithJobId {
+                job_id,
+                metadata: PsyProvingJobMetadata {
+                    expected_public_inputs_hash: header.qfhash::<Hasher>(),
+                    reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
+                    reward_tree_node_index: 0,
+                    reward_tree_node_level: 0,
+                    reward_tree_node_children: 1,
+                    dependencies: vec![root_header.job_id],
+                },
+            });
+            self.total_jobs += 1;
+            root_header = GlobalUserTreeAggregatorHeaderWithJobId { header, job_id };
+        }
         let current_validator_user_leaf = self
             .current_validator_user_leaf
             .clone()
@@ -966,7 +1002,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let new_last_checkpoint_id = if fee == 0 {
             current_validator_user_leaf.last_checkpoint_id
         } else {
-            F::from_u64_value(self.current_checkpoint_id)
+            F::from_u64_value(finalization_checkpoint_id)
         };
         let new_user_leaf = PQEDUserLeaf {
             public_key: current_validator_user_leaf.public_key,
@@ -1004,7 +1040,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let root_guta_header_hash = root_header.header.qfhash::<Hasher>();
         let action = RealmFinalizeGUTAAction {
             chain_domain,
-            checkpoint_id: F::from_u64_value(self.current_checkpoint_id),
+            checkpoint_id: F::from_u64_value(finalization_checkpoint_id),
             realm_id: F::from_u64_value(self.realm_id_u64),
             checkpoint_tree_root: root_header.header.checkpoint_tree_root,
             validator_tree_root: proofs.checkpoint_leaf.global_state_roots.validator_tree_root,
@@ -1024,7 +1060,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
         let finalizer_expected_pi = final_guta_header.qfhash::<Hasher>();
 
-        let finalizer_job_id = QProvingJobDataID::realm_finalize_guta(self.current_checkpoint_id, self.realm_id_u64 as u32);
+        let finalizer_job_id = QProvingJobDataID::realm_finalize_guta(finalization_checkpoint_id, self.realm_id_u64 as u32);
         // root_guta_whitelist_proof is ignored by the circuit prove path (library fills it).
         // Keep a serializable empty proof for the witness shape.
         let finalizer_input = RealmFinalizeGUTAInput {
@@ -1035,7 +1071,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 index: 0,
                 siblings: vec![],
             },
-            checkpoint_id: F::from_u64_value(self.current_checkpoint_id),
+            checkpoint_id: F::from_u64_value(finalization_checkpoint_id),
             realm_sub_id: self.realm_sub_id_u64 as u16,
             anchor_checkpoint_leaf: proofs.anchor_checkpoint_leaf,
             anchor_checkpoint_tree_proof: proofs.anchor_checkpoint_tree_proof,
@@ -1197,7 +1233,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.job_level_map.insert(job_id, (0, self.planned_jobs[0].len()));
                 self.planned_jobs[0].push(job);
                 let root_header = self
-                    .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), new_guta_header)
+                    .append_realm_finalize_guta::<Hasher, TempStore>(checkpoint_tree, global_user_tree, temp_store.clone(), new_guta_header)
                     .await?
                     .0;
                 self.update_reward_tree_config(&root_header.job_id, reward_tree_root_level, reward_tree_root_index)?;
@@ -1229,7 +1265,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             // this is the root
             let straggler = self.job_stragglers[level].take().unwrap();
             let root_header = self
-                .append_realm_finalize_guta::<Hasher, TempStore>(global_user_tree, temp_store.clone(), straggler)
+                .append_realm_finalize_guta::<Hasher, TempStore>(checkpoint_tree, global_user_tree, temp_store.clone(), straggler)
                 .await?
                 .0;
             self.update_reward_tree_config(&root_header.job_id, reward_tree_root_level, reward_tree_root_index)?;

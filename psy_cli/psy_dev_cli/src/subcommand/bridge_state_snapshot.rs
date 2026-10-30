@@ -428,7 +428,7 @@ async fn authenticate_archive_source(coordinator: &Store, realm: &Store, config:
 
 async fn authenticate_membership(store: &Store, coordinator: &Store, target: u64, burn: &WithdrawalBurnRecord, checkpoint: u64, committed: Hash4) -> anyhow::Result<()> {
     ensure!(matches!(burn.token_contract_id, TOKEN_CONTRACT | USDT_CONTRACT), "burn token contract is not a token contract");
-    burn.amount_u64().map_err(|error| anyhow::anyhow!("burn amount is not canonical: {error:?}"))?;
+    burn.validate_amount().map_err(|error| anyhow::anyhow!("burn amount is not canonical: {error:?}"))?;
     let sender = authenticate_user(store, target, checkpoint, u64::from(burn.sender_user_id), committed).await?;
     let key = withdrawal_key(burn)?;
     let index = store.contract_state_imt_get_leaf_index_for_key(checkpoint, u64::from(burn.sender_user_id), u64::from(burn.token_contract_id), &node_hash(key)?).await?.context("withdrawal key is absent")?;

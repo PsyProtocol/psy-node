@@ -131,8 +131,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderB32<F, D>
     /// Important! This function is unsafe!
     /// It fails for 3+ inputs all set to 0xffffffff
     ///
-    /// More generally, it fails if the sum of the three interleaved inputs for a given iteration exceeds the Goldilocks field characteristic.
-    /// In these cases, the sum gets reduced mod the field order and will produce.
+    /// More generally, it fails if the sum of the three interleaved inputs for
+    /// a given iteration exceeds the Goldilocks field characteristic. Since
+    /// the uninterleave gate rejects any slot holding both bits, a fold where
+    /// three or more of the inputs share a 1-bit at any position is also
+    /// unprovable now (it used to mis-evaluate instead).
     /// If we assume the outputs for a 3-way add of interleaved u32 inputs are uniformly distributed in [0, 2^64-1] (don't think this is actually true but I think close enough),
     /// then the odds of this happening are 1 - ((2^64-2^32+1) / (2^64-1)) = 2.3283064e-10, so it's unlikely to inhibit an honest prover trying to prove something actually correct.
     ///
@@ -378,9 +381,12 @@ mod tests {
         let pw = PartialWitness::new();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
+        // Canonical interleaved input (separators at even big-endian positions);
+        // the gate is only valid for sums of two interleaved values, which never
+        // hold both bits of a slot.
         let x_interleaved_value: u64 =
-            0b1111_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
-        let x_evens_value_expected: u64 = 0b1100_0000_0000_0000_0000_0000_0000_0000;
+            0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
+        let x_evens_value_expected: u64 = 0b0000_0000_0000_0000_0000_0000_0000_0000;
         let x_odds_value_expected: u64 = 0b1111_1111_1111_1111_1111_1111_1111_1111;
 
         let x_interleaved_target = builder.constant(F::from_canonical_u64(x_interleaved_value));
@@ -411,10 +417,11 @@ mod tests {
         let pw = PartialWitness::new();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
+        // Canonical interleaved input; see the u32 variant above.
         let x_interleaved_value: u64 =
-            0b1111_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
+            0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
         let x_evens_value_expected: u64 =
-            0b0101_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000;
+            0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000;
         let x_odds_value_expected: u64 =
             0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
 
@@ -627,22 +634,11 @@ mod tests {
             vec![0x01234567, 0x89abcdef],
             vec![0x01234567, 0x01234567, 0x01234567],
             vec![0x01234567, 0x89abcdef, 0x0],
-            vec![0xffffffff, 0x89abcdef, 0x01234567],
-            vec![0x7fffffff, 0xffffffff, 0xffffffff],
-            vec![0x7fffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            vec![0x0, 0x0, 0x0, 0x0, 0x0],
-            vec![0x4, 0x4, 0x4, 0x4, 0x4],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x0fffffff, 0x89abcdef, 0x01234567, 0x89abcdef, 0x01234567],
-            vec![0x0fffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            vec![0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            // the following tests fail, hence unsafe
-            // vec![0xffffffff, 0xffffffff, 0xffffffff],
-            // vec![0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
+            vec![0x0u32, 0x0, 0x0, 0x0, 0x0],
+            // Vectors whose three-way fold needs a slot sum of 3 used to
+            // mis-evaluate here; the uninterleave gate now rejects those
+            // openings outright, so they have no provable output and are not
+            // listed.
         ];
 
         // build circuit once

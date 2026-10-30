@@ -332,7 +332,6 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         part_1_header,
         old_stats: genesis_stats,
         block_time: genesis_stats.block_time + F::ONE,
-        final_random_seed_contribution: qhash(400),
         pm_jobs_completed: PPMJobsCompletedStats {
             deploy_contracts_completed: F::ONE,
             register_users_completed: F::ONE,
@@ -807,6 +806,7 @@ fn sample_withdrawal() -> WithdrawalBatchClaimSlotInputs<F> {
         amount: sample_words(121),
         nonce: sample_words(131),
         destination_chain_index: 0,
+        token_contract_id: 4,
         leaf_index: 0,
         siblings: zero_siblings(WITHDRAWAL_TREE_HEIGHT),
     }
@@ -863,6 +863,7 @@ fn sample_withdrawal_leaf_hash() -> QHashOut<F> {
         .chain(withdrawal.amount.into_iter().map(u64::from))
         .chain(withdrawal.nonce.into_iter().map(u64::from))
         .chain(std::iter::once(withdrawal.destination_chain_index as u64))
+        .chain(std::iter::once(withdrawal.token_contract_id as u64))
         .map(F::from_noncanonical_u64)
         .collect::<Vec<_>>();
     QHashOut(PoseidonHash::hash_no_pad(&felts))

@@ -49,17 +49,19 @@ This document describes the Plonky2 bridge circuits that the relayer and prove-p
 -   **File:** `psy_plonky2_common_circuits/src/bridge/withdrawal_batch_claim_circuit.rs:60-184` (core lines: ~285)
 -   **Purpose:** Prove up to 32 withdrawal leaves are included under a withdrawal Merkle root and commit the claim batch for L1 `Bridge.batchClaimWithdrawal`.
 -   **Public Inputs:** `withdrawal_root` (u32×8), `real_count`, `bridge_user_id`, `batch_commit` (u32×8).
--   **Private Inputs / Witness:** Per slot: `sender_user_id`, `recipient`, `token`, `amount`, `nonce`, `destination_chain_index`, `leaf_index`, siblings; shared root / bridge user / count.
+-   **Private Inputs / Witness:** Per slot: `sender_user_id`, `recipient`, `token`, `amount`, `nonce`, `destination_chain_index`, `token_contract_id` (word 34), `leaf_index`, siblings; shared root / bridge user / count.
 -   **Constraints (pseudocode):**
 
     ```text
     assert real_count <= 32
     for i in 0..32:
-      leaf = Poseidon(sender || recipient || token || amount || nonce || dest_chain)
+      slot = sender || recipient || token || amount || nonce || dest_chain || token_contract_id
+      leaf = Poseidon(slot)          // 35 felts; node/services identity
       MerkleProof(value=leaf, index=leaf_index) → root
       if inactive: zero fields and siblings
-    batch_commit = keccak(all slot data words)
-    register PI(root, real_count, bridge_user_id, batch_commit)
+    batch_commit = keccak(all 32×35 slot words)  // includes token_contract_id
+    l1_key = keccak(one slot's 35 big-endian u32 words)  // 140 bytes; not Poseidon(slot) and not the raw nonce
+    register PI(root, real_count, bridge_user_id, batch_commit)  // 18 words, unchanged
     ```
 
 -   **Role:** Withdrawal claim Plonky2 circuit; wrapped by `WithdrawalClaimWrapCircuit`.
@@ -213,4 +215,4 @@ L2 withdrawals appended
   → WithdrawalBatchClaimCircuit (+ WithdrawalClaimWrap) → Bridge.batchClaimWithdrawal
 ```
 
-Leaf hash asymmetry: deposit leaf preimage on L1 uses keccak for the Solidity leaf; Plonky2 deposit batch uses Poseidon over the deposit word layout for the frontier tree. Withdrawal leaf preimage is Poseidon end-to-end. See [`docs/src/dev/bridge-common-operations.md`](../dev/bridge-common-operations.md#architecture) and `encoding` notes in memory architecture docs.
+Leaf hash asymmetry: deposit leaf preimage on L1 uses keccak for the Solidity leaf; Plonky2 deposit batch uses Poseidon over the deposit word layout for the frontier tree. A withdrawal's node/services identity is Poseidon over the 35-felt slot, while its L1 pending, claimed, and receipt-event key is keccak256 of those same 35 big-endian u32 words (140 bytes). The raw nonce is only a field. See [`docs/src/dev/bridge-common-operations.md`](../dev/bridge-common-operations.md#architecture).

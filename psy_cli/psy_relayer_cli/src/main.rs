@@ -1,4 +1,4 @@
-use std::{fs, path::{Path, PathBuf}, time::Duration};
+use std::{fs, io::{self, Read, Write}, path::{Path, PathBuf}, time::Duration};
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context};
@@ -36,7 +36,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Offline, in-place schema-2 to schema-3 journal migration; stop all guardians and the relayer first.
+    /// Offline journal migration: guardian schema 3 is validated, relayer 3 moves to 4; stop all guardians and the relayer first.
     MigrateGuardianJournals {
         #[arg(long)]
         rpc_config: PathBuf,
@@ -58,7 +58,7 @@ enum Commands {
         #[arg(long = "l1-config")]
         l1_config: Vec<PathBuf>,
     },
-    /// Register, bootstrap, or replace the bridge multisig policy.
+    /// Register the bridge account, or freeze a bootstrap or replacement request.
     GuardianPolicy {
         #[arg(long)]
         rpc_config: String,
@@ -71,6 +71,40 @@ enum Commands {
         exclusive_registration_intake: bool,
         #[arg(long)]
         next_members_json: Option<String>,
+        /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+        #[arg(long = "l1-config")]
+        l1_config: Vec<PathBuf>,
+    },
+    /// Sign one frozen policy request with one stopped guardian's existing key.
+    GuardianPolicySign {
+        #[arg(long)]
+        rpc_config: PathBuf,
+        #[arg(long)]
+        guardian_root: PathBuf,
+        #[arg(long)]
+        guardian_id: u8,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        account_public_key: String,
+        #[arg(long)]
+        nonce: u64,
+        #[arg(long)]
+        operation: PolicyOperation,
+        #[arg(long)]
+        member_hash: Vec<String>,
+        /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+        #[arg(long = "l1-config")]
+        l1_config: Vec<PathBuf>,
+    },
+    /// Prove and submit the frozen policy request from two local signatures.
+    GuardianPolicyResume {
+        #[arg(long)]
+        rpc_config: String,
+        #[arg(long)]
+        guardian_root: String,
+        #[arg(long)]
+        request_id: String,
         /// Local deployment document. Repeated flags replace the network `l1_config_url`.
         #[arg(long = "l1-config")]
         l1_config: Vec<PathBuf>,
@@ -198,10 +232,9 @@ fn default_deposit_tree_contract_id() -> u64 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(io::stderr)
+        .with_ansi(false)
         .init();
 
     let cli = Cli::parse();
@@ -216,20 +249,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 bridge::daemon::run_guardian_register(&rpc_config, &guardian_root, &l1_config, exclusive_registration_intake).await
             }
-            GuardianPolicyIntent::Bootstrap => {
-                if !exclusive_registration_intake || next_members_json.is_some() {
-                    anyhow::bail!("guardian-policy bootstrap requires exclusive intake and derives members from the configured initial account");
-                }
-                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_root, &l1_config).await
+            GuardianPolicyIntent::Bootstrap | GuardianPolicyIntent::Replace => {
+                prepare_guardian_policy(&rpc_config, &guardian_root, &l1_config, intent, exclusive_registration_intake, next_members_json.as_deref()).await
             }
-            GuardianPolicyIntent::Replace => {
-                if exclusive_registration_intake {
-                    anyhow::bail!("guardian-policy replace does not accept exclusive registration intake");
-                }
-                let members_json = next_members_json.ok_or_else(|| anyhow::anyhow!("guardian-policy replace requires --next-members-json"))?;
-                let members = guardian_common::protocol::parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(members_json.as_bytes())?;
-                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_root, &l1_config, members).await
-            }
+        },
+        Some(Commands::GuardianPolicySign { rpc_config, guardian_root, guardian_id, request_id, account_public_key, nonce, operation, member_hash, l1_config }) => {
+            sign_guardian_policy(&rpc_config, &guardian_root, &l1_config, guardian_id, &request_id, &account_public_key, nonce, operation, &member_hash).await
+        }
+        Some(Commands::GuardianPolicyResume { rpc_config, guardian_root, request_id, l1_config }) => {
+            resume_guardian_policy(&rpc_config, &guardian_root, &l1_config, &request_id).await
         },
         Some(Commands::Initialize { keystore_dir }) => {
             tracing::info!("Initializing keystore at: {}", keystore_dir);
@@ -280,6 +308,66 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::RegenerateGroth16Keystore(args)) => bridge::regen_groth16_keystore::run(args),
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum PolicyOperation { Bootstrap, ReplacePolicy }
+
+fn parse_hash4(text: &str) -> anyhow::Result<guardian_common::protocol::Hash4> {
+    guardian_common::protocol::parse_canonical_json(format!("\"{text}\"").as_bytes()).map_err(|_| anyhow!("hash must be canonical 32-byte hex"))
+}
+
+fn read_stdin() -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    io::stdin().read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_stdout(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(bytes)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
+async fn prepare_guardian_policy(rpc_config: &str, guardian_root: &str, documents: &[PathBuf], intent: GuardianPolicyIntent, exclusive: bool, next_members_json: Option<&str>) -> anyhow::Result<()> {
+    let config = guardian_common::protocol::GuardianConfig::load(Path::new(rpc_config), Path::new(guardian_root), documents).await?;
+    let (operation, members) = match intent {
+        GuardianPolicyIntent::Bootstrap => {
+            anyhow::ensure!(exclusive && next_members_json.is_none(), "guardian-policy bootstrap requires exclusive intake and derives members from the configured initial account");
+            let hashes = config.initial_account()?.initial_policy.member_hashes;
+            (guardian_common::protocol::GuardianOperation::Bootstrap, [hashes[0], hashes[1], hashes[2]])
+        }
+        GuardianPolicyIntent::Replace => {
+            anyhow::ensure!(!exclusive, "guardian-policy replace does not accept exclusive registration intake");
+            let text = next_members_json.context("guardian-policy replace requires --next-members-json")?;
+            (guardian_common::protocol::GuardianOperation::ReplacePolicy, guardian_common::protocol::parse_canonical_json(text.as_bytes())?)
+        }
+        GuardianPolicyIntent::Register => unreachable!("register is dispatched separately"),
+    };
+    let frozen = bridge::daemon::prepare_guardian_policy(rpc_config, guardian_root, documents, operation, members).await?;
+    let request = frozen.decode()?;
+    let account = serde_json::to_value(config.account_public_key()?)?.as_str().context("account hash encoding")?.to_owned();
+    eprintln!("request_id=0x{} nonce={} operation={:?} account={}", hex::encode(request.request_id()?.0), request.session_nonce, request.operation, account);
+    write_stdout(frozen.as_str().as_bytes())
+}
+
+async fn sign_guardian_policy(rpc_config: &Path, guardian_root: &Path, documents: &[PathBuf], guardian_id: u8, request_id: &str, account: &str, nonce: u64, operation: PolicyOperation, members: &[String]) -> anyhow::Result<()> {
+    let members: [String; 3] = members.to_vec().try_into().map_err(|_| anyhow!("guardian-policy-sign requires exactly three ordered --member-hash values"))?;
+    let request = guardian_common::protocol::parse_canonical_json::<guardian_common::protocol::GuardianSignRequest>(&read_stdin()?)?;
+    let operation = match operation { PolicyOperation::Bootstrap => guardian_common::protocol::GuardianOperation::Bootstrap, PolicyOperation::ReplacePolicy => guardian_common::protocol::GuardianOperation::ReplacePolicy };
+    let response = guardian::service::sign_policy(rpc_config, guardian_root, documents, guardian_id, request, parse_request_id(request_id)?, parse_hash4(account)?, nonce, operation, [parse_hash4(&members[0])?, parse_hash4(&members[1])?, parse_hash4(&members[2])?]).await?;
+    write_stdout(&serde_json::to_vec(&response)?)
+}
+
+fn parse_request_id(text: &str) -> anyhow::Result<guardian_common::protocol::Hex32> {
+    guardian_common::protocol::parse_canonical_json(format!("\"{text}\"").as_bytes()).map_err(|_| anyhow!("request id must be canonical 32-byte hex"))
+}
+
+async fn resume_guardian_policy(rpc_config: &str, guardian_root: &str, documents: &[PathBuf], request_id: &str) -> anyhow::Result<()> {
+    let responses = guardian_common::protocol::parse_canonical_json::<[guardian_common::protocol::GuardianSignResponse; 2]>(&read_stdin()?)?;
+    let _checkpoint = bridge::daemon::resume_guardian_policy(rpc_config, guardian_root, documents, parse_request_id(request_id)?, responses).await?;
+    Ok(())
+}
 
 async fn migrate_guardian_journals(rpc_config: &Path, guardian_root: &Path, l1_config: &[PathBuf]) -> anyhow::Result<()> {
     let config = guardian_common::protocol::GuardianConfig::load(rpc_config, guardian_root, l1_config).await
@@ -298,8 +386,8 @@ async fn migrate_guardian_journals(rpc_config: &Path, guardian_root: &Path, l1_c
         println!("database={} schema=3 signed_rows={} session_rows={} rewritten={}", names[index], counts.signed, counts.sessions, counts.rewritten);
     }
     let requests = bridge::guardian_client::migrate_relayer_journal(&databases[3], &config)
-        .map_err(|_| anyhow!("relayer.redb: migration rejected; this database may already be committed and earlier database commits remain; inspect the journal and rerun migration, which validates an existing schema 3"))?;
-    println!("database=relayer.redb schema=3 request_rows={requests}");
+        .map_err(|_| anyhow!("relayer.redb: migration rejected; this database may already be committed and earlier database commits remain; inspect the journal and rerun migration, which validates an existing schema 3 or 4"))?;
+    println!("database=relayer.redb schema=4 request_rows={requests}");
     Ok(())
 }
 

@@ -1536,7 +1536,7 @@ mod gatherer_builder_tests {
 
     use crate::{
         coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
-        test_common::TestNetworkConfig,
+        test_common::{fixture_validator_tree_root, TestNetworkConfig},
     };
 
     use super::*;
@@ -1602,7 +1602,7 @@ mod gatherer_builder_tests {
                 user_tree_root,
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: user_tree_root,
-                validator_tree_root: zh(2),
+                validator_tree_root: fixture_validator_tree_root(REALM_ID as u32, REALM_SUB_ID as u16),
             },
             should_revert_last_changes: should_revert,
             block_state: block_state(0),
@@ -1811,7 +1811,7 @@ mod gatherer_builder_tests {
         let bytes = fs.files.get(&backup_path).unwrap().value().clone();
         assert_eq!(bytes.len(), 4 + 8 + 32 + 128 + 8 + 8);
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let read_output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, &backup_path, &mut read_tree).await?;
+        let read_output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(fs.as_ref(), &backup_path, &mut read_tree).await?;
         assert_eq!(read_output.next_user_id, 2);
         assert_eq!(read_output.end_user_registration_tree_hash, output.db_output.end_user_registration_tree_hash);
         assert_eq!(read_output.total_jobs, total);

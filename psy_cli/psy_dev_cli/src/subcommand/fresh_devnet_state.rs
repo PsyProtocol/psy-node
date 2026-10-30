@@ -343,6 +343,7 @@ mod tests {
             transaction.open_table(TableDefinition::<RelayerDepositTreeKey, &[u8]>::new("deposit_tree_states")).unwrap();
             transaction.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).unwrap();
             transaction.open_table(TableDefinition::<RelayerWithdrawalNonceKey, u64>::new("guardian_withdrawal_nonce")).unwrap();
+            transaction.open_table(bridge_database::WITHDRAWAL_QUARANTINE).unwrap();
         } else {
             transaction.open_table(GUARDIAN_SCHEMA).unwrap().insert((), GUARDIAN_SCHEMA_VERSION).unwrap();
             transaction.open_table(TableDefinition::<(), [u8; 33]>::new("guardian_signer")).unwrap().insert((), &[2u8; 33]).unwrap();
@@ -429,6 +430,7 @@ mod tests {
         transaction.open_table(TableDefinition::<RelayerDepositTreeKey, &[u8]>::new("deposit_tree_states")).unwrap();
         transaction.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).unwrap();
         transaction.open_table(TableDefinition::<RelayerWithdrawalNonceKey, u64>::new("guardian_withdrawal_nonce")).unwrap();
+        transaction.open_table(bridge_database::WITHDRAWAL_QUARANTINE).unwrap();
         transaction.commit().unwrap();
         assert!(validate_database(&old, true).unwrap_err().to_string().contains(LEGACY_JOURNAL));
         assert_eq!(old.begin_read().unwrap().open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).unwrap().get(1).unwrap().unwrap().value(), &[6u8][..]);
@@ -521,7 +523,7 @@ mod tests {
         let held = open_databases(&directory.open()).unwrap();
         for (index, item) in held.iter().enumerate() {
             let database = item.database.as_ref().unwrap();
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), match index { 0 => 0, _ => 8 });
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), match index { 0 => 0, 3 => 9, _ => 8 });
             if index != 0 {
                 assert_eq!(runtime_row(database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
                 if index == 3 {
@@ -604,7 +606,7 @@ mod tests {
         for (index, name) in DATABASES.iter().enumerate() {
             let database = held.iter().find(|item| item.name == *name).unwrap().database.as_ref().unwrap();
             assert_eq!(runtime_row(database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 8);
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), if index == 3 { 9 } else { 8 });
         }
         drop(held);
 
@@ -614,7 +616,7 @@ mod tests {
         for index in [0, 1, 3] {
             let database = Database::open(directory.0.join(DATABASES[index])).unwrap();
             assert_eq!(runtime_row(&database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 8);
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), if index == 3 { 9 } else { 8 });
         }
         let old = Database::open(directory.0.join(DATABASES[2])).unwrap();
         assert_eq!(runtime_row(&old, false), vec![9; 33]);

@@ -19,7 +19,10 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use alloy_primitives::keccak256;
 use plonky2::field::{goldilocks_field::GoldilocksField as F, types::PrimeField64};
+use plonky2::hash::poseidon::PoseidonHash;
+use plonky2::plonk::config::Hasher;
 use psy_client_common::{
     args::{ContractCallArgs, ContractCallData},
     data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut},
@@ -2334,26 +2337,275 @@ pub fn withdraw_nonce_to_hex(nonce: &[u8; 32]) -> String {
     format!("0x{}", hex::encode(nonce))
 }
 
+/// Draw budget shared by generate_withdraw_nonce's all-zero retry and
+/// reserve_withdrawal_nonce's claimed redraw — one bounded policy, not two.
+pub const WITHDRAW_NONCE_DRAWS: usize = 8;
+
 /// Draws a fresh 256-bit withdraw nonce from the OS entropy pool. An all-zero
 /// draw is retried rather than accepted, the draw count is capped so a broken
 /// entropy source fails loudly, and the clock is never a fallback — a
 /// unix-seconds nonce has neither uniqueness nor width.
 fn generate_withdraw_nonce(rng: &mut impl RngCore) -> Result<[u8; 32]> {
-    const DRAWS: usize = 8;
-    for _ in 0..DRAWS {
+    for _ in 0..WITHDRAW_NONCE_DRAWS {
         let mut bytes = [0u8; 32];
         rng.try_fill_bytes(&mut bytes).map_err(|e| anyhow!("OS entropy source failed: {e}"))?;
         if bytes != [0u8; 32] {
             return Ok(bytes);
         }
     }
-    bail!("OS entropy produced an all-zero withdraw nonce {DRAWS} times in a row")
+    bail!("OS entropy produced an all-zero withdraw nonce {WITHDRAW_NONCE_DRAWS} times in a row")
 }
 
-/// Production draw from the OS entropy pool; tests inject their own RNG into
-/// `generate_withdraw_nonce` instead of sampling real randomness.
-pub fn random_withdraw_nonce() -> Result<[u8; 32]> {
-    generate_withdraw_nonce(&mut rand::rngs::OsRng)
+/// The full field set one withdraw binds, in L1 slot order. Both the internal
+/// reservation identity and the L1 preflight key derive from it, so a repeated
+/// nonce under different content is a different withdrawal, never a collision.
+struct WithdrawalIdentityFields {
+    sender_user_id: u32,
+    recipient: [u32; 8],
+    token: [u32; 8],
+    amount: [u32; 8],
+    nonce: [u32; 8],
+    destination_chain_index: u32,
+    token_contract_id: u32,
+}
+
+fn words64_to_words32(words: [u64; 8]) -> [u32; 8] {
+    words.map(|value| value as u32)
+}
+
+impl WithdrawalIdentityFields {
+    fn nonce_words(nonce: &[u8; 32]) -> [u32; 8] {
+        u256_bytes_to_u32x8_be(nonce).map(|value| value as u32)
+    }
+
+    fn nonce_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (word, chunk) in self.nonce.iter().zip(out.chunks_exact_mut(4)) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn slot_words(&self) -> impl Iterator<Item = u32> + '_ {
+        std::iter::once(self.sender_user_id)
+            .chain(self.recipient)
+            .chain(self.token)
+            .chain(self.amount)
+            .chain(self.nonce)
+            .chain(std::iter::once(self.destination_chain_index))
+            .chain(std::iter::once(self.token_contract_id))
+    }
+
+    /// The node-internal canonical identity: the withdrawal leaf hash limbs —
+    /// Poseidon over the 35 leaf words, per Goldilocks limb low u32 then high
+    /// u32. Reservations are keyed on this full leaf, not on a
+    /// (chain, sender, nonce) tuple.
+    fn leaf_identity_words(&self) -> [u32; 8] {
+        let felts: Vec<F> = self.slot_words().map(F::from_canonical_u32).collect();
+        let hash = PoseidonHash::hash_no_pad(&felts);
+        let mut limbs = [0u32; 8];
+        for (index, felt) in hash.elements.iter().enumerate() {
+            let value = felt.to_canonical_u64();
+            limbs[index * 2] = value as u32;
+            limbs[index * 2 + 1] = (value >> 32) as u32;
+        }
+        limbs
+    }
+
+    /// The L1 preflight key: keccak256 over the same 35 words, each big-endian
+    /// u32 (140 bytes) — the exact bytes32 the Bridge uses as the
+    /// `claimedNullifiers` key and the topic1 identity of every withdrawal
+    /// event. Never the raw nonce and never the leaf hash.
+    fn l1_claim_key(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(35 * 4);
+        for word in self.slot_words() {
+            buf.extend_from_slice(&word.to_be_bytes());
+        }
+        keccak256(&buf).into()
+    }
+
+    fn l1_claim_key_words(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        for (word, chunk) in out.iter_mut().zip(self.l1_claim_key().chunks_exact(4)) {
+            *word = u32::from_be_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes"));
+        }
+        out
+    }
+}
+
+fn u32x8_hex(words: &[u32; 8]) -> String {
+    let mut bytes = Vec::with_capacity(32);
+    for word in words {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn withdrawal_reservations() -> std::sync::MutexGuard<'static, std::collections::HashSet<[u32; 8]>> {
+    static RESERVED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<[u32; 8]>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    RESERVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn withdrawal_sender_u32(sender_user_id: u64) -> Result<u32> {
+    u32::try_from(sender_user_id).map_err(|_| {
+        anyhow!("sender_user_id {sender_user_id} exceeds u32; the L1 nullifier domain is not truncated")
+    })
+}
+
+/// Packs the withdraw arguments into the identity field set, or `None` when a
+/// field does not fit the u32 slot encoding (such a withdrawal was never
+/// reserved).
+fn withdrawal_identity_fields(
+    sender_user_id: u64,
+    l1_recipient: &str,
+    l1_token_address: &str,
+    amount_nano: u64,
+    dest_chain_index: u64,
+    contract_id: u64,
+    nonce: &[u8; 32],
+) -> Option<WithdrawalIdentityFields> {
+    Some(WithdrawalIdentityFields {
+        sender_user_id: withdrawal_sender_u32(sender_user_id).ok()?,
+        recipient: words64_to_words32(evm_addr_to_u32x8_be(l1_recipient).ok()?),
+        token: words64_to_words32(evm_addr_to_u32x8_be(l1_token_address).ok()?),
+        amount: words64_to_words32(u256_to_u32x8_be(amount_nano as u128)),
+        nonce: WithdrawalIdentityFields::nonce_words(nonce),
+        destination_chain_index: u32::try_from(dest_chain_index).ok()?,
+        token_contract_id: u32::try_from(contract_id).ok()?,
+    })
+}
+
+/// A reserved withdraw kept for the error-path release: the full identity
+/// field set the leaf reservation was keyed on.
+#[derive(Clone, Debug)]
+pub struct WithdrawalReservation {
+    pub sender_user_id: u64,
+    pub l1_recipient: String,
+    pub l1_token_address: String,
+    pub amount_nano: u64,
+    pub dest_chain_index: u64,
+    pub contract_id: u64,
+    pub nonce: [u8; 32],
+}
+
+impl WithdrawalReservation {
+    fn identity_fields(&self) -> Option<WithdrawalIdentityFields> {
+        withdrawal_identity_fields(self.sender_user_id, &self.l1_recipient, &self.l1_token_address, self.amount_nano, self.dest_chain_index, self.contract_id, &self.nonce)
+    }
+}
+
+/// Drops an in-process reservation after a burn that did not submit, so the
+/// returned nonce can be pinned again. A submitted burn keeps the reservation.
+/// A field set that never fit the u32 slot encoding was never reserved.
+pub fn release_withdrawal_reservation(record: &WithdrawalReservation) {
+    let Some(fields) = record.identity_fields() else {
+        return;
+    };
+    withdrawal_reservations().remove(&fields.leaf_identity_words());
+}
+
+/// `EndCapSubmissionError` is raised only after `submit_end_cap_proof` is awaited.
+/// The request may already have been accepted, so the reservation stays. Any other
+/// error happened before that send and the reservation can be reused.
+pub fn withdrawal_submission_is_uncertain(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.downcast_ref::<psy_prover::session::EndCapSubmissionError>().is_some())
+}
+
+/// Pins or draws the withdraw nonce and reserves the withdrawal's full leaf
+/// identity (Poseidon over the 35 slot words). The L1 preflight read is
+/// `claimedNullifiers(keccak(35 slot words))` — the audited Bridge keys the
+/// mapping and every withdrawal event on that identity bytes32, so a repeated
+/// nonce under different sender/recipient/token/amount/destination/contract
+/// content is a different claim and never collides. A pinned nonce is checked
+/// exactly once and never re-randomized; a generated nonce redraws only
+/// claimed or already-reserved draws, at most WITHDRAW_NONCE_DRAWS of them.
+/// Any undeterminable L1 check aborts immediately. The returned word is the
+/// proof nonce, never a nullifier hash.
+pub async fn reserve_withdrawal_nonce(
+    client: &crate::l1::L1Client,
+    bridge: alloy_primitives::Address,
+    sender_user_id: u64,
+    l1_recipient: &str,
+    l1_token_address: &str,
+    amount_nano: u64,
+    dest_chain_index: u64,
+    contract_id: u64,
+    pinned: Option<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let fields_for = |nonce: &[u8; 32]| -> Result<WithdrawalIdentityFields> {
+        let sender = withdrawal_sender_u32(sender_user_id)?;
+        let destination = u32::try_from(dest_chain_index).map_err(|_| {
+            anyhow!("destination_chain_index {dest_chain_index} exceeds u32; the L1 identity domain is not truncated")
+        })?;
+        let contract = u32::try_from(contract_id).map_err(|_| {
+            anyhow!("contract_id {contract_id} exceeds u32; the L1 identity domain is not truncated")
+        })?;
+        Ok(WithdrawalIdentityFields {
+            sender_user_id: sender,
+            recipient: words64_to_words32(evm_addr_to_u32x8_be(l1_recipient)?),
+            token: words64_to_words32(evm_addr_to_u32x8_be(l1_token_address)?),
+            amount: words64_to_words32(u256_to_u32x8_be(amount_nano as u128)),
+            nonce: WithdrawalIdentityFields::nonce_words(nonce),
+            destination_chain_index: destination,
+            token_contract_id: contract,
+        })
+    };
+    if let Some(nonce) = pinned {
+        try_reserve_identity(client, bridge, &fields_for(&nonce)?, true).await?;
+        return Ok(nonce);
+    }
+    for _ in 0..WITHDRAW_NONCE_DRAWS {
+        let nonce = generate_withdraw_nonce(&mut rand::rngs::OsRng)?;
+        if try_reserve_identity(client, bridge, &fields_for(&nonce)?, false).await? {
+            return Ok(nonce);
+        }
+    }
+    bail!("all {WITHDRAW_NONCE_DRAWS} generated withdraw nonces were already claimed on the destination bridge — nothing was submitted")
+}
+
+/// `Ok(true)` means the identity is now reserved. `Ok(false)` means a generated
+/// draw should be retried. Pinned collisions and L1 errors are `Err`.
+async fn try_reserve_identity(
+    client: &crate::l1::L1Client,
+    bridge: alloy_primitives::Address,
+    fields: &WithdrawalIdentityFields,
+    pinned: bool,
+) -> Result<bool> {
+    let leaf = fields.leaf_identity_words();
+    let nonce = fields.nonce_bytes();
+    if withdrawal_reservations().contains(&leaf) {
+        if pinned {
+            bail!(
+                "withdraw identity (leaf {}) nonce {} is already reserved in this process — nothing was submitted; pass a different nonce",
+                u32x8_hex(&leaf),
+                withdraw_nonce_to_hex(&nonce)
+            );
+        }
+        return Ok(false);
+    }
+    if client.is_withdrawal_claimed(bridge, &fields.l1_claim_key()).await? {
+        if pinned {
+            bail!(
+                "withdraw nonce {} (claim identity {}) is already claimed on the destination bridge — nothing was submitted; pass a different nonce",
+                withdraw_nonce_to_hex(&nonce),
+                u32x8_hex(&fields.l1_claim_key_words())
+            );
+        }
+        return Ok(false);
+    }
+    let mut reserved = withdrawal_reservations();
+    if !reserved.insert(leaf) {
+        if pinned {
+            bail!(
+                "withdraw identity (leaf {}) nonce {} is already reserved in this process — nothing was submitted; pass a different nonce",
+                u32x8_hex(&leaf),
+                withdraw_nonce_to_hex(&nonce)
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 impl WalletManager {
@@ -3121,4 +3373,256 @@ impl WalletManager {
             .await?;
         Ok(proof.value.0.elements[0].to_canonical_u64())
     }
+}
+
+#[cfg(test)]
+mod withdraw_nonce_reservation_tests {
+    use super::*;
+    use crate::l1::tests::{rpc_err, rpc_ok, spawn_json_rpc_fixture};
+    use std::sync::atomic::Ordering;
+
+    fn test_bridge() -> alloy_primitives::Address {
+        "0x00000000000000000000000000000000000000b2".parse().unwrap()
+    }
+
+    fn claimed_word() -> String {
+        format!("0x{}1", "0".repeat(63))
+    }
+
+    fn unclaimed_word() -> String {
+        format!("0x{}", "0".repeat(64))
+    }
+
+    const FIXTURE_RECIPIENT: &str = "0xfB11910FD59f62a9046884109905fa6f88B4be43";
+    const FIXTURE_TOKEN: &str = "0xbBC0D21A312006eB0E902c279d5E53Dc8225cBB6";
+    const FIXTURE_AMOUNT_NANO: u64 = 50_000_000;
+    const FIXTURE_CONTRACT_ID: u64 = 4;
+    const FIXTURE_DEST_CHAIN: u64 = 0;
+
+    async fn reserve(
+        client: &crate::l1::L1Client,
+        sender: u64,
+        dest_chain_index: u64,
+        pinned: Option<[u8; 32]>,
+    ) -> anyhow::Result<[u8; 32]> {
+        reserve_withdrawal_nonce(
+            client,
+            test_bridge(),
+            sender,
+            FIXTURE_RECIPIENT,
+            FIXTURE_TOKEN,
+            FIXTURE_AMOUNT_NANO,
+            dest_chain_index,
+            FIXTURE_CONTRACT_ID,
+            pinned,
+        )
+        .await
+    }
+
+    fn release(sender: u64, dest_chain_index: u64, nonce: &[u8; 32]) {
+        release_withdrawal_reservation(&crate::wallet::WithdrawalReservation {
+            sender_user_id: sender,
+            l1_recipient: FIXTURE_RECIPIENT.to_string(),
+            l1_token_address: FIXTURE_TOKEN.to_string(),
+            amount_nano: FIXTURE_AMOUNT_NANO,
+            dest_chain_index,
+            contract_id: FIXTURE_CONTRACT_ID,
+            nonce: *nonce,
+        });
+    }
+
+    /// A pinned nonce the bridge reports consumed is refused with the
+    /// used-nonce family and checked EXACTLY once — never redrawn.
+    #[tokio::test]
+    async fn a_pinned_claimed_nonce_is_refused_and_never_redrawn() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(claimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [7u8; 32];
+        let err = reserve(&client, 11, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a pinned nonce is preflighted exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_unclaimed_nonce_is_returned_verbatim() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0xAA; 32];
+        assert_eq!(
+            reserve(&client, 12, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap(),
+            pinned,
+            "a pinned unclaimed nonce is used bit-verbatim"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The first 7 preflights report the draw consumed, the 8th is fresh —
+    /// retries consume draws and stay inside the budget.
+    #[tokio::test]
+    async fn generated_nonces_retry_only_claimed_draws_within_the_bound() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_fixture = served.clone();
+        let (url, calls) = spawn_json_rpc_fixture(move |_| {
+            let n = served_for_fixture.fetch_add(1, Ordering::SeqCst);
+            let word = if n < 7 { claimed_word() } else { unclaimed_word() };
+            rpc_ok(serde_json::json!(word))
+        });
+        let client = crate::l1::L1Client::read_only(url);
+        let nonce = reserve(&client, 13, FIXTURE_DEST_CHAIN, None).await.unwrap();
+        assert_ne!(nonce, [0u8; 32], "a generated nonce is never zero");
+        assert_eq!(calls.load(Ordering::SeqCst), WITHDRAW_NONCE_DRAWS, "exactly the budget was drawn");
+    }
+
+    #[tokio::test]
+    async fn generated_nonces_refuse_after_the_full_bound_is_claimed() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(claimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let err = reserve(&client, 14, FIXTURE_DEST_CHAIN, None).await.unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), WITHDRAW_NONCE_DRAWS, "no draw beyond the budget");
+    }
+
+    /// A preflight that cannot decide aborts immediately — no further draws,
+    /// nothing submitted, and NOT the used-nonce family.
+    #[tokio::test]
+    async fn an_undeterminable_preflight_aborts_immediately() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_fixture = served.clone();
+        let (url, calls) = spawn_json_rpc_fixture(move |_| {
+            let n = served_for_fixture.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                rpc_ok(serde_json::json!(claimed_word()))
+            } else {
+                rpc_err("destination rpc is down")
+            }
+        });
+        let client = crate::l1::L1Client::read_only(url);
+        let err = reserve(&client, 15, FIXTURE_DEST_CHAIN, None).await.unwrap_err();
+        assert!(!err.to_string().contains("already claimed"), "undetermined, not consumed: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "fail closed stops at the first undeterminable check");
+    }
+
+    #[tokio::test]
+    async fn preflight_sends_the_keccak_claim_identity_not_the_raw_nonce_or_leaf_hash() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_for_fixture = seen.clone();
+        let (url, calls) = spawn_json_rpc_fixture(move |req| {
+            *seen_for_fixture.lock().unwrap() = Some(req);
+            rpc_ok(serde_json::json!(unclaimed_word()))
+        });
+        let client = crate::l1::L1Client::read_only(url);
+        let mut nonce = [0u8; 32];
+        nonce[31] = 0x02;
+        assert_eq!(
+            reserve(&client, 1, FIXTURE_DEST_CHAIN, Some(nonce)).await.unwrap(),
+            nonce,
+            "the burn nonce is unchanged"
+        );
+        let req = seen.lock().unwrap().take().expect("eth_call");
+        let raw = req["params"][0]["data"].as_str().unwrap().strip_prefix("0x").unwrap();
+        // The audited Bridge keys claimedNullifiers on the keccak identity over
+        // the 35 slot words; the raw nonce and the Poseidon leaf hash are never
+        // the key. The expected 140-byte preimage is built independently here.
+        let mut words: Vec<u32> = vec![1];
+        words.extend(words64_to_words32(evm_addr_to_u32x8_be(FIXTURE_RECIPIENT).unwrap()));
+        words.extend(words64_to_words32(evm_addr_to_u32x8_be(FIXTURE_TOKEN).unwrap()));
+        words.extend(words64_to_words32(u256_to_u32x8_be(FIXTURE_AMOUNT_NANO as u128)));
+        words.extend(WithdrawalIdentityFields::nonce_words(&nonce));
+        words.push(u32::try_from(FIXTURE_DEST_CHAIN).unwrap());
+        words.push(u32::try_from(FIXTURE_CONTRACT_ID).unwrap());
+        assert_eq!(words.len(), 35);
+        let mut buf = Vec::with_capacity(35 * 4);
+        for word in &words {
+            buf.extend_from_slice(&word.to_be_bytes());
+        }
+        assert_eq!(&raw[8..], hex::encode(keccak256(&buf)));
+        assert_ne!(&raw[8..], hex::encode(nonce), "the raw nonce is never the L1 key");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_full_identity_cannot_be_reserved_twice() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0x11u8; 32];
+        reserve(&client, 17, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap();
+        let err = reserve(&client, 17, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap_err();
+        assert!(err.to_string().contains("already reserved"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the second pin is refused before another L1 read");
+    }
+
+    #[tokio::test]
+    async fn the_same_nonce_with_different_content_is_a_different_reservation() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0x22u8; 32];
+        assert_eq!(reserve(&client, 18, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap(), pinned);
+        // Same nonce, different sender: a different leaf identity, so a
+        // separate claim — exactly the triple-identity collision the full
+        // leaf key removes.
+        assert_eq!(reserve(&client, 19, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap(), pinned);
+        // Same nonce and sender, different destination chain: different leaf.
+        assert_eq!(reserve(&client, 18, 1, Some(pinned)).await.unwrap(), pinned);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn releasing_a_reservation_allows_the_same_identity_to_be_pinned_again() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0x33u8; 32];
+        reserve(&client, 20, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap();
+        release(20, FIXTURE_DEST_CHAIN, &pinned);
+        assert_eq!(reserve(&client, 20, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap(), pinned);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sender_above_u32_is_refused_before_any_l1_read() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let err = reserve(&client, u64::MAX, FIXTURE_DEST_CHAIN, Some([4u8; 32]))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("sender_user_id"),
+            "the refusal must name the out-of-range field: {message}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn sample_submission_error() -> anyhow::Error {
+        psy_prover::session::EndCapSubmissionError {
+            end_user_leaf_hash: QHashOut::<F>::from_values(1, 2, 3, 4),
+            contract_slot_updates: Vec::new(),
+            source: anyhow!("response lost after submit"),
+        }
+        .into()
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_submission_keeps_the_reservation() {
+        let (url, _) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0x44u8; 32];
+        reserve(&client, 21, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap();
+        let err = sample_submission_error().context("withdraw failed");
+        assert!(withdrawal_submission_is_uncertain(&err));
+        let again = reserve(&client, 21, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap_err();
+        assert!(again.to_string().contains("already reserved"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_pre_submit_error_releases_the_reservation() {
+        let (url, _) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0x55u8; 32];
+        reserve(&client, 22, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap();
+        let err = anyhow!("proof rejected before submission");
+        assert!(!withdrawal_submission_is_uncertain(&err));
+        release(22, FIXTURE_DEST_CHAIN, &pinned);
+        assert_eq!(reserve(&client, 22, FIXTURE_DEST_CHAIN, Some(pinned)).await.unwrap(), pinned);
+    }
+
 }

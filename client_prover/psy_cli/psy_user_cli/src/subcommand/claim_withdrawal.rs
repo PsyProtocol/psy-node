@@ -22,15 +22,97 @@ use serde::Deserialize;
 use super::args::ClaimWithdrawalArgs;
 use crate::result::{CommandResult, L1TransactionResult, L1TransactionStatus};
 
-const WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS: usize = 1088;
-const WITHDRAWAL_BATCH_CLAIM_SIGNATURE: &str = "batchClaimWithdrawal(uint256[8],uint256[18],uint256[1088])";
-#[cfg(test)]
-const LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE: &str = "batchClaimWithdrawal(uint256[8],uint256[18],uint256[864])";
+const WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS: usize = 1120;
+/// Slot layout: the 35 audited L1 words — sender_user_id, recipient[8],
+/// token[8], amount[8], nonce[8], destination_chain_index, token_contract_id
+/// (word 34). The withdrawal leaf hash is a Merkle-leaf-only field, never a
+/// slot word.
+const WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS: usize = 35;
+const WITHDRAWAL_BATCH_CLAIM_SIGNATURE: &str = "batchClaimWithdrawal(uint256[8],uint256[18],uint256[1120])";
 
-#[derive(Debug, Deserialize)]
+/// The services/API lookup identity: the withdrawal leaf hash bytes32
+/// (Poseidon over the 35 leaf words) — the same bytes as the leaf_hash on the
+/// proof payload. The L1 `claimedNullifiers` key is the keccak claim identity
+/// over the same 35 words instead.
+fn withdrawal_leaf_nullifier(
+    sender_user_id: u64,
+    recipient: &str,
+    token_address: &str,
+    amount: &str,
+    nonce_hex: &str,
+    destination_chain_index: u64,
+    token_contract_id: u64,
+) -> anyhow::Result<[u8; 32]> {
+    let leaf_hash = compute_withdrawal_leaf_hash(
+        sender_user_id,
+        recipient,
+        token_address,
+        amount,
+        nonce_hex,
+        destination_chain_index,
+        token_contract_id,
+    )?;
+    decode_bytes32(&leaf_hash)
+}
+
+/// The L1 claim identity: keccak256 over the 35 slot words — sender_user_id,
+/// recipient[8], token[8], amount[8], nonce[8], destination_chain_index,
+/// token_contract_id — each word big-endian (140 bytes). The Bridge keys
+/// `claimedNullifiers`, pending withdrawals, and every withdrawal event topic
+/// on these bytes; the raw nonce and the Poseidon leaf hash are not keys.
+fn withdrawal_l1_claim_identity(
+    sender_user_id: u64,
+    recipient: &str,
+    token_address: &str,
+    amount: &str,
+    nonce_hex: &str,
+    destination_chain_index: u64,
+    token_contract_id: u64,
+) -> anyhow::Result<[u8; 32]> {
+    let sender = u32::try_from(sender_user_id)
+        .map_err(|_| anyhow::anyhow!("sender_user_id {sender_user_id} exceeds u32"))?;
+    let dest = u32::try_from(destination_chain_index)
+        .map_err(|_| anyhow::anyhow!("destination_chain_index {destination_chain_index} exceeds u32"))?;
+    let contract = u32::try_from(token_contract_id)
+        .map_err(|_| anyhow::anyhow!("token_contract_id {token_contract_id} exceeds u32"))?;
+    let mut buf = Vec::with_capacity(35 * 4);
+    for word in std::iter::once(sender)
+        .chain(hex_to_u32x8_be(recipient)?.into_iter().map(|v| v as u32))
+        .chain(hex_to_u32x8_be(token_address)?.into_iter().map(|v| v as u32))
+        .chain(u256_to_u32x8_be(amount)?.into_iter().map(|v| v as u32))
+        .chain(bytes32_hex_to_u32x8_be(nonce_hex, "nonce")?)
+        .chain(std::iter::once(dest))
+        .chain(std::iter::once(contract))
+    {
+        buf.extend_from_slice(&word.to_be_bytes());
+    }
+    Ok(keccak256(&buf).into())
+}
+
+fn bytes32_hex(bytes: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn decode_bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
+    let normalized = normalize_u256_hex_32bytes(value)?;
+    let raw = normalized.strip_prefix("0x").unwrap_or(&normalized);
+    let bytes = hex::decode(raw)?;
+    anyhow::ensure!(bytes.len() == 32, "value must be 32 bytes");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+#[derive(Debug)]
 struct WithdrawalClaimProofPayload {
+    /// JSON null means unmatched or checkpoint 0. A missing key is rejected.
     sender_user_id: Option<u64>,
-    withdrawal_index: Option<u64>,
+    /// JSON null pairs with a null sender. A non-null value is lowercase `0x` + 64 hex.
+    /// There is no `nullifier_hex` field on this endpoint.
+    nullifier: Option<String>,
+    /// Proven burn source contract id (services row; leaf-only field, never an
+    /// L1 slot word). Null only with a null sender.
+    token_contract_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,7 +124,8 @@ struct WithdrawalClaimProofResponse {
     subtree_proof: Option<Vec<String>>,
     withdrawal_root: Option<String>,
     checkpoint_id: Option<u64>,
-    withdrawal: Option<WithdrawalClaimProofPayload>,
+    #[serde(deserialize_with = "deserialize_withdrawal_payload")]
+    withdrawal: WithdrawalClaimProofPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +142,7 @@ fn compute_withdrawal_leaf_hash(
     amount: &str,
     nonce_hex: &str,
     destination_chain_index: u64,
+    token_contract_id: u64,
 ) -> anyhow::Result<String> {
     let sender_user_id_u32 = u32::try_from(sender_user_id).map_err(|_| anyhow::anyhow!("sender_user_id exceeds u32"))?;
     let recipient_words = hex_to_u32x8_be(recipient)?;
@@ -66,6 +150,7 @@ fn compute_withdrawal_leaf_hash(
     let amount_words = u256_to_u32x8_be(amount)?;
     let nonce_words = bytes32_hex_to_u32x8_be(nonce_hex, "nonce")?;
     let chain_u32 = u32::try_from(destination_chain_index).map_err(|_| anyhow::anyhow!("destination_chain_index exceeds u32"))?;
+    let token_contract_u32 = u32::try_from(token_contract_id).map_err(|_| anyhow::anyhow!("token_contract_id exceeds u32"))?;
 
     let felts: Vec<GoldilocksField> = std::iter::once(GoldilocksField::from_canonical_u64(sender_user_id_u32 as u64))
         .chain(recipient_words.iter().map(|&w| GoldilocksField::from_canonical_u64(w as u64)))
@@ -73,6 +158,7 @@ fn compute_withdrawal_leaf_hash(
         .chain(amount_words.iter().map(|&w| GoldilocksField::from_canonical_u64(w as u64)))
         .chain(nonce_words.iter().map(|&w| GoldilocksField::from_canonical_u64(w as u64)))
         .chain(std::iter::once(GoldilocksField::from_canonical_u64(chain_u32 as u64)))
+        .chain(std::iter::once(GoldilocksField::from_canonical_u64(token_contract_u32 as u64)))
         .collect();
     let leaf_hash = PoseidonHash::hash_no_pad(&felts);
     let elems = leaf_hash.elements;
@@ -86,12 +172,18 @@ fn compute_withdrawal_leaf_hash(
         (elems[3].to_canonical_u64() & 0xffff_ffff) as u32,
         (elems[3].to_canonical_u64() >> 32) as u32,
     ];
+    Ok(withdrawal_leaf_hash_hex(words))
+}
+
+/// Withdrawal leaf hash hex: per Goldilocks limb low u32 then high u32, each
+/// word big-endian. This rendering is the exact services/API identity bytes.
+fn withdrawal_leaf_hash_hex(words: [u32; 8]) -> String {
     let mut hex_str = String::with_capacity(66);
     hex_str.push_str("0x");
     for w in &words {
         hex_str.push_str(&format!("{:08x}", w));
     }
-    Ok(hex_str)
+    hex_str
 }
 
 fn resolve_bridge_address_for_network(deployments_network: &str) -> anyhow::Result<String> {
@@ -237,10 +329,12 @@ async fn eth_call_at_receipt(rpc_url: &str, to: &str, data: &[u8], receipt: &Rec
     serde_json::from_value(value).map_err(|err| anyhow::anyhow!("eth_call result is not a string: {err}"))
 }
 
-/// Reads Bridge.claimedNullifiers(nonce). `block` is "latest" for pre-send
-/// checks; mined attribution uses `eth_call_at_receipt`.
-async fn read_claimed_withdrawal_nonce(rpc_url: &str, bridge_address: &str, nonce_hex: &str, block: &str) -> anyhow::Result<bool> {
-    let data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
+/// Reads Bridge.claimedNullifiers(nullifier). `block` is "latest" for pre-send
+/// checks; mined attribution uses `eth_call_at_receipt`. The word is the L1
+/// claim identity — keccak over the 35 slot words — never the raw nonce and
+/// never the leaf-hash services identity.
+async fn read_claimed_nullifier(rpc_url: &str, bridge_address: &str, nullifier: &[u8; 32], block: &str) -> anyhow::Result<bool> {
+    let data = build_claimed_nullifier_call_data(nullifier);
     let result: String = serde_json::from_value(
         rpc_call(
             rpc_url,
@@ -255,13 +349,13 @@ async fn read_claimed_withdrawal_nonce(rpc_url: &str, bridge_address: &str, nonc
     parse_abi_bool_word(&result, "claimedNullifiers")
 }
 
-async fn read_claimed_withdrawal_nonce_at_receipt(
+async fn read_claimed_nullifier_at_receipt(
     rpc_url: &str,
     bridge_address: &str,
-    nonce_hex: &str,
+    nullifier: &[u8; 32],
     receipt: &ReceiptBlockIdentity,
 ) -> anyhow::Result<bool> {
-    let data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
+    let data = build_claimed_nullifier_call_data(nullifier);
     let raw = eth_call_at_receipt(rpc_url, bridge_address, &data, receipt).await?;
     parse_abi_bool_word(&raw, "claimedNullifiers")
 }
@@ -288,32 +382,32 @@ fn parse_abi_bool_word(hex_str: &str, context: &str) -> anyhow::Result<bool> {
     }
 }
 
-fn build_claimed_withdrawal_nonce_call_data(nonce_hex: &str) -> anyhow::Result<Vec<u8>> {
-    let normalized = normalize_u256_hex_32bytes(nonce_hex)?;
-    let nonce_raw = normalized.strip_prefix("0x").unwrap_or(&normalized);
-    let nonce_bytes = hex::decode(nonce_raw)?;
-    anyhow::ensure!(nonce_bytes.len() == 32, "nonce must be 32 bytes");
-
+fn build_claimed_nullifier_call_data(nullifier: &[u8; 32]) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32);
     data.extend_from_slice(&keccak256("claimedNullifiers(bytes32)".as_bytes())[..4]);
-    data.extend_from_slice(&nonce_bytes);
-    Ok(data)
+    data.extend_from_slice(nullifier);
+    data
 }
 
-/// Frozen `event WithdrawalClaimItemFailed(bytes32 indexed nonce, uint8 indexed slotIndex, uint8 reason)`
-/// from Bridge.sol: item-local failures skip the slot instead of reverting.
+/// Frozen `event WithdrawalClaimItemFailed(bytes32 indexed nullifier, uint8 indexed slotIndex, uint8 reason)`.
+/// The ABI types are unchanged, so topic0 is unchanged; topic1 is the L1 claim
+/// identity (keccak over the 35 slot words).
 const WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT: &str = "WithdrawalClaimItemFailed(bytes32,uint8,uint8)";
 
-/// Frozen `event WithdrawalPendingCreated(bytes32 indexed nonce, address indexed token, address indexed recipient, uint256 amount, uint64 claimableAt)`
-/// from Bridge.sol, emitted by `_registerPendingWithdrawal`; the only canonical
-/// per-nonce registration evidence, and it survives settlement.
+/// Frozen `event WithdrawalClaimed(bytes32 indexed nullifier, address indexed recipient, address indexed token, uint256 amount)`
+/// emitted by Bridge.sol on a direct payout; carries the same (token, recipient,
+/// amount) outcome as WithdrawalPendingCreated. Topic1 is the L1 claim identity.
 const WITHDRAWAL_CLAIMED_EVENT: &str = "WithdrawalClaimed(bytes32,address,address,uint256)";
+
+/// Frozen `event WithdrawalPendingCreated(bytes32 indexed nullifier, address indexed token, address indexed recipient, uint256 amount, uint64 claimableAt)`
+/// from Bridge.sol, emitted by `_registerPendingWithdrawal`. Topic1 is the
+/// L1 claim identity. It is the only canonical registration evidence and it survives settlement.
 const WITHDRAWAL_PENDING_CREATED_EVENT: &str = "WithdrawalPendingCreated(bytes32,address,address,uint256,uint64)";
 
 /// Outcome tuple carried by WithdrawalPendingCreated or WithdrawalClaimed: (token, recipient, amount).
 type WithdrawalRegistrationTuple = ([u8; 32], [u8; 32], [u8; 32]);
 
-/// Frozen Bridge.sol CLAIM_REASON_* codes; 0 means valid and 11..=255 are reserved.
+/// Frozen Bridge.sol CLAIM_REASON_* codes; 0 means valid and 12..=255 are reserved.
 fn describe_withdrawal_claim_failure_reason(reason: u8) -> String {
     match reason {
         1 => "address high bits nonzero (1)".to_string(),
@@ -326,6 +420,7 @@ fn describe_withdrawal_claim_failure_reason(reason: u8) -> String {
         8 => "amount out of range (8)".to_string(),
         9 => "total overflow (9)".to_string(),
         10 => "claimable-at overflow (10)".to_string(),
+        11 => "Router does not dual-bind the token to an L2 contract id (11)".to_string(),
         other => format!("unknown failure reason {other}"),
     }
 }
@@ -371,8 +466,8 @@ fn find_matching_log<T>(logs: &serde_json::Value, matcher: impl Fn(&serde_json::
 }
 
 /// `WithdrawalClaimItemFailed(bytes32 indexed nonce, uint8 indexed slotIndex, uint8 reason)`:
-/// topics [sig, nonce, slotIndex], reason non-indexed in the data word. The full
-/// emitter tuple must match (contract address, event topic, indexed nonce, and —
+/// topics [sig, claim identity, slotIndex], reason non-indexed in the data word. The full
+/// emitter tuple must match (contract address, event topic, indexed identity, and —
 /// for this single-slot submitter — slot 0), and the reason word must be exactly
 /// 32 bytes with the upper 31 zero. Malformed or unrelated logs are ignored;
 /// an undecodable event can never affect the classification, which is decided
@@ -380,7 +475,7 @@ fn find_matching_log<T>(logs: &serde_json::Value, matcher: impl Fn(&serde_json::
 fn parse_withdrawal_claim_item_failed_log(
     log: &serde_json::Value,
     bridge_address: &str,
-    nonce_bytes: &[u8; 32],
+    claim_identity: &[u8; 32],
 ) -> Option<u8> {
     if log_is_reorg_removed(log) || !log_emitter_matches(log, bridge_address) {
         return None;
@@ -393,7 +488,7 @@ fn parse_withdrawal_claim_item_failed_log(
     if failed_topic0.as_slice() != &keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..] {
         return None;
     }
-    if hex_word_bytes32(topics[1].as_str()?)?.as_slice() != nonce_bytes.as_slice() {
+    if hex_word_bytes32(topics[1].as_str()?)?.as_slice() != claim_identity.as_slice() {
         return None;
     }
     if hex_word_bytes32(topics[2].as_str()?)? != [0u8; 32] {
@@ -407,14 +502,14 @@ fn parse_withdrawal_claim_item_failed_log(
     }
 }
 
-/// CLAIM_REASON_* code from the WithdrawalClaimItemFailed log for this nonce
+/// CLAIM_REASON_* code from the WithdrawalClaimItemFailed log for this claim
 /// in the receipt's `logs` array.
 fn extract_withdrawal_claim_item_failure_reason(
     logs: &serde_json::Value,
     bridge_address: &str,
-    nonce_bytes: &[u8; 32],
+    claim_identity: &[u8; 32],
 ) -> Option<u8> {
-    find_matching_log(logs, |log| parse_withdrawal_claim_item_failed_log(log, bridge_address, nonce_bytes))
+    find_matching_log(logs, |log| parse_withdrawal_claim_item_failed_log(log, bridge_address, claim_identity))
 }
 
 /// `WithdrawalPendingCreated(bytes32 indexed nonce, address indexed token,
@@ -429,7 +524,7 @@ fn extract_withdrawal_claim_item_failure_reason(
 fn parse_withdrawal_pending_created_log(
     log: &serde_json::Value,
     bridge_address: &str,
-    nonce_bytes: &[u8; 32],
+    claim_identity: &[u8; 32],
 ) -> anyhow::Result<Option<WithdrawalRegistrationTuple>> {
     if log_removed_flag(log)? || !log_emitter_matches(log, bridge_address) {
         return Ok(None);
@@ -445,13 +540,13 @@ fn parse_withdrawal_pending_created_log(
         return Ok(None);
     }
     // Recognized event: the frozen ABI fixes four topics. A malformed count —
-    // including a missing nonce topic — is malformed evidence, never an
-    // ignored log; a well-formed event for a different nonce stays irrelevant.
+    // including a missing identity topic — is malformed evidence, never an
+    // ignored log; a well-formed event for a different identity stays irrelevant.
     anyhow::ensure!(topics.len() == 4, "WithdrawalPendingCreated log has {} topics, expected 4", topics.len());
-    let Some(topic_nonce) = topics.get(1).and_then(|topic| topic.as_str()).and_then(hex_word_bytes32) else {
-        anyhow::bail!("WithdrawalPendingCreated log has a malformed nonce topic");
+    let Some(topic_identity) = topics.get(1).and_then(|topic| topic.as_str()).and_then(hex_word_bytes32) else {
+        anyhow::bail!("WithdrawalPendingCreated log has a malformed nullifier topic");
     };
-    if topic_nonce.as_slice() != nonce_bytes.as_slice() {
+    if topic_identity.as_slice() != claim_identity.as_slice() {
         return Ok(None);
     }
     let (Some(token), Some(recipient)) = (
@@ -471,33 +566,198 @@ fn parse_withdrawal_pending_created_log(
     Ok(Some((token, recipient, amount)))
 }
 
-/// Every canonical WithdrawalPendingCreated for this nonce in a receipt's
+/// Every canonical WithdrawalPendingCreated for this claim identity in a receipt's
 /// `logs` array — for the submitted transaction this is its own registration
 /// evidence. A non-array `logs` value or a malformed `removed` flag is an
 /// error — never an empty list.
 fn extract_withdrawal_pending_created_tuples(
     logs: &serde_json::Value,
     bridge_address: &str,
-    nonce_bytes: &[u8; 32],
+    claim_identity: &[u8; 32],
 ) -> anyhow::Result<Vec<WithdrawalRegistrationTuple>> {
     let array = logs
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("registration log response is not an array"))?;
     let mut tuples = Vec::new();
     for log in array {
-        if let Some(tuple) = parse_withdrawal_pending_created_log(log, bridge_address, nonce_bytes)? {
+        if let Some(tuple) = parse_withdrawal_pending_created_log(log, bridge_address, claim_identity)? {
             tuples.push(tuple);
         }
     }
     Ok(tuples)
 }
 
-/// The raw 32-byte nonce from the claimedNullifiers calldata builder.
-fn claimed_nonce_bytes(nonce_hex: &str) -> anyhow::Result<[u8; 32]> {
-    let call_data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&call_data[4..]);
-    Ok(bytes)
+struct MatchedWithdrawal {
+    leaf_index: u64,
+    leaf_hash: String,
+    siblings: Vec<String>,
+    withdrawal_root: String,
+    token_contract_id: u64,
+}
+
+fn parse_lowercase_nullifier(value: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        value.starts_with("0x")
+            && value.len() == 66
+            && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && value[2..] == value[2..].to_ascii_lowercase(),
+        "withdrawal.nullifier must be 0x plus 64 lowercase hex, got {value}"
+    );
+    decode_bytes32(value)
+}
+
+fn require_slot_binds_identity(
+    slot_data: &[String],
+    sender_user_id: u32,
+    recipient_words: &[u32],
+    token_words: &[u32],
+    amount_words: &[u32],
+    nonce_words: &[u32],
+    destination_chain_index: u32,
+    token_contract_id: u32,
+) -> anyhow::Result<()> {
+    let word = |index: usize, name: &str| -> anyhow::Result<U256> {
+        slot_data
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("slot_data missing {name} word {index}"))?
+            .parse::<U256>()
+            .map_err(|err| anyhow::anyhow!("slot_data {name} word {index} is not a uint256: {err}"))
+    };
+    anyhow::ensure!(
+        word(0, "sender")? == U256::from(sender_user_id),
+        "prove-proxy slot_data sender does not match --sender-user-id {sender_user_id}"
+    );
+    // All 35 slot words must equal the locally verified withdrawal. A
+    // prove-proxy returning a proof for a different leaf under the same root
+    // must be rejected BEFORE any L1 send, not detected afterwards.
+    for (base, name, words) in [
+        (1usize, "recipient", recipient_words),
+        (9, "token", token_words),
+        (17, "amount", amount_words),
+        (25, "nonce", nonce_words),
+    ] {
+        for (offset, expected) in words.iter().enumerate() {
+            anyhow::ensure!(
+                word(base + offset, name)? == U256::from(*expected),
+                "prove-proxy slot_data {name} word {} does not match the withdrawal's own {name}",
+                base + offset
+            );
+        }
+    }
+    anyhow::ensure!(
+        word(33, "destination_chain_index")? == U256::from(destination_chain_index),
+        "prove-proxy slot_data destination chain does not match --destination-chain-index {destination_chain_index}"
+    );
+    anyhow::ensure!(
+        word(34, "token_contract_id")? == U256::from(token_contract_id),
+        "prove-proxy slot_data token contract id does not match --token-contract-id {token_contract_id}"
+    );
+    // Every word of every inactive padding slot must be zero, matching the
+    // circuit's commitment over the 35 words per slot. Slot 1's first word
+    // (index 35) is included here: a leaf-hash limb or any other smuggled
+    // nonzero word fails as nonzero padding.
+    for slot in 1..WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS / WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS {
+        for offset in 0..WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS {
+            let index = slot * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS + offset;
+            anyhow::ensure!(word(index, "padding")?.is_zero(), "single-slot claim has a nonzero dummy word {index}");
+        }
+    }
+    Ok(())
+}
+
+/// `found=true` requires the matched indexed row to carry this CLI's sender
+/// and token contract plus the requested nullifier, and proof material.
+/// `found=false` with a null sender is the pending or unmatched echo — the
+/// claim is unavailable, not failed; a matched row whose identity disagrees
+/// is a hard error. A missing key never reaches here; the deserializer
+/// rejects it.
+fn require_services_identity(
+    proof: &WithdrawalClaimProofResponse,
+    sender_user_id: u64,
+    expected_nullifier: &[u8; 32],
+    token_contract_id: u64,
+) -> anyhow::Result<Option<MatchedWithdrawal>> {
+    let payload = &proof.withdrawal;
+    let returned_sender = payload.sender_user_id;
+    let returned_nullifier = payload.nullifier.as_deref();
+    if proof.found {
+        let Some(sender) = returned_sender else {
+            anyhow::bail!("found withdrawal proof has null withdrawal.sender_user_id");
+        };
+        let Some(nullifier) = returned_nullifier else {
+            anyhow::bail!("found withdrawal proof has null withdrawal.nullifier");
+        };
+        validate_identity(sender, nullifier, sender_user_id, expected_nullifier)?;
+        let returned_contract = payload.token_contract_id.ok_or_else(|| anyhow::anyhow!("found withdrawal proof has null withdrawal.token_contract_id"))?;
+        anyhow::ensure!(
+            returned_contract == token_contract_id,
+            "found withdrawal proof token contract {returned_contract} does not match --token-contract-id {token_contract_id}"
+        );
+        let leaf_index = proof.leaf_index.ok_or_else(|| anyhow::anyhow!("found withdrawal proof is missing leaf_index"))?;
+        let leaf_hash = proof.leaf_hash.clone().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("found withdrawal proof is missing leaf_hash"))?;
+        let siblings = proof.subtree_proof.clone().ok_or_else(|| anyhow::anyhow!("found withdrawal proof is missing siblings"))?;
+        let withdrawal_root = proof.withdrawal_root.clone().filter(|value| !value.is_empty()).ok_or_else(|| anyhow::anyhow!("found withdrawal proof is missing withdrawal_root"))?;
+        return Ok(Some(MatchedWithdrawal { leaf_index, leaf_hash, siblings, withdrawal_root, token_contract_id }));
+    }
+    match (returned_sender, returned_nullifier) {
+        // Pending or unmatched: the requested nullifier is echoed with a null
+        // sender; the claim stays unavailable.
+        (None, _) => Ok(None),
+        // A matched identity without proof material: verify it, then report
+        // unavailable.
+        (Some(sender), Some(nullifier)) => {
+            validate_identity(sender, nullifier, sender_user_id, expected_nullifier)?;
+            let returned_contract = payload.token_contract_id.ok_or_else(|| anyhow::anyhow!("matched withdrawal identity has null withdrawal.token_contract_id; the leaf hash identity cannot be verified"))?;
+            anyhow::ensure!(
+                returned_contract == token_contract_id,
+                "matched withdrawal token contract {returned_contract} does not match --token-contract-id {token_contract_id}"
+            );
+            Ok(None)
+        }
+        (Some(_), None) => anyhow::bail!("withdrawal.sender_user_id is set but withdrawal.nullifier is null"),
+    }
+}
+
+fn deserialize_withdrawal_payload<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<WithdrawalClaimProofPayload, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let object = value.as_object().ok_or_else(|| serde::de::Error::custom("withdrawal must be an object"))?;
+    if !object.contains_key("sender_user_id") {
+        return Err(serde::de::Error::custom("missing withdrawal.sender_user_id"));
+    }
+    if !object.contains_key("nullifier") {
+        return Err(serde::de::Error::custom("missing withdrawal.nullifier"));
+    }
+    if !object.contains_key("token_contract_id") {
+        return Err(serde::de::Error::custom("missing withdrawal.token_contract_id"));
+    }
+    let sender_user_id = match &object["sender_user_id"] {
+        serde_json::Value::Null => None,
+        value => Some(serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?),
+    };
+    let nullifier = match &object["nullifier"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        _ => return Err(serde::de::Error::custom("withdrawal.nullifier must be a string or null")),
+    };
+    let token_contract_id = match &object["token_contract_id"] {
+        serde_json::Value::Null => None,
+        value => Some(serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?),
+    };
+    Ok(WithdrawalClaimProofPayload { sender_user_id, nullifier, token_contract_id })
+}
+
+fn validate_identity(sender: u64, nullifier: &str, sender_user_id: u64, expected_nullifier: &[u8; 32]) -> anyhow::Result<()> {
+    anyhow::ensure!(sender == sender_user_id, "withdrawal sender_user_id {sender} does not match --sender-user-id {sender_user_id}");
+    let got = parse_lowercase_nullifier(nullifier)?;
+    anyhow::ensure!(
+        got == *expected_nullifier,
+        "withdrawal.nullifier {} does not match the withdrawal leaf hash nullifier {}",
+        bytes32_hex(&got),
+        bytes32_hex(expected_nullifier)
+    );
+    Ok(())
 }
 
 fn parse_u256_word_array(proof_data: &serde_json::Value, field: &str, expected_len: usize) -> anyhow::Result<Vec<String>> {
@@ -527,19 +787,26 @@ fn parse_u256_word_array(proof_data: &serde_json::Value, field: &str, expected_l
 
 pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
     let services_url = args.services_url.trim_end_matches('/');
-    let sender_user_id_q = args.sender_user_id.map(|v| format!("&sender_user_id={}", v)).unwrap_or_default();
+    let sender_user_id = args.sender_user_id;
+    let sender_user_id_u32 = u32::try_from(sender_user_id).map_err(|_| {
+        anyhow::anyhow!("sender_user_id {sender_user_id} exceeds u32; the withdrawal leaf domain is not truncated")
+    })?;
     let nonce_hex = normalize_u256_hex_32bytes(&args.nonce)?;
+    let nonce_bytes = decode_bytes32(&nonce_hex)?;
+    // The query identity is the withdrawal leaf hash bytes32 over the full
+    // 35-word preimage; the sender, nonce, and token contract are leaf
+    // fields, never separate query parameters.
+    let nullifier = withdrawal_leaf_nullifier(sender_user_id, &args.recipient, &args.token_address, &args.amount, &nonce_hex, args.destination_chain_index, args.token_contract_id)?;
+    let nullifier_hex = bytes32_hex(&nullifier);
+    // The L1 claim identity: the claimedNullifiers key and every withdrawal
+    // event topic on the destination Bridge.
+    let claim_identity = withdrawal_l1_claim_identity(sender_user_id, &args.recipient, &args.token_address, &args.amount, &nonce_hex, args.destination_chain_index, args.token_contract_id)?;
     let proof_url = format!(
-        "{}/api/v1/bridge/withdrawal-claim-proof?recipient={}&token_address={}&amount={}&nonce={}&destination_chain_index={}{}",
+        "{}/api/v1/bridge/withdrawal-claim-proof?destination_chain_index={}&nullifier={}",
         services_url,
-        urlencoding(&to_32byte_hex(&args.recipient)),
-        urlencoding(&to_32byte_hex(&args.token_address)),
-        decimal_amount_to_hex(&args.amount),
-        nonce_hex,
         args.destination_chain_index,
-        sender_user_id_q,
+        nullifier_hex,
     );
-
     tracing::info!("Fetching proof from: {}", proof_url);
     let http_client = Client::new();
     let resp = http_client
@@ -547,44 +814,36 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         .send()
         .await?
         .json::<ApiResponse<WithdrawalClaimProofResponse>>()
-        .await?;
-
+        .await
+        .map_err(|err| anyhow::Error::new(err).context("withdrawal proof response could not be decoded"))?;
     if !resp.success {
         anyhow::bail!("psy-services error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
     }
     let proof = resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))?;
-
-    if !proof.found {
-        println!("Withdrawal not found in tree. Is the withdrawal event indexed by psy-services?");
-        return Ok(CommandResult::L1Transaction(L1TransactionResult {
-            transaction_hash: None,
-            status: L1TransactionStatus::NotFound,
-            chain_id: None,
-        }));
-    }
-
-    let leaf_index = proof.leaf_index.unwrap_or(0);
-    let leaf_hash = proof.leaf_hash.unwrap_or_default();
-    let siblings = proof.subtree_proof.unwrap_or_default();
-    let withdrawal_root = proof.withdrawal_root.unwrap_or_default();
-
+    let matched = match require_services_identity(&proof, sender_user_id, &nullifier, args.token_contract_id)? {
+        Some(matched) => matched,
+        None => {
+            println!("Withdrawal proof unavailable. The nullifier is pending or unmatched; a null sender echo is not a verified proof.");
+            return Ok(CommandResult::L1Transaction(L1TransactionResult {
+                transaction_hash: None,
+                status: L1TransactionStatus::NotFound,
+                chain_id: None,
+            }));
+        }
+    };
+    let MatchedWithdrawal { leaf_index, leaf_hash, siblings, withdrawal_root, token_contract_id } = matched;
     println!("=== Withdrawal Claim Proof ===");
-    println!("leaf_index:     {}", leaf_index);
-    println!("leaf_hash:      {}", leaf_hash);
-    println!("withdrawal_root: {}", withdrawal_root);
+    println!("leaf_index:     {leaf_index}");
+    println!("leaf_hash:      {leaf_hash}");
+    println!("withdrawal_root: {withdrawal_root}");
+    println!("nullifier:      {nullifier_hex}");
     println!("siblings:       [");
-    for (i, s) in siblings.iter().enumerate() {
-        println!("  {}: {}", i, s);
+    for (i, sibling) in siblings.iter().enumerate() {
+        println!("  {i}: {sibling}");
     }
     println!("]");
     println!("sibling_count:  {}", siblings.len());
 
-    let sender_user_id = proof
-        .withdrawal
-        .as_ref()
-        .and_then(|w| w.sender_user_id)
-        .or(args.sender_user_id)
-        .ok_or_else(|| anyhow::anyhow!("withdrawal proof response missing sender_user_id; re-run with --sender-user-id"))?;
     let expected_leaf_hash = compute_withdrawal_leaf_hash(
         sender_user_id,
         &args.recipient,
@@ -592,50 +851,44 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         &args.amount,
         &nonce_hex,
         args.destination_chain_index,
+        token_contract_id,
     )?;
-    tracing::info!("Expected leaf hash: {}", expected_leaf_hash);
+    tracing::info!("Expected leaf hash: {expected_leaf_hash}");
     anyhow::ensure!(
         leaf_hash.eq_ignore_ascii_case(&expected_leaf_hash),
-        "withdrawal leaf hash mismatch: expected {}, got {}",
-        expected_leaf_hash,
-        leaf_hash
+        "withdrawal leaf hash mismatch: expected {expected_leaf_hash}, got {leaf_hash}"
     );
 
-    // Bridge.claimedNullifiers is keyed by the raw bytes32 withdrawal nonce.
     if let Some(prove_proxy_url) = &args.prove_proxy_url {
         let deployments_network = resolve_current_deployments_network(&args.rpc_config)?;
         let bridge_addr = resolve_bridge_address_for_network(&deployments_network)?;
-        // A consumed nonce can never register again: the item would be skipped
-        // with reason 5 no matter which withdrawal consumed it. Advisory
-        // preflight at the provider's canonical head; mined attribution below
-        // stays pinned to the receipt.
-        if read_claimed_withdrawal_nonce(&args.l1_rpc_url, &bridge_addr, &nonce_hex, "latest").await? {
+        if read_claimed_nullifier(&args.l1_rpc_url, &bridge_addr, &claim_identity, "latest").await? {
             anyhow::bail!(
-                "withdrawal nonce {} is already consumed (claimedNullifiers is true); refusing to submit",
-                nonce_hex
+                "withdrawal claim identity {} is already consumed (claimedNullifiers is true); sender {sender_user_id} nonce {nonce_hex} leaf nullifier {nullifier_hex}; refusing to submit",
+                bytes32_hex(&claim_identity)
             );
         }
 
-        tracing::info!("Generating Groth16 proof via prove-proxy: {}", prove_proxy_url);
-
+        tracing::info!("Generating Groth16 proof via prove-proxy: {prove_proxy_url}");
         let recipient_u32x8 = hex_to_u32x8_be(&args.recipient)?;
         let token_u32x8 = hex_to_u32x8_be(&args.token_address)?;
         let amount_u32x8 = u256_to_u32x8_be(&args.amount)?;
         let nonce_u32x8 = bytes32_hex_to_u32x8_be(&nonce_hex, "nonce")?;
-        let dest_chain_u32 = args.destination_chain_index as u32;
+        let dest_chain_u32 = u32::try_from(args.destination_chain_index).map_err(|_| anyhow::anyhow!("destination_chain_index exceeds u32"))?;
+        let token_contract_id_u32 = u32::try_from(token_contract_id).map_err(|_| anyhow::anyhow!("token_contract_id exceeds u32"))?;
         let bridge_user_id: u32 = 524288;
-
         let witness = serde_json::json!({
             "bridge_user_id": bridge_user_id,
             "withdrawals": [{
                 "withdrawal_root": withdrawal_root,
-                "sender_user_id": sender_user_id as u32,
+                "sender_user_id": sender_user_id_u32,
                 "recipient": recipient_u32x8,
                 "token": token_u32x8,
                 "amount": amount_u32x8,
                 "nonce": nonce_u32x8,
                 "destination_chain_index": dest_chain_u32,
-                "leaf_index": leaf_index as u32,
+                "token_contract_id": token_contract_id_u32,
+                "leaf_index": u32::try_from(leaf_index).map_err(|_| anyhow::anyhow!("leaf_index exceeds u32"))?,
                 "bridge_user_id": bridge_user_id,
                 "siblings": siblings,
             }]
@@ -647,15 +900,12 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
             "method": "psy_prove_withdrawal_batch_claim_groth16",
             "params": [witness],
         });
-
         let mut req = http_client.post(prove_proxy_url).json(&req_body);
         if let Some(token) = &args.prove_proxy_token {
             req = req.bearer_auth(token);
         }
-
         let prove_resp = req.send().await?;
         let prove_result: serde_json::Value = prove_resp.json().await?;
-
         if let Some(err) = prove_result.get("error") {
             if let Some(message) = err.get("message").and_then(|v| v.as_str()) {
                 let data = err.get("data").cloned().unwrap_or(serde_json::Value::Null);
@@ -663,22 +913,25 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
             }
             anyhow::bail!("prove-proxy error: {}", err);
         }
-
         let proof_data = &prove_result["result"];
         tracing::info!("Groth16 proof generated successfully");
-
         let signer: PrivateKeySigner = args.private_key.parse()?;
         let bridge: Address = bridge_addr.parse()?;
         let sol_proof = parse_u256_word_array(proof_data, "solidity_proof", 8)?;
         let public_inputs = parse_u256_word_array(proof_data, "public_inputs", 18)?;
         let slot_data = parse_u256_word_array(proof_data, "slot_data", WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS)?;
+        let recipient_words: Vec<u32> = recipient_u32x8.iter().map(|v| *v as u32).collect();
+        let token_words: Vec<u32> = token_u32x8.iter().map(|v| *v as u32).collect();
+        let amount_words: Vec<u32> = amount_u32x8.iter().map(|v| *v as u32).collect();
+        require_slot_binds_identity(&slot_data, sender_user_id_u32, &recipient_words, &token_words, &amount_words, &nonce_u32x8, dest_chain_u32, token_contract_id_u32)?;
+
 
         println!("\n=== L1 Claim Data ===");
         println!("bridge_address: {}", bridge_addr);
         println!("public_inputs count: {}", public_inputs.len());
         println!("slot_data count: {}", slot_data.len());
 
-        // Build calldata for batchClaimWithdrawal(uint256[8],uint256[18],uint256[1088])
+        // Build calldata for batchClaimWithdrawal(uint256[8],uint256[18],uint256[1120])
         let selector = alloy_primitives::keccak256(WITHDRAWAL_BATCH_CLAIM_SIGNATURE.as_bytes());
         let mut data = Vec::with_capacity(4 + (8 + 18 + WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS) * 32);
         data.extend_from_slice(&selector[..4]);
@@ -795,7 +1048,7 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
             );
         }
 
-        // A status-1 receipt does not prove this nonce registered. Bind the
+        // A status-1 receipt does not prove this nullifier registered. Bind the
         // receipt's block hash first, then read claimedNullifiers there.
         let receipt_block = parse_block_number(
             receipt["blockNumber"].as_str().unwrap_or_default(),
@@ -805,35 +1058,28 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         let receipt_hash = parse_block_hash(&receipt["blockHash"], "claim-withdrawal receipt")
             .map_err(|err| anyhow::anyhow!("claim-withdrawal receipt missing valid blockHash: tx_hash={:#x}: {err}", tx_hash))?;
         let receipt_identity = ReceiptBlockIdentity { number: receipt_block, hash: receipt_hash };
-        let registered = read_claimed_withdrawal_nonce_at_receipt(rpc_url, &bridge_addr, &nonce_hex, &receipt_identity)
+        let registered = read_claimed_nullifier_at_receipt(rpc_url, &bridge_addr, &claim_identity, &receipt_identity)
             .await
             .map_err(|err| {
                 anyhow::anyhow!(
-                    "could not verify claimedNullifiers for nonce {} at receipt block {:#x} {}: {}",
-                    nonce_hex, receipt_block, receipt_identity.hash, err
+                    "could not verify claimedNullifiers for claim identity {} (nonce {nonce_hex}, leaf nullifier {nullifier_hex}) at receipt block {:#x} {}: {err}",
+                    bytes32_hex(&claim_identity), receipt_block, receipt_identity.hash
                 )
             })?;
-        let nonce_bytes = claimed_nonce_bytes(&nonce_hex)?;
         let receipt_logs = receipt
             .get("logs")
             .ok_or_else(|| anyhow::anyhow!("claim-withdrawal receipt missing logs: tx_hash={:#x}", tx_hash))?;
-        let own_tuples = extract_withdrawal_pending_created_tuples(receipt_logs, &bridge_addr, &nonce_bytes)
+        let own_tuples = extract_withdrawal_pending_created_tuples(receipt_logs, &bridge_addr, &claim_identity)
             .map_err(|err| anyhow::anyhow!("claim-withdrawal receipt logs are malformed: tx_hash={:#x}: {err}", tx_hash))?;
 
-        let reason_code = extract_withdrawal_claim_item_failure_reason(receipt_logs, &bridge_addr, &nonce_bytes);
-        // A slot-0 failure for this nonce is authoritative and can never
-        // coexist with a registration of the same item; it is parsed before any
-        // success verdict so contradictory logs never confirm.
+        let reason_code = extract_withdrawal_claim_item_failure_reason(receipt_logs, &bridge_addr, &claim_identity);
         if let Some(reason) = reason_code {
             anyhow::bail!(
-                "L1 claim-withdrawal failed: nonce {} item skipped with {}; the WithdrawalClaimItemFailed event for this nonce and slot 0 is authoritative and refuses success",
-                nonce_hex,
+                "L1 claim-withdrawal failed: nonce {nonce_hex} (leaf nullifier {nullifier_hex}) item skipped with {}; the WithdrawalClaimItemFailed event for this nonce key and slot 0 is authoritative and refuses success",
                 describe_withdrawal_claim_failure_reason(reason)
             );
         }
 
-        // This transaction's own WithdrawalPendingCreated for the nonce is the
-        // only registration evidence for the submitted call.
         if registered && !own_tuples.is_empty() {
             println!("status: success");
             return Ok(CommandResult::L1Transaction(L1TransactionResult {
@@ -849,12 +1095,12 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
             "claimedNullifiers is false and no WithdrawalClaimItemFailed event decoded".to_string()
         };
         println!(
-            "claim not registered: nonce {} skipped at receipt block {:#x} ({})",
-            nonce_hex, receipt_block, reason
+            "claim not registered: nullifier {nullifier_hex} nonce {nonce_hex} skipped at receipt block {:#x} ({reason})",
+            receipt_block
         );
         anyhow::bail!(
-            "L1 claim-withdrawal transaction succeeded but withdrawal nonce {} was not registered at receipt block {:#x}: {}",
-            nonce_hex, receipt_block, reason
+            "L1 claim-withdrawal transaction succeeded but withdrawal nullifier {nullifier_hex} (nonce {nonce_hex}) was not registered at receipt block {:#x}: {reason}",
+            receipt_block
         );
     } else {
         Ok(CommandResult::L1Transaction(L1TransactionResult {
@@ -876,12 +1122,14 @@ mod tests {
     };
 
     use super::{
-        build_claimed_withdrawal_nonce_call_data, bytes32_hex_to_u32x8_be, claimed_nonce_bytes, compute_withdrawal_leaf_hash,
-        decimal_amount_to_hex, describe_withdrawal_claim_failure_reason, extract_withdrawal_claim_item_failure_reason,
-        extract_withdrawal_pending_created_tuples, hex_to_u32x8_be, keccak256, normalize_u256_hex_32bytes, parse_u256_word_array,
-        resolve_bridge_address_for_network, run, to_32byte_hex, LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE,
-        WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT,
-        WITHDRAWAL_PENDING_CREATED_EVENT, WITHDRAWAL_CLAIMED_EVENT,
+        build_claimed_nullifier_call_data, bytes32_hex_to_u32x8_be, compute_withdrawal_leaf_hash, decimal_amount_to_hex,
+        describe_withdrawal_claim_failure_reason, extract_withdrawal_claim_item_failure_reason, extract_withdrawal_pending_created_tuples,
+        decode_bytes32, hex_to_u32x8_be, keccak256, normalize_u256_hex_32bytes, parse_u256_word_array, require_slot_binds_identity,
+        resolve_bridge_address_for_network, run, to_32byte_hex, u256_to_u32x8_be, withdrawal_l1_claim_identity, withdrawal_leaf_hash_hex,
+        withdrawal_leaf_nullifier,
+        WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS,
+        WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS, WITHDRAWAL_CLAIMED_EVENT, WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT,
+        WITHDRAWAL_PENDING_CREATED_EVENT,
     };
     use crate::result::{CommandResult, L1TransactionStatus};
     use crate::subcommand::args::ClaimWithdrawalArgs;
@@ -922,22 +1170,28 @@ mod tests {
 
     #[test]
     fn claim_withdrawal_signature_matches_current_slot_width() {
-        assert_eq!(WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, 1088);
-        assert!(WITHDRAWAL_BATCH_CLAIM_SIGNATURE.contains("[1088]"));
-        assert_ne!(
-            keccak256(WITHDRAWAL_BATCH_CLAIM_SIGNATURE.as_bytes())[..4],
-            keccak256(LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE.as_bytes())[..4]
-        );
+        assert_eq!(WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, 32 * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS);
+        assert_eq!(WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, 1120);
+        assert!(WITHDRAWAL_BATCH_CLAIM_SIGNATURE.contains("[1120]"));
     }
 
     #[test]
-    fn claim_withdrawal_claimed_precheck_uses_raw_bytes32_nonce() {
-        let nonce = "13";
-        let normalized = normalize_u256_hex_32bytes(nonce).unwrap();
-        let expected_nonce = hex::decode(normalized.trim_start_matches("0x")).unwrap();
-        let calldata = build_claimed_withdrawal_nonce_call_data(nonce).unwrap();
+    fn withdrawal_leaf_hash_hex_renders_low_limb_first_big_endian() {
+        // Shared rendering vector across circuit, contracts, CLI, dapp and
+        // services: limb 0x1122334455667788 contributes words 0x55667788 then
+        // 0x11223344; the bytes32 packs each word big-endian.
+        let words: [u32; 8] = [
+            0x55667788, 0x11223344, 0xeeff0011, 0xaabbccdd, 0x00000002, 0x00000001, 0x00000000,
+            0xffffffff,
+        ];
+        assert_eq!(
+            withdrawal_leaf_hash_hex(words),
+            "0x5566778811223344eeff0011aabbccdd000000020000000100000000ffffffff"
+        );
+        let got = withdrawal_leaf_hash_hex(words);
+        let calldata = build_claimed_nullifier_call_data(&decode_bytes32(&got).unwrap());
         assert_eq!(&calldata[..4], &keccak256("claimedNullifiers(bytes32)".as_bytes())[..4]);
-        assert_eq!(&calldata[4..], expected_nonce.as_slice());
+        assert_eq!(&calldata[4..], decode_bytes32(&got).unwrap().as_slice());
     }
 
     #[test]
@@ -965,6 +1219,7 @@ mod tests {
             amount,
             &normalized_nonce,
             destination_chain_index,
+            4,
         )
         .unwrap();
         let services_url = spawn_single_response_server(serde_json::json!({
@@ -976,7 +1231,9 @@ mod tests {
                 "siblings": [],
                 "withdrawal_root": "0x1234",
                 "withdrawal": {
-                    "sender_user_id": sender_user_id
+                    "sender_user_id": sender_user_id,
+                    "nullifier": format!("0x{}", hex::encode(fixture_nullifier())),
+                    "token_contract_id": 4
                 }
             }
         }));
@@ -991,7 +1248,8 @@ mod tests {
             amount: amount.to_string(),
             nonce: nonce.to_string(),
             destination_chain_index,
-            sender_user_id: None,
+            sender_user_id,
+            token_contract_id: 4,
             prove_proxy_url: None,
             prove_proxy_token: None,
         };
@@ -1005,17 +1263,6 @@ mod tests {
         assert_eq!(result.chain_id, None);
     }
 
-    #[test]
-    fn claim_withdrawal_resolves_localhost_bridge_from_checked_in_deployments() {
-        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
-        let summary_path = super::super::deployments::resolve_deployments_file("localhost", "deployed-contracts.json");
-        let summary: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(summary_path).unwrap()).unwrap();
-        let expected = summary["proxies"]["Bridge_Proxy"]
-            .as_str()
-            .or_else(|| summary["core"]["Bridge"].as_str())
-            .unwrap();
-        assert_eq!(bridge, expected);
-    }
 
     type RpcRequestLog = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
 
@@ -1023,6 +1270,35 @@ mod tests {
     /// Well-known anvil devnet key #0 — public test fixture, not a secret.
     const L1_TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    /// The one bridge address every test fixture uses. Tests must not depend
+    /// on a checked-in local deployment file: the resolver override is pointed
+    /// at a process-private deployments fixture instead.
+    const FIXTURE_BRIDGE_ADDRESS: &str = "0x00000000000000000000000000000000000000b2";
+
+    /// Installs the process-wide deployments fixture once: a temp-dir
+    /// `PSY_DEPLOYMENTS_DIR` holding the fixture bridge address, so
+    /// `resolve_bridge_address_for_network` never reads a checked-in
+    /// deployment. Every test shares one address, so parallel reads of the
+    /// override stay consistent.
+    fn install_deployments_fixture() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("psy-claim-withdrawal-deployments-{}", std::process::id()));
+            let network_dir = dir.join("localhost");
+            std::fs::create_dir_all(&network_dir).expect("deployments fixture dir");
+            let summary = serde_json::json!({
+                "proxies": { "Bridge_Proxy": FIXTURE_BRIDGE_ADDRESS },
+                "core": { "Bridge": FIXTURE_BRIDGE_ADDRESS },
+            });
+            std::fs::write(
+                network_dir.join("deployed-contracts.json"),
+                serde_json::to_string(&summary).unwrap(),
+            )
+            .expect("deployments fixture file");
+            std::env::set_var("PSY_DEPLOYMENTS_DIR", &dir);
+        });
+    }
 
     fn u256_word(value: u64) -> serde_json::Value {
         serde_json::json!(format!("0x{:064x}", value))
@@ -1154,19 +1430,195 @@ mod tests {
         let data = params[0]["data"].as_str().unwrap();
         let selector = format!("0x{}", hex::encode(&keccak256("claimedNullifiers(bytes32)".as_bytes())[..4]));
         assert!(data.starts_with(&selector), "eth_call must target claimedNullifiers: {data}");
-        assert_eq!(hex::decode(&data[2 + selector.len() - 2..]).unwrap().len(), 32, "nonce word must be 32 bytes");
+        let raw = data.strip_prefix("0x").unwrap();
+        assert_eq!(&raw[8..], hex::encode(fixture_claim_identity()), "claimedNullifiers key is the keccak claim identity");
+        assert_ne!(&raw[8..], hex::encode(fixture_nonce_bytes()), "the pre-cutover raw nonce is never the L1 key");
+        assert_ne!(&raw[8..], hex::encode(fixture_nullifier()), "the leaf-hash services identity is never the L1 key");
     }
 
-    /// WithdrawalPendingCreated log for the fixture's withdrawal (nonce 13,
-    /// token 0xd970…, recipient 0x1f1a…). The amount word is opaque to the
-    /// submitter, which never compares payout fields.
+    fn fixture_nonce_bytes() -> [u8; 32] {
+        let normalized = normalize_u256_hex_32bytes("13").unwrap();
+        hex::decode(normalized.trim_start_matches("0x")).unwrap().try_into().unwrap()
+    }
+
+    fn fixture_nullifier() -> [u8; 32] {
+        withdrawal_leaf_nullifier(
+            42,
+            "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9",
+            "0xd970407ff0af85d90d936c1c457504e5415af424",
+            "990000000",
+            &normalize_u256_hex_32bytes("13").unwrap(),
+            0,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn fixture_nullifier_topic() -> String {
+        format!("0x{}", hex::encode(fixture_nullifier()))
+    }
+    /// The fixture withdrawal's L1 claim identity: keccak over its 35 slot words.
+    fn fixture_claim_identity() -> [u8; 32] {
+        withdrawal_l1_claim_identity(
+            42,
+            "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9",
+            "0xd970407ff0af85d90d936c1c457504e5415af424",
+            "990000000",
+            &normalize_u256_hex_32bytes("13").unwrap(),
+            0,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn fixture_claim_identity_topic() -> String {
+        format!("0x{}", hex::encode(fixture_claim_identity()))
+    }
+
+    fn u256_decimal(value: u64) -> String {
+        value.to_string()
+    }
+
+    fn fixture_slot_data() -> serde_json::Value {
+        // One real slot carrying the EXACT 35 words of the fixture withdrawal
+        // (same args the CLI runs with), then inactive slots all zero. The
+        // full-identity binding compares every word before the send; the leaf
+        // hash stays a leaf-only field with no slot position.
+        let mut words = vec!["0".to_string(); WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS];
+        words[0] = u256_decimal(42);
+        let recipient = hex_to_u32x8_be("0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9").unwrap();
+        let token = hex_to_u32x8_be("0xd970407ff0af85d90d936c1c457504e5415af424").unwrap();
+        let amount = u256_to_u32x8_be("990000000").unwrap();
+        let nonce = bytes32_hex_to_u32x8_be(&normalize_u256_hex_32bytes("13").unwrap(), "nonce").unwrap();
+        for (offset, word) in recipient.into_iter().chain(token).chain(amount).enumerate() {
+            words[1 + offset] = u256_decimal(u64::from(word));
+        }
+        for (offset, word) in nonce.into_iter().enumerate() {
+            words[25 + offset] = u256_decimal(u64::from(word));
+        }
+        words[33] = u256_decimal(0);
+        words[34] = u256_decimal(4);
+        serde_json::Value::Array(words.into_iter().map(serde_json::Value::String).collect())
+    }
+
+    fn fixture_leaf_hash_hex() -> String {
+        compute_withdrawal_leaf_hash(
+            42,
+            "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9",
+            "0xd970407ff0af85d90d936c1c457504e5415af424",
+            "990000000",
+            &normalize_u256_hex_32bytes("13").unwrap(),
+            0,
+            4,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn slot_binding_rejects_any_mutated_word_before_send() {
+        let nonce = bytes32_hex_to_u32x8_be(&normalize_u256_hex_32bytes("13").unwrap(), "nonce").unwrap();
+        // The locally verified withdrawal is the FIXTURE withdrawal: its
+        // recipient/token/amount words are the same nonzero values
+        // fixture_slot_data packs, not zeros.
+        let to_words32 = |hex_str: &str| -> Vec<u32> { hex_to_u32x8_be(hex_str).unwrap().into_iter().map(|v| v as u32).collect() };
+        let recipient_words = to_words32("0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9");
+        let token_words = to_words32("0xd970407ff0af85d90d936c1c457504e5415af424");
+        let amount_words: Vec<u32> = u256_to_u32x8_be("990000000").unwrap().into_iter().map(|v| v as u32).collect();
+        let words = |json: serde_json::Value| -> Vec<String> {
+            json.as_array().unwrap().iter().map(|word| word.as_str().unwrap().to_string()).collect()
+        };
+        let bound = words(fixture_slot_data());
+        assert!(require_slot_binds_identity(&bound, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).is_ok());
+
+        let mut wrong_sender = bound.clone();
+        wrong_sender[0] = u256_decimal(43);
+        let err = require_slot_binds_identity(&wrong_sender, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("sender"), "{err}");
+
+        // Recipient, token, and amount must each equal the locally verified
+        // withdrawal: a prove-proxy returning a valid proof for a different
+        // leaf under the same root is rejected BEFORE the L1 send.
+        for (base, name) in [(1usize, "recipient"), (9, "token"), (17, "amount")] {
+            let mut mutated = bound.clone();
+            mutated[base] = u256_decimal(1);
+            let err = require_slot_binds_identity(&mutated, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+        }
+
+        let mut wrong_nonce = bound.clone();
+        wrong_nonce[32] = u256_decimal(1);
+        let err = require_slot_binds_identity(&wrong_nonce, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("nonce"), "{err}");
+
+        let err = require_slot_binds_identity(&bound, 42, &recipient_words, &token_words, &amount_words, &nonce, 1, 4).unwrap_err();
+        assert!(err.to_string().contains("destination chain"), "{err}");
+
+        // Word 34 must carry this claim's token contract id; a different id
+        // does not bind this claim.
+        let mut wrong_contract = bound.clone();
+        wrong_contract[34] = u256_decimal(5);
+        let err = require_slot_binds_identity(&wrong_contract, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("token contract"), "{err}");
+
+        // A leaf-hash limb parked at slot 1's first word (index 35) is padding.
+        let mut legacy_limb = bound.clone();
+        legacy_limb[35] = u256_decimal(1);
+        let err = require_slot_binds_identity(&legacy_limb, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("dummy"), "{err}");
+
+        // Any nonzero word in an inactive padding slot must be rejected.
+        let mut dummy_word = bound.clone();
+        dummy_word[WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS + 35] = u256_decimal(1);
+        let err = require_slot_binds_identity(&dummy_word, 42, &recipient_words, &token_words, &amount_words, &nonce, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("dummy"), "{err}");
+    }
+
+    #[test]
+    fn the_same_nonce_for_another_sender_has_a_different_nullifier() {
+        assert_ne!(
+            withdrawal_leaf_nullifier(42, "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9", "0xd970407ff0af85d90d936c1c457504e5415af424", "990000000", &normalize_u256_hex_32bytes("13").unwrap(), 0, 4).unwrap(),
+            withdrawal_leaf_nullifier(43, "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9", "0xd970407ff0af85d90d936c1c457504e5415af424", "990000000", &normalize_u256_hex_32bytes("13").unwrap(), 0, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn l1_claim_identity_binds_full_content_not_the_nonce() {
+        let fixture = |sender: u64, token: &str, amount: &str, contract: u64| {
+            withdrawal_l1_claim_identity(
+                sender,
+                "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9",
+                token,
+                amount,
+                &normalize_u256_hex_32bytes("13").unwrap(),
+                0,
+                contract,
+            )
+            .unwrap()
+        };
+        let identity = fixture(42, "0xd970407ff0af85d90d936c1c457504e5415af424", "990000000", 4);
+        // The L1 key is neither the raw nonce nor the Poseidon leaf hash.
+        assert_ne!(identity, fixture_nonce_bytes());
+        assert_ne!(identity, fixture_nullifier());
+        // Same nonce, different sender / token / contract id: different claims.
+        assert_ne!(identity, fixture(43, "0xd970407ff0af85d90d936c1c457504e5415af424", "990000000", 4));
+        assert_ne!(identity, fixture(42, "0xd970407ff0af85d90d936c1c457504e5415af425", "990000000", 4));
+        assert_ne!(identity, fixture(42, "0xd970407ff0af85d90d936c1c457504e5415af424", "990000000", 5));
+        // Amount high bits bind: 2^64 + 1 differs from its low-limb truncation.
+        assert_ne!(
+            fixture(42, "0xd970407ff0af85d90d936c1c457504e5415af424", "18446744073709551617", 4),
+            fixture(42, "0xd970407ff0af85d90d936c1c457504e5415af424", "1", 4)
+        );
+    }
+
+
     fn pending_created_log(amount_word: &str) -> serde_json::Value {
+        install_deployments_fixture();
         let bridge = resolve_bridge_address_for_network("localhost").unwrap();
         serde_json::json!([{
             "address": bridge,
             "topics": [
                 format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_PENDING_CREATED_EVENT.as_bytes())[..])),
-                normalize_u256_hex_32bytes("13").unwrap(),
+                fixture_claim_identity_topic(),
                 to_32byte_hex("0xd970407ff0af85d90d936c1c457504e5415af424"),
                 to_32byte_hex("0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9"),
             ],
@@ -1183,22 +1635,23 @@ mod tests {
         topics.swap(2, 3);
         logs[0]["data"] = serde_json::json!(amount);
         let bridge = resolve_bridge_address_for_network("localhost").unwrap();
-        let nonce = claimed_nonce_bytes("13").unwrap();
-        let tuples = extract_withdrawal_pending_created_tuples(&logs, &bridge, &nonce).unwrap();
-        let pending = extract_withdrawal_pending_created_tuples(&pending_created_log(&amount), &bridge, &nonce).unwrap();
+        let identity = fixture_claim_identity();
+        let tuples = extract_withdrawal_pending_created_tuples(&logs, &bridge, &identity).unwrap();
+        let pending = extract_withdrawal_pending_created_tuples(&pending_created_log(&amount), &bridge, &identity).unwrap();
         assert_eq!(tuples, pending);
         logs[0]["data"] = serde_json::json!("0x01");
-        assert!(extract_withdrawal_pending_created_tuples(&logs, &bridge, &nonce).is_err());
+        assert!(extract_withdrawal_pending_created_tuples(&logs, &bridge, &identity).is_err());
     }
 
-    /// WithdrawalClaimItemFailed log for nonce 13, slot 0, with a numeric reason.
+    /// WithdrawalClaimItemFailed log for the fixture claim identity, slot 0, with a numeric reason.
     fn item_failed_log(reason: u8) -> serde_json::Value {
+        install_deployments_fixture();
         let bridge = resolve_bridge_address_for_network("localhost").unwrap();
         serde_json::json!([{
             "address": bridge,
             "topics": [
                 format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..])),
-                normalize_u256_hex_32bytes("13").unwrap(),
+                fixture_claim_identity_topic(),
                 format!("0x{:064x}", 0u64),
             ],
             "data": format!("0x{:064x}", reason as u64),
@@ -1222,14 +1675,14 @@ mod tests {
         mut calls_by_block: BTreeMap<String, serde_json::Value>,
         method_overrides: BTreeMap<&'static str, serde_json::Value>,
     ) -> (ClaimWithdrawalArgs, RpcRequestLog) {
+        install_deployments_fixture();
         let recipient = "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9";
         let token_address = "0xd970407ff0af85d90d936c1c457504e5415af424";
         let amount = "990000000";
         let nonce = "13";
         let sender_user_id = 42u64;
         let normalized_nonce = normalize_u256_hex_32bytes(nonce).unwrap();
-        let leaf_hash = compute_withdrawal_leaf_hash(sender_user_id, recipient, token_address, amount, &normalized_nonce, 0).unwrap();
-
+        let leaf_hash = compute_withdrawal_leaf_hash(sender_user_id, recipient, token_address, amount, &normalized_nonce, 0, 4).unwrap();
         let services_url = spawn_single_response_server(serde_json::json!({
             "success": true,
             "data": {
@@ -1238,7 +1691,7 @@ mod tests {
                 "leaf_hash": leaf_hash,
                 "siblings": [],
                 "withdrawal_root": "0x1234",
-                "withdrawal": { "sender_user_id": sender_user_id }
+                "withdrawal": { "sender_user_id": sender_user_id, "nullifier": format!("0x{}", hex::encode(fixture_nullifier())), "token_contract_id": 4 }
             }
         }));
 
@@ -1248,7 +1701,7 @@ mod tests {
             "result": {
                 "solidity_proof": repeat_words(8),
                 "public_inputs": repeat_words(18),
-                "slot_data": repeat_words(WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS),
+                "slot_data": fixture_slot_data(),
             }
         }));
 
@@ -1303,7 +1756,8 @@ mod tests {
             amount: amount.to_string(),
             nonce: nonce.to_string(),
             destination_chain_index: 0,
-            sender_user_id: None,
+            sender_user_id,
+            token_contract_id: 4,
             prove_proxy_url: Some(prove_proxy_url),
             prove_proxy_token: None,
         };
@@ -1365,7 +1819,8 @@ mod tests {
         };
         let normalized_nonce = normalize_u256_hex_32bytes("13").unwrap();
         let message = err.to_string();
-        assert!(message.contains(&normalized_nonce), "error must name the nonce: {message}");
+        assert!(message.contains(&normalized_nonce), "error must name the proof nonce: {message}");
+        assert!(message.contains(&format!("0x{}", hex::encode(fixture_nullifier()))), "error must name the nullifier: {message}");
         assert!(message.contains("not registered"), "error must state the skip: {message}");
         assert!(message.contains("claimedNullifiers is false"), "error must name the mapping state: {message}");
 
@@ -1555,77 +2010,82 @@ mod tests {
 
     #[test]
     fn claim_withdrawal_item_failed_event_requires_emitter_tuple() {
-        let normalized_nonce = normalize_u256_hex_32bytes("13").unwrap();
-        let nonce_bytes: [u8; 32] = hex::decode(normalized_nonce.trim_start_matches("0x")).unwrap().try_into().unwrap();
+        let identity_topic = fixture_claim_identity_topic();
+        let identity = fixture_claim_identity();
+        let leaf_topic = fixture_nullifier_topic();
+        install_deployments_fixture();
         let bridge = resolve_bridge_address_for_network("localhost").unwrap();
         let topic0 = format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..]));
         let zero_word = format!("0x{:064x}", 0u64);
-        let log_with = |address: &str, nonce_topic: &str, slot_topic: &str, data: &str| {
+        let log_with = |address: &str, key_topic: &str, slot_topic: &str, data: &str| {
             serde_json::json!([{
                 "address": address,
-                "topics": [topic0.clone(), nonce_topic, slot_topic],
+                "topics": [topic0.clone(), key_topic, slot_topic],
                 "data": data,
             }])
         };
         let reason_word = format!("0x{:064x}", 8u64);
 
         assert_eq!(
-            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, &reason_word), &bridge, &nonce_bytes),
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &identity_topic, &zero_word, &reason_word), &bridge, &identity),
             Some(8)
         );
         assert_eq!(
-            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, &reason_word), &bridge, &[0u8; 32]),
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &leaf_topic, &zero_word, &reason_word), &bridge, &identity),
             None,
-            "a Failed event for a different nonce must be ignored"
+            "a Failed event whose topic is the leaf-hash services identity is not this withdrawal's claim identity"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &identity_topic, &zero_word, &reason_word), &bridge, &[0u8; 32]),
+            None,
+            "a Failed event for a different claim identity key must be ignored"
         );
         assert_eq!(
             extract_withdrawal_claim_item_failure_reason(
-                &log_with("0x000000000000000000000000000000000000dead", &normalized_nonce, &zero_word, &reason_word),
+                &log_with("0x000000000000000000000000000000000000dead", &identity_topic, &zero_word, &reason_word),
                 &bridge,
-                &nonce_bytes
+                &identity
             ),
             None,
             "a Failed event from another emitter must be ignored"
         );
         assert_eq!(
             extract_withdrawal_claim_item_failure_reason(
-                &log_with(&bridge, &normalized_nonce, &format!("0x{:064x}", 1u64), &reason_word),
+                &log_with(&bridge, &identity_topic, &format!("0x{:064x}", 1u64), &reason_word),
                 &bridge,
-                &nonce_bytes
+                &identity
             ),
             None,
             "a Failed event for a nonzero slot must be ignored (single-slot submitter)"
         );
         assert_eq!(
-            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, "0x08"), &bridge, &nonce_bytes),
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &identity_topic, &zero_word, "0x08"), &bridge, &identity),
             None,
             "a malformed reason data word must be undecodable, not a reason"
         );
         assert_eq!(
             extract_withdrawal_claim_item_failure_reason(
-                &log_with(&bridge, &normalized_nonce, &zero_word, &format!("0x{:063x}08", 1u64)),
+                &log_with(&bridge, &identity_topic, &zero_word, &format!("0x{:063x}08", 1u64)),
                 &bridge,
-                &nonce_bytes
+                &identity
             ),
             None,
             "a non-canonical reason word (upper bytes set) must be undecodable"
         );
-        assert_eq!(
-            extract_withdrawal_claim_item_failure_reason(&serde_json::json!({}), &bridge, &nonce_bytes),
-            None
-        );
+        assert_eq!(extract_withdrawal_claim_item_failure_reason(&serde_json::json!({}), &bridge, &identity), None);
     }
 
     #[test]
     fn claim_withdrawal_pending_created_log_presence_and_validation() {
-        let nonce_bytes = claimed_nonce_bytes("13").unwrap();
+        let identity = fixture_claim_identity();
+        install_deployments_fixture();
         let bridge = resolve_bridge_address_for_network("localhost").unwrap();
         let amount_word = fixture_amount_word();
         let log = pending_created_log(&amount_word);
 
-        // This tx's own event for the nonce is registration evidence; presence
+        // This tx's own event for the claim identity is registration evidence; presence
         // is all the submitter reads — payout fields are never compared.
-        let tuples = extract_withdrawal_pending_created_tuples(&log, &bridge, &nonce_bytes).unwrap();
+        let tuples = extract_withdrawal_pending_created_tuples(&log, &bridge, &identity).unwrap();
         assert_eq!(tuples.len(), 1);
         let expected_token = hex::decode(to_32byte_hex("0xd970407ff0af85d90d936c1c457504e5415af424").trim_start_matches("0x")).unwrap();
         assert_eq!(tuples[0].0.as_slice(), expected_token.as_slice());
@@ -1633,12 +2093,15 @@ mod tests {
         // A reorg-removed log is never evidence.
         let mut removed = pending_created_log(&amount_word);
         removed[0]["removed"] = serde_json::json!(true);
-        assert!(extract_withdrawal_pending_created_tuples(&removed, &bridge, &nonce_bytes).unwrap().is_empty());
+        assert!(extract_withdrawal_pending_created_tuples(&removed, &bridge, &identity).unwrap().is_empty());
 
-        // Wrong nonce / wrong emitter must not decode.
+        // A different key (leaf hash, pre-cutover raw nonce), a zero key, or
+        // the wrong emitter must not decode.
+        assert!(extract_withdrawal_pending_created_tuples(&log, &bridge, &fixture_nullifier()).unwrap().is_empty());
+        assert!(extract_withdrawal_pending_created_tuples(&log, &bridge, &fixture_nonce_bytes()).unwrap().is_empty());
         assert!(extract_withdrawal_pending_created_tuples(&log, &bridge, &[0u8; 32]).unwrap().is_empty());
         assert!(
-            extract_withdrawal_pending_created_tuples(&log, "0x000000000000000000000000000000000000dead", &nonce_bytes)
+            extract_withdrawal_pending_created_tuples(&log, "0x000000000000000000000000000000000000dead", &identity)
                 .unwrap()
                 .is_empty()
         );
@@ -1647,20 +2110,119 @@ mod tests {
         for flag in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!(null)] {
             let mut bad = pending_created_log(&amount_word);
             bad[0]["removed"] = flag;
-            let err = extract_withdrawal_pending_created_tuples(&bad, &bridge, &nonce_bytes).unwrap_err();
+            let err = extract_withdrawal_pending_created_tuples(&bad, &bridge, &identity).unwrap_err();
             assert!(err.to_string().contains("not a boolean"), "{err}");
         }
 
         // A recognized event with a wrong topic count is an error, not an ignored log.
         let mut short_topics = pending_created_log(&amount_word);
         short_topics[0]["topics"] = serde_json::json!([short_topics[0]["topics"][0]]);
-        assert!(extract_withdrawal_pending_created_tuples(&short_topics, &bridge, &nonce_bytes).is_err());
+        assert!(extract_withdrawal_pending_created_tuples(&short_topics, &bridge, &identity).is_err());
     }
 
     #[test]
     fn claim_withdrawal_failure_reason_names_are_frozen() {
         assert_eq!(describe_withdrawal_claim_failure_reason(5), "nullifier already claimed (5)");
         assert_eq!(describe_withdrawal_claim_failure_reason(10), "claimable-at overflow (10)");
-        assert!(describe_withdrawal_claim_failure_reason(11).contains("unknown"), "reserved codes stay unnamed");
+        assert_eq!(
+            describe_withdrawal_claim_failure_reason(11),
+            "Router does not dual-bind the token to an L2 contract id (11)"
+        );
+        assert!(describe_withdrawal_claim_failure_reason(12).contains("unknown"), "reserved codes stay unnamed");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_rejects_found_proof_without_nullifier() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": true, "leaf_index": 0, "leaf_hash": "0x11", "siblings": [], "withdrawal_root": "0x1234", "withdrawal": { "sender_user_id": 42 } }
+        }));
+        let err = run(proof_only_args(services_url, 42, "13")).await.err().expect("expected the claim to fail");
+        assert!(format!("{err:#}").contains("missing withdrawal.nullifier"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_rejects_nullifier_hex_alias() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": true, "leaf_index": 0, "leaf_hash": "0x11", "siblings": [], "withdrawal_root": "0x1234", "nullifier_hex": format!("0x{}", hex::encode(fixture_nullifier())), "withdrawal": { "sender_user_id": 42 } }
+        }));
+        let err = run(proof_only_args(services_url, 42, "13")).await.err().expect("expected the alias to be refused");
+        assert!(format!("{err:#}").contains("missing withdrawal.nullifier"), "alias must not satisfy the contract: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_rejects_proof_sender_mismatch() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": true, "leaf_index": 0, "leaf_hash": "0x11", "siblings": [], "withdrawal_root": "0x1234", "withdrawal": { "sender_user_id": 7, "nullifier": format!("0x{}", hex::encode(fixture_nullifier())), "token_contract_id": 4 } }
+        }));
+        let err = run(proof_only_args(services_url, 42, "13")).await.err().expect("expected the sender mismatch to fail");
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_rejects_proof_nullifier_mismatch() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": true, "leaf_index": 0, "leaf_hash": "0x11", "siblings": [], "withdrawal_root": "0x1234", "withdrawal": { "sender_user_id": 42, "nullifier": format!("0x{:064x}", 3u64), "token_contract_id": 4 } }
+        }));
+        let err = run(proof_only_args(services_url, 42, "13")).await.err().expect("expected the nullifier mismatch to fail");
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_rejects_absent_identity_keys_when_not_found() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": false, "checkpoint_id": 0, "withdrawal": { "recipient": "0x1" } }
+        }));
+        let err = run(proof_only_args(services_url, 42, "13")).await.err().expect("expected absent keys to fail");
+        assert!(format!("{err:#}").contains("missing withdrawal.sender_user_id"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_explicit_null_identity_is_unavailable() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": { "found": false, "checkpoint_id": 0, "withdrawal": { "sender_user_id": null, "nullifier": null, "token_contract_id": null } }
+        }));
+        let result = run(proof_only_args(services_url, 42, "13")).await.unwrap();
+        let CommandResult::L1Transaction(result) = result else { panic!("expected L1 result") };
+        assert!(matches!(result.status, L1TransactionStatus::NotFound));
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_matched_without_proof_is_unavailable() {
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": {
+                "found": false,
+                "checkpoint_id": 9,
+                "leaf_hash": "0x11",
+                "withdrawal": { "sender_user_id": 42, "nullifier": format!("0x{}", hex::encode(fixture_nullifier())), "token_contract_id": 4 }
+            }
+        }));
+        let result = run(proof_only_args(services_url, 42, "13")).await.unwrap();
+        let CommandResult::L1Transaction(result) = result else { panic!("expected L1 result") };
+        assert!(matches!(result.status, L1TransactionStatus::NotFound));
+    }
+
+    fn proof_only_args(services_url: String, sender_user_id: u64, nonce: &str) -> ClaimWithdrawalArgs {
+        ClaimWithdrawalArgs {
+            rpc_config: "definitely-missing-config.json".to_string(),
+            services_url,
+            l1_rpc_url: "http://127.0.0.1:9".to_string(),
+            private_key: "unused-in-proof-only-mode".to_string(),
+            recipient: "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9".to_string(),
+            token_address: "0xd970407ff0af85d90d936c1c457504e5415af424".to_string(),
+            amount: "990000000".to_string(),
+            nonce: nonce.to_string(),
+            destination_chain_index: 0,
+            sender_user_id,
+            token_contract_id: 4,
+            prove_proxy_url: None,
+            prove_proxy_token: None,
+        }
     }
 }

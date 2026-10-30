@@ -49,6 +49,11 @@ impl LeftLinearRightVariableHeightStateTransitionGadget {
             a_header.guta_circuit_whitelist,
             b_header.guta_circuit_whitelist,
         );
+        // the left aggregation's end root is the subtree state the right proof starts from
+        builder.connect_hashes(
+            a_header.state_transition.new_node_value,
+            right_delta_merkle_proof_gadget.old_root,
+        );
         // ensure that the node for a_header matches the parent node of the right delta merkle proof
         builder.connect(
             a_header.state_transition.node_index,
@@ -117,5 +122,127 @@ impl LeftLinearRightVariableHeightStateTransitionGadget {
 impl<const D: usize> ToGUTAHeader<D> for LeftLinearRightVariableHeightStateTransitionGadget {
     fn get_guta_header<H: AlgebraicHasher<F>, F: RichField + Extendable<D>>(&self, _builder: &mut CircuitBuilder<F, D>, _default_guta_circuit_whitelist: HashOutTarget) -> GlobalUserTreeAggregatorHeaderGadget {
        self.new_guta_header.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{
+        crypto::hash::merkle_proof::DeltaMerkleProofCore,
+        data::hash::merkle_node_key::SimpleMerkleNodeKey,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+    };
+    use plonky2::{
+        field::goldilocks_field::GoldilocksField,
+        field::types::Field,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{
+            circuit_builder::CircuitBuilder,
+            circuit_data::CircuitConfig,
+            config::{GenericConfig, PoseidonGoldilocksConfig},
+        },
+    };
+
+    use super::super::guta_header::GlobalUserTreeAggregatorHeaderGadget;
+    use super::LeftLinearRightVariableHeightStateTransitionGadget;
+
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+    const D: usize = 2;
+    type H = <C as GenericConfig<D>>::Hasher;
+
+    fn chain_witness(forged: bool) -> anyhow::Result<()> {
+        let tree_height = 2usize;
+        let mut store = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, QHashOut<F>>::new(tree_height as u8);
+        let index = 1u64;
+        let old_value = QHashOut::from_values(1, 2, 3, 4);
+        let new_value = QHashOut::from_values(9, 8, 7, 6);
+        store.set_leaf_no_proof(index, old_value);
+        let start = store.get_leaf_in_subtree(1, 2, index);
+        store.set_node_value(SimpleMerkleNodeKey::new(2, index), new_value);
+        store.rehash_from_node_to_level(SimpleMerkleNodeKey::new(2, index), 1);
+        let end = store.get_leaf_in_subtree(1, 2, index);
+        let dmp = DeltaMerkleProofCore {
+            old_root: start.root,
+            old_value: start.value,
+            new_root: end.root,
+            new_value,
+            index,
+            siblings: start.siblings,
+        };
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let a_header = GlobalUserTreeAggregatorHeaderGadget::add_virtual_to(&mut builder);
+        let b_header = GlobalUserTreeAggregatorHeaderGadget::add_virtual_to(&mut builder);
+        let gadget = LeftLinearRightVariableHeightStateTransitionGadget::add_virtual_to::<H, F, D>(
+            &mut builder,
+            a_header,
+            b_header,
+            tree_height,
+            tree_height,
+        );
+
+        let mut pw = PartialWitness::new();
+        let checkpoint_tree_root = QHashOut::from_values(7, 7, 7, 7);
+        let whitelist = QHashOut::from_values(8, 8, 8, 8);
+        let end_root = if forged { QHashOut::ZERO } else { dmp.old_root };
+        set_header_witness(&mut pw, &a_header, whitelist, checkpoint_tree_root, QHashOut::ZERO, end_root, index >> 1, 1)?;
+        set_header_witness(&mut pw, &b_header, whitelist, checkpoint_tree_root, old_value, new_value, index, 2)?;
+        gadget.set_witness_params(&mut pw, &dmp)?;
+
+        let data = builder.build::<C>();
+        match data.prove(pw) {
+            Err(_) => assert!(forged, "honest chain must be provable"),
+            Ok(proof) => {
+                if forged {
+                    assert!(data.verify(proof).is_err(), "a spliced transition must not verify");
+                } else {
+                    data.verify(proof)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_header_witness(
+        witness: &mut PartialWitness<F>,
+        header: &GlobalUserTreeAggregatorHeaderGadget,
+        whitelist: QHashOut<F>,
+        checkpoint_tree_root: QHashOut<F>,
+        old_node_value: QHashOut<F>,
+        new_node_value: QHashOut<F>,
+        node_index: u64,
+        node_level: u64,
+    ) -> anyhow::Result<()> {
+        witness.set_hash_target(header.guta_circuit_whitelist, whitelist.0)?;
+        witness.set_hash_target(header.checkpoint_tree_root, checkpoint_tree_root.0)?;
+        witness.set_hash_target(header.state_transition.old_node_value, old_node_value.0)?;
+        witness.set_hash_target(header.state_transition.new_node_value, new_node_value.0)?;
+        witness.set_target(header.state_transition.node_index, F::from_noncanonical_u64(node_index))?;
+        witness.set_target(header.state_transition.node_level, F::from_noncanonical_u64(node_level))?;
+        for target in [
+            header.stats.guta_fees_collected,
+            header.stats.da_fees_collected,
+            header.stats.user_ops_processed,
+            header.stats.total_transactions,
+            header.stats.slots_modified,
+            header.total_aggregation_proofs_generated,
+        ] {
+            witness.set_target(target, F::ZERO)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_a_chained_transition() -> Result<()> {
+        chain_witness(false)
+    }
+
+    #[test]
+    fn rejects_splicing_two_unrelated_transitions() -> Result<()> {
+        chain_witness(true)
     }
 }

@@ -125,9 +125,11 @@ mod create_tests {
         env.coordinator.seed_realm_root(0, env.genesis.prepared_updates.new_realm_root);
 
         let proposal_backup_dir = tempfile::tempdir()?;
-        let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
+        let proposal_backup = Arc::new(
+            crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?,
+        );
         let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-            u64::from(TEST_CHAIN_ID),
+            TEST_CHAIN_ID,
             &env.genesis_data,
             Arc::clone(&env.file_system),
             TEST_GUTA_BACKUP_DIR.to_string(),
@@ -142,7 +144,7 @@ mod create_tests {
             fingerprint_config(),
             Arc::clone(&env.coordinator),
             Arc::new(crate::test_common::TestZKVerifier {}),
-            proposal_backup,
+            Arc::clone(&proposal_backup),
             None,
         )
         .await?;
@@ -162,8 +164,9 @@ mod create_tests {
         assert_eq!(shared.gathering_unique_pending_id, 1);
 
         // the gatherer background task is alive until aborted
-        assert!(!processor.guta_gatherer_join.as_ref().unwrap().is_finished());
-        processor.guta_gatherer_join.as_ref().unwrap().abort();
+        let gatherer_handle = processor.guta_gatherer_join.as_ref().unwrap();
+        assert!(!gatherer_handle.is_finished());
+        gatherer_handle.abort();
 
         // the same wiring types as the production realm processor instantiation
         let _type_check: &TestRealmProcessor = &processor.db;
@@ -179,11 +182,13 @@ mod create_tests {
         let observe_db = Arc::clone(&env.db);
         let observe_guta_queue = Arc::clone(&env.guta_queue);
         let observe_coordinator = Arc::clone(&env.coordinator);
+        let proposal_backup_dir = tempfile::tempdir()?;
+        let proposal_backup = Arc::new(
+            crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?,
+        );
         let run_handle = tokio::spawn(async move {
-            let proposal_backup_dir = tempfile::tempdir()?;
-            let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
             let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-                u64::from(TEST_CHAIN_ID),
+                TEST_CHAIN_ID,
                 &genesis_data,
                 Arc::clone(&env.file_system),
                 TEST_GUTA_BACKUP_DIR.to_string(),
@@ -198,11 +203,11 @@ mod create_tests {
                 fingerprint_config(),
                 Arc::clone(&env.coordinator),
                 Arc::new(crate::test_common::TestZKVerifier {}),
-                proposal_backup,
+                Arc::clone(&proposal_backup),
                 None,
             )
             .await?;
-            crate::realm::processor::core::runner::run_realm_processor(processor).await
+            crate::realm::processor::core::runner::run_realm_processor_loop(processor).await
         });
 
         // construction commits genesis (writing the pending-id-0 mapping) and

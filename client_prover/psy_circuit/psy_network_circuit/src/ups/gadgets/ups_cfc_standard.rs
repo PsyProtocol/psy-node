@@ -5,7 +5,9 @@ use plonky2::{
     plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher},
 };
 use psy_client_data::ups::ups_standard_cfc_input::UPSVerifyCFCStandardStepInput;
+use psy_common_circuit::builder::core::CircuitBuilderHelpersCore;
 use psy_common_circuit::traits::WitnessValueFor;
+use psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
 use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
 
 use super::{
@@ -31,13 +33,32 @@ impl UPSVerifyCFCStandardStepGadget {
         ups_session_proof_tree_height: usize,
     ) -> Self {
         let corrections = CorrectUPSHeaderHashesGadget::from_previous_step(previous_step_header_gadget);
-        Self::add_virtual_to_with_corrections::<H, F, D>(
+        let step = Self::add_virtual_to_with_corrections::<H, F, D>(
             builder,
             previous_step_header_gadget,
             &corrections,
             current_proof_tree_root,
             ups_session_proof_tree_height,
-        )
+        );
+
+        // A standard call is user-initiated, so its caller is the sentinel
+        // account, never a real contract. The inner target is otherwise free
+        // and flows into the public inputs, the transaction-stack hash, and
+        // the callee's GetCallerContractId - a prover could name any trusted
+        // calling contract. Deferred pops go through
+        // add_virtual_to_with_corrections and keep the enqueuing contract's
+        // id, so the pin lives only on this plain entry.
+        let default_caller = builder.constant_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
+        builder.connect(
+            step.process_cfc_state_delta_gadget
+                .cfc_transaction_input_context
+                .transaction_call_start_ctx
+                .call_data
+                .caller_contract_id,
+            default_caller,
+        );
+
+        step
     }
     pub fn add_virtual_to_with_corrections<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         builder: &mut CircuitBuilder<F, D>,

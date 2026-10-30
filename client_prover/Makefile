@@ -96,7 +96,7 @@ USER1_ID                 := 1
 
 SDC_PATH                 := "sdc.json"
 SDC_FINGERPRINT          := "136ed39299c17a8cc4ea84e0b676e74c70d2a1668abaf346088d2df4087304c5"
-SD_KEY_FINGERPRINT      := "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278"
+SD_KEY_FINGERPRINT      := "d00cde3aee2958f5ce5c1e49a374924703cbd25dc9af7143edc136a5045a7119"
 TRACE_FILE               ?= trace.json
 METHOD_NAME              ?= transfer
 TX_INPUTS                ?= [0, 11000000000]

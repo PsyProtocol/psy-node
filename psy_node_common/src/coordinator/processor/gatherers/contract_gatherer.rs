@@ -546,7 +546,7 @@ mod gatherer_tests {
 
     use crate::{
         coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
-        test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore},
+        test_common::{create_test_unified_db, fixture_validator_tree_root, TestNetworkConfig, TestUnifiedDatabaseStore},
     };
 
     use super::*;
@@ -624,7 +624,7 @@ mod gatherer_tests {
                 user_tree_root: zh(3),
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: zh(3),
-                validator_tree_root: zh(2),
+                validator_tree_root: fixture_validator_tree_root(REALM_ID as u32, REALM_SUB_ID as u16),
             },
             should_revert_last_changes: false,
             block_state: block_state(1),
