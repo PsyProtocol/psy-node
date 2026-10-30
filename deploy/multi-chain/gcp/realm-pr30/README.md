@@ -6,6 +6,10 @@ Execution evidence: [2026-10-29 release](DEPLOYED-20261029.md) and
 This is a state-preserving, per-unit hotfix, not a fresh deployment runner.
 Keep Genesis, databases, pending IDs, queues, keys and existing configuration.
 
+Source-only follow-up: [IMT coverage integration, October 30](IMT-COVERAGE-INTEGRATION-20261030.md).
+That compatible backport is not deployed by the branch push; the live artifact
+records below remain unchanged.
+
 ## Combined Processor Hotfix
 
 Current Processor mapping: [combined hotfix manifest](imt-metadata-live-release.json).
