@@ -20,11 +20,13 @@ class ConfigPreparationTests(unittest.TestCase):
         self.release = fixture.release
         self.retained = fixture.config
         self.retained["networks"]["testnet"].update(guardian_configs=copy.deepcopy(self.release["guardian_configs"]), guardian_history=[])
+        self.retained["networks"]["testnet"]["coordinator_configs"] = copy.deepcopy(self.release["coordinator_configs"])
         for realm in self.retained["networks"]["testnet"]["realm_configs"]:
             realm["rpc_url"] = [f"https://realm{index}.invalid/" for index in range(3)]
         self.canonical = copy.deepcopy(self.retained)
         self.canonical["defaultNetwork"] = "localhost"
         self.canonical["networks"]["testnet"]["guardian_configs"] = []
+        self.canonical["networks"]["testnet"]["coordinator_configs"] = [{"id": 0, "rpc_url": ["https://coordinator.invalid/"]}]
         self.retained["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 10
         self.retained["networks"]["testnet"]["unexpected_private_field"] = "NEVER-COPY"
 
@@ -77,6 +79,18 @@ class ConfigPreparationTests(unittest.TestCase):
             path.write_text("{}")
             with self.assertRaises(ValueError):
                 prepare.read_pinned(path, "0" * 64)
+
+    def test_internal_coordinator_is_retained_instead_of_public_template(self):
+        config = prepare.build_config(self.canonical, self.retained, self.release)
+        self.assertEqual(config["networks"]["testnet"]["coordinator_configs"], self.release["coordinator_configs"])
+
+    def test_public_or_unapproved_coordinator_is_rejected(self):
+        for coordinators in ([], [{"id": 0, "rpc_url": ["https://coordinator.invalid/"]}],
+                             [{"id": 0, "rpc_url": ["http://127.0.0.1:1337/"]}]):
+            retained = copy.deepcopy(self.retained)
+            retained["networks"]["testnet"]["coordinator_configs"] = coordinators
+            with self.assertRaises(ValueError):
+                prepare.build_config(self.canonical, retained, self.release)
 
     def test_missing_optional_guardian_history_does_not_copy_template_history(self):
         self.retained["networks"]["testnet"].pop("guardian_history")

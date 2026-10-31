@@ -4,6 +4,94 @@ This is an offline preparation checkpoint, not a completed deployment or an
 activation package. No database, live service, L1 contract, key or npm package
 was changed by this work.
 
+## Repair Checklist: 2026-10-31
+
+These are preparation tasks, not permission to activate services. Source fixes
+are prepared separately from deployment scripts. A source application without
+tests and independent review is not complete.
+
+| Task | Status | Acceptance |
+|---|---|---|
+| Faucet batch departure and safe retries | Locally committed; scoped tests/review passed | `b9c1cdd9`; ports `c4bf6e16`, `16d3b773`, `afc27728`; atomic bounded queue, policy-bound batch capacity, uncertain delivery never switches operator |
+| Relayer readiness and deposit admission | Locally committed; scoped tests/review passed | `c9a2dfe7`; Services read 2s, row 70s / round 75s to allow L1 pool failover; event-id cursor; root-not-yet-known spends no attempt; at most 32 finalized deposits per chain per round |
+| Worker reputation and fetch replay | Locally committed; scoped tests/review passed | `310d35c5`; port only reputation/replay of `876c1432`; preserve whitelist and PR30/IMT; real Redis replay tests 2/2 passed |
+| BSC fees | Locally committed; scoped tests/review passed | `1f1e2f0a`; port `c9105056` observed-history strategy and strict config parsing; no packed-deposit port |
+| Deployment inputs and Router | Partially complete | Fixed Router base `394153fa`; explicit reviewed contracts commit; role inventory, fresh core planning, internal Coordinator and epoch-32 build binding; 112 offline tests passed; installers remain pending |
+| Build isolation and consumer pins | Partially complete | Clean every local package from full locked metadata before compilation, including out-of-workspace path dependencies; final publication, consumer pins and immutable release build remain pending |
+
+The complete fleet package, new actual-key Genesis, proving setup and real E2E
+acceptance remain separate release gates below. Do not advance their pins or
+claim activation readiness while this checklist is incomplete.
+
+### Current Work And Remaining Boundaries
+
+Runtime changes are isolated on local `fix/fresh-runtime-gaps-20261031`, based
+on `e2884812`, now at `b9c1cdd9`; deployment-only changes are separate. Neither
+is a new published release yet. The profile still identifies the last published
+runtime, not this local candidate. `runtime_inputs_frozen` is false and the v2
+builder enforces it before invoking Docker. Do not flip it until the accepted
+runtime is published and consumer/source/input checks are complete.
+
+The current preview profile SHA-256 is
+`5b065248c01e8f121a0cea72e104e24acf1e46fb1052eba1a60b56721bcc5111`.
+This is a preparation checkpoint, not the eventual final release hash. The CLI
+planner requires that hash and checks supplied config bytes against the profile.
+
+Scoped release-mode results after corrections:
+
+| Suite | Passed |
+|---|---:|
+| Faucet | 32 |
+| Submission-error classification | 4 |
+| Provider (unchanged since its first passing port run) | 162 |
+| Relayer, including BSC fee policy | 423 |
+| Reputation, Worker API and PR30 redelivery | 68 |
+| Rollback snapshot/executor regression | 84 |
+| Node core | 69 |
+| Memory store | 6 |
+| NATS unit tests | 7 |
+| Real Redis replay integration | 2 |
+| Build / plan / L1 packaging | 89 |
+| Config preparation / preflight | 23 |
+
+Failures from earlier runs are retained. Old Faucet/Worker fixtures were fixed
+without relaxing production authentication. The Relayer regression now supplies
+one explicit outcome per attempted row, preserving the existing failure charge
+for genuinely missing outcomes. Two build-gate regressions failed before their
+fixes (unfrozen profile and uncached local dependency cleanup), then passed.
+These are scoped tests, not the full release DAG or real new-chain acceptance.
+Evidence logs are local `tmp/fresh-*-20261031.log`; no logs or generated binaries
+belong in this Git delivery. No live service was contacted or changed.
+
+Before enabling the reputation port, all Edges must share one private Redis
+database with `maxmemory-policy noeviction`. Every Edge and queue-creating unit
+must agree on `NATS_WORKER_ACK_WAIT_MS` and existing consumer `ack_wait`.
+The fresh planner emits one explicit lease on all 16 units; live acceptance
+must still check Redis policy and actual consumers. No Worker upgrade is needed
+for fresh fetch signatures or matching submit tags.
+
+Known residual risk: an in-flight accepted proof can race with job redelivery;
+the replaced claimant may receive one lease-expiry penalty and miss its success
+credit. Removing this race needs a claim-lifecycle change, not a weakened proof
+check. Readiness age/timeout WARN metrics are also follow-up work.
+The pre-zero claim absorption applies only while the worker remains at zero.
+After recovery an old claim may cause another penalty: the record does not
+persist a separate historical zero-transition timestamp. This is a disclosed
+policy limitation, not a claim that every outage is globally deduplicated.
+
+Faucet full-policy proof/memory acceptance, including the default 10-recipient
+batch, is still pending. Pure capacity checks do not prove that resource gate.
+The stale-anchor retry can exhaust the only operator's exclusion set; before-
+submit already-claimed now returns immediately, but that exact behavior lacks
+a standalone end-to-end test. These affect retry availability, not permission
+to retry an uncertain submission. Final Guardian/deposit-cap acceptance and
+sanitized readiness failure classifications remain release follow-ups.
+
+The old host, Services and Faucet installers are still R3-only. In particular,
+the old Faucet source/artifact pin must not be renamed to an unbuilt candidate.
+Finish their release/namespace/artifact migration after final hashes exist.
+The version-2 core plan is a preview, not an installation package.
+
 ## Source And Consumers
 
 The published Node candidate is
@@ -43,6 +131,16 @@ membership-populated config below. They are compilation checks, not WASM,
 new compiler-contract generation or final release artifact acceptance.
 
 ## Actual Config Candidate
+
+**Superseded:** the old hash below describes the October-30 candidate. It omitted
+the retained internal Coordinator endpoints and is no longer accepted by the
+repaired preparation/preflight. The repaired script has now regenerated the
+config from the same two hash-verified public inputs, retaining internal ports
+15370/15371/15372. The new hash is
+`04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d`,
+frozen as `runtime_config_sha256` in the profile. Local candidate:
+`tmp/fresh-runtime-config-20261031/`. No private keys were read. Use build-spec
+v2 after final source publication; do not reuse the superseded output.
 
 The canonical checked-in config defaults to localhost and has no testnet
 Guardian, Validator or Worker identities. `PSY_NETWORK=testnet` selected

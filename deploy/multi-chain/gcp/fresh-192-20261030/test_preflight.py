@@ -1,6 +1,7 @@
 """Synthetic read-only preflight tests; no cloud, Docker, keys or broadcasts."""
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -17,6 +18,8 @@ class Fresh192PreflightTests(unittest.TestCase):
         self.release = preflight.document(preflight.HERE / "release.json")
         self.config = {"defaultNetwork": "testnet", "networks": {"testnet": {
             "magic": self.release["network_magic"], "p2p": {"checkpoints_per_epoch": 32},
+            "coordinator_configs": copy.deepcopy(self.release["coordinator_configs"]),
+            "guardian_configs": copy.deepcopy(self.release["guardian_configs"]),
             "whitelist": {"enabled": True, "secp256k1": ["02" + "1" * 64]},
             "guardian_initial_member_hashes": ["1", "02", "003"],
             "realm_configs": [{"id": i, "validators": [{
@@ -42,6 +45,27 @@ class Fresh192PreflightTests(unittest.TestCase):
 
     def test_valid_config_format_is_not_runtime_acceptance(self):
         preflight.config_checks(self.config, self.release)
+
+    def test_structurally_valid_config_still_requires_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(self.config))
+            self.assertEqual(preflight.document(path, hashlib.sha256(path.read_bytes()).hexdigest()), self.config)
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                preflight.document(path, "0" * 64)
+
+    def test_release_profile_rejects_wrong_backend_admission_or_batch_choices(self):
+        preflight.release_checks(self.release)
+        for key, value in (("proving_backend", "jtmb"), ("native_deposits_allowed", True),
+                           ("public_deposits_after_deploy", True), ("faucet_operator_count", 10),
+                           ("withdrawal_append_supported_batch_sizes", [1, 2]),
+                           ("namespace_prefix", "fresh20261027r3"), ("account_identity_mode", "fresh-faucet"),
+                           ("worker_queue_ack_wait_ms", 0), ("worker_queue_ack_wait_ms", True),
+                           ("redis_maxmemory_policy", "allkeys-lru")):
+            release = copy.deepcopy(self.release)
+            release[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                preflight.release_checks(release)
 
     def test_old_epoch_disabled_whitelist_and_wrong_network_reject(self):
         for mutation in (lambda c: c.update(defaultNetwork="localhost"),
@@ -95,7 +119,10 @@ class Fresh192PreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.json"
             config.write_text(json.dumps(self.config))
-            with patch.object(preflight, "source_checks"), contextlib.redirect_stdout(output):
+            release = copy.deepcopy(self.release)
+            release["runtime_config_sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
+            (Path(tmp) / "release.json").write_text(json.dumps(release))
+            with patch.object(preflight, "HERE", Path(tmp)), patch.object(preflight, "source_checks"), contextlib.redirect_stdout(output):
                 self.assertEqual(preflight.main(["--source", tmp, "--config", str(config)]), 0)
         report = json.loads(output.getvalue())
         self.assertTrue(report["source_preflight_passed"])

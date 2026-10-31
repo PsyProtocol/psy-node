@@ -3,11 +3,17 @@
   "release_id": "core-testnet-20261030-sd192",
   "deployment_branch": "deploy/testnet",
   "runtime_candidate_commit": "e28848127f4cef87bea4e63cc9fb9b79edc18d93",
+  "runtime_inputs_frozen": false,
   "network": "testnet",
   "cli_network": "psy-public-testnet",
   "network_magic": "0x1337CF514544CF69",
-  "proving_backend": "plonky2",
+  "proving_backend": "plonky2-poseidon-goldilocks",
+  "coordinator_configs": [
+    {"id": 0, "rpc_url": ["http://10.148.0.25:15370", "http://10.148.0.25:15371", "http://10.148.0.25:15372"]}
+  ],
   "checkpoints_per_epoch": 32,
+  "worker_queue_ack_wait_ms": 30000,
+  "redis_maxmemory_policy": "noeviction",
   "sd_key_max_calldata_words": 192,
   "max_introspectable_transactions": 64,
   "faucet_operator_count": 100,
@@ -15,6 +21,7 @@
   "account_identity_mode": "fresh-faucet-and-relayer",
   "canonical_config_sha256": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
   "retained_public_config_sha256": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
+  "runtime_config_sha256": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
   "guardian_configs": [
     {"id": 1, "listen_address": "10.148.0.39:15441", "rpc_url": "http://10.148.0.39:15441"},
     {"id": 2, "listen_address": "10.148.0.40:15442", "rpc_url": "http://10.148.0.40:15442"},

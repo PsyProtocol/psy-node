@@ -78,15 +78,38 @@ def validators(topology):
             yield realm["id"], position, validator
 
 
-def validate_topology(t):
-    fields(t, ("schema_version", "release_id", "runtime_commit", "psy_network",
+def validate_topology(t, release_profile=None):
+    topology_fields = ("schema_version", "release_id", "runtime_commit", "psy_network",
                "network", "proving_backend", "hosts", "infrastructure", "coordinator",
-               "realms", "faucet_operator_count"), "topology")
+               "realms", "faucet_operator_count")
+    require(isinstance(t, dict), "topology must be an object")
+    fresh = t.get("schema_version") == 2
+    if fresh:
+        topology_fields += ("namespace_prefix", "checkpoints_per_epoch", "worker_queue_ack_wait_ms")
+    fields(t, topology_fields, "topology")
     number(t["faucet_operator_count"], 100, 100, "faucet operator count")
-    require(type(t["schema_version"]) is int and t["schema_version"] == 1, "unsupported schema")
-    require(t["runtime_commit"] == RUNTIME_COMMIT,
+    require(type(t["schema_version"]) is int and t["schema_version"] in (1, 2), "unsupported schema")
+    expected_commit, expected_release = RUNTIME_COMMIT, "core-testnet-20261027-r3"
+    prefix = "fresh20261027r3"
+    if fresh:
+        require(isinstance(release_profile, dict), "fresh topology requires a release profile")
+        expected_commit = release_profile["runtime_candidate_commit"]
+        expected_release = release_profile["release_id"]
+        prefix = release_profile["namespace_prefix"]
+        require(re.fullmatch(r"fresh[0-9]{8}sd192", prefix) is not None and
+                t["namespace_prefix"] == prefix, "fresh namespace prefix mismatch")
+        require(re.fullmatch(r"core-testnet-[0-9]{8}-sd192", expected_release) is not None,
+                "invalid fresh release id")
+        require(type(t["checkpoints_per_epoch"]) is int and
+                t["checkpoints_per_epoch"] == release_profile["checkpoints_per_epoch"] == 32,
+                "fresh topology requires epoch 32")
+        require(t["proving_backend"] == release_profile["proving_backend"], "release backend mismatch")
+        number(t["worker_queue_ack_wait_ms"], 1, 2**63 - 1, "worker queue lease")
+        require(t["worker_queue_ack_wait_ms"] == release_profile["worker_queue_ack_wait_ms"],
+                "worker queue lease differs from release profile")
+    require(t["runtime_commit"] == expected_commit,
             "runtime commit must match pinned published source")
-    require(t["release_id"] == "core-testnet-20261027-r3", "unexpected release ID")
+    require(t["release_id"] == expected_release, "unexpected release ID")
     require(t["psy_network"] == "testnet" and t["network"] == "psy-public-testnet",
             "network selection must be testnet / psy-public-testnet")
     require(t["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected proving backend")
@@ -113,7 +136,7 @@ def validate_topology(t):
     namespaces, sockets = set(), set()
 
     def namespace(value, expected):
-        require(isinstance(value, str) and re.fullmatch(r"fresh20261027r3_[a-z0-9_]+", value)
+        require(isinstance(value, str) and re.fullmatch(re.escape(prefix) + r"_[a-z0-9_]+", value)
                 and len(value) <= 48, "invalid fresh namespace")
         require(value not in namespaces, "shared namespace across validators/coordinator")
         require(value == expected, "namespace differs from approved role")
@@ -125,7 +148,7 @@ def validate_topology(t):
         require(identity not in sockets, "duplicate host/listener port")
         sockets.add(identity)
 
-    namespace(c["namespace"], "fresh20261027r3_coordinator")
+    namespace(c["namespace"], prefix + "_coordinator")
     for port in c["edge_ports"]:
         socket(c["host"], port, 15370)
     require(isinstance(t["realms"], list) and len(t["realms"]) == 2, "exactly two Realms required")
@@ -143,7 +166,7 @@ def validate_topology(t):
                     "validator registration/user order differs from approved slots")
             require(v["processor_host"] == PROCESSORS[index] and v["edge_host"] == EDGES[rid],
                     "validator host differs from approved placement")
-            namespace(v["namespace"], f"fresh20261027r3_r{rid}_v{index + 1}")
+            namespace(v["namespace"], f"{prefix}_r{rid}_v{index + 1}")
             socket(v["processor_host"], v["processor_port"], 15400)
             socket(v["edge_host"], v["edge_port"], 15400)
             socket(v["edge_host"], v["http_port"], 15380)
@@ -190,7 +213,10 @@ def validate_inputs(t, config, genesis, whitelist):
     networks = config.get("networks", {})
     selected = networks.get("testnet")
     require(isinstance(selected, dict), "testnet config required")
-    for key, expected in CONSENSUS.items():
+    consensus = dict(CONSENSUS)
+    if t["schema_version"] == 2:
+        consensus["p2p"] = {**CONSENSUS["p2p"], "checkpoints_per_epoch": t["checkpoints_per_epoch"]}
+    for key, expected in consensus.items():
         require(selected.get(key) == expected and type(selected.get(key)) is type(expected),
                 f"testnet consensus mismatch: {key}")
     require(selected.get("whitelist") == policy, "testnet whitelist differs from dedicated policy")
@@ -265,6 +291,8 @@ def services(t):
     config_root = f'/etc/psy-core/{t["release_id"]}'
     state = f'/var/lib/psy-core/{t["release_id"]}'
     env = {"PSY_NETWORK": t["psy_network"], "PSY_CONFIG_PATH": config_root + "/config.json"}
+    if t["schema_version"] == 2:
+        env["NATS_WORKER_ACK_WAIT_MS"] = str(t["worker_queue_ack_wait_ms"])
     common = ["--network", t["network"], "--proving-backend", t["proving_backend"]]
     for key, value in t["infrastructure"].items():
         common.extend(["--" + key.replace("_", "-"), value])
@@ -273,7 +301,8 @@ def services(t):
     def add(role, name, host, namespace, args):
         argv = [release + "/bin/psy_node_cli", "start-" + role, *common,
                 "--db-namespace", namespace, *args]
-        unit = "psy-core-r3-" + name + ".service"
+        unit_prefix = "psy-core-" + t["namespace_prefix"] + "-" if t["schema_version"] == 2 else "psy-core-r3-"
+        unit = unit_prefix + name + ".service"
         quote = lambda value: '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         preview = "\n".join([
             "[Unit]", "Description=OFFLINE PREVIEW " + name, "After=network-online.target",
@@ -314,8 +343,8 @@ def services(t):
     return result
 
 
-def make_plan(topology, config=None, genesis=None, whitelist=None):
-    validate_topology(topology)
+def make_plan(topology, config=None, genesis=None, whitelist=None, release_profile=None):
+    validate_topology(topology, release_profile)
     blockers = [RUNTIME_BLOCKER]
     inputs_valid = False
     if config is None or genesis is None or whitelist is None:
@@ -349,16 +378,31 @@ def make_plan(topology, config=None, genesis=None, whitelist=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", type=Path, default=HERE / "topology.json")
+    parser.add_argument("--release-profile", type=Path)
+    parser.add_argument("--release-profile-sha256")
     for name in ("config", "genesis", "whitelist"):
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args(argv)
     try:
         topology, digest = read_json(args.topology)
+        require(isinstance(topology, dict), "topology must be an object")
+        if topology.get("schema_version") == 2:
+            require(args.release_profile is not None, "fresh topology requires a release profile")
         hashes, inputs = {"topology": digest}, {}
+        if args.release_profile is not None:
+            inputs["release_profile"], hashes["release_profile"] = read_json(args.release_profile)
+            require(isinstance(args.release_profile_sha256, str) and
+                    re.fullmatch(r"[0-9a-f]{64}", args.release_profile_sha256) is not None and
+                    hashes["release_profile"] == args.release_profile_sha256, "release profile hash mismatch")
+        else:
+            require(args.release_profile_sha256 is None, "release profile path required")
         for name in ("config", "genesis", "whitelist"):
             path = getattr(args, name)
             if path is not None:
                 inputs[name], hashes[name] = read_json(path)
+        if topology.get("schema_version") == 2 and "config" in hashes:
+            require(hashes["config"] == inputs["release_profile"]["runtime_config_sha256"],
+                    "release config hash mismatch")
         report = make_plan(topology, **inputs)
         report["input_sha256"] = hashes
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError) as error:

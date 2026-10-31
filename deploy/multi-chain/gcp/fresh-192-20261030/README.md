@@ -6,6 +6,36 @@ The published runtime candidate is
 `deploy/testnet`; runtime integration into `testnet-dev` remains a separate step.
 Neither a successful preflight nor a Git push authorizes reset or activation.
 
+`release.json` is the preparation role inventory. Historical `fresh-topology/`
+and `live/components.json` describe older cohorts, not this deployment's inputs.
+For this cohort: Relayer stays on `gcp-coordinator-worker`, Faucet on `arc99x2`,
+SYSTEM on `arc99x1`, USER on `arc99x3`. Do not rewrite old observations as live
+measurements. `topology.json` here is the core-only version-2 planning input.
+
+```sh
+python3 -B deploy/multi-chain/gcp/core-only/plan.py \
+  --topology deploy/multi-chain/gcp/fresh-192-20261030/topology.json \
+  --release-profile deploy/multi-chain/gcp/fresh-192-20261030/release.json \
+  --release-profile-sha256 "$RELEASE_PROFILE_SHA256"
+```
+
+This read-only preview returns 2 until acceptance is complete. It renders 16 core
+units only when the caller supplies the reviewed profile SHA-256. Obtain that
+hash from the accepted preparation record, not an untrusted replacement profile.
+When config is supplied, its exact bytes must match the profile too. It renders
+units in seven fresh namespaces from `namespace_prefix`; it does not install
+them. The historical host, Services and Faucet installers still require their
+own artifact/namespace migration and must not be used with these new inputs.
+All core Edges must use the same private Redis database for cross-Edge fetch
+replay protection. Per-role namespaces do not partition the replay keys.
+The version-2 plan sets `NATS_WORKER_ACK_WAIT_MS` on all 16 units from one
+release value (initially the unchanged 30000 ms default). Before activation,
+check actual JetStream consumer `ack_wait` against it and measured proof p99;
+adjust the release value consistently if necessary, never only the Edge.
+Check the shared Redis instance uses `maxmemory-policy noeviction`: eviction of
+a live replay key would reopen that signature. The offline planner cannot
+certify either live Redis policy or existing JetStream consumer configuration.
+
 ## Preparation Parameters
 
 `release.json` records testnet magic `0x1337CF514544CF69`, Plonky2, epoch 32,
@@ -50,8 +80,9 @@ execute during status checks. Inherited Git directory/worktree overrides are
 removed. All six validator identities must be structurally complete and unique;
 this does not establish retained-key provenance or curve-point validity.
 
-The historical `core-only` planner/installers still pin R3 source, epoch 10,
-old account identities, artifact hashes and namespaces. Do not call them with
+The historical `core-only` version-1 planner default and installers still pin
+R3 source, epoch 10, old account identities, artifact hashes and namespaces.
+The new version-2 preview above is not an updated installer. Do not call old installers with
 renamed inputs or replace only their version strings. Likewise, the historical
 `source-versions.env` and published SDK 2.1.0 are not this release lock.
 
@@ -86,12 +117,12 @@ The PostgreSQL installer now fixes 2 GiB Docker shared memory and compressed
 a fresh installer that replaces a container, not a live database maintenance
 command. Hasura's existing bounded logging remains unchanged.
 
-## Explicit Fresh Faucet Generation
+## Fresh Faucet And Relayer Generation
 
 The native generator now accepts `--fresh-faucet-identities` only alongside
 hash-pinned imported keys and prior public Genesis. It permits a common old
 Faucet fingerprint to change to a common new nonzero fingerprint for every
-operator. Every public-key parameter, all Validator/Relayer fingerprints and
+operator. In `fresh-faucet` mode, every public-key parameter and all Validator/Relayer fingerprints and
 the six Validator role mappings remain checked. The normal import mode still
 rejects all fingerprint changes. This is not a live account migration.
 
@@ -111,7 +142,7 @@ The block time, eight pinned public inputs, six complete compiler artifacts and
 separately hash-pinned private-key array are still required. The snippet is not
 a complete generation spec. Run `plan` first, then `generate` with the same
 spec, keys and new protected output path. Both record the selected identity
-mode and epoch; generation passes the explicit native flag exactly once.
+mode and epoch; combined generation passes each native opt-in flag exactly once.
 Version 1 remains strict import with epoch 10. Nothing silently upgrades it.
 
 The retained R3 Genesis also has an older registration-2 multisig fingerprint.
@@ -132,7 +163,7 @@ the final actual-key Genesis or matching Compiler/SDK artifacts exist.
 hash-pinned JSON inputs: the canonical config at the selected Node/Genesis
 revision and the retained approved testnet config. It keeps canonical
 consensus parameters and selects testnet, retaining only Guardian commitments,
-the approved ordered Guardian endpoints, Realm membership and the Worker
+the approved ordered Guardian endpoints, internal Coordinator endpoints, Realm membership and the Worker
 whitelist from the prior config. Nested identity objects have exact field
 allowlists; credential-bearing RPC URLs reject. Nonempty Guardian governance
 history rejects and no history is copied. The two input hashes must match

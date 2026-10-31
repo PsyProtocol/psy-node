@@ -14,7 +14,7 @@ import preflight
 
 
 RETAINED_FIELDS = ("guardian_initial_member_hashes", "guardian_configs",
-                   "realm_configs", "whitelist")
+                   "realm_configs", "whitelist", "coordinator_configs")
 
 
 def read_pinned(path, digest):
@@ -54,6 +54,14 @@ def build_config(canonical, retained, release):
             raise ValueError("ordered Guardian ids required")
         public_url(guardian["rpc_url"])
     fields(previous["whitelist"], ("enabled", "secp256k1"))
+    if previous.get("coordinator_configs") != release["coordinator_configs"]:
+        raise ValueError("Coordinator endpoints differ from approved internal placement")
+    for coordinator in previous["coordinator_configs"]:
+        fields(coordinator, ("id", "rpc_url"))
+        if type(coordinator["id"]) is not int or coordinator["id"] != 0:
+            raise ValueError("invalid Coordinator id")
+        for url in coordinator["rpc_url"]:
+            public_url(url)
     for realm in previous["realm_configs"]:
         fields(realm, ("id", "rpc_url", "validators"))
         urls = realm["rpc_url"]

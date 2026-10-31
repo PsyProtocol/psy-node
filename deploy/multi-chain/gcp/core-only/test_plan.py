@@ -62,9 +62,62 @@ class PlanTests(unittest.TestCase):
     def report(self):
         return plan.make_plan(self.t, self.c, self.g, self.w)
 
+    def test_fresh_plan_uses_release_namespaces_and_epoch_without_reusing_r3(self):
+        release, _ = plan.read_json(HERE.parent / "fresh-192-20261030/release.json")
+        self.t.update(schema_version=2, release_id=release["release_id"],
+                      runtime_commit=release["runtime_candidate_commit"],
+                      namespace_prefix=release["namespace_prefix"], checkpoints_per_epoch=32,
+                      worker_queue_ack_wait_ms=release["worker_queue_ack_wait_ms"])
+        self.t["coordinator"]["namespace"] = release["namespace_prefix"] + "_coordinator"
+        for rid, position, validator in plan.validators(self.t):
+            validator["namespace"] = f'{release["namespace_prefix"]}_r{rid}_v{position}'
+        self.c["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 32
+        report = plan.make_plan(self.t, self.c, self.g, self.w, release_profile=release)
+        self.assertTrue(report["input_consistency_passed"])
+        self.assertEqual(len(report["services"]), 16)
+        for service in report["services"]:
+            self.assertTrue(service["namespace"].startswith(release["namespace_prefix"] + "_"))
+            self.assertNotIn("r3", service["unit"])
+            self.assertIn(release["release_id"], service["argv"][0])
+            self.assertEqual(service["environment"]["NATS_WORKER_ACK_WAIT_MS"], "30000")
+        self.t["worker_queue_ack_wait_ms"] = 1
+        with self.assertRaisesRegex(plan.PlanError, "lease differs"):
+            plan.make_plan(self.t, self.c, self.g, self.w, release_profile=release)
+        self.t["worker_queue_ack_wait_ms"] = release["worker_queue_ack_wait_ms"]
+        self.c["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 10
+        with self.assertRaises(plan.PlanError):
+            plan.make_plan(self.t, self.c, self.g, self.w, release_profile=release)
+
     def edit_networks(self, edit):
         for network in self.c["networks"].values():
             edit(network)
+
+    def test_fresh_cli_binds_release_profile_hash_and_forwards_profile(self):
+        root = HERE.parent / "fresh-192-20261030"
+        _, digest = plan.read_json(root / "release.json")
+        args = ["--topology", str(root / "topology.json"), "--release-profile", str(root / "release.json")]
+        for missing in (args[:2], args):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(plan.main(missing), 2)
+            self.assertEqual(json.loads(output.getvalue())["services"], [])
+        for supplied, expected_units in ((digest, 16), ("0" * 64, 0)):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(plan.main(args + ["--release-profile-sha256", supplied]), 2)
+            report = json.loads(output.getvalue())
+            self.assertEqual(len(report["services"]), expected_units)
+            self.assertFalse(report["deployment_ready"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(self.c))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(plan.main(args + ["--release-profile-sha256", digest, "--config", str(path)]), 2)
+            self.assertEqual(json.loads(output.getvalue())["services"], [])
+
+    def test_non_object_topology_fails_with_a_plan_error(self):
+        with self.assertRaisesRegex(plan.PlanError, "object"):
+            plan.validate_topology([])
 
     def reject(self, message):
         with self.assertRaisesRegex(plan.PlanError, message):
