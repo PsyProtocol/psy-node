@@ -85,11 +85,21 @@ features, network selector or fallback config can be supplied through the spec.
   stamp revision, source lock/circuit hashes, image/toolchain, commands,
   environment, binary hashes and log hashes. Keep output private.
 
+While holding all cache locks, the manifest also snapshots the SHA-256 of every
+release rlib named by Cargo's structured compiler-artifact output. These are
+`release_libraries`; the filenames alone do not prove cache contents remained
+unchanged after the build. The Genesis tool linker requires these producer
+hashes and rejects missing receipts or a library replaced at the same path.
+Do not add hashes retroactively to an old manifest from its current cache.
+
 `release-build.log` retains Cargo's JSON compiler-artifact records with rendered
 diagnostics. Use those exact filenames when compiling the standalone Genesis
 validator against this generator's dependency rlibs; never select a library by
 mtime or a wildcard from a cache containing several source/feature cohorts.
-The JSON records add provenance only, not a new build or acceptance gate.
+Host build-dependency records use a different optimization profile. The linker
+requires one unambiguous release library per dependency, including the rebuilt
+`std`/`core` set when Cargo's build-std is active. The JSON records and producer
+hashes establish linkage provenance, not proof or new-chain acceptance.
 
 This manifest is **build evidence only**: `runtime_approved=false` and
 `deployment_ready=false`. No exact circuit tests or new-Genesis native acceptance

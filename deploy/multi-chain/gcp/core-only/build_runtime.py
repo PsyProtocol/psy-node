@@ -143,6 +143,33 @@ def command(argv, *, log=None):
     return subprocess.check_output(argv, text=True, stderr=subprocess.PIPE).strip()
 
 
+def release_libraries(log_path, target):
+    libraries = {}
+    total = 0
+    with log_path.open() as stream:
+        while line := stream.readline(16 * 1024 * 1024 + 1):
+            total += len(line)
+            require(len(line) <= 16 * 1024 * 1024 and total <= 256 * 1024 * 1024,
+                    "compiler artifact log exceeds bound")
+            if not line.startswith("{"):
+                continue
+            entry = json.loads(line, object_pairs_hook=unique_object)
+            if entry.get("reason") != "compiler-artifact":
+                continue
+            profile = entry["profile"]
+            if (entry["target"]["kind"] not in (["lib"], ["rlib"]) or profile.get("test") is not False
+                    or profile.get("opt_level") != "3" or profile.get("debug_assertions") is not False):
+                continue
+            for filename in entry["filenames"]:
+                if not filename.endswith(".rlib"):
+                    continue
+                path = absolute_path(filename)
+                require(path.parent == target / "release/deps", "library path outside release target")
+                libraries[str(path)] = digest(path)
+    require(libraries, "no release library artifacts recorded")
+    return libraries
+
+
 def check_source(spec):
     source = Path(spec["source"]["path"])
     def git(*args):
@@ -310,6 +337,7 @@ def build_runtime(spec_path):
             "checkpoints_per_epoch": document(Path(spec["inputs"]["config"]["path"]))["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"],
             "build_network": "none", "environment": environment, "build_command": build,
             "local_clean_command": clean, "local_package_specs": package_specs,
+            "release_libraries": release_libraries(out / "release-build.log", Path(spec["caches"]["target"])),
             "compiler_revision": document(Path(spec["inputs"]["bundle_stamp"]["path"]))["compilerRevision"],
             "rustc_version": versions.strip(), "go_version": go_version.strip(), "binaries": hashes,
             "glibc_maximums": glibc, "spec_sha256": spec_sha, "recipe_sha256": digest(Path(__file__).resolve()),

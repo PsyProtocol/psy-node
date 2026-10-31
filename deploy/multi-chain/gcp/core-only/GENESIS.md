@@ -5,6 +5,43 @@ on `testnet-dev`; reusable deployment tools and this procedure belong on
 `deploy/testnet`, under `deploy/`. Temporary directories hold build outputs and
 evidence, not an alternative deployment implementation.
 
+For the current epoch-32 / SD192 preparation, use
+[the fresh profile](../fresh-192-20261030/README.md); the R3 topology and package
+notes below are historical and do not select the next runtime.
+
+## Build And Measure The Offline Tools
+
+After the pinned five-CLI build, compile the typed verifier and privacy-circuit
+measurement executable from its exact Cargo artifact records and producer rlib
+hashes. Keep exclusive ownership of the four build caches through this step.
+
+```sh
+python3 -B deploy/multi-chain/gcp/core-only/build_genesis_tools.py \
+  --runtime-manifest "$RUNTIME_BUILD/manifest.json" \
+  --runtime-manifest-sha256 "$RUNTIME_MANIFEST_SHA256" \
+  --output "$NEW_GENESIS_TOOLS"
+
+RAYON_NUM_THREADS=4 "$NEW_GENESIS_TOOLS/measure_genesis_fingerprints" \
+  --node-source-commit "$RUNTIME_SOURCE_SHA" --config-sha256 "$RUNTIME_CONFIG_SHA256" \
+  > "$NEW_MEASUREMENTS_JSON"
+```
+
+The linker is offline, takes the same cache locks, mounts dependencies read-only,
+and preserves partial outputs on failure. It rejects missing/ambiguous records,
+host-profile libraries, same-name files outside the recorded target and hashes
+different from the producer's snapshot. It never reconstructs a missing receipt
+from the current cache. It runs only invalid-argument checks, not the Rust unit
+harness, real circuit construction, Genesis validation or any network process.
+Its manifest records tool/source/library/log hashes and remains not deployable.
+
+The measurement executable constructs the real DepositInclusion and
+PrivateNoteInclusion circuits with the compiled wallet heights. It requires
+compiled testnet magic, epoch 32 and SD192, and emits the six-field schema below.
+Its source/config pins are caller-supplied labels, not a self-attestation: use
+the values from the linked runtime manifest and retain the tool-build manifest.
+This does not generate a proof. Hash the output and pass it to the existing
+`prepare_genesis.py` spec, together with the freshly linked `verify_genesis`.
+
 ## Scope And Order
 
 Use the `PsyProtocol` repository organization for release sources. Check the

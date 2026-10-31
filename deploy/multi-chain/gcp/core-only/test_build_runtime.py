@@ -59,6 +59,7 @@ class RuntimeBuildTests(unittest.TestCase):
         self.fail_help = False
         self.change_input = False
         self.fail_clean = False
+        self.omit_library_records = False
         self.actual_commit = self.spec["source"]["commit"]
 
     def save_spec(self):
@@ -97,6 +98,15 @@ class RuntimeBuildTests(unittest.TestCase):
                     (release / binary).write_bytes(b"\x7fELFsynthetic-" + binary.encode())
                 if self.change_input:
                     Path(self.inputs["bundle"]["path"]).write_text("changed")
+                dependencies = release / "deps"
+                dependencies.mkdir()
+                library = dependencies / "libfixture-a.rlib"
+                library.write_bytes(b"synthetic library")
+                if not self.omit_library_records:
+                    kwargs["log"].write_text(json.dumps({"reason": "compiler-artifact",
+                        "target": {"name": "fixture", "kind": ["lib"]},
+                        "profile": {"test": False, "opt_level": "3", "debug_assertions": False},
+                        "filenames": [str(library)]}) + "\n")
             if "objdump" in argv:
                 return "0000 (GLIBC_" + self.glibc + ") fixture\n"
             if "--help" in argv and self.fail_help:
@@ -118,6 +128,8 @@ class RuntimeBuildTests(unittest.TestCase):
         self.assertEqual(set(manifest["binaries"]), set(build.BINS))
         self.assertEqual(manifest["verification"]["cli_help_passed"], 5)
         self.assertEqual(manifest["verification"]["genesis_acceptance"], "pending")
+        library = Path(self.spec["caches"]["target"]) / "release/deps/libfixture-a.rlib"
+        self.assertEqual(manifest["release_libraries"], {str(library): build.digest(library)})
         self.assertEqual(manifest["config_sha256"], self.inputs["config"]["sha256"])
         self.assertEqual(manifest["genesis_contracts_sha256"], self.inputs["bundle"]["sha256"])
         for key, path in (
@@ -286,6 +298,12 @@ class RuntimeBuildTests(unittest.TestCase):
         self.change_input = True
         with self.assertRaises(ValueError): self.run_build()
         self.assertTrue((Path(self.spec["output"]) / "release-build.log").exists())
+        self.assertFalse((Path(self.spec["output"]) / "manifest.json").exists())
+
+    def test_missing_release_library_records_never_publish_manifest(self):
+        self.omit_library_records = True
+        with self.assertRaisesRegex(ValueError, "no release library artifacts"):
+            self.run_build()
         self.assertFalse((Path(self.spec["output"]) / "manifest.json").exists())
 
     def test_glibc_and_help_failure_never_publish_manifest(self):
