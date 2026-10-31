@@ -17,7 +17,7 @@ tests and independent review is not complete.
 | Worker reputation and fetch replay | Published in `15d6316d`; scoped tests/review passed | Port `310d35c5`, reputation/replay only from `876c1432`; preserve whitelist and PR30/IMT; real Redis replay tests 2/2 passed |
 | BSC fees | Published in `15d6316d`; scoped tests/review passed | Port `1f1e2f0a` from `c9105056`, observed-history strategy and strict config parsing; no packed-deposit port |
 | Deployment inputs and Router | Partially complete | Fixed Router base `394153fa`; explicit reviewed contracts commit; role inventory, fresh core planning, internal Coordinator and epoch-32 build binding; 112 offline tests passed; installers remain pending |
-| Build isolation and consumer pins | Partially complete | Clean every local package from full locked metadata before compilation, including out-of-workspace path dependencies; final publication, consumer pins and immutable release build remain pending |
+| Build isolation and consumer pins | Source pins published; final artifacts pending | Clean every local package from full locked metadata, including out-of-workspace path dependencies; all three consumer Cargo pins are aligned; immutable release build and final gitlink closure remain pending |
 
 The complete fleet package, new actual-key Genesis, proving setup and real E2E
 acceptance remain separate release gates below. Do not advance their pins or
@@ -135,14 +135,48 @@ checksums, features, aliases and dependency lists were preserved.
 | Compiler | `81e0a022d7d323fa8707cd1cfa06a858943ad5aa` | `prepare/sd192-20261030` |
 | SDK | `b950dc65d049eb1fd453d19c9e61d541da43b5d1` | `prepare/sd192-20261030` |
 | Services | `e04493b70673e5d5314aa203ab293997c8c5e4fa` | `prepare/sd192-20261030` |
+| Genesis contract artifacts | `6ec29ad967be9099fd7a79c3bc0ff9a40fd2bf33` | `prepare/sd192-20261030` |
 
 Use the canonical `PsyProtocol` repositories. The local Services worktree's
 configured origin still points to `QEDProtocol`; publication uses the explicit
 authorized `PsyProtocol/psy-services` destination without changing shared Git
 configuration. The existing withdrawal-identity fix remains in its ancestry.
 No npm version was reserved or published. A new SDK/WASM and client cohort is
-still required. The historical generated Genesis below is not silently
-re-stamped as a result of these source-pin updates.
+still required. Node and SDK parent gitlinks have not been promoted to the new
+Genesis child; do that only through the accepted artifact closure, not by
+moving a Cargo consumer away from the immutable source `15d6316d`.
+
+### Current Full Contract Generation
+
+Clean published Compiler `81e0a022`, consuming Node `15d6316d`, completed the
+entire original `make gen-deploy-json` recipe in the pinned Bookworm image:
+six real Plonky2 contract circuit sets, token/update artifacts, all six ABI
+exports and the automatic provenance step. The successful run exited zero and
+ended with `psy-genesis contract artifact + genesis_abi/ + compiler provenance
+regenerated`. No manual stamp recovery was used.
+
+The first run stopped before contract compilation because Make expected its
+default local `target/release/dargo`, while the build uses an external Cargo
+target. The corrected invocation uses Make's existing `DARGO` override to the
+same just-built binary. Node is mounted read-only and the clean Compiler Git
+metadata is exposed read-only for the original provenance step. Keep both
+`tmp/compiler-runtime-genesis-generation-20261031.log` and the successful
+`tmp/compiler-runtime-genesis-generation-r2-20261031.log`; the former is not
+reported as a success. The reusable invocation is in [README.md](README.md).
+
+The bundle, token/update files and every ABI are byte-identical to `a486a531`:
+
+| Artifact | SHA-256 |
+|---|---|
+| `genesis_contracts.json` | `0f4a4a8cbeaff5621d05fa795b6aa157809eb5753fde1c5da62027753bbb9c9f` |
+| `token.json` | `36cb09dc75798a28a09586067f6b577da4e1eb675522d5bea4507fb15d886ddd` |
+| `token.update.json` | `d4fdcd384595bc4899a4115275f78fe72e8c3a1c726f18844245b58f22858ff6` |
+
+Only the automatic Compiler revision/source hash and the Genesis README
+changed in `6ec29ad9`. Their exact staged diff passed independent review.
+This closes public contract regeneration, not actual-key network Genesis,
+native bootstrap, full-policy SD-key proof/memory, five-entry EndCap,
+SDK/WASM, bridge setup or three-chain E2E gates.
 
 ## Historical October-30 Preparation
 
@@ -236,8 +270,8 @@ Host/key provenance and native acceptance are separate checks.
    integration into `testnet-dev` is complete at `15d6316d`; never merge
    deployment scripts backward. Resolve the inherited deployment-test failures
    before release acceptance.
-2. Reconcile the generated Compiler artifacts below with the accepted cohort,
-   rebuilding if the consumed library or generation inputs change. Rebuild
+2. Public contract regeneration is complete as recorded above; rebuild again
+   if the consumed library or generation inputs change. Rebuild
    compatible SDK/WASM; publish producer revisions before downstream gitlinks.
 3. Generate the actual-key Genesis and 100-operator export using spec v2 and
    explicit `fresh-faucet-and-relayer` mode. The retained R3 Genesis has the
@@ -262,7 +296,7 @@ Services 0dcc27e1b3ecf613234e96b359fa9ef1966fdd6bbb673197d7e11ac31925d425
 Lock DAG 76ac257a81a815946ae93e59f9297bac3fba5bf976643f5db5eb9621b266b959
 ```
 
-## Full Contract Generation Update
+## Historical Full Contract Generation: October 30
 
 Published Genesis artifact candidate:
 `a486a5314ce81f63dad76f9839f69380f0784be0`, branch `prepare/sd192-20261030`.

@@ -87,11 +87,14 @@ The new version-2 preview above is not an updated installer. Do not call old ins
 renamed inputs or replace only their version strings. Likewise, the historical
 `source-versions.env` and published SDK 2.1.0 are not this release lock.
 
-## Remaining Preparation Order
+## Preparation And Remaining Gates
 
-1. Freeze one accepted published runtime revision for all downstream Node pins.
+1. Source publication and all three downstream Node Cargo pins are complete
+   at `15d6316d`; retain that immutable source during final artifact integration.
 2. Rebuild Compiler and full contract artifacts, measuring affected fingerprints
-   and checking token0/token4 layouts, methods and privacy bindings.
+   and checking token0/token4 layouts, methods and privacy bindings. Public
+   contract regeneration completed at Genesis `6ec29ad9`; final native
+   actual-key network acceptance is still required.
 3. Prepare a fresh Genesis and 100 Faucet public identities. Retain Guardian,
    P2P, worker and operator private-key material; the changed Faucet fingerprint
    does not preserve old public identity. Use the reviewed explicit transition
@@ -119,6 +122,26 @@ a fresh installer that replaces a container, not a live database maintenance
 command. Hasura's existing bounded logging remains unchanged.
 
 ## Fresh Faucet And Relayer Generation
+
+Before network Genesis assembly, regenerate the compiler-owned public contracts
+from the clean published Compiler with the same published Node Cargo revision.
+Use the pinned Bookworm build environment and its accepted public config. The
+original Make recipe supports an external Cargo target directory through this
+explicit command override:
+
+```sh
+PSY_NETWORK=testnet PSY_CONFIG_PATH="$PINNED_CANONICAL_CONFIG" \
+  make gen-deploy-json PSY_NETWORK=testnet PSY_GENESIS="$PREPARED_GENESIS_REPO" \
+  DARGO="RUST_LOG=dargo=info $CARGO_TARGET_DIR/release/dargo"
+```
+
+Do not use the default repository-local `target/release/dargo` when Cargo writes
+to an external target. Require the recipe's final provenance marker and a zero
+exit; compilation alone is not success. The image must include Node and expose
+the clean Compiler's Git metadata read-only for the original provenance step.
+Inspect generated diffs, hashes and ABIs before publishing the Genesis child.
+This builds `genesis_contracts.json`, not the membership-populated network
+`genesis.json` or any private keys. Actual network assembly follows below.
 
 The native generator now accepts `--fresh-faucet-identities` only alongside
 hash-pinned imported keys and prior public Genesis. It permits a common old
