@@ -42,10 +42,45 @@ class RunnerTests(unittest.TestCase):
         root = self.root / "bundle"
         root.mkdir(mode=0o700)
         self.write(root / "fresh_l1.cjs", "public fixture")
-        manifest = {"version": 1, "contracts_base": m.BASE, "contracts_commit": m.SOURCE, "signer": m.SIGNER,
+        manifest = {"version": 1, "contracts_base": m.BASE, "contracts_commit": "b" * 40, "signer": m.SIGNER,
                     "verifiers": {}, "files": m.inventory(root)}
         m.write_json(root / "manifest.json", manifest)
         return root, m.digest(root / "manifest.json")
+
+    def test_admission_fixed_base_is_required(self):
+        self.assertEqual(m.BASE, "394153fa7b4eb1b5f041131d15036a38321620f0")
+
+    def test_pack_requires_operator_pinned_contracts_revision(self):
+        with patch.object(m.subprocess, "run") as child, self.assertRaises(SystemExit):
+            m.main(["pack", "--contracts", str(self.root), "--verifiers", "unused",
+                    "--verifiers-sha256", "0" * 64, "--output", str(self.root / "out")])
+        child.assert_not_called()
+
+    def test_pack_rejects_non_descendant_and_extra_contract_changes_before_reading_exports(self):
+        commit = "b" * 40
+        args = SimpleNamespace(contracts=str(self.root), contracts_commit=commit,
+                               verifiers="unused", verifiers_sha256="0" * 64,
+                               output=str(self.root / "out"))
+        approved = "\n".join(sorted(m.VERIFIERS)) + "\n"
+        for ancestor, changed, reason in (
+                (False, approved.encode(), "contracts Git verification failed"),
+                (True, (approved + "contracts/Router.sol\n").encode(), "candidate changes more than four exported verifiers")):
+            def git(argv, **kwargs):
+                command = argv[3]
+                if command == "rev-parse":
+                    return subprocess.CompletedProcess(argv, 0, (commit + "\n").encode())
+                if command == "status":
+                    return subprocess.CompletedProcess(argv, 0, b"")
+                if command == "merge-base":
+                    return subprocess.CompletedProcess(argv, 0 if ancestor else 1, b"")
+                if command == "diff":
+                    return subprocess.CompletedProcess(argv, 0, changed)
+                raise AssertionError(command)
+            with self.subTest(ancestor=ancestor), patch.object(m.subprocess, "run", side_effect=git), \
+                    patch.object(m, "read_json") as exports, self.assertRaisesRegex(m.GateError, reason):
+                m.pack(args)
+            exports.assert_not_called()
+            self.assertFalse(Path(args.output).exists())
 
     def test_policy_requires_explicit_bucket_decision(self):
         p = policy()

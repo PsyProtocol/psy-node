@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare/check a fresh, offline L1 bundle; never reuse old deployment records.
 
-pack --contracts DIR --verifiers JSON --verifiers-sha256 SHA --output NEW_DIR
+pack --contracts DIR --contracts-commit SHA --verifiers JSON --verifiers-sha256 SHA --output NEW_DIR
   JSON is exactly {"src/<Verifier>.sol": "sha256", ...} for all four verifiers.
   Requires frozen pnpm dependencies and freshly compiled Hardhat artifacts.
 check --bundle DIR --manifest-sha256 SHA
@@ -20,7 +20,7 @@ Only deploy can broadcast. It requires an explicit reviewed public policy:
  "bscTestnet":{...},"baseSepolia":{...}}}.
 Each token has the exact TokenFlowConfig fields (five uint128 amount strings,
 three uint32 delay strings, configured:true). No policy defaults are supplied.
-The old pUSDT 40,000 amount bucket/refill is not expressible in aee3b39e.
+The old pUSDT 40,000 amount bucket/refill is absent from the pinned admission-fixed base.
 Deposits MUST remain contract-paused; withdrawal registration/claims stay open.
 All initial owners/admins/proposer and timelock admin are the verified signer;
 only DefaultProxyAdmin transfers to the 48-hour timelock. No role revocations.
@@ -57,8 +57,7 @@ import urllib.parse
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-BASE = "aee3b39ed08f4f4838b63207df3ee5fbb55c53bc"
-SOURCE = "5ba12a360c29243b687076997f97e80c2050895b"
+BASE = "394153fa7b4eb1b5f041131d15036a38321620f0"
 SIGNER = "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad"
 NETWORKS = {"sepolia": (11155111, 0, 18545, "SEPOLIA"),
             "bscTestnet": (97, 1, 18645, "BSC_TESTNET"),
@@ -182,9 +181,11 @@ def pack(args):
         p = subprocess.run(["git", "-C", str(source), *cmd], capture_output=True, check=False)
         require(p.returncode == 0, "contracts Git verification failed")
         return p.stdout
-    commit = SOURCE
+    commit = args.contracts_commit
+    require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), "full contracts commit required")
     require(git("rev-parse", "HEAD").decode().strip() == commit, "wrong contracts commit")
     require(not git("status", "--porcelain", "--untracked-files=no").strip(), "contracts tracked worktree must be clean")
+    git("merge-base", "--is-ancestor", BASE, commit)
     changed = set(git("diff", "--name-only", BASE, commit).decode().splitlines())
     require(changed.issubset(VERIFIERS), "candidate changes more than four exported verifiers")
     exports = read_json(args.verifiers, args.verifiers_sha256)
@@ -219,7 +220,8 @@ def verify_bundle(bundle, expected):
     manifest = read_json(bundle / "manifest.json", expected)
     require(set(manifest) == {"version", "contracts_base", "contracts_commit", "signer", "verifiers", "files"}
             and manifest["version"] == 1 and manifest["contracts_base"] == BASE
-            and manifest["contracts_commit"] == SOURCE
+            and isinstance(manifest["contracts_commit"], str)
+            and re.fullmatch(r"[0-9a-f]{40}", manifest["contracts_commit"])
             and manifest["signer"] == SIGNER, "bundle identity mismatch")
     actual = inventory(bundle)
     actual.pop("manifest.json")
@@ -392,7 +394,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("pack")
-    for name in ("contracts", "verifiers", "verifiers-sha256", "output"):
+    for name in ("contracts", "contracts-commit", "verifiers", "verifiers-sha256", "output"):
         p.add_argument("--" + name, required=True)
     for name in ("check", "prepare", "deploy"):
         p = commands.add_parser(name)
