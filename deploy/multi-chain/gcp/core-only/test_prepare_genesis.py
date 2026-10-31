@@ -194,13 +194,14 @@ class GenesisPreparationTests(unittest.TestCase):
 
     def test_serial_generate_inject_validate_and_protected_outputs(self):
         before = self.keys.read_bytes()
-        with patch.dict(os.environ, {"PRIVATE_ENV_SENTINEL": "secret", "LD_PRELOAD": "untrusted"}), \
+        with patch.dict(os.environ, {"PRIVATE_ENV_SENTINEL": "secret", "LD_PRELOAD": "untrusted", "RAYON_NUM_THREADS": "128"}), \
              patch.object(prepare.subprocess, "run", side_effect=self.child) as run:
             code, summary = self.invoke("generate")
         self.assertEqual(code, 0)
         self.assertTrue(summary["ready_static"])
         self.assertFalse(summary["deployment_ready"])
         self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.kwargs["env"]["RAYON_NUM_THREADS"] == "4" for call in run.call_args_list))
         self.assertEqual(self.keys.read_bytes(), before)
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((self.output / "private_keys.json").stat().st_mode), 0o600)

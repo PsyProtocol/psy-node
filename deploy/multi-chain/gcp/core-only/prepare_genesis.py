@@ -256,7 +256,7 @@ def generate(loaded):
         write_json(out / "plan.json", summary)
         env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "PSY_NETWORK": "testnet",
                "PSY_CONFIG_PATH": str(public / "config.json"), "PSY_PROJECTS_DIR": str(work),
-               "RUST_LOG": "off", "RUST_BACKTRACE": "0"}
+               "RUST_LOG": "off", "RUST_BACKTRACE": "0", "RAYON_NUM_THREADS": "4"}
         command = [entries["binary"]["path"], "generate-genesis-data", "--repo-root", str(repo),
                    "--genesis-contracts", str(public / "genesis_contracts.json"),
                    "--private-keys-in", entries["private_keys"]["path"],

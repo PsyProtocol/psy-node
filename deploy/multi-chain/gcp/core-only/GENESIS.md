@@ -199,6 +199,10 @@ writing, retains the 100 Faucet operators, injects the approved public P2P
 membership through `prepare_network.py`, and runs the typed bytecode/layout
 verifier. It has no random-key fallback.
 
+Both native children use a fixed `RAYON_NUM_THREADS=4`, independent of inherited
+shell settings. This bounds circuit-construction parallelism, not total memory;
+measure available memory separately before starting full-contract validation.
+
 ## Outputs And Failure Handling
 
 - `genesis.json`: final membership-injected candidate.
