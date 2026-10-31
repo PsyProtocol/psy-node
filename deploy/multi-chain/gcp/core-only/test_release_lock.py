@@ -30,17 +30,21 @@ def build_test_retirement():
     return {"hosts": hosts}, {"paths": paths}
 
 
-def build_test_lock(release_dir=None, private_dir=None):
+def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, runtime_config_sha256=None,
+                    genesis_sha256=None, node_sha256=None):
     """Return a schema-valid synthetic lock; directories, when given, receive matching input files."""
     digest = lambda label: sha256(label.encode())
     release = {"schema_version": 1, "release_id": "core-testnet-20260101-sd192", "network": "testnet",
-               "network_magic": "0x1337CF514544CF69", "namespace_prefix": "fresh20260101sd192",
-               "runtime_candidate_commit": "1" * 40, "runtime_config_sha256": digest("runtime"),
+               "network_magic": "0x1337CF514544CF69", "namespace_prefix": "fresh20260101sd192", "worker_queue_ack_wait_ms": 30000,
+               "runtime_candidate_commit": "1" * 40, "checkpoints_per_epoch": 32,
+               "proving_backend": "plonky2-poseidon-goldilocks",
+               "runtime_config_sha256": digest("runtime") if runtime_config_sha256 is None else runtime_config_sha256,
                "canonical_config_sha256": digest("canonical")}
     binaries = {name: digest(name) for name in lock_module.CLI_BINARIES}
-    artifacts = {"genesis_sha256": digest("genesis"), "binaries": binaries,
+    binaries["psy_node_cli"] = binaries["psy_node_cli"] if node_sha256 is None else node_sha256
+    artifacts = {"genesis_sha256": digest("genesis") if genesis_sha256 is None else genesis_sha256, "binaries": binaries,
                  "preparation_commits": {"compiler": "2" * 40, "genesis": "3" * 40}}
-    texts = {"release.json": json.dumps(release), "topology.json": '{"hosts": {"gcp-test-cp": "10.0.0.25"}}', "artifacts.json": json.dumps(artifacts),
+    texts = {"release.json": json.dumps(release), "topology.json": topology_text or '{"hosts": {"gcp-test-cp": "10.0.0.25"}}', "artifacts.json": json.dumps(artifacts),
              "risk-acceptance.md": "risk\n", "worker-whitelist.json": "{}\n"}
     retired, retained = build_test_retirement()
     private = {"retired-state.json": json.dumps(retired), "retained-paths.json": json.dumps(retained)}
@@ -58,6 +62,8 @@ def build_test_lock(release_dir=None, private_dir=None):
     rid = release["release_id"]
     paths = {role: {"release": f"/opt/{role}/{rid}", "config": f"/etc/{role}/{rid}", "state": f"/var/lib/{role}/{rid}"}
              for role in lock_module.PATH_ROLES}
+    paths["core"] = {"release": f"/opt/psy-core/releases/{rid}", "config": f"/etc/psy-core/{rid}",
+                     "state": f"/var/lib/psy-core/{rid}"}
     return {
         "schema_version": 1, "release_id": rid, "network": "testnet", "network_magic": release["network_magic"],
         "inputs": {"release_profile": sha256(texts["release.json"].encode()),
@@ -73,7 +79,8 @@ def build_test_lock(release_dir=None, private_dir=None):
                     "contracts": "5" * 40, "services": "6" * 40, "indexer": "7" * 40},
         "binaries": {**binaries, "psy-services": digest("psy-services"), "psy-indexer": digest("psy-indexer")},
         "paths": paths,
-        "units": {"core_prefix": f"psy-core-{namespace}-", "guardian_prefix": f"psy-guardian-{namespace}-",
+        "units": {"core_prefix": f"psy-core-{namespace}-", "core_namespace_prefix": namespace,
+                  "guardian_prefix": f"psy-guardian-{namespace}-",
                   "relayer": f"psy-core-relayer-{namespace}.service", "worker_prefix": f"psy-core-worker-{namespace}-",
                   "proxy_prefix": f"psy-core-prove-proxy-{namespace}-", "faucet": f"psy-faucet-{namespace}.service",
                   "services": f"psy-services-{namespace}.service", "indexer_prefix": f"psy-indexer-{namespace}-",
@@ -96,7 +103,7 @@ def build_test_lock(release_dir=None, private_dir=None):
                "gas_budget_sha256": {chain: digest("gas" + chain) for chain in CHAINS}},
         "ingress": {"fenced_hosts": ["fenced.example.test"], "faucet_hosts": ["faucet.example.test"],
                     "maintenance_tag": "maintenance-test"},
-        "gates": {"l2_stability_checkpoint_count": 100},
+        "gates": {"l2_stability_checkpoint_count": 100, "worker_queue_ack_wait_ms": 30000},
         "tool_sha256": {name: digest(name) for name in lock_module.TOOL_NAMES},
     }
 
@@ -178,6 +185,28 @@ class ReleaseLockTests(unittest.TestCase):
             lock["gates"]["l2_stability_checkpoint_count"] = value
             with self.assertRaisesRegex(ValueError, "l2_stability_checkpoint_count"):
                 self.validate(lock)
+
+    def test_validate_rejects_core_namespace_differing_from_profile(self):
+        lock = copy.deepcopy(self.lock)
+        lock["units"]["core_namespace_prefix"] = "fresh20260102sd192"
+        with self.assertRaisesRegex(ValueError, "core_namespace_prefix differs from the release profile"):
+            self.validate(lock)
+
+    def test_validate_rejects_worker_ack_wait_differing_from_profile(self):
+        for value in (1, 30000.0, True, 0, "30000"):
+            lock = copy.deepcopy(self.lock)
+            lock["gates"]["worker_queue_ack_wait_ms"] = value
+            with self.assertRaisesRegex(ValueError, "worker_queue_ack_wait_ms"):
+                self.validate(lock)
+
+    def test_load_checked_release_lock_validates_the_lock_directory(self):
+        path = self.release_dir / "release-lock.json"
+        raw = json.dumps(self.lock).encode()
+        path.write_bytes(raw)
+        self.assertEqual(lock_module.load_checked_release_lock(path, sha256(raw)), self.lock)
+        (self.release_dir / "risk-acceptance.md").write_text("changed\n")
+        with self.assertRaisesRegex(ValueError, "input hash differs from file: risk_acceptance"):
+            lock_module.load_checked_release_lock(path, sha256(raw))
 
     def test_validate_rejects_unit_prefix_without_namespace(self):
         lock = copy.deepcopy(self.lock)

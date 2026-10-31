@@ -11,7 +11,8 @@ import unittest
 from unittest.mock import patch
 
 import prepare_workers as workers
-from test_plan import fixture
+
+HERE = Path(__file__).resolve().parent
 
 
 class WorkerPreparationTests(unittest.TestCase):
@@ -24,7 +25,7 @@ class WorkerPreparationTests(unittest.TestCase):
         self.package = self.root / "package"
         self.network = self.root / "network.json"
         self.topology = self.root / "topology.json"
-        self.topology_bytes = workers.encode(fixture()[0])
+        self.topology_bytes = workers.encode(json.loads((HERE / "topology.json").read_bytes()))
         self.topology.write_bytes(self.topology_bytes)
         self.stack.enter_context(patch.object(workers, "TOPOLOGY_SHA256", workers.digest(self.topology_bytes)))
         self.binary = b"test-only-worker-binary"

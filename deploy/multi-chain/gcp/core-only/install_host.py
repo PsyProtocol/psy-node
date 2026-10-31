@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Install one staged core-only host package; never start or enable services.
 
-Usage: sudo python3 install_host.py --package /private/host --check-only
-       sudo python3 install_host.py --package /private/host
-       sudo python3 install_host.py --cohort sd192 --package /private/fresh-host --check-only
+Usage: sudo python3 install_host.py --release-lock L --release-lock-sha256 H --package /private/host --check-only
+       sudo python3 install_host.py --release-lock L --release-lock-sha256 H --package /private/host
 
-R3 is the default. SD192 requires explicit --cohort sd192; package content cannot
-select or override the cohort's source, artifact pins, paths or namespace.
-manifest.json must contain exactly these fields (R3 values shown):
-  {"schema_version": 1, "release_id": "core-testnet-20261027-r3",
-   "source_commit": "3d31758738f833a7eea6f9ff7fd680a69a0d9a44",
+The hash-pinned release lock selects the source, artifact pins, paths and namespace;
+package content cannot select or override them.
+manifest.json must contain exactly these fields (placeholders shown):
+  {"schema_version": 1, "release_id": "<lock release_id>",
+   "source_commit": "<lock sources.runtime>",
    "network": "testnet", "host": "<topology alias>",
    "private_ip": "<host RFC1918 IPv4>", "files": {"relative/path": "sha256"}}
 files covers ALL payload files, excluding manifest.json itself. Allowed payloads:
@@ -50,17 +49,6 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 
-SOURCE_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-# Historical R3 pins remain separate from the explicitly selected fresh release.
-PINNED_SHA256 = {
-    "bin/psy_node_cli": "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9",
-    "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-    "genesis.json": "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
-}
-RELEASE_ID = "core-testnet-20261027-r3"
-RELEASE = Path("/opt/psy-core/releases") / RELEASE_ID
-CONFIG = Path("/etc/psy-core") / RELEASE_ID
-STATE = Path("/var/lib/psy-core") / RELEASE_ID
 UNITS = Path("/etc/systemd/system")
 ROOT_UID = 0
 ROOT_GID = 0
@@ -76,31 +64,33 @@ HOSTS = {"gcp-cp-ce": "10.148.0.25", "gcp-realm-processor": "10.148.0.37",
 class CoreRelease:
     release_id: str
     source_commit: str
-    pins: Mapping[str, str | None]
+    pins: Mapping[str, str]
     unit_prefix: str
     namespace_prefix: str
-    worker_queue_ack_wait_ms: int | None
+    worker_queue_ack_wait_ms: int
     release_dir: Path
     config_dir: Path
     state_dir: Path
-    profile_sha256: str | None = None
+    profile_sha256: str
 
 
-def get_release(cohort="r3"):
-    if cohort == "r3":
-        return CoreRelease(RELEASE_ID, SOURCE_COMMIT, MappingProxyType(dict(PINNED_SHA256)),
-                           "psy-core-r3-", "fresh20261027r3", None, RELEASE, CONFIG, STATE)
-    if cohort == "sd192":
-        release_id = "core-testnet-20261030-sd192"
-        return CoreRelease(release_id, "15d6316d1bd28bb535698a4797e3c6261e6c9597", MappingProxyType({
-            "bin/psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
-            "config.json": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
-            "genesis.json": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
-        }), "psy-core-fresh20261030sd192-", "fresh20261030sd192", 30000,
-            Path("/opt/psy-core/releases") / release_id, Path("/etc/psy-core") / release_id,
-            Path("/var/lib/psy-core") / release_id,
-            "8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282")
-    raise InstallError("unknown core release; select r3 or sd192 explicitly")
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise InstallError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_core_release(lock):
+    core = lock["paths"]["core"]
+    if type(lock["gates"]["worker_queue_ack_wait_ms"]) is not int:
+        raise InstallError("worker_queue_ack_wait_ms must be an integer")
+    pins = {"bin/psy_node_cli": lock["binaries"]["psy_node_cli"],
+            "config.json": lock["inputs"]["runtime_config"], "genesis.json": lock["inputs"]["genesis"]}
+    return CoreRelease(lock["release_id"], lock["sources"]["runtime"], MappingProxyType(pins),
+                       lock["units"]["core_prefix"], lock["units"]["core_namespace_prefix"],
+                       lock["gates"]["worker_queue_ack_wait_ms"], Path(core["release"]),
+                       Path(core["config"]), Path(core["state"]), lock["inputs"]["release_profile"])
 
 
 class InstallError(ValueError):
@@ -150,8 +140,7 @@ def read_file(parent, name):
         return source.read(), info
 
 
-def read_package(path, release=None):
-    release = release or get_release()
+def read_package(path, release):
     fd = directory(path)
     try:
         owner = os.fstat(fd)
@@ -190,8 +179,7 @@ def read_package(path, release=None):
     finally:
         os.close(fd)
     require("manifest.json" in payloads, "manifest missing")
-    require(all(release.pins.values()), "r3 artifact pins not frozen" if release.worker_queue_ack_wait_ms is None
-            else "fresh artifact pins not frozen")
+    require(all(release.pins.values()), "release artifact pins not frozen")
     manifest = decode_json(payloads["manifest.json"])
     require(set(manifest) == {"schema_version", "release_id", "source_commit", "network",
                               "host", "private_ip", "files"}, "unexpected manifest fields")
@@ -234,8 +222,7 @@ def validate_ip(value):
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")), "RFC1918 IPv4 required")
 
 
-def host_inventory(host, release=None):
-    release = release or get_release()
+def host_inventory(host, release):
     require(isinstance(host, str), "invalid host alias")
     keys = set()
     if host == "gcp-cp-ce":
@@ -254,8 +241,7 @@ def host_inventory(host, release=None):
     return {release.unit_prefix + name + ".service" for name in names}, keys
 
 
-def validate_unit(name, raw, keys, host, release=None):
-    release = release or get_release()
+def validate_unit(name, raw, keys, host, release):
     try:
         text = raw.decode("ascii")
     except UnicodeError:
@@ -287,8 +273,7 @@ def validate_unit(name, raw, keys, host, release=None):
             require((section, key) not in values, "duplicate unit directive")
             values[section, key] = value
     required_env = {"PSY_NETWORK=testnet", "PSY_CONFIG_PATH=" + str(release.config_dir / "config.json")}
-    if release.worker_queue_ack_wait_ms is not None:
-        required_env.add("NATS_WORKER_ACK_WAIT_MS=" + str(release.worker_queue_ack_wait_ms))
+    required_env.add("NATS_WORKER_ACK_WAIT_MS=" + str(release.worker_queue_ack_wait_ms))
     optional_env = {"RUST_LOG=info", "RUST_MIN_STACK=134217728", "RAYON_NUM_THREADS=2"}
     require(required_env <= set(environments) <= required_env | optional_env
             and len(environments) == len(set(environments)), "unit environment must contain only approved public values")
@@ -431,8 +416,7 @@ def get_runtime_user():
     return user.pw_uid, user.pw_gid
 
 
-def build_paths(payloads, user, release=None):
-    release = release or get_release()
+def build_paths(payloads, user, release):
     uid, gid = user if user is not None else (-1, -1)
     files = {}
     for name, raw in payloads.items():
@@ -456,8 +440,7 @@ def build_paths(payloads, user, release=None):
     return files, directories
 
 
-def check_paths(files, directories, release=None):
-    release = release or get_release()
+def check_paths(files, directories, release):
     managed = (release.release_dir, release.config_dir, release.state_dir)
     for path, (mode, uid, gid) in sorted(directories.items(), key=lambda item: len(item[0].parts)):
         try:
@@ -499,8 +482,7 @@ def check_paths(files, directories, release=None):
                     and not os.path.lexists("/run/systemd/system/" + path.name + ".d"), "runtime unit override conflict")
 
 
-def create_directory(path, mode, uid, gid, release=None):
-    release = release or get_release()
+def create_directory(path, mode, uid, gid, release):
     parent = directory(path.parent)
     try:
         try:
@@ -561,8 +543,7 @@ def install_file(path, raw, mode, uid, gid):
         os.close(parent)
 
 
-def install_host(package, check_only=False, release=None):
-    release = release or get_release()
+def install_host(package, check_only, release):
     require(os.geteuid() == 0, "run with sudo/root, including --check-only")
     manifest, payloads = read_package(package, release)
     check_host(manifest)
@@ -590,10 +571,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--package", required=True, type=Path, help="private per-host staging directory")
     parser.add_argument("--check-only", action="store_true", help="read-only preflight; no account/file changes or reload")
-    parser.add_argument("--cohort", choices=("r3", "sd192"), default="r3", help="explicit artifact cohort; default retains R3")
+    parser.add_argument("--release-lock", required=True, type=Path, help="release lock that pins the release")
+    parser.add_argument("--release-lock-sha256", required=True, help="expected SHA256 of the release lock")
     args = parser.parse_args(argv)
     try:
-        report = install_host(args.package, args.check_only, get_release(args.cohort))
+        release = load_core_release(read_release_lock(args.release_lock, args.release_lock_sha256))
+        report = install_host(args.package, args.check_only, release)
     except (InstallError, OSError, ValueError, TypeError, KeyError) as error:
         message = str(error) if isinstance(error, InstallError) else "unreadable or malformed host input"
         print(json.dumps({"error": message}), file=sys.stderr)

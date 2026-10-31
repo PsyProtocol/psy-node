@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import prepare_genesis as prepare
-from test_prepare_network import fixture
+from test_prepare_network import LOCK, PROFILE, fixture
 
 
 class GenesisPreparationTests(unittest.TestCase):
@@ -23,7 +23,9 @@ class GenesisPreparationTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.output = self.root / "output"
         canonical, p2p, commitments, topology, whitelist, self.genesis = fixture()
-        self.config = prepare.network.assemble_config(canonical, p2p, commitments, topology, whitelist)
+        self.config = prepare.network.assemble_config(canonical, p2p, commitments, topology, whitelist, LOCK, PROFILE)
+        # The default spec is version 1, which keeps the epoch-10 consensus; version-2 tests set 32 themselves.
+        self.config["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 10
         self.genesis["contracts"] = [{"test": i} for i in range(6)]
         self.secret = self.encode(["SECRET-SENTINEL-never-output"] * 107)
         self.keys = self.root / "retained-keys.json"

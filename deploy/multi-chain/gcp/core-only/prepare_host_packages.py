@@ -2,7 +2,6 @@
 """Prepare private, host-specific core packages locally; never SSH or start nodes."""
 import argparse
 import ctypes
-from dataclasses import replace
 import hashlib
 import json
 import os
@@ -14,12 +13,7 @@ import tempfile
 
 import plan
 import install_host as installer
-
-
-HERE = Path(__file__).resolve().parent
-NODE_SHA256 = "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9"
-CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-GENESIS_SHA256 = "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173"
+import release_lock
 
 
 def require(value, message):
@@ -90,29 +84,23 @@ def publish_packages(source, destination):
 
 
 def prepare(args):
-    cohort = getattr(args, "cohort", "r3")
-    release = installer.get_release(cohort)
-    if cohort == "r3":
-        require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r3 artifact pins not frozen")
-        require(getattr(args, "release_profile", None) is None, "R3 does not accept a fresh release profile")
-        release = replace(release, pins={"bin/psy_node_cli": NODE_SHA256,
-                                        "config.json": CONFIG_SHA256, "genesis.json": GENESIS_SHA256})
-    topology, _ = plan.read_json(args.topology)
+    lock = release_lock.load_checked_release_lock(args.release_lock, args.release_lock_sha256)
+    release = installer.load_core_release(lock)
+    require(all(release.pins.values()), "release artifact pins not frozen")
+    release_dir = args.release_lock.resolve().parent
+    topology, topology_hash = plan.read_json(release_dir / "topology.json")
+    require(topology_hash == lock["inputs"]["topology"], "topology hash differs from the lock")
     require(topology["release_id"] == release.release_id and topology["runtime_commit"] == release.source_commit,
-            "topology differs from selected artifact cohort")
-    profile = None
-    if cohort == "sd192":
-        require(topology["schema_version"] == 2, "SD192 requires a version-2 topology")
-        profile_path = getattr(args, "release_profile", None)
-        require(profile_path is not None, "SD192 requires the pinned release profile")
-        profile, profile_hash = plan.read_json(regular(profile_path))
-        require(profile_hash == release.profile_sha256, "release profile hash mismatch")
-        require(profile["runtime_config_sha256"] == release.pins["config.json"],
-                "release config pin mismatch")
+            "topology differs from the release lock")
+    profile, profile_hash = plan.read_json(regular(release_dir / "release.json"))
+    require(profile_hash == release.profile_sha256, "release profile hash mismatch")
+    require(profile["runtime_config_sha256"] == release.pins["config.json"], "release config pin mismatch")
+    plan.check_lock_release(lock, profile)
     config, config_hash = plan.read_json(regular(args.config))
     genesis, genesis_hash = plan.read_json(regular(args.genesis))
-    whitelist, _ = plan.read_json(args.whitelist)
-    report = plan.make_plan(topology, config, genesis, whitelist, profile)
+    whitelist, whitelist_hash = plan.read_json(release_dir.parent / "core-only" / "worker-whitelist.json")
+    require(whitelist_hash == lock["inputs"]["worker_whitelist"], "worker whitelist hash mismatch")
+    report = plan.make_plan(topology, config, genesis, whitelist, release_profile=profile)
     require(report["input_consistency_passed"], "public inputs inconsistent")
     require(config_hash == release.pins["config.json"], "config differs from compiled testnet config")
     require(genesis_hash == release.pins["genesis.json"], "Genesis hash mismatch")
@@ -191,10 +179,8 @@ def build_packages(args, staging, topology, report, private_keys, key_inputs, ha
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", type=Path, default=HERE / "topology.json")
-    parser.add_argument("--whitelist", type=Path, default=HERE / "worker-whitelist.json")
-    parser.add_argument("--cohort", choices=("r3", "sd192"), default="r3")
-    parser.add_argument("--release-profile", type=Path, help="required hash-pinned SD192 profile; not accepted for R3")
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     for name in ("config", "genesis", "node-binary", "private-keys", "faucet-operators", "p2p-keys", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     prepare(parser.parse_args())

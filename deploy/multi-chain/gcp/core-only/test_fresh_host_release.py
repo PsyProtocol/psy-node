@@ -13,6 +13,8 @@ import install_host as installer
 import plan
 import prepare_host_packages as packages
 import test_prepare_host_packages as package_fixtures
+from test_plan import fixture
+from test_release_lock import build_test_lock
 
 
 HERE = Path(__file__).resolve().parent
@@ -22,7 +24,8 @@ class FreshReleaseTests(unittest.TestCase):
     def test_fresh_release_matches_verified_receipt(self):
         receipt = json.loads((HERE.parent / "fresh-192-20261030/artifacts.json").read_bytes())
         profile = json.loads((HERE.parent / "fresh-192-20261030/release.json").read_bytes())
-        release = installer.get_release("sd192")
+        lock = json.loads((HERE.parent / "fresh-192-20261030/release-lock.json").read_bytes())
+        release = installer.load_core_release(lock)
         self.assertEqual(release.release_id, receipt["release_id"])
         self.assertEqual(release.source_commit, receipt["source_commit"])
         self.assertEqual(release.pins, {"bin/psy_node_cli": receipt["binaries"]["psy_node_cli"],
@@ -33,20 +36,21 @@ class FreshReleaseTests(unittest.TestCase):
         self.assertEqual(release.unit_prefix, "psy-core-fresh20261030sd192-")
         self.assertFalse(receipt["deployment_ready"])
 
-    def test_legacy_default_and_fresh_selection_are_distinct(self):
-        old = installer.get_release()
-        new = installer.get_release("sd192")
-        self.assertEqual(old.release_id, installer.RELEASE_ID)
-        self.assertEqual(old.pins, installer.PINNED_SHA256)
-        self.assertEqual(old.unit_prefix, "psy-core-r3-")
-        self.assertIsNone(old.worker_queue_ack_wait_ms)
+    def test_distinct_locks_select_distinct_release_paths(self):
+        first = build_test_lock()
+        second = build_test_lock()
+        second["release_id"] = "core-testnet-20260202-sd192"
+        second["paths"]["core"] = {name: path.replace(first["release_id"], second["release_id"])
+                                   for name, path in first["paths"]["core"].items()}
+        old, new = installer.load_core_release(first), installer.load_core_release(second)
         self.assertNotEqual(old.release_dir, new.release_dir)
         self.assertNotEqual(old.config_dir, new.config_dir)
         self.assertNotEqual(old.state_dir, new.state_dir)
 
-    def test_unknown_release_is_not_inferred_from_a_package(self):
-        with self.assertRaises(installer.InstallError):
-            installer.get_release("latest")
+    def test_release_is_never_inferred_from_a_package_or_a_name(self):
+        with self.assertRaises(KeyError):
+            installer.load_core_release({})
+        self.assertFalse(hasattr(installer, "get_release"))
 
 
 class FreshPackageTests(unittest.TestCase):
@@ -55,20 +59,16 @@ class FreshPackageTests(unittest.TestCase):
         self.base.setUp()
         self.addCleanup(self.base.doCleanups)
         self.args = self.base.args
-        self.args.cohort = "sd192"
-        self.topology = json.loads((HERE.parent / "fresh-192-20261030/topology.json").read_bytes())
-        self.args.topology.write_text(json.dumps(self.topology))
-        config = json.loads(self.args.config.read_bytes())
-        config["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 32
-        self.args.config.write_text(json.dumps(config))
-        self.base.hashes["config.json"] = packages.digest(self.args.config)
-        self.profile = json.loads((HERE.parent / "fresh-192-20261030/release.json").read_bytes())
-        self.profile["runtime_config_sha256"] = self.base.hashes["config.json"]
-        self.args.release_profile = self.base.root / "profile.json"
-        self.args.release_profile.write_text(json.dumps(self.profile))
-        self.release = replace(installer.get_release("sd192"), pins=self.base.hashes,
-                               profile_sha256=packages.digest(self.args.release_profile))
-        self.select = self.enterContext(patch.object(installer, "get_release", return_value=self.release))
+        self.topology = self.base.topology
+        self.release = installer.load_core_release(self.base.lock)
+        self.release_dir = self.args.release_lock.parent
+
+    def rewrite_lock(self, change):
+        lock = json.loads(self.args.release_lock.read_bytes())
+        change(lock)
+        raw = json.dumps(lock).encode()
+        self.args.release_lock.write_bytes(raw)
+        self.args.release_lock_sha256 = hashlib.sha256(raw).hexdigest()
 
     def test_all_six_fresh_packages_pass_installer_validation(self):
         packages.prepare(self.args)
@@ -88,22 +88,31 @@ class FreshPackageTests(unittest.TestCase):
         self.assertEqual(total, 16)
 
     def test_missing_profile_stops_before_private_input_reads(self):
-        self.args.release_profile = None
-        with self.assertRaisesRegex(ValueError, "pinned release profile"):
+        (self.release_dir / "release.json").unlink()
+        with self.assertRaises(OSError):
             packages.prepare(self.args)
         self.base.assert_no_output()
 
     def test_changed_profile_hash_is_not_accepted(self):
-        self.args.release_profile.write_text(json.dumps({**self.profile, "checkpoints_per_epoch": 10}))
-        with self.assertRaisesRegex(ValueError, "profile hash mismatch"):
+        profile = json.loads((self.release_dir / "release.json").read_bytes())
+        (self.release_dir / "release.json").write_text(json.dumps({**profile, "checkpoints_per_epoch": 10}))
+        with self.assertRaisesRegex(ValueError, "input hash differs from file: release_profile"):
             packages.prepare(self.args)
         self.base.assert_no_output()
 
     def test_profile_config_pin_cannot_differ_from_release(self):
-        self.profile["runtime_config_sha256"] = "0" * 64
-        self.args.release_profile.write_text(json.dumps(self.profile))
-        self.select.return_value = replace(self.release, profile_sha256=packages.digest(self.args.release_profile))
-        with self.assertRaisesRegex(ValueError, "release config pin mismatch"):
+        profile = json.loads((self.release_dir / "release.json").read_bytes())
+        (self.release_dir / "release.json").write_text(json.dumps({**profile, "runtime_config_sha256": "0" * 64}))
+        with self.assertRaisesRegex(ValueError, "runtime_config hash differs from the release profile"):
+            packages.prepare(self.args)
+        self.base.assert_no_output()
+
+    def test_changed_lock_is_not_accepted(self):
+        self.args.release_lock_sha256 = "0" * 64
+        with self.assertRaisesRegex(ValueError, "release lock hash mismatch"):
+            packages.prepare(self.args)
+        self.rewrite_lock(lambda lock: lock["paths"]["core"].update(state="/var/lib/psy-core/other-release"))
+        with self.assertRaises(ValueError):
             packages.prepare(self.args)
         self.base.assert_no_output()
 
@@ -133,7 +142,8 @@ class FreshInstallerTests(unittest.TestCase):
                 return os.stat_result(fields)
             return info
         self.stack.enter_context(patch.object(installer.os, "fstat", side_effect=normalized_root))
-        original = installer.get_release("sd192")
+        self.lock = build_test_lock()
+        original = installer.load_core_release(self.lock)
         self.artifacts = {"bin/psy_node_cli": b"synthetic SD192 executable",
                           "config.json": b'{"defaultNetwork":"testnet","networks":{"testnet":{}}}',
                           "genesis.json": b"synthetic Genesis"}
@@ -172,7 +182,7 @@ class FreshInstallerTests(unittest.TestCase):
     def create_package(self, original):
         for name, raw in self.artifacts.items():
             self.write(name, raw)
-        topology = json.loads((HERE.parent / "fresh-192-20261030/topology.json").read_bytes())
+        topology = fixture(self.lock)[0]
         for service in plan.services(topology):
             if service["host"] == self.host:
                 text = packages.unit_text(service, self.release.release_id)
@@ -187,9 +197,9 @@ class FreshInstallerTests(unittest.TestCase):
         self.save_manifest()
 
     def test_fresh_install_is_idempotent_and_never_starts(self):
-        result = installer.install_host(self.package, release=self.release)
+        result = installer.install_host(self.package, False, self.release)
         self.assertFalse(result["started"])
-        installer.install_host(self.package, release=self.release)
+        installer.install_host(self.package, False, self.release)
         self.assertFalse(any(set(call.args[0]) & {"start", "stop", "enable", "restart"}
                              for call in self.commands.call_args_list))
 
@@ -205,21 +215,21 @@ class FreshInstallerTests(unittest.TestCase):
             unit.write_bytes(raw)
             self.save_manifest()
             with self.assertRaises(installer.InstallError):
-                installer.install_host(self.package, release=self.release)
+                installer.install_host(self.package, False, self.release)
             self.assertFalse((self.root / "host").exists())
         self.commands.assert_not_called()
 
     def test_cross_cohort_manifest_and_namespace_are_refused(self):
-        self.manifest["release_id"] = installer.RELEASE_ID
+        self.manifest["release_id"] = self.release.release_id + "-other"
         self.save_manifest()
         with self.assertRaises(installer.InstallError):
-            installer.install_host(self.package, release=self.release)
+            installer.install_host(self.package, False, self.release)
         self.manifest["release_id"] = self.release.release_id
         unit = next((self.package / "units").iterdir())
-        unit.write_bytes(unit.read_bytes().replace(b"fresh20261030sd192_r", b"fresh20261027r3_r"))
+        unit.write_bytes(unit.read_bytes().replace(self.release.namespace_prefix.encode() + b"_r", b"fresh20261027r3_r"))
         self.save_manifest()
         with self.assertRaises(installer.InstallError):
-            installer.install_host(self.package, release=self.release)
+            installer.install_host(self.package, False, self.release)
         self.commands.assert_not_called()
 
     def test_old_active_r3_unit_still_blocks_fresh_installation(self):
@@ -230,7 +240,7 @@ class FreshInstallerTests(unittest.TestCase):
             return original(argv)
         self.commands.side_effect = active_old
         with self.assertRaisesRegex(installer.InstallError, "running or transitioning"):
-            installer.install_host(self.package, release=self.release)
+            installer.install_host(self.package, False, self.release)
         self.assertFalse((self.root / "host").exists())
 
 

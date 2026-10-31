@@ -7,16 +7,22 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import install_host
+from test_release_lock import build_test_lock
+
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("activate_host", HERE / "activate_host.py")
 a = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(a)
+a.h = install_host
+LOCK = build_test_lock()
+RELEASE = install_host.load_core_release(LOCK)
 
 
 class ActivateTests(unittest.TestCase):
     def setUp(self):
         self.host = "gcp-cp-ce"
-        self.units = a.h.host_inventory(self.host)[0]
+        self.units = a.h.host_inventory(self.host, RELEASE)[0]
         self.manifest = {"host": self.host, "private_ip": a.h.HOSTS[self.host],
                          "files": {"bin/psy_node_cli": "a" * 64}}
         self.calls = []
@@ -50,13 +56,13 @@ class ActivateTests(unittest.TestCase):
                 patch.object(a.h, "read_package", return_value=(self.manifest, {})), \
                 patch.object(a, "installed"), patch.object(a, "show", side_effect=self.show), \
                 patch.object(a.h, "command", side_effect=self.command), \
-                patch.object(a, "process", side_effect=lambda n, digest: {"unit": n, "pid": 123, "exe_sha256": digest}):
-            return a.activate(Path("/unused-private-package"), phase, apply)
+                patch.object(a, "process", side_effect=lambda n, digest, release: {"unit": n, "pid": 123, "exe_sha256": digest}):
+            return a.activate(Path("/unused-private-package"), phase, RELEASE, apply)
 
     def test_exact_role_selection_for_all_six_hosts(self):
         for host in a.h.HOSTS:
             self.manifest.update(host=host, private_ip=a.h.HOSTS[host])
-            units = a.h.host_inventory(host)[0]
+            units = a.h.host_inventory(host, RELEASE)[0]
             for phase in ("processors", "edges"):
                 expected = sorted(n for n in units if n.endswith("processor.service") == (phase == "processors"))
                 self.calls.clear()
@@ -102,39 +108,39 @@ class ActivateTests(unittest.TestCase):
             files = {path: (b"approved", 0o644, os.getuid(), os.getgid())}
             with patch.object(a.h, "get_runtime_user", return_value=(123, 123)), \
                     patch.object(a.h, "build_paths", return_value=(files, {})):
-                a.installed({})
+                a.installed({}, RELEASE)
                 path.write_bytes(b"changed")
                 with self.assertRaises(ValueError):
-                    a.installed({})
+                    a.installed({}, RELEASE)
                 path.write_bytes(b"approved")
                 path.chmod(0o666)
                 with self.assertRaises(ValueError):
-                    a.installed({})
+                    a.installed({}, RELEASE)
                 path.unlink()
                 with self.assertRaises(FileNotFoundError):
-                    a.installed({})
+                    a.installed({}, RELEASE)
 
     def test_proc_hash_path_and_pid_are_checked(self):
         name = sorted(self.units)[0]
         self.active.add(name)
         digest = a.hashlib.sha256(b"binary").hexdigest()
         with patch.object(a, "show", side_effect=self.show), \
-                patch.object(a.os, "readlink", return_value=str(a.h.RELEASE / "bin/psy_node_cli")), \
+                patch.object(a.os, "readlink", return_value=str(RELEASE.release_dir / "bin/psy_node_cli")), \
                 patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"binary")):
-            self.assertEqual(a.process(name, digest)["pid"], 123)
+            self.assertEqual(a.process(name, digest, RELEASE)["pid"], 123)
             with self.assertRaisesRegex(ValueError, "hash mismatch"):
-                a.process(name, "0" * 64)
+                a.process(name, "0" * 64, RELEASE)
             with patch.object(a.os, "readlink", return_value="/old/binary"), self.assertRaises(ValueError):
-                a.process(name, digest)
+                a.process(name, digest, RELEASE)
             with patch.object(a, "show", side_effect=[self.show(name), {"MainPID": "124", "ActiveState": "active"}]), self.assertRaises(ValueError):
-                a.process(name, digest)
+                a.process(name, digest, RELEASE)
 
     def test_new_start_waits_through_active_executor_but_rejects_permanent_failed_or_existing_wrong_exe(self):
         for case in ("transition", "permanent", "failed", "existing"):
             with self.subTest(case=case):
                 self.manifest.update(host="gcp-edge-1", private_ip=a.h.HOSTS["gcp-edge-1"])
                 self.manifest["files"]["bin/psy_node_cli"] = a.hashlib.sha256(b"binary").hexdigest()
-                first = sorted(a.h.host_inventory("gcp-edge-1")[0])[0]
+                first = sorted(a.h.host_inventory("gcp-edge-1", RELEASE)[0])[0]
                 self.active = {first} if case == "existing" else set()
                 self.calls.clear()
                 clock, reads = [0.0], [0]
@@ -142,7 +148,7 @@ class ActivateTests(unittest.TestCase):
                     reads[0] += 1
                     if case in ("permanent", "existing") or (case == "transition" and reads[0] == 1):
                         return "/usr/lib/systemd/systemd-executor"
-                    return str(a.h.RELEASE / "bin/psy_node_cli")
+                    return str(RELEASE.release_dir / "bin/psy_node_cli")
                 def show(name):
                     value = self.show(name)
                     if case == "failed" and name in self.active:
@@ -157,12 +163,12 @@ class ActivateTests(unittest.TestCase):
                         patch.object(a.time, "monotonic", side_effect=lambda: clock[0]), \
                         patch.object(a.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
                     if case == "transition":
-                        result = a.activate(Path("/unused"), "edges", True)
+                        result = a.activate(Path("/unused"), "edges", RELEASE, True)
                         self.assertEqual(len(result["processes"]), 3)
                         self.assertGreater(clock[0], 0)
                     else:
                         with self.assertRaises(a.h.InstallError):
-                            a.activate(Path("/unused"), "edges", True)
+                            a.activate(Path("/unused"), "edges", RELEASE, True)
                     mutations = [c for c in self.calls if c[1] == "enable"]
                     if case == "permanent":
                         self.assertGreaterEqual(clock[0], 15)
@@ -177,7 +183,10 @@ class ActivateTests(unittest.TestCase):
                               (ValueError("PRIVATE_PAYLOAD_SENTINEL"), "ValueError")):
             output = io.StringIO()
             with self.subTest(error=type(error).__name__), \
-                    patch("sys.argv", ["activate_host.py", "--package", "/unused", "--phase", "processors"]), \
+                    patch("sys.argv", ["activate_host.py", "--release-lock", "/unused", "--release-lock-sha256", "0" * 64,
+                                       "--package", "/unused", "--phase", "processors"]), \
+                    patch.object(a, "read_release_lock", return_value=LOCK), \
+                    patch.object(a, "load_helper", return_value=install_host), \
                     patch.object(a, "activate", side_effect=error), patch("sys.stdout", output):
                 with self.assertRaises(SystemExit) as caught:
                     a.main()
@@ -185,6 +194,32 @@ class ActivateTests(unittest.TestCase):
             self.assertIn("no rollback attempted; inspect", str(caught.exception))
             self.assertNotIn("PRIVATE_PAYLOAD_SENTINEL", str(caught.exception) + output.getvalue())
             self.assertEqual(output.getvalue(), "")
+
+    def test_activate_host_uses_lock_release_dir(self):
+        name = sorted(self.units)[0]
+        self.active.add(name)
+        digest = a.hashlib.sha256(b"binary").hexdigest()
+        expected = Path(LOCK["paths"]["core"]["release"]) / "bin/psy_node_cli"
+        self.assertEqual(RELEASE.release_dir, Path(LOCK["paths"]["core"]["release"]))
+        with patch.object(a, "show", side_effect=self.show), \
+                patch.object(a.os, "readlink", return_value=str(expected)), \
+                patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"binary")):
+            self.assertEqual(a.process(name, digest, RELEASE)["pid"], 123)
+        other = install_host.load_core_release({**LOCK, "paths": {**LOCK["paths"], "core": {
+            **LOCK["paths"]["core"], "release": "/opt/other-release"}}})
+        with patch.object(a, "show", side_effect=self.show), \
+                patch.object(a.os, "readlink", return_value=str(expected)), \
+                patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"binary")):
+            with self.assertRaisesRegex(ValueError, "unexpected running executable"):
+                a.process(name, digest, other)
+
+    def test_helper_hash_comes_from_the_lock(self):
+        lock = {**LOCK, "tool_sha256": {**LOCK["tool_sha256"], "install_host.py": "0" * 64}}
+        with self.assertRaisesRegex(SystemExit, "install_host.py hash mismatch"):
+            a.load_helper(lock)
+        good = {**LOCK, "tool_sha256": {**LOCK["tool_sha256"], "install_host.py": a.hashlib.sha256(
+            (HERE / "install_host.py").read_bytes()).hexdigest()}}
+        self.assertTrue(callable(a.load_helper(good).load_core_release))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Activate only installed R3 processors or edges. No SSH, DB reset or rollback.
+"""Activate only installed release processors or edges. No SSH, DB reset or rollback.
 
 Without --apply this is root-only read-only preflight. Successful activation is
 process/executable evidence only, never checkpoint or network readiness.
-Keep the exact reviewed install_host.py sibling beside this file.
+Keep the exact install_host.py sibling named by the release lock beside this file.
 """
 import argparse
 import hashlib
@@ -14,14 +14,25 @@ import stat
 import time
 import types
 
-HELPER_SHA256 = "0c2b63f996fd1be7eb4909cb2a5b15c88b377405833cc8a15fd532951264a164"
-_path = Path(__file__).with_name("install_host.py")
-_raw = _path.read_bytes()
-if hashlib.sha256(_raw).hexdigest() != HELPER_SHA256:
-    raise SystemExit("install_host.py hash mismatch")
-h = types.ModuleType("approved_install_host")
-h.__file__ = str(_path)
-exec(compile(_raw, str(_path), "exec"), h.__dict__)
+h = None
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise SystemExit("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_helper(lock):
+    path = Path(__file__).with_name("install_host.py")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != lock["tool_sha256"]["install_host.py"]:
+        raise SystemExit("install_host.py hash mismatch")
+    module = types.ModuleType("approved_install_host")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
 
 
 def show(name):
@@ -29,12 +40,12 @@ def show(name):
     return dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
 
 
-def process(name, expected):
+def process(name, expected, release):
     value = show(name)
     h.require(value.get("ActiveState") == "active" and value.get("MainPID", "0").isdigit()
               and int(value["MainPID"]) > 0, "unit not active with PID: " + name)
     path = Path("/proc") / value["MainPID"] / "exe"
-    h.require(os.readlink(path) == str(h.RELEASE / "bin/psy_node_cli"), "unexpected running executable")
+    h.require(os.readlink(path) == str(release.release_dir / "bin/psy_node_cli"), "unexpected running executable")
     with path.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     h.require(digest == expected, "running executable hash mismatch")
@@ -43,11 +54,11 @@ def process(name, expected):
     return {"unit": name, "pid": int(value["MainPID"]), "exe_sha256": digest}
 
 
-def installed(payloads):
+def installed(payloads, release):
     user = h.get_runtime_user()
     h.require(user is not None, "installed runtime account missing")
-    files, directories = h.build_paths(payloads, user)
-    h.check_paths(files, directories)
+    files, directories = h.build_paths(payloads, user, release)
+    h.check_paths(files, directories, release)
     for path, (raw, mode, uid, gid) in files.items():
         parent = h.directory(path.parent)
         try:
@@ -58,7 +69,7 @@ def installed(payloads):
                   "installed artifact differs: " + str(path))
 
 
-def preflight(manifest, units, expected):
+def preflight(manifest, units, expected, release):
     addresses = json.loads(h.command(["ip", "-j", "-4", "address", "show"]))
     h.require(manifest["private_ip"] == h.HOSTS[manifest["host"]] and any(
         a.get("local") == manifest["private_ip"] for i in addresses for a in i.get("addr_info", [])), "target IP mismatch")
@@ -79,32 +90,32 @@ def preflight(manifest, units, expected):
                   and value.get("FragmentPath") == str(h.UNITS / name) and value.get("DropInPaths") == ""
                   and value.get("NeedDaemonReload") == "no", "unit source/override/reload mismatch")
         if value.get("ActiveState") == "active":
-            process(name, expected)
+            process(name, expected, release)
         else:
-            h.require(value.get("ActiveState") == "inactive" and value.get("MainPID") == "0", "R3 unit transitioning or failed")
+            h.require(value.get("ActiveState") == "inactive" and value.get("MainPID") == "0", "release unit transitioning or failed")
 
 
-def activate(package, phase, apply=False):
+def activate(package, phase, release, apply):
     h.require(os.geteuid() == 0, "root required")
     h.require(phase in ("processors", "edges"), "invalid phase")
-    manifest, payloads = h.read_package(package)
-    units, _ = h.host_inventory(manifest["host"])
+    manifest, payloads = h.read_package(package, release)
+    units, _ = h.host_inventory(manifest["host"], release)
     selected = sorted(n for n in units if n.endswith("processor.service") == (phase == "processors"))
     h.require(selected, "host has no units for requested phase")
-    installed(payloads)
+    installed(payloads, release)
     expected = manifest["files"]["bin/psy_node_cli"]
-    preflight(manifest, units, expected)
+    preflight(manifest, units, expected, release)
     results = []
     if apply:
         for name in selected:
-            preflight(manifest, units, expected)
+            preflight(manifest, units, expected, release)
             active = show(name).get("ActiveState") == "active"
             h.command(["systemctl", "enable", *([] if active else ["--now"]), name])
             deadline = time.monotonic() + 15
             # Type=simple can report active before the executor reaches execve.
             while True:
                 try:
-                    result = process(name, expected)
+                    result = process(name, expected, release)
                     break
                 except (h.InstallError, FileNotFoundError, ProcessLookupError):
                     if (active or time.monotonic() >= deadline or
@@ -119,13 +130,18 @@ def activate(package, phase, apply=False):
 
 
 def main():
+    global h
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--phase", choices=("processors", "edges"), required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+    lock = read_release_lock(args.release_lock, args.release_lock_sha256)
+    h = load_helper(lock)
     try:
-        print(json.dumps(activate(args.package, args.phase, args.apply), sort_keys=True))
+        print(json.dumps(activate(args.package, args.phase, h.load_core_release(lock), args.apply), sort_keys=True))
     except Exception as error:
         detail = str(error) if isinstance(error, h.InstallError) else type(error).__name__
         raise SystemExit("Activation failed: " + detail + "; no rollback attempted; inspect selected units") from None

@@ -39,59 +39,6 @@ deployment, Caddy configuration, Guardian custody, or P2P identity is replaced.
 - P2P processor ports 41001..41003 and 41021..41023; Edge ports 41101..41103
   and 41121..41123. These are planned ports, not remotely verified free ports.
 
-### Temporary Realm 1 placement (2026-10-26)
-
-The baseline `topology.json` above remains the target after memory expansion.
-The operator authorized a temporary placement: Realm 0 positions 1/2/3 stay on
-their original hosts, while all three Realm 1 Processors run on the Coordinator
-host. This is a functional test layout, not host-fault-tolerant Realm 1 capacity.
-The Coordinator host was measured at 8 CPUs and approximately 30 GiB usable RAM,
-with 21 GiB available before adding Realm 1. Individual Realm Processors consumed
-approximately 4 GiB after startup; two do not fit safely on the original 8 GB VMs.
-
-`place_realm1_on_coordinator.py` prepares a small private package from the retained
-original R3 packages accepted by `install_host.py`. Its unit names and slice are
-R3-scoped; it rejects R2 and new SD192 package provenance before staging files.
-It is not an installer for the next fresh release. Only Realm 1
-`processor_addresses` change to the Coordinator's
-private IP; identities, ports, namespaces, Genesis and consensus parameters do not
-change. The three new Processor units and the three Realm 1 Edge drop-ins select
-`realm1-cp-ce-config.json`. Other processes retain the original config. The three
-temporary Processors share `psy-realm1-r3.slice` with `MemoryHigh=16G` and
-`MemoryMax=18G`; this bounds their aggregate memory, but does not guarantee
-availability if that limit is reached. Start them sequentially and inspect logs,
-memory, P2P connections and checkpoint synchronization before each next start.
-
-```sh
-python3 -B deploy/multi-chain/gcp/core-only/place_realm1_on_coordinator.py prepare \
-  --packages /absolute/private/original-host-packages \
-  --output /absolute/private/new-placement-packages
-```
-
-Copy only each host's package to that host, with the script and its imported
-`install_host.py`, `prepare_host_packages.py`, `plan.py` modules alongside it.
-Run `apply --package PATH --check-only`, then `apply --package PATH` as root.
-Neither command starts services. Keep the original Realm 1 units stopped and
-disabled. During this rollout each old unit also has a
-`90-temporary-placement-hold.conf` drop-in with a `ConditionPathExists` pointing
-to the absent `/var/lib/psy-core/core-testnet-20261026/realm1-return-authorized`.
-Do not create that file or remove the guard while its replacement is running.
-Before copying state, verify no old Realm 1 instance is active; the first temporary
-placement checked that no old `realm_1_N` checkpoint directory existed.
-
-Return after expansion is a state-preserving migration, not a second fresh start:
-quiesce Realm 1 admission, wait for pending work to drain, stop all three temporary
-Processors, then transfer each validator's complete `realm_1_N` checkpoint and
-proposal-backup directory to its original host with ownership preserved. Keep the
-same remote database namespaces and keys. Stop the Realm 1 Edges while restoring
-their original routing configuration. The script's `rollback --package PATH`
-removes only matching temporary config, units, drop-ins and slice files; it keeps
-keys and state and neither starts nor stops services. It is not a state-transfer
-command. Remove only the exact old-host hold drop-ins after replacement processes
-are confirmed stopped and state transfer is verified. Reload systemd and resume
-the original instances, then verify all three peer connections and checkpoints
-before reopening admission. Never run both copies of one validator identity.
-
 | Realm | Position | Registration | User ID |
 | --- | --- | --- | --- |
 | 0 | 1 | 0 | 0 |
@@ -206,8 +153,12 @@ install the pinned source. Genesis generation is a separate operation.
 From the deployment worktree root:
 
 ```sh
-python3 -B deploy/multi-chain/gcp/core-only/plan.py
 python3 -B deploy/multi-chain/gcp/core-only/plan.py \
+  --release-lock deploy/multi-chain/gcp/fresh-192-20261030/release-lock.json \
+  --release-lock-sha256 "$RELEASE_LOCK_SHA256"
+python3 -B deploy/multi-chain/gcp/core-only/plan.py \
+  --release-lock deploy/multi-chain/gcp/fresh-192-20261030/release-lock.json \
+  --release-lock-sha256 "$RELEASE_LOCK_SHA256" \
   --config /absolute/path/to/public-config.json \
   --genesis /absolute/path/to/genesis.json \
   --whitelist /absolute/path/to/worker-whitelist.json
@@ -219,14 +170,17 @@ Assemble a new public config without generating keys or Genesis:
 
 ```sh
 python3 -B deploy/multi-chain/gcp/core-only/prepare_network.py \
+  --release-lock deploy/multi-chain/gcp/fresh-192-20261030/release-lock.json \
+  --release-lock-sha256 "$RELEASE_LOCK_SHA256" \
   --canonical-config /absolute/path/to/psy-genesis/config.json \
   --p2p-config /absolute/path/to/preserved-p2p/config.json \
   --guardian-commitments /absolute/path/to/preserved-guardian/public-commitments.json \
-  --topology deploy/multi-chain/gcp/core-only/topology.json \
-  --whitelist deploy/multi-chain/gcp/core-only/worker-whitelist.json \
   --config-out /absolute/path/outside-git/new-testnet-config.json
 ```
 
+The topology, release profile and worker whitelist are read from the lock's
+directory and bound to its hashes. The canonical and P2P configs must carry the
+release epoch (`checkpoints_per_epoch` 32, equal in topology and profile).
 The output parent must exist and the output must not already exist. The source
 P2P config must select testnet and contain the preserved six identities. The
 Guardian commitments retain their original key-generation source provenance;
@@ -285,36 +239,44 @@ indexers, proof proxies, L1 deployment, Caddy and frontends are outside this pla
 
 ### Fresh SD192 Preparation
 
-The default commands below still select historical R3. For the fresh SD192
-candidate, explicitly select `--cohort sd192` on both the package builder and
-installer. Use the adjacent `fresh-192-20261030/topology.json` and its pinned
-`release.json`; the builder requires `--release-profile` for this cohort.
-For example, from this directory, with private absolute input paths supplied:
+The release lock `../fresh-192-20261030/release-lock.json` selects the source,
+artifact pins, paths, unit prefix and namespace. The core tools (`plan.py`, `prepare_network.py`, `prepare_host_packages.py`,
+`install_host.py`, `activate_host.py`) take
+`--release-lock PATH --release-lock-sha256 HASH` (both required), where the hash is
+the `sha256sum` of the lock file. The builder reads the topology, release profile
+and worker whitelist from the lock's release directory and checks them against the
+lock. For example, from this directory, with private absolute input paths supplied:
 
 ```sh
-python3 -B prepare_host_packages.py --cohort sd192 \
-  --topology ../fresh-192-20261030/topology.json \
-  --release-profile ../fresh-192-20261030/release.json \
+python3 -B prepare_host_packages.py \
+  --release-lock ../fresh-192-20261030/release-lock.json --release-lock-sha256 "$LOCK_SHA256" \
   --config "$CONFIG" --genesis "$GENESIS" --node-binary "$NODE_BINARY" \
   --private-keys "$PRIVATE_KEYS" --faucet-operators "$FAUCET_OPERATORS" \
   --p2p-keys "$P2P_KEYS" --output "$NEW_PRIVATE_PACKAGE_DIRECTORY"
 ```
 
-This is offline packaging only. The source, binary, config, Genesis and release
-profile hashes are fixed in `install_host.get_release("sd192")`; unknown or
-cross-cohort inputs fail closed. Fresh units use `fresh20261030sd192` isolation
-and `NATS_WORKER_ACK_WAIT_MS=30000`. Keep the retained registration and P2P keys;
-this command neither generates keys nor regenerates Genesis.
+This is offline packaging only. Unknown or cross-release inputs fail closed. Units
+use the lock's core namespace and `NATS_WORKER_ACK_WAIT_MS` from its gates. Keep the
+retained registration and P2P keys; this command neither generates keys nor
+regenerates Genesis.
 
-Only after separate installation approval, use the reviewed installer with
-`--cohort sd192 --check-only` before removing `--check-only`. Installation never
-starts or enables services. `activate_host.py` and the temporary placement
-adapter remain R3-only and must not be used to activate these fresh packages.
-Guardian, Workers, proxies, Relayer, Faucet and Services need their own matching
-fresh release preparation. See the fresh profile's `artifacts.json` and
+Only after separate installation approval, run the installer with
+`--check-only` before removing `--check-only`:
+
+```sh
+sudo python3 install_host.py --release-lock L --release-lock-sha256 H --package /absolute/private/host-package --check-only
+```
+
+Installation never starts or enables services. `activate_host.py` takes the same
+two lock arguments and checks the installed `install_host.py` against the lock's
+`tool_sha256`. Guardian, Workers, proxies, Relayer, Faucet and Services need their
+own matching fresh release preparation. See the fresh profile's `artifacts.json` and
 `PREPARATION-STATUS.md` for the remaining release gates.
 
 ### Historical R3 Procedure
+
+The commands in this subsection predate the release lock and omit `--release-lock`
+and `--release-lock-sha256`; add both to every tool call.
 
 `prepare_host_packages.py` requires the validated public config and new Genesis,
 the pinned release node binary, the retained private P2P inventory, and private

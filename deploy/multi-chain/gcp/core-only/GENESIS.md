@@ -68,36 +68,36 @@ divergent branch happens to be called `mainnet-beta`.
    `plan.py` and `prepare_host_packages.py`, then install with `install_host.py`.
    Reconcile their source pins, release ID and fresh database namespaces first.
 
-The topology, planner and network assembler now select the r3 preparation below;
-host installers remain pinned to the preceding cohort. This procedure does not
-repin installers, stop services, clear databases, install host packages, reset L1
-contracts, or open public admission. Do not run an old
-full-stack reset/start entrypoint to complete these steps. L1 replacement and
-service startup require their own reviewed deployment steps after this gate.
+The planner, network assembler and package builder select the release through the
+hash-pinned release lock (`--release-lock`, `--release-lock-sha256`), and the host
+installers read the same lock. This procedure does not stop services, clear
+databases, install host packages, reset L1 contracts, or open public admission.
+Do not run an old full-stack reset/start entrypoint to complete these steps. L1
+replacement and service startup require their own reviewed deployment steps after
+this gate.
 
-## R3 Topology Preparation
+## Release Topology Preparation
 
-Only `topology.json`, `plan.py` and `prepare_network.py` select:
+The release lock, with the `topology.json` and `release.json` beside it, selects:
 
-- Runtime `3d31758738f833a7eea6f9ff7fd680a69a0d9a44`, not a later test-only commit.
-- Release `core-testnet-20261027-r3`.
-- All 16 planned units use `psy-core-r3-`, distinct from existing `psy-core-r2-`
-  units; this is not an overwrite of same-name units.
-- Namespaces `fresh20261027r3_coordinator` and `fresh20261027r3_r{0,1}_v{1,2,3}`,
+- The runtime commit (`sources.runtime`), not a later test-only commit.
+- The release ID, unit prefix (`units.core_prefix`) and core namespace
+  (`units.core_namespace_prefix`); all 16 planned units use that prefix.
+- Seven namespaces, `<namespace>_coordinator` and `<namespace>_r{0,1}_v{1,2,3}`,
   with each namespace bound to its exact role.
 - Both Realms' Processor positions 1/2/3 on `.37/.42/.43`; the six retained
   Validator identities, registration order, ports and Edge placement are unchanged.
 
-The tests consume the checked-in topology without overriding its cohort fields.
-The planner still reports `deployment_ready=false`, `release_approved=false`
+The tests build their topology from a synthetic lock without overriding cohort
+fields. The planner still reports `deployment_ready=false`, `release_approved=false`
 and exits 2 even when input consistency passes. Guardian custody provenance
-remains `de539f565ec1a92f91bb4e9686e1442e89ba8639`.
+is `sources.guardian_key` in the lock.
 
 Pending integration, not approved by this preparation:
 
 | Files | Required before packaging or installation |
 | --- | --- |
-| `prepare_host_packages.py`, `install_host.py` | Freeze final binary/build identity and independently verified Genesis/config hashes; align r3 paths and namespace checks together. Existing r2 artifact pins are unchanged and reject an r3 package. |
+| `prepare_host_packages.py`, `install_host.py` | Pins and paths come from the release lock; its pending binary, Genesis and config hashes must be filled and `release_lock.py check --require-complete` must pass first. |
 | `prepare_workers.py` | Freeze worker, topology, build and attestation hashes; review release paths and slice names. |
 | `prepare_proxies.py` | Freeze runtime/package pins and review retained-setup compatibility without bypassing circuit/config/bundle comparisons. |
 | `install_guardian.py`, `guardian_exec.py` | Align runtime/release/state paths while retaining custody source and key hashes. |

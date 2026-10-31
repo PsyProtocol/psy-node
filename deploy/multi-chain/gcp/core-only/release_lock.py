@@ -23,7 +23,7 @@ SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "servi
 CLI_BINARIES = ("psy_dev_cli", "psy_node_cli", "psy_relayer_cli", "psy_user_cli", "psy_worker_cli")
 SERVICE_BINARIES = ("psy-services", "psy-indexer")
 PATH_ROLES = ("core", "guardian", "relayer", "worker", "proxy", "faucet", "services", "envio")
-UNITS = ("core_prefix", "guardian_prefix", "relayer", "worker_prefix", "proxy_prefix", "faucet", "services",
+UNITS = ("core_prefix", "core_namespace_prefix", "guardian_prefix", "relayer", "worker_prefix", "proxy_prefix", "faucet", "services",
          "indexer_prefix", "envio")
 IMAGES = ("scylla", "valkey", "nats", "postgres", "nostr")
 CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
@@ -116,6 +116,12 @@ def load_release_lock(path, expected_sha256):
     return parse(raw)
 
 
+def load_checked_release_lock(path, expected_sha256):
+    lock = load_release_lock(path, expected_sha256)
+    validate_release_lock(lock, Path(path).resolve().parent, False)
+    return lock
+
+
 def fields(value, names, label):
     require(isinstance(value, dict) and set(value) == set(names), f"{label} fields")
     return value
@@ -161,6 +167,11 @@ def check_profile(lock, release, artifacts):
     require(inputs["canonical_config"] == release["canonical_config_sha256"],
             "canonical_config hash differs from the release profile")
     require(inputs["genesis"] == artifacts["genesis_sha256"], "genesis hash differs from artifacts")
+    require(lock["units"]["core_namespace_prefix"] == release["namespace_prefix"],
+            "core_namespace_prefix differs from the release profile")
+    require(type(lock["gates"]["worker_queue_ack_wait_ms"]) is type(release["worker_queue_ack_wait_ms"])
+            and lock["gates"]["worker_queue_ack_wait_ms"] == release["worker_queue_ack_wait_ms"],
+            "worker_queue_ack_wait_ms differs from the release profile")
     sources = lock["sources"]
     require(sources["runtime"] == release["runtime_candidate_commit"], "runtime commit differs from the release profile")
     for name in ("compiler", "genesis"):
@@ -263,7 +274,8 @@ def check_chain_values(lock, walk):
         require(isinstance(ingress[name], list) and ingress[name] and all(
             isinstance(host, str) and host for host in ingress[name]), f"ingress.{name} must list hosts")
     walk.text(ingress["maintenance_tag"], "ingress.maintenance_tag")
-    gates = fields(lock["gates"], ("l2_stability_checkpoint_count",), "gates")
+    gates = fields(lock["gates"], ("l2_stability_checkpoint_count", "worker_queue_ack_wait_ms"), "gates")
+    walk.number(gates["worker_queue_ack_wait_ms"], "gates.worker_queue_ack_wait_ms", 1, 2**63 - 1)
     require(type(gates["l2_stability_checkpoint_count"]) is int and gates["l2_stability_checkpoint_count"] == 100,
             "gates.l2_stability_checkpoint_count must be 100")
     tools = lock["tool_sha256"]

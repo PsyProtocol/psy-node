@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -11,17 +12,23 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from test_plan import fixture as plan_fixture, profile_for
+from test_release_lock import build_test_lock
+
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("prepare_network", HERE / "prepare_network.py")
 prepare = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prepare)
 WORKER_KEY = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+LOCK = build_test_lock()
+PROFILE = profile_for(LOCK)
 
 
 def fixture():
-    topology = json.loads((HERE / "topology.json").read_text())
+    topology = plan_fixture(LOCK)[0]
     network = copy.deepcopy(prepare.CONSENSUS)
+    network["p2p"]["checkpoints_per_epoch"] = PROFILE["checkpoints_per_epoch"]
     network.update(
         realm_configs=[{"id": rid, "rpc_url": ["https://old.example"], "validators": []}
                        for rid in (0, 1)],
@@ -51,7 +58,7 @@ def fixture():
                 "edge_nodes": [{"node_id": edge, "addresses": [
                     f"/ip4/127.0.0.1/tcp/41101/p2p/{prepare.peer_id(edge)}"]}],
             })
-    commitments = {"node_source": prepare.SOURCE_BASE, "user_cli_sha256": "ab" * 32,
+    commitments = {"node_source": LOCK["sources"]["guardian_key"], "user_cli_sha256": "ab" * 32,
                    "guardian_initial_member_hashes": [f"{i:064x}" for i in (1, 2, 3)],
                    "password_storage": "systemd user-scoped host-bound encrypted credentials"}
     genesis = {"contracts": [{"unchanged": "contract bytes"}],
@@ -68,9 +75,12 @@ def fixture():
 class AssemblyTests(unittest.TestCase):
     def setUp(self):
         self.canonical, self.p2p, self.commitments, self.topology, self.whitelist, self.genesis = fixture()
+        self.lock = copy.deepcopy(LOCK)
+        self.profile = copy.deepcopy(PROFILE)
 
     def assemble(self):
-        return prepare.assemble_config(self.canonical, self.p2p, self.commitments, self.topology, self.whitelist)
+        return prepare.assemble_config(self.canonical, self.p2p, self.commitments, self.topology, self.whitelist,
+                                       self.lock, self.profile)
 
     def members(self):
         return self.p2p["networks"]["testnet"]["realm_configs"][0]["validators"]
@@ -89,6 +99,8 @@ class AssemblyTests(unittest.TestCase):
             self.assertEqual(network["fees"], self.canonical["networks"][name]["fees"])
             self.assertEqual(network["whitelist"], self.whitelist["networks"]["testnet"]["whitelist"])
             for field, value in prepare.CONSENSUS.items():
+                if field == "p2p":
+                    value = {**value, "checkpoints_per_epoch": self.profile["checkpoints_per_epoch"]}
                 self.assertEqual(network[field], value)
             self.assertEqual(network["coordinator_configs"], [{"id": 0, "rpc_url": [
                 f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}])
@@ -113,6 +125,31 @@ class AssemblyTests(unittest.TestCase):
             self.assertNotIn("l1_config_url", network)
             self.assertNotIn("guardian_history", network)
 
+    def test_assembled_config_carries_the_release_epoch(self):
+        epoch = self.profile["checkpoints_per_epoch"]
+        self.assertEqual(epoch, 32)
+        self.assertEqual(self.assemble()["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"], epoch)
+
+    def test_canonical_and_p2p_epoch_must_match_the_topology_epoch(self):
+        for label, documents in (("canonical", [self.canonical]), ("p2p", [self.p2p]), ("both", [self.canonical, self.p2p])):
+            for document in documents:
+                document["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 10
+            with self.subTest(stale=label), self.assertRaisesRegex(prepare.PrepareError, "consensus mismatch: p2p"):
+                self.assemble()
+            for document in documents:
+                document["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 32
+
+    def test_topology_epoch_must_equal_the_profile_epoch(self):
+        for value in (10, 31, 33, True, "32", None):
+            with self.subTest(topology_epoch=value):
+                self.topology["checkpoints_per_epoch"] = value
+                with self.assertRaisesRegex(prepare.PrepareError, "topology epoch differs from the release profile"):
+                    self.assemble()
+        self.topology["checkpoints_per_epoch"] = 32
+        self.profile["checkpoints_per_epoch"] = 10
+        with self.assertRaisesRegex(prepare.PrepareError, "topology epoch differs from the release profile"):
+            self.assemble()
+
     def test_only_testnet_source_is_supported(self):
         self.assertEqual(self.assemble()["defaultNetwork"], "testnet")
         self.p2p["defaultNetwork"] = "localhost"
@@ -129,39 +166,43 @@ class AssemblyTests(unittest.TestCase):
     def test_runtime_commit_is_separate_from_retained_guardian_identity(self):
         before = copy.deepcopy(self.commitments)
         first = self.assemble()
-        self.assertEqual(self.topology["runtime_commit"], "3d31758738f833a7eea6f9ff7fd680a69a0d9a44")
+        self.assertEqual(self.topology["runtime_commit"], self.lock["sources"]["runtime"])
         self.assertNotIn("runtime_source_base", self.topology)
         self.assertNotIn("runtime_patch_sha256", self.topology)
         self.assertEqual(self.assemble(), first)
         self.assertEqual(self.commitments, before)
-        self.assertEqual(self.commitments["node_source"], prepare.SOURCE_BASE)
-        self.assertEqual(self.commitments["node_source"], "de539f565ec1a92f91bb4e9686e1442e89ba8639")
+        self.assertEqual(self.commitments["node_source"], self.lock["sources"]["guardian_key"])
+        self.assertNotEqual(self.commitments["node_source"], self.lock["sources"]["runtime"])
         self.commitments["node_source"] = self.topology["runtime_commit"]
         with self.assertRaisesRegex(prepare.PrepareError, "Guardian commitments source"):
             self.assemble()
 
     def test_runtime_commit_must_match_published_pin(self):
-        for value in (None, "", True, 123, [], {}, "0" * 40, prepare.SOURCE_BASE,
+        for value in (None, "", True, 123, [], {}, "0" * 40, self.lock["sources"]["guardian_key"],
                       "cd" * 20, "dcc1146514ef3eca2336640f6d95e5a1c04feff9",
                       "5d38eefc07b0925ed9875b74805d9c3fea73d998",
-                      "3d317587", prepare.RUNTIME_COMMIT.upper(), prepare.RUNTIME_COMMIT + "\n"):
+                      "3d317587", self.lock["sources"]["runtime"][:-1] + "2", self.lock["sources"]["runtime"] + "\n"):
             with self.subTest(value=value):
                 self.topology["runtime_commit"] = value
                 with self.assertRaisesRegex(prepare.PrepareError, "runtime commit must match pinned published source"):
                     self.assemble()
 
-    def test_r3_topology_is_consumed_without_fixture_repinning(self):
-        self.assertEqual(self.topology["release_id"], "core-testnet-20261027-r3")
-        self.assertEqual(self.topology["coordinator"]["namespace"], "fresh20261027r3_coordinator")
+    def test_topology_is_consumed_with_the_lock_namespace(self):
+        namespace = self.lock["units"]["core_namespace_prefix"]
+        self.assertEqual(self.topology["release_id"], self.lock["release_id"])
+        self.assertEqual(self.topology["coordinator"]["namespace"], namespace + "_coordinator")
         result = self.assemble()["networks"]["testnet"]
         for rid, realm in enumerate(self.topology["realms"]):
             for index, validator in enumerate(realm["validators"]):
-                self.assertEqual(validator["namespace"], f"fresh20261027r3_r{rid}_v{index + 1}")
+                self.assertEqual(validator["namespace"], f"{namespace}_r{rid}_v{index + 1}")
                 address = result["realm_configs"][rid]["validators"][index]["processor_addresses"][0]
                 self.assertTrue(address.startswith(f"/ip4/10.148.0.{(37, 42, 43)[index]}/tcp/"))
+        self.lock["units"]["core_namespace_prefix"] = "fresh20270102sd256"
+        with self.assertRaisesRegex(prepare.PrepareError, "topology namespace differs from the release lock"):
+            self.assemble()
 
     def test_other_release_ids_are_rejected(self):
-        for value in (None, "core-testnet-20261026", "core-testnet-20261026-r2", "core-testnet-20261027-r3\n"):
+        for value in (None, "core-testnet-20261026", "core-testnet-20261026-r2", self.lock["release_id"] + "\n"):
             with self.subTest(value=value):
                 self.topology["release_id"] = value
                 with self.assertRaisesRegex(prepare.PrepareError, "unexpected release ID"):
@@ -173,7 +214,7 @@ class AssemblyTests(unittest.TestCase):
         for target in targets:
             original = target["namespace"]
             for value in (None, [], "fresh20261026_coordinator", "fresh20261026r2_r0_v1",
-                          "fresh20261027r3_unused", original + "\n"):
+                          self.lock["units"]["core_namespace_prefix"] + "_unused", original + "\n"):
                 with self.subTest(original=original, value=value):
                     target["namespace"] = value
                     with self.assertRaisesRegex(prepare.PrepareError, "namespace differs from approved role"):
@@ -205,7 +246,7 @@ class AssemblyTests(unittest.TestCase):
                 prepare.validate_whitelist(document)
 
     def test_topology_rejects_runtime_base_and_patch_fields(self):
-        for field, value in (("runtime_source_base", prepare.SOURCE_BASE),
+        for field, value in (("runtime_source_base", self.lock["sources"]["guardian_key"]),
                              ("runtime_patch_sha256", "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa"),
                              ("patch_sha256", "ab" * 32)):
             with self.subTest(field=field):
@@ -399,9 +440,22 @@ class FilesystemTests(unittest.TestCase):
         self.documents = fixture()
         names = ("canonical", "p2p", "commitments", "topology", "whitelist", "genesis")
         for name, document in zip(names, self.documents):
-            (self.root / f"{name}.json").write_text(json.dumps(document))
-        self.args = []
-        for flag, name in zip(("canonical-config", "p2p-config", "guardian-commitments", "topology", "whitelist"), names):
+            if name not in ("topology", "whitelist"):
+                (self.root / f"{name}.json").write_text(json.dumps(document))
+        self.write_release()
+
+    def write_release(self):
+        self.release_dir = self.root / "release"
+        self.release_dir.mkdir(exist_ok=True)
+        lock = self.lock = build_test_lock(self.release_dir, topology_text=json.dumps(self.documents[3]))
+        self.whitelist_path = self.root / "core-only" / "worker-whitelist.json"
+        self.whitelist_path.write_text(json.dumps(self.documents[4]))
+        lock["inputs"]["worker_whitelist"] = hashlib.sha256(self.whitelist_path.read_bytes()).hexdigest()
+        raw = json.dumps(lock).encode()
+        (self.release_dir / "release-lock.json").write_bytes(raw)
+        self.args = ["--release-lock", str(self.release_dir / "release-lock.json"),
+                     "--release-lock-sha256", hashlib.sha256(raw).hexdigest()]
+        for flag, name in zip(("canonical-config", "p2p-config", "guardian-commitments"), ("canonical", "p2p", "commitments")):
             self.args += ["--" + flag, str(self.root / f"{name}.json")]
 
     def run_cli(self, *extra):
@@ -412,7 +466,7 @@ class FilesystemTests(unittest.TestCase):
         return result
 
     def test_two_stage_cli_does_not_change_inputs(self):
-        before = {path: path.read_bytes() for path in self.root.iterdir()}
+        before = {path: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
         self.assertEqual(self.run_cli("--config-out", self.root / "config.json"), 0, self.last_error)
         config_bytes = (self.root / "config.json").read_bytes()
         self.assertEqual(self.run_cli("--genesis-in", self.root / "genesis.json",
@@ -431,8 +485,10 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual(self.run_cli("--genesis-in", self.root / "genesis.json",
                                          "--genesis-out", self.root / "injected.json"), 0, self.last_error)
         self.assertEqual(reader.call_args_list, [
-            *[call(self.root / f"{name}.json") for name in
-              ("canonical", "p2p", "commitments", "topology", "whitelist")],
+            *[call(self.root / f"{name}.json") for name in ("canonical", "p2p", "commitments")],
+            call(self.release_dir / "topology.json", sha256=self.lock["inputs"]["topology"]),
+            call(self.whitelist_path, sha256=self.lock["inputs"]["worker_whitelist"]),
+            call(self.release_dir / "release.json", sha256=self.lock["inputs"]["release_profile"]),
             call(self.root / "genesis.json", max_bytes=prepare.MAX_GENESIS_INPUT_BYTES),
         ])
 
@@ -505,17 +561,46 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(self.run_cli("--config-out", self.root / "output.json"), 1)
         self.assertFalse((self.root / "output.json").exists())
 
-    def test_whitelist_argument_is_mandatory(self):
-        self.args = self.args[:-2]
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-            prepare.main(self.args + ["--config-out", str(self.root / "output.json")])
-        self.assertEqual(error.exception.code, 2)
+    def test_release_lock_arguments_are_mandatory(self):
+        for removed in (slice(0, 2), slice(2, 4)):
+            args = self.args[:removed.start] + self.args[removed.stop:]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                prepare.main(args + ["--config-out", str(self.root / "output.json")])
+            self.assertEqual(error.exception.code, 2)
+        self.assertFalse((self.root / "output.json").exists())
+
+    def test_changed_lock_or_whitelist_fails_before_outputs(self):
+        args = list(self.args)
+        self.args[3] = "0" * 64
+        self.assertEqual(self.run_cli("--config-out", self.root / "output.json"), 1)
+        self.assertIn("release lock hash mismatch", self.last_error)
+        self.args = args
+        other = {"networks": {"testnet": {"whitelist": {
+            "enabled": True, "secp256k1": ["03" + WORKER_KEY[2:]]}}}}
+        prepare.validate_whitelist(other)
+        self.whitelist_path.write_text(json.dumps(other))
+        self.assertEqual(self.run_cli("--config-out", self.root / "output.json"), 1)
+        self.assertIn("input hash differs from file: worker_whitelist", self.last_error)
+        self.assertFalse((self.root / "output.json").exists())
+
+    def test_topology_read_after_validation_must_still_match_the_lock(self):
+        original = prepare.read_public_json
+
+        def swapped(path, **options):
+            if Path(path).name == "topology.json":
+                (self.release_dir / "topology.json").write_text(json.dumps({**self.documents[3], "faucet_operator_count": 99}))
+            return original(path, **options)
+
+        with patch.object(prepare, "read_public_json", side_effect=swapped):
+            self.assertEqual(self.run_cli("--config-out", self.root / "output.json"), 1)
+        self.assertIn("public input hash differs from the lock", self.last_error)
         self.assertFalse((self.root / "output.json").exists())
 
     def test_disabled_whitelist_fails_before_outputs(self):
         self.documents[4]["networks"]["testnet"]["whitelist"]["enabled"] = False
-        (self.root / "whitelist.json").write_text(json.dumps(self.documents[4]))
+        self.write_release()
         self.assertEqual(self.run_cli("--config-out", self.root / "output.json"), 1)
+        self.assertIn("worker whitelist must be enabled", self.last_error)
         self.assertFalse((self.root / "output.json").exists())
 
 

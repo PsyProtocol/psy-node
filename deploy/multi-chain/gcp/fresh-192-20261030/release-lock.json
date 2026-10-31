@@ -77,6 +77,7 @@
   },
   "units": {
     "core_prefix": "psy-core-fresh20261030sd192-",
+    "core_namespace_prefix": "fresh20261030sd192",
     "guardian_prefix": "psy-guardian-fresh20261030sd192-",
     "relayer": "psy-core-relayer-fresh20261030sd192.service",
     "worker_prefix": "psy-core-worker-fresh20261030sd192-",
@@ -178,11 +179,12 @@
     "maintenance_tag": "psy-sd192-maintenance"
   },
   "gates": {
-    "l2_stability_checkpoint_count": 100
+    "l2_stability_checkpoint_count": 100,
+    "worker_queue_ack_wait_ms": 30000
   },
   "tool_sha256": {
     "activate_bridge.py": "cd8762d5f1e2800ee5bb86b9ada15ec83f3305c2e7adb60660b3d497bdd4332e",
-    "activate_host.py": "cff95c9b0dd453be5d3ffe1b3d6d5424b9b4cfd7554979e603a1de350773e576",
+    "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
     "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
     "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
     "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
@@ -191,7 +193,7 @@
     "indexer_backup_mirror.py": "fea7793cfca5b69ab88a26f1f4774196a3966dacc942f29e3ed574886810c1d7",
     "install_envio.py": "d251bde36b6173a51873a42053fb884494d62de994ca75a58b4c5dd858fbb309",
     "install_guardian.py": "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a",
-    "install_host.py": "0c2b63f996fd1be7eb4909cb2a5b15c88b377405833cc8a15fd532951264a164",
+    "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
     "install_relayer.py": "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9",
     "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
     "prepare_bridge_forwarders.py": "8ea58b8e6f8e178a0fff1574948e5a784e95d5e60d1236456d75942a6c83b833",

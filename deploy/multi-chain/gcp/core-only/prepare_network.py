@@ -2,8 +2,9 @@
 """Assemble public core-network inputs offline; never generate or load secrets.
 
 Stage 1: --config-out PATH. Stage 2: --genesis-in PATH --genesis-out PATH
-(--config-out may be omitted). All five public input arguments, including a
-testnet worker whitelist, are required in both stages. Existing P2P identities
+(--config-out may be omitted). The release lock, canonical config, P2P config
+and Guardian commitments are required in both stages; the topology and the
+testnet worker whitelist come from the lock's release directory. Existing P2P identities
 and Guardian commitments are always reused; there is no key-generation path.
 Outputs must be new files outside Git checkouts. Runtime key
 possession, curve-point validation and circuit acceptance remain separate gates.
@@ -11,6 +12,7 @@ possession, curve-point validation and circuit acceptance remain separate gates.
 
 import argparse
 import copy
+import hashlib
 import ipaddress
 import json
 import os
@@ -19,9 +21,9 @@ import re
 import stat
 import sys
 
+import release_lock
 
-SOURCE_BASE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-RUNTIME_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
+
 MAX_PUBLIC_INPUT_BYTES = 64 * 1024 * 1024
 MAX_GENESIS_INPUT_BYTES = 1024 * 1024 * 1024
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
@@ -102,15 +104,23 @@ def private_ip(value):
     return value
 
 
-def validate_topology(topology):
+def validate_topology(topology, lock, profile):
     fields(topology, ("schema_version", "release_id", "runtime_commit", "psy_network",
                       "network", "proving_backend", "hosts", "infrastructure",
-                      "coordinator", "realms", "faucet_operator_count"), "topology")
+                      "coordinator", "realms", "faucet_operator_count", "namespace_prefix",
+                      "checkpoints_per_epoch", "worker_queue_ack_wait_ms"), "topology")
     integer(topology["faucet_operator_count"], 100, 100, "faucet operator count")
-    integer(topology["schema_version"], 1, 1, "topology version")
-    require(topology["runtime_commit"] == RUNTIME_COMMIT,
+    integer(topology["schema_version"], 2, 2, "topology version")
+    namespace = lock["units"]["core_namespace_prefix"]
+    require(topology["runtime_commit"] == lock["sources"]["runtime"],
             "runtime commit must match pinned published source")
-    require(topology["release_id"] == "core-testnet-20261027-r3", "unexpected release ID")
+    require(topology["release_id"] == lock["release_id"], "unexpected release ID")
+    require(topology["namespace_prefix"] == namespace, "topology namespace differs from the release lock")
+    require(type(topology["checkpoints_per_epoch"]) is int
+            and topology["checkpoints_per_epoch"] == profile["checkpoints_per_epoch"] == 32,
+            "topology epoch differs from the release profile")
+    integer(topology["worker_queue_ack_wait_ms"], lock["gates"]["worker_queue_ack_wait_ms"],
+            lock["gates"]["worker_queue_ack_wait_ms"], "worker queue lease")
     require(topology["psy_network"] == "testnet" and topology["network"] == "psy-public-testnet",
             "runtime requires PSY_NETWORK=testnet with --network psy-public-testnet")
     require(topology["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected backend")
@@ -120,7 +130,7 @@ def validate_topology(topology):
         private_ip(value)
     coordinator = topology["coordinator"]
     fields(coordinator, ("host", "namespace", "edge_ports"), "coordinator")
-    require(coordinator["namespace"] == "fresh20261027r3_coordinator",
+    require(coordinator["namespace"] == namespace + "_coordinator",
             "coordinator namespace differs from approved role")
     require(hosts.get(coordinator["host"]) == "10.148.0.25"
             and coordinator["edge_ports"] == [15370, 15371, 15372],
@@ -148,7 +158,7 @@ def validate_topology(topology):
                                "processor_port", "edge_host", "edge_port", "http_port",
                                "namespace"), "topology validator")
             registration, uid = SLOTS[rid][index]
-            require(validator["namespace"] == f"fresh20261027r3_r{rid}_v{index + 1}",
+            require(validator["namespace"] == f"{namespace}_r{rid}_v{index + 1}",
                     "validator namespace differs from approved role")
             integer(validator["registration_id"], registration, registration, "registration slot")
             integer(validator["validator_user_id"], uid, uid, "validator user ID")
@@ -204,12 +214,13 @@ def validate_whitelist(document):
     return copy.deepcopy(policy)
 
 
-def assemble_config(canonical, p2p, commitments, topology, whitelist):
-    validate_topology(topology)
+def assemble_config(canonical, p2p, commitments, topology, whitelist, lock, profile):
+    validate_topology(topology, lock, profile)
+    epoch = topology["checkpoints_per_epoch"]
     policy = validate_whitelist(whitelist)
     require(isinstance(canonical.get("networks"), dict), "missing canonical networks")
     selected = canonical["networks"].get("testnet")
-    validate_consensus(selected)
+    validate_consensus(selected, checkpoints_per_epoch=epoch)
     for realm in ordered_realms(selected):
         require(realm.get("validators", []) == [], "canonical input must have empty membership")
     require("guardian_initial_member_hashes" not in selected,
@@ -217,10 +228,11 @@ def assemble_config(canonical, p2p, commitments, topology, whitelist):
     source_name = p2p.get("defaultNetwork")
     require(source_name == "testnet", "P2P source defaultNetwork must be testnet")
     source = p2p.get("networks", {}).get(source_name)
-    validate_consensus(source)
+    validate_consensus(source, checkpoints_per_epoch=epoch)
     source_realms = ordered_realms(source)
     # Existing custody provenance does not change when the runtime commit advances.
-    require(commitments.get("node_source") == SOURCE_BASE, "Guardian commitments source must be de539")
+    require(commitments.get("node_source") == lock["sources"]["guardian_key"],
+            "Guardian commitments source differs from the release lock")
     hashes = commitments.get("guardian_initial_member_hashes")
     require(isinstance(hashes, list) and len(hashes) == 3, "three Guardian commitments required")
     normalized_hashes = [public_hex(value, 32, "Guardian commitment") for value in hashes]
@@ -323,7 +335,7 @@ def reject_constant(_):
     raise PrepareError("non-finite JSON value")
 
 
-def read_public_json(path, *, max_bytes=MAX_PUBLIC_INPUT_BYTES):
+def read_public_json(path, *, max_bytes=MAX_PUBLIC_INPUT_BYTES, sha256=None):
     require(Path(path).suffix == ".json" and Path(path).name != "private_keys.json"
             and "keystore" not in Path(path).name.lower(), "only public JSON inputs are accepted")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -333,6 +345,7 @@ def read_public_json(path, *, max_bytes=MAX_PUBLIC_INPUT_BYTES):
                 f"public input must be a regular JSON file of at most {max_bytes // (1024 * 1024)} MiB")
         raw = handle.read(max_bytes + 1)
     require(len(raw) <= max_bytes, "public input exceeds size limit")
+    require(sha256 is None or hashlib.sha256(raw).hexdigest() == sha256, "public input hash differs from the lock")
     value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
     require(isinstance(value, dict), "public input must be a JSON object")
     return value
@@ -406,7 +419,9 @@ def write_new_outputs(outputs):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("canonical-config", "p2p-config", "guardian-commitments", "topology", "whitelist"):
+    parser.add_argument("--release-lock", required=True, type=Path)
+    parser.add_argument("--release-lock-sha256", required=True)
+    for name in ("canonical-config", "p2p-config", "guardian-commitments"):
         parser.add_argument("--" + name, required=True, type=Path)
     for name in ("config-out", "genesis-in", "genesis-out"):
         parser.add_argument("--" + name, type=Path)
@@ -414,19 +429,30 @@ def main(argv=None):
     try:
         require(bool(args.genesis_in) == bool(args.genesis_out), "Genesis input/output must be paired")
         require(args.config_out or args.genesis_out, "at least one output is required")
+        try:
+            lock = release_lock.load_checked_release_lock(args.release_lock, args.release_lock_sha256)
+        except ValueError as error:
+            raise PrepareError(str(error)) from None
+        release_dir = args.release_lock.resolve().parent
+        topology_path, profile_path = release_dir / "topology.json", release_dir / "release.json"
+        whitelist_path = release_dir.parent / "core-only" / "worker-whitelist.json"
         inputs = [args.canonical_config, args.p2p_config, args.guardian_commitments,
-                  args.topology, args.whitelist]
+                  topology_path, whitelist_path, profile_path]
         if args.genesis_in:
             inputs.append(args.genesis_in)
         outputs = [path for path in (args.config_out, args.genesis_out) if path]
         require(not ({path.resolve() for path in inputs} & {path.resolve() for path in outputs}),
                 "output must not overwrite an input")
-        config = assemble_config(*(read_public_json(path) for path in inputs[:5]))
-        documents = [(args.config_out, config)] if args.config_out else []
+        documents = [read_public_json(path) for path in inputs[:3]]
+        documents.append(read_public_json(topology_path, sha256=lock["inputs"]["topology"]))
+        documents.append(read_public_json(whitelist_path, sha256=lock["inputs"]["worker_whitelist"]))
+        profile = read_public_json(profile_path, sha256=lock["inputs"]["release_profile"])
+        config = assemble_config(*documents, lock, profile)
+        output_documents = [(args.config_out, config)] if args.config_out else []
         if args.genesis_in:
             genesis = read_public_json(args.genesis_in, max_bytes=MAX_GENESIS_INPUT_BYTES)
-            documents.append((args.genesis_out, inject_genesis(genesis, config)))
-        write_new_outputs(documents)
+            output_documents.append((args.genesis_out, inject_genesis(genesis, config)))
+        write_new_outputs(output_documents)
     except (PrepareError, OSError, ValueError, KeyError, TypeError) as error:
         message = str(error) if isinstance(error, PrepareError) else "invalid input or unavailable output path"
         print("prepare-network: " + message, file=sys.stderr)

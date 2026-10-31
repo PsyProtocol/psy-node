@@ -25,15 +25,16 @@ measurements. `topology.json` here is the core-only version-2 planning input.
 
 ```sh
 python3 -B deploy/multi-chain/gcp/core-only/plan.py \
-  --topology deploy/multi-chain/gcp/fresh-192-20261030/topology.json \
-  --release-profile deploy/multi-chain/gcp/fresh-192-20261030/release.json \
-  --release-profile-sha256 "$RELEASE_PROFILE_SHA256"
+  --release-lock deploy/multi-chain/gcp/fresh-192-20261030/release-lock.json \
+  --release-lock-sha256 "$RELEASE_LOCK_SHA256"
 ```
 
-This read-only preview returns 2 until acceptance is complete. It renders 16 core
-units only when the caller supplies the reviewed profile SHA-256. Obtain that
-hash from the accepted preparation record, not an untrusted replacement profile.
-When config is supplied, its exact bytes must match the profile too. It renders
+This read-only preview returns 2 until acceptance is complete. It reads
+`topology.json` and `release.json` from the lock's directory and renders 16 core
+units only when the caller supplies the reviewed lock SHA-256 and the lock agrees
+with those files. Obtain that hash from the accepted preparation record, not an
+untrusted replacement lock. When `--config`, `--genesis` or `--whitelist` is
+supplied, its exact bytes must match the lock's pins. It renders
 units in seven fresh namespaces from `namespace_prefix`; it does not install
 them. The historical host, Services and Faucet installers still require their
 own artifact/namespace migration and must not be used with these new inputs.

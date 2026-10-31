@@ -8,9 +8,9 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
+import release_lock
 
-HERE = Path(__file__).resolve().parent
-RUNTIME_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
+
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
          ((1, 1048576), (3, 1572864), (5, 1310720)))
 PROCESSORS = ("gcp-realm-processor", "realm-processors-b", "realm-processors-c")
@@ -78,35 +78,30 @@ def validators(topology):
             yield realm["id"], position, validator
 
 
-def validate_topology(t, release_profile=None):
+def validate_topology(t, release_profile):
     topology_fields = ("schema_version", "release_id", "runtime_commit", "psy_network",
                "network", "proving_backend", "hosts", "infrastructure", "coordinator",
-               "realms", "faucet_operator_count")
+               "realms", "faucet_operator_count", "namespace_prefix", "checkpoints_per_epoch",
+               "worker_queue_ack_wait_ms")
     require(isinstance(t, dict), "topology must be an object")
-    fresh = t.get("schema_version") == 2
-    if fresh:
-        topology_fields += ("namespace_prefix", "checkpoints_per_epoch", "worker_queue_ack_wait_ms")
     fields(t, topology_fields, "topology")
     number(t["faucet_operator_count"], 100, 100, "faucet operator count")
-    require(type(t["schema_version"]) is int and t["schema_version"] in (1, 2), "unsupported schema")
-    expected_commit, expected_release = RUNTIME_COMMIT, "core-testnet-20261027-r3"
-    prefix = "fresh20261027r3"
-    if fresh:
-        require(isinstance(release_profile, dict), "fresh topology requires a release profile")
-        expected_commit = release_profile["runtime_candidate_commit"]
-        expected_release = release_profile["release_id"]
-        prefix = release_profile["namespace_prefix"]
-        require(re.fullmatch(r"fresh[0-9]{8}sd192", prefix) is not None and
-                t["namespace_prefix"] == prefix, "fresh namespace prefix mismatch")
-        require(re.fullmatch(r"core-testnet-[0-9]{8}-sd192", expected_release) is not None,
-                "invalid fresh release id")
-        require(type(t["checkpoints_per_epoch"]) is int and
-                t["checkpoints_per_epoch"] == release_profile["checkpoints_per_epoch"] == 32,
-                "fresh topology requires epoch 32")
-        require(t["proving_backend"] == release_profile["proving_backend"], "release backend mismatch")
-        number(t["worker_queue_ack_wait_ms"], 1, 2**63 - 1, "worker queue lease")
-        require(t["worker_queue_ack_wait_ms"] == release_profile["worker_queue_ack_wait_ms"],
-                "worker queue lease differs from release profile")
+    require(type(t["schema_version"]) is int and t["schema_version"] == 2, "unsupported schema")
+    require(isinstance(release_profile, dict), "topology requires a release profile")
+    expected_commit = release_profile["runtime_candidate_commit"]
+    expected_release = release_profile["release_id"]
+    prefix = release_profile["namespace_prefix"]
+    release_format = re.fullmatch(r"core-testnet-([0-9]{8})-([a-z]+[0-9]+)", str(expected_release))
+    require(release_format is not None, "invalid release id")
+    require(prefix == "fresh" + release_format[1] + release_format[2] and t["namespace_prefix"] == prefix,
+            "namespace prefix mismatch")
+    require(type(t["checkpoints_per_epoch"]) is int and
+            t["checkpoints_per_epoch"] == release_profile["checkpoints_per_epoch"] == 32,
+            "topology requires epoch 32")
+    require(t["proving_backend"] == release_profile["proving_backend"], "release backend mismatch")
+    number(t["worker_queue_ack_wait_ms"], 1, 2**63 - 1, "worker queue lease")
+    require(t["worker_queue_ack_wait_ms"] == release_profile["worker_queue_ack_wait_ms"],
+            "worker queue lease differs from release profile")
     require(t["runtime_commit"] == expected_commit,
             "runtime commit must match pinned published source")
     require(t["release_id"] == expected_release, "unexpected release ID")
@@ -213,9 +208,7 @@ def validate_inputs(t, config, genesis, whitelist):
     networks = config.get("networks", {})
     selected = networks.get("testnet")
     require(isinstance(selected, dict), "testnet config required")
-    consensus = dict(CONSENSUS)
-    if t["schema_version"] == 2:
-        consensus["p2p"] = {**CONSENSUS["p2p"], "checkpoints_per_epoch": t["checkpoints_per_epoch"]}
+    consensus = {**CONSENSUS, "p2p": {**CONSENSUS["p2p"], "checkpoints_per_epoch": t["checkpoints_per_epoch"]}}
     for key, expected in consensus.items():
         require(selected.get(key) == expected and type(selected.get(key)) is type(expected),
                 f"testnet consensus mismatch: {key}")
@@ -286,13 +279,26 @@ def validate_inputs(t, config, genesis, whitelist):
             hex_value(key[field], 32, "Genesis " + field)
 
 
+def core_paths(release_id):
+    return {"release": f"/opt/psy-core/releases/{release_id}", "config": f"/etc/psy-core/{release_id}",
+            "state": f"/var/lib/psy-core/{release_id}"}
+
+
+def core_unit_prefix(namespace_prefix):
+    return "psy-core-" + namespace_prefix + "-"
+
+
+def check_lock_release(lock, profile):
+    require(lock["paths"]["core"] == core_paths(profile["release_id"]), "core paths differ from the lock")
+    require(lock["units"]["core_prefix"] == core_unit_prefix(profile["namespace_prefix"]),
+            "core unit prefix differs from the lock")
+
+
 def services(t):
-    release = f'/opt/psy-core/releases/{t["release_id"]}'
-    config_root = f'/etc/psy-core/{t["release_id"]}'
-    state = f'/var/lib/psy-core/{t["release_id"]}'
-    env = {"PSY_NETWORK": t["psy_network"], "PSY_CONFIG_PATH": config_root + "/config.json"}
-    if t["schema_version"] == 2:
-        env["NATS_WORKER_ACK_WAIT_MS"] = str(t["worker_queue_ack_wait_ms"])
+    paths = core_paths(t["release_id"])
+    release, config_root, state = paths["release"], paths["config"], paths["state"]
+    env = {"PSY_NETWORK": t["psy_network"], "PSY_CONFIG_PATH": config_root + "/config.json",
+           "NATS_WORKER_ACK_WAIT_MS": str(t["worker_queue_ack_wait_ms"])}
     common = ["--network", t["network"], "--proving-backend", t["proving_backend"]]
     for key, value in t["infrastructure"].items():
         common.extend(["--" + key.replace("_", "-"), value])
@@ -301,7 +307,7 @@ def services(t):
     def add(role, name, host, namespace, args):
         argv = [release + "/bin/psy_node_cli", "start-" + role, *common,
                 "--db-namespace", namespace, *args]
-        unit_prefix = "psy-core-" + t["namespace_prefix"] + "-" if t["schema_version"] == 2 else "psy-core-r3-"
+        unit_prefix = core_unit_prefix(t["namespace_prefix"])
         unit = unit_prefix + name + ".service"
         quote = lambda value: '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         preview = "\n".join([
@@ -343,7 +349,7 @@ def services(t):
     return result
 
 
-def make_plan(topology, config=None, genesis=None, whitelist=None, release_profile=None):
+def make_plan(topology, config=None, genesis=None, whitelist=None, *, release_profile):
     validate_topology(topology, release_profile)
     blockers = [RUNTIME_BLOCKER]
     inputs_valid = False
@@ -377,33 +383,26 @@ def make_plan(topology, config=None, genesis=None, whitelist=None, release_profi
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", type=Path, default=HERE / "topology.json")
-    parser.add_argument("--release-profile", type=Path)
-    parser.add_argument("--release-profile-sha256")
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     for name in ("config", "genesis", "whitelist"):
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args(argv)
     try:
-        topology, digest = read_json(args.topology)
-        require(isinstance(topology, dict), "topology must be an object")
-        if topology.get("schema_version") == 2:
-            require(args.release_profile is not None, "fresh topology requires a release profile")
-        hashes, inputs = {"topology": digest}, {}
-        if args.release_profile is not None:
-            inputs["release_profile"], hashes["release_profile"] = read_json(args.release_profile)
-            require(isinstance(args.release_profile_sha256, str) and
-                    re.fullmatch(r"[0-9a-f]{64}", args.release_profile_sha256) is not None and
-                    hashes["release_profile"] == args.release_profile_sha256, "release profile hash mismatch")
-        else:
-            require(args.release_profile_sha256 is None, "release profile path required")
-        for name in ("config", "genesis", "whitelist"):
+        lock = release_lock.load_checked_release_lock(args.release_lock, args.release_lock_sha256)
+        release_dir = args.release_lock.resolve().parent
+        topology, topology_hash = read_json(release_dir / "topology.json")
+        profile, profile_hash = read_json(release_dir / "release.json")
+        require(profile_hash == lock["inputs"]["release_profile"], "release profile hash differs from the lock")
+        require(topology_hash == lock["inputs"]["topology"], "topology hash differs from the lock")
+        check_lock_release(lock, profile)
+        hashes, inputs = {"topology": topology_hash, "release_profile": profile_hash}, {}
+        for name, lock_name in (("config", "runtime_config"), ("genesis", "genesis"), ("whitelist", "worker_whitelist")):
             path = getattr(args, name)
             if path is not None:
                 inputs[name], hashes[name] = read_json(path)
-        if topology.get("schema_version") == 2 and "config" in hashes:
-            require(hashes["config"] == inputs["release_profile"]["runtime_config_sha256"],
-                    "release config hash mismatch")
-        report = make_plan(topology, **inputs)
+                require(hashes[name] == lock["inputs"][lock_name], f"{name} hash differs from the lock")
+        report = make_plan(topology, release_profile=profile, **inputs)
         report["input_sha256"] = hashes
     except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError) as error:
         message = str(error) if isinstance(error, PlanError) else "Malformed or unreadable input"
