@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "release_id": "core-testnet-20261030-sd192",
+  "network": "testnet",
+  "network_magic": "0x1337CF514544CF69",
+  "inputs": {
+    "release_profile": "8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282",
+    "topology": "f2baf55c95218e186ab3fa37ba3c068208372ffa746373bc2f6c1eff8dfc9526",
+    "artifacts": "94bfa7af49ffca2e3eb3c5e76bd4a9ed8c4904499979b9fea36ee63636845297",
+    "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
+    "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
+    "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
+    "worker_whitelist": "d55077d02c67cb2a9f1cf9ba8b3620d98134c9416deb6b7fd4b8274cd3b1540c",
+    "risk_acceptance": "b05874b9d98ee4397c6a5ccdb0a7d0dfeb8e50a9d3209645e5f6662f5cc9b333",
+    "retired_state": "db61952882b46c4e22a4ac33225ee9ca39d96e9f5335b32e7f71ef423a0e59dd",
+    "retained_paths": "54575b40bbf62f0c1be447f57301640099999a1f1728976e22dba95617801182"
+  },
+  "sources": {
+    "runtime": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
+    "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
+    "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
+    "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
+    "contracts": "",
+    "services": "",
+    "indexer": ""
+  },
+  "binaries": {
+    "psy_dev_cli": "ec29b42b125f9b4cf574e5211841882094b0bdeaeab171871ca0956af4be1e23",
+    "psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
+    "psy_relayer_cli": "a5bb1076fe274d8ac839552d7d298259f91d6dbb94e2bc0a0455cfd5ad52b4f5",
+    "psy_user_cli": "8e6d1eb75033cd896e15acc9e541ca82142fc8cb4a691df16b00d0e9a125482f",
+    "psy_worker_cli": "20d67f8578097f8526468c7f172ea6759aba201037a44840f0587855f9aa025c",
+    "psy-services": "",
+    "psy-indexer": ""
+  },
+  "paths": {
+    "core": {
+      "release": "/opt/psy-core/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-core/core-testnet-20261030-sd192",
+      "state": "/var/lib/psy-core/core-testnet-20261030-sd192"
+    },
+    "guardian": {
+      "release": "/opt/psy-guardian/releases/core-testnet-20261030-sd192",
+      "config": "/var/lib/psy-guardian-custody",
+      "state": "/var/lib/psy-guardian/core-testnet-20261030-sd192"
+    },
+    "relayer": {
+      "release": "/opt/psy-core-relayer/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-core-relayer/core-testnet-20261030-sd192",
+      "state": "/var/lib/psy-core-relayer/core-testnet-20261030-sd192"
+    },
+    "worker": {
+      "release": "/opt/psy-core-worker/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-core-worker/core-testnet-20261030-sd192",
+      "state": "/var/lib/psy-core-worker/core-testnet-20261030-sd192"
+    },
+    "proxy": {
+      "release": "/opt/psy-core-prove-proxy/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-core-prove-proxy/core-testnet-20261030-sd192",
+      "state": "/var/lib/psy-core-prove-proxy/core-testnet-20261030-sd192"
+    },
+    "faucet": {
+      "release": "/opt/psy-faucet/releases/core-testnet-20261030-sd192-x2",
+      "config": "/etc/psy-faucet/core-testnet-20261030-sd192-x2",
+      "state": "/var/lib/psy-faucet-fresh20261030sd192-x2"
+    },
+    "services": {
+      "release": "/opt/psy-services/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-services-fresh20261030sd192",
+      "state": "/var/lib/psy-services-fresh20261030sd192"
+    },
+    "envio": {
+      "release": "/opt/psy-envio/releases/core-testnet-20261030-sd192",
+      "config": "/etc/psy-envio/core-testnet-20261030-sd192",
+      "state": "/var/lib/psy-envio/core-testnet-20261030-sd192"
+    }
+  },
+  "units": {
+    "core_prefix": "psy-core-fresh20261030sd192-",
+    "guardian_prefix": "psy-guardian-fresh20261030sd192-",
+    "relayer": "psy-core-relayer-fresh20261030sd192.service",
+    "worker_prefix": "psy-core-worker-fresh20261030sd192-",
+    "proxy_prefix": "psy-core-prove-proxy-fresh20261030sd192-",
+    "faucet": "psy-faucet-fresh20261030sd192.service",
+    "services": "psy-services-fresh20261030sd192.service",
+    "indexer_prefix": "psy-indexer-fresh20261030sd192-",
+    "envio": "psy-envio-fresh20261030sd192.service"
+  },
+  "hosts": {
+    "gcp-psy-service": "10.148.0.38",
+    "gcp-coordinator-worker": "10.148.0.31",
+    "gcp-gateway": "10.148.0.32",
+    "gcp-faucet": "10.148.0.33",
+    "gcp-scylla": "10.148.0.23",
+    "gcp-redis": "10.148.0.12",
+    "gcp-nats": "10.148.0.20",
+    "gcp-postgres": "10.148.0.24",
+    "gcp-nostr": "10.148.0.29",
+    "gcp-c4d-1": "10.148.0.34",
+    "arc99x1": "10.250.0.13",
+    "arc99x2": "10.250.0.14",
+    "arc99x3": "10.250.0.12",
+    "guardian-next-1": "10.148.0.39",
+    "guardian-next-2": "10.148.0.40",
+    "guardian-next-3": "10.148.0.41"
+  },
+  "services": {
+    "database": "psy_services_fresh20261030sd192",
+    "owner": "psy_services_fresh20261030sd192",
+    "redis_db": 14,
+    "key_prefix": "psy_svc_fresh20261030sd192:",
+    "listen": "10.148.0.38:3001",
+    "backups": "/var/lib/psy-core/core-testnet-20261030-sd192/checkpoints",
+    "mirror": "/var/lib/psy-indexer-mirror-fresh20261030sd192"
+  },
+  "envio": {
+    "database": "envio_bridge_fresh20261030sd192",
+    "project": "psy-envio-fresh20261030sd192",
+    "image": "hasura/graphql-engine@sha256:13bb9088f5b011b15af117fd1b175360f5205946bee1a78d9e0c846e5a38551c",
+    "graphql_port": 29899,
+    "hasura_port": 38081,
+    "rpc_routes": {
+      "sepolia": "http://10.148.0.32:18545",
+      "bscTestnet": "http://10.148.0.32:18645",
+      "baseSepolia": "http://10.148.0.32:18945"
+    }
+  },
+  "faucet": {
+    "account": "psy-faucet-r2",
+    "listen_port": 29998,
+    "operators_sha256": ""
+  },
+  "images": {
+    "scylla": "scylladb/scylla@sha256:7e93267357fe3fbd3da3c92aa0e980f08ddadc1fe8a38c2aae3a3f7f9a1014a7",
+    "valkey": "valkey/valkey@sha256:3b55fbaa0cd93cf0d9d961f405e4dfcc70efe325e2d84da207a0a8e6d8fde4f9",
+    "nats": "nats@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00",
+    "postgres": "postgres@sha256:71e27bf60b70bded003791b5573f8b808365613f341df20ffcf0c1ed7bc13ddf",
+    "nostr": "scsibug/nostr-rs-relay@sha256:03f54bfbffff80a50db62c9287913bd25a2dec08033b56d2122bc2550363d5c5"
+  },
+  "groth16": {
+    "setup_manifest_sha256": "",
+    "verifiers": {
+      "gnark_groth16_verifier": "",
+      "deposit_batch_verifier": "",
+      "withdrawal_claim_verifier": ""
+    }
+  },
+  "l1": {
+    "signer": "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad",
+    "output_root": "/var/lib/psy-fresh20261030sd192",
+    "bundle_sha256": "",
+    "policy_sha256": "",
+    "gas_budget_sha256": {
+      "sepolia": "",
+      "bscTestnet": "",
+      "baseSepolia": ""
+    }
+  },
+  "ingress": {
+    "fenced_hosts": [
+      "coordinator.psy-protocol.xyz",
+      "coordinator-stg.psy-protocol.xyz",
+      "realm0.psy-protocol.xyz",
+      "realm0-stg.psy-protocol.xyz",
+      "realm1.psy-protocol.xyz",
+      "realm1-stg.psy-protocol.xyz",
+      "prove.psy-protocol.xyz",
+      "prove-stg.psy-protocol.xyz",
+      "services.psy-protocol.xyz",
+      "services-stg.psy-protocol.xyz",
+      "indexer.psy-protocol.xyz",
+      "indexer-stg.psy-protocol.xyz"
+    ],
+    "faucet_hosts": [
+      "faucet.psy-protocol.xyz",
+      "faucet-stg.psy-protocol.xyz"
+    ],
+    "maintenance_tag": "psy-sd192-maintenance"
+  },
+  "gates": {
+    "l2_stability_checkpoint_count": 100
+  },
+  "tool_sha256": {
+    "activate_bridge.py": "cd8762d5f1e2800ee5bb86b9ada15ec83f3305c2e7adb60660b3d497bdd4332e",
+    "activate_host.py": "cff95c9b0dd453be5d3ffe1b3d6d5424b9b4cfd7554979e603a1de350773e576",
+    "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
+    "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
+    "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
+    "fresh_l1.py": "fb68c45ce29e7ee5fb6404491e10146abe9e127741c676b5a9d16fbc31d04b49",
+    "guardian_exec.py": "edaef4870cf666b9478911fafdc5d69c3a4c6b2e0a4d8280892db5caf1a0b9d1",
+    "indexer_backup_mirror.py": "fea7793cfca5b69ab88a26f1f4774196a3966dacc942f29e3ed574886810c1d7",
+    "install_envio.py": "d251bde36b6173a51873a42053fb884494d62de994ca75a58b4c5dd858fbb309",
+    "install_guardian.py": "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a",
+    "install_host.py": "0c2b63f996fd1be7eb4909cb2a5b15c88b377405833cc8a15fd532951264a164",
+    "install_relayer.py": "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9",
+    "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
+    "prepare_bridge_forwarders.py": "8ea58b8e6f8e178a0fff1574948e5a784e95d5e60d1236456d75942a6c83b833",
+    "prepare_faucet.py": "1ce5b823ba27389d2210468fbe41ea8b18dc6d1336f0fa52739af08052e6ed2f",
+    "prepare_proxies.py": "0d91693df906575f55c6031f711f9172023bc7adecf32eedde8aacaa97d0743c",
+    "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
+    "prepare_workers.py": "4592a624249e798d61ef9c786774a4c60ad12f3d1e253733ccd343d708f8d4c4",
+    "relayer_exec.py": "98befed16fc38214bf7c6c444158b4a4c61d77035eec2352261e66f9386e6fb6"
+  }
+}
