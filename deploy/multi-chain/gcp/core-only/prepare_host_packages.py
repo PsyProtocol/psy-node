@@ -2,6 +2,7 @@
 """Prepare private, host-specific core packages locally; never SSH or start nodes."""
 import argparse
 import ctypes
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import stat
 import tempfile
 
 import plan
+import install_host as installer
 
 
 HERE = Path(__file__).resolve().parent
@@ -88,17 +90,34 @@ def publish_packages(source, destination):
 
 
 def prepare(args):
-    require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r3 artifact pins not frozen")
+    cohort = getattr(args, "cohort", "r3")
+    release = installer.get_release(cohort)
+    if cohort == "r3":
+        require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r3 artifact pins not frozen")
+        require(getattr(args, "release_profile", None) is None, "R3 does not accept a fresh release profile")
+        release = replace(release, pins={"bin/psy_node_cli": NODE_SHA256,
+                                        "config.json": CONFIG_SHA256, "genesis.json": GENESIS_SHA256})
     topology, _ = plan.read_json(args.topology)
+    require(topology["release_id"] == release.release_id and topology["runtime_commit"] == release.source_commit,
+            "topology differs from selected artifact cohort")
+    profile = None
+    if cohort == "sd192":
+        require(topology["schema_version"] == 2, "SD192 requires a version-2 topology")
+        profile_path = getattr(args, "release_profile", None)
+        require(profile_path is not None, "SD192 requires the pinned release profile")
+        profile, profile_hash = plan.read_json(regular(profile_path))
+        require(profile_hash == release.profile_sha256, "release profile hash mismatch")
+        require(profile["runtime_config_sha256"] == release.pins["config.json"],
+                "release config pin mismatch")
     config, config_hash = plan.read_json(regular(args.config))
     genesis, genesis_hash = plan.read_json(regular(args.genesis))
     whitelist, _ = plan.read_json(args.whitelist)
-    report = plan.make_plan(topology, config, genesis, whitelist)
+    report = plan.make_plan(topology, config, genesis, whitelist, profile)
     require(report["input_consistency_passed"], "public inputs inconsistent")
-    require(config_hash == CONFIG_SHA256, "config differs from compiled testnet config")
-    require(genesis_hash == GENESIS_SHA256, "Genesis hash mismatch")
+    require(config_hash == release.pins["config.json"], "config differs from compiled testnet config")
+    require(genesis_hash == release.pins["genesis.json"], "Genesis hash mismatch")
     node_hash = digest(regular(args.node_binary))
-    require(node_hash == NODE_SHA256, "node binary hash mismatch")
+    require(node_hash == release.pins["bin/psy_node_cli"], "node binary hash mismatch")
     private_keys = json.loads(regular(args.private_keys, True).read_bytes())
     require(isinstance(private_keys, list) and len(private_keys) == 107 and private_keys[2] is None,
             "private registration inventory mismatch")
@@ -174,6 +193,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", type=Path, default=HERE / "topology.json")
     parser.add_argument("--whitelist", type=Path, default=HERE / "worker-whitelist.json")
+    parser.add_argument("--cohort", choices=("r3", "sd192"), default="r3")
+    parser.add_argument("--release-profile", type=Path, help="required hash-pinned SD192 profile; not accepted for R3")
     for name in ("config", "genesis", "node-binary", "private-keys", "faucet-operators", "p2p-keys", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     prepare(parser.parse_args())

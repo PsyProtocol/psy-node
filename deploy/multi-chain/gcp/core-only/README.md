@@ -283,6 +283,39 @@ indexers, proof proxies, L1 deployment, Caddy and frontends are outside this pla
 
 ## Host packages and installation
 
+### Fresh SD192 Preparation
+
+The default commands below still select historical R3. For the fresh SD192
+candidate, explicitly select `--cohort sd192` on both the package builder and
+installer. Use the adjacent `fresh-192-20261030/topology.json` and its pinned
+`release.json`; the builder requires `--release-profile` for this cohort.
+For example, from this directory, with private absolute input paths supplied:
+
+```sh
+python3 -B prepare_host_packages.py --cohort sd192 \
+  --topology ../fresh-192-20261030/topology.json \
+  --release-profile ../fresh-192-20261030/release.json \
+  --config "$CONFIG" --genesis "$GENESIS" --node-binary "$NODE_BINARY" \
+  --private-keys "$PRIVATE_KEYS" --faucet-operators "$FAUCET_OPERATORS" \
+  --p2p-keys "$P2P_KEYS" --output "$NEW_PRIVATE_PACKAGE_DIRECTORY"
+```
+
+This is offline packaging only. The source, binary, config, Genesis and release
+profile hashes are fixed in `install_host.get_release("sd192")`; unknown or
+cross-cohort inputs fail closed. Fresh units use `fresh20261030sd192` isolation
+and `NATS_WORKER_ACK_WAIT_MS=30000`. Keep the retained registration and P2P keys;
+this command neither generates keys nor regenerates Genesis.
+
+Only after separate installation approval, use the reviewed installer with
+`--cohort sd192 --check-only` before removing `--check-only`. Installation never
+starts or enables services. `activate_host.py` and the temporary placement
+adapter remain R3-only and must not be used to activate these fresh packages.
+Guardian, Workers, proxies, Relayer, Faucet and Services need their own matching
+fresh release preparation. See the fresh profile's `artifacts.json` and
+`PREPARATION-STATUS.md` for the remaining release gates.
+
+### Historical R3 Procedure
+
 `prepare_host_packages.py` requires the validated public config and new Genesis,
 the pinned release node binary, the retained private P2P inventory, and private
 Genesis/operator outputs. Run `--help` for the explicit path arguments. Its new

@@ -3,8 +3,11 @@
 
 Usage: sudo python3 install_host.py --package /private/host --check-only
        sudo python3 install_host.py --package /private/host
+       sudo python3 install_host.py --cohort sd192 --package /private/fresh-host --check-only
 
-manifest.json must contain exactly:
+R3 is the default. SD192 requires explicit --cohort sd192; package content cannot
+select or override the cohort's source, artifact pins, paths or namespace.
+manifest.json must contain exactly these fields (R3 values shown):
   {"schema_version": 1, "release_id": "core-testnet-20261027-r3",
    "source_commit": "3d31758738f833a7eea6f9ff7fd680a69a0d9a44",
    "network": "testnet", "host": "<topology alias>",
@@ -19,7 +22,7 @@ that proves binary build provenance. Binary, config and Genesis bytes must also
 match this installer's release pins. The caller owns build/key/Genesis checks.
 
 Both modes validate hashes, host IP, stopped core/legacy units and existing paths.
-New r3 unit names do not permit concurrent old r2 or parth instances.
+New cohort unit names do not permit concurrent old core or parth instances.
 --check-only makes no writes and does not create the system account. Installation
 creates psy-core, publishes only missing files without overwriting, and calls
 daemon-reload. Exact existing bytes, modes and ownership are idempotent; any
@@ -29,6 +32,7 @@ key generation, package download, service start/enable, or parth changes occur.
 """
 
 import argparse
+from dataclasses import dataclass
 import grp
 import hashlib
 import ipaddress
@@ -41,11 +45,13 @@ import shlex
 import stat
 import subprocess
 import sys
+from types import MappingProxyType
+from typing import Mapping
 from urllib.parse import urlsplit
 
 
 SOURCE_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-# Packaging and installation remain blocked until the final binary is approved.
+# Historical R3 pins remain separate from the explicitly selected fresh release.
 PINNED_SHA256 = {
     "bin/psy_node_cli": "bc5419fd8ef89eb6cdef3dfbd29f4f6a232bcb4920ec97809a995a1bc225b7e9",
     "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
@@ -64,6 +70,37 @@ EDGES = ("gcp-edge-1", "gcp-edge-2")
 HOSTS = {"gcp-cp-ce": "10.148.0.25", "gcp-realm-processor": "10.148.0.37",
          "realm-processors-b": "10.148.0.42", "realm-processors-c": "10.148.0.43",
          "gcp-edge-1": "10.148.0.36", "gcp-edge-2": "10.148.0.35"}
+
+
+@dataclass(frozen=True)
+class CoreRelease:
+    release_id: str
+    source_commit: str
+    pins: Mapping[str, str | None]
+    unit_prefix: str
+    namespace_prefix: str
+    worker_queue_ack_wait_ms: int | None
+    release_dir: Path
+    config_dir: Path
+    state_dir: Path
+    profile_sha256: str | None = None
+
+
+def get_release(cohort="r3"):
+    if cohort == "r3":
+        return CoreRelease(RELEASE_ID, SOURCE_COMMIT, MappingProxyType(dict(PINNED_SHA256)),
+                           "psy-core-r3-", "fresh20261027r3", None, RELEASE, CONFIG, STATE)
+    if cohort == "sd192":
+        release_id = "core-testnet-20261030-sd192"
+        return CoreRelease(release_id, "15d6316d1bd28bb535698a4797e3c6261e6c9597", MappingProxyType({
+            "bin/psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
+            "config.json": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
+            "genesis.json": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
+        }), "psy-core-fresh20261030sd192-", "fresh20261030sd192", 30000,
+            Path("/opt/psy-core/releases") / release_id, Path("/etc/psy-core") / release_id,
+            Path("/var/lib/psy-core") / release_id,
+            "8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282")
+    raise InstallError("unknown core release; select r3 or sd192 explicitly")
 
 
 class InstallError(ValueError):
@@ -113,7 +150,8 @@ def read_file(parent, name):
         return source.read(), info
 
 
-def read_package(path):
+def read_package(path, release=None):
+    release = release or get_release()
     fd = directory(path)
     try:
         owner = os.fstat(fd)
@@ -152,16 +190,17 @@ def read_package(path):
     finally:
         os.close(fd)
     require("manifest.json" in payloads, "manifest missing")
-    require(all(PINNED_SHA256.values()), "r3 artifact pins not frozen")
+    require(all(release.pins.values()), "r3 artifact pins not frozen" if release.worker_queue_ack_wait_ms is None
+            else "fresh artifact pins not frozen")
     manifest = decode_json(payloads["manifest.json"])
     require(set(manifest) == {"schema_version", "release_id", "source_commit", "network",
                               "host", "private_ip", "files"}, "unexpected manifest fields")
     require(type(manifest["schema_version"]) is int and manifest["schema_version"] == 1,
             "unsupported manifest schema")
-    require(manifest["release_id"] == RELEASE_ID and manifest["source_commit"] == SOURCE_COMMIT
+    require(manifest["release_id"] == release.release_id and manifest["source_commit"] == release.source_commit
             and manifest["network"] == "testnet", "release/source/network mismatch")
     validate_ip(manifest["private_ip"])
-    expected_units, keys = host_inventory(manifest["host"])
+    expected_units, keys = host_inventory(manifest["host"], release)
     require(manifest["private_ip"] == HOSTS[manifest["host"]], "host alias/private IP mismatch")
     expected = {"bin/psy_node_cli", "config.json", "genesis.json"} | keys
     expected.update("units/" + unit for unit in expected_units)
@@ -174,14 +213,14 @@ def read_package(path):
     for name, digest in hashes.items():
         require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "invalid SHA256")
         require(hashlib.sha256(payloads[name]).hexdigest() == digest, "payload SHA256 mismatch: " + name)
-        require(name not in PINNED_SHA256 or digest == PINNED_SHA256[name], "release artifact pin mismatch: " + name)
+        require(name not in release.pins or digest == release.pins[name], "release artifact pin mismatch: " + name)
         require(payloads[name], "empty payload: " + name)
     config = decode_json(payloads["config.json"])
     require(config.get("defaultNetwork") == "testnet"
             and isinstance(config.get("networks"), dict)
             and isinstance(config["networks"].get("testnet"), dict), "config must select testnet")
     for unit in expected_units:
-        validate_unit(unit, payloads["units/" + unit], keys, manifest["host"])
+        validate_unit(unit, payloads["units/" + unit], keys, manifest["host"], release)
     return manifest, payloads
 
 
@@ -195,7 +234,8 @@ def validate_ip(value):
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")), "RFC1918 IPv4 required")
 
 
-def host_inventory(host):
+def host_inventory(host, release=None):
+    release = release or get_release()
     require(isinstance(host, str), "invalid host alias")
     keys = set()
     if host == "gcp-cp-ce":
@@ -211,10 +251,11 @@ def host_inventory(host):
         keys = {f"keys/realm-{realm}-v{position}/edge_identity.key" for position in range(1, 4)}
     else:
         raise InstallError("unknown core host")
-    return {"psy-core-r3-" + name + ".service" for name in names}, keys
+    return {release.unit_prefix + name + ".service" for name in names}, keys
 
 
-def validate_unit(name, raw, keys, host):
+def validate_unit(name, raw, keys, host, release=None):
+    release = release or get_release()
     try:
         text = raw.decode("ascii")
     except UnicodeError:
@@ -245,7 +286,9 @@ def validate_unit(name, raw, keys, host):
         else:
             require((section, key) not in values, "duplicate unit directive")
             values[section, key] = value
-    required_env = {"PSY_NETWORK=testnet", "PSY_CONFIG_PATH=" + str(CONFIG / "config.json")}
+    required_env = {"PSY_NETWORK=testnet", "PSY_CONFIG_PATH=" + str(release.config_dir / "config.json")}
+    if release.worker_queue_ack_wait_ms is not None:
+        required_env.add("NATS_WORKER_ACK_WAIT_MS=" + str(release.worker_queue_ack_wait_ms))
     optional_env = {"RUST_LOG=info", "RUST_MIN_STACK=134217728", "RAYON_NUM_THREADS=2"}
     require(required_env <= set(environments) <= required_env | optional_env
             and len(environments) == len(set(environments)), "unit environment must contain only approved public values")
@@ -257,7 +300,7 @@ def validate_unit(name, raw, keys, host):
         ("Service", "TimeoutStopSec"): "300", ("Service", "KillSignal"): "SIGTERM",
         ("Service", "LimitCORE"): "0", ("Service", "PrivateTmp"): "true",
         ("Service", "ProtectHome"): "true", ("Service", "ProtectSystem"): "strict",
-        ("Service", "ReadWritePaths"): str(STATE), ("Service", "StandardOutput"): "journal",
+        ("Service", "ReadWritePaths"): str(release.state_dir), ("Service", "StandardOutput"): "journal",
         ("Service", "StandardError"): "journal",
     }
     for key, expected in fixed.items():
@@ -266,13 +309,13 @@ def validate_unit(name, raw, keys, host):
         require(("Service", key) not in values or re.fullmatch(r"[0-9]+", values["Service", key]),
                 "invalid numeric unit directive")
     for key, expected in {"User": "psy-core", "Group": "psy-core", "Type": "simple",
-                          "WorkingDirectory": str(RELEASE), "UMask": "0077"}.items():
+                          "WorkingDirectory": str(release.release_dir), "UMask": "0077"}.items():
         require(values.get(("Service", key)) == expected, "unsafe unit runtime settings")
     argv = shlex.split(values.get(("Service", "ExecStart"), ""))
     role = "realm-" + ("processor" if name.endswith("-processor.service") else "edge")
     if "coordinator" in name:
         role = "coordinator-processor" if name.endswith("-processor.service") else "coordinator-edge"
-    require(argv[:2] == [str(RELEASE / "bin/psy_node_cli"), "start-" + role], "unexpected unit executable/role")
+    require(argv[:2] == [str(release.release_dir / "bin/psy_node_cli"), "start-" + role], "unexpected unit executable/role")
     options, current = {}, None
     for value in argv[2:]:
         if value.startswith("--"):
@@ -292,7 +335,7 @@ def validate_unit(name, raw, keys, host):
     require(options.get("--network") == ["psy-public-testnet"] and
             options.get("--proving-backend") == ["plonky2-poseidon-goldilocks"], "unsafe node network/backend")
     namespace = options.get("--db-namespace", [])
-    require(len(namespace) == 1 and re.fullmatch(r"fresh20261027r3_(coordinator|r[01]_v[123])", namespace[0]),
+    require(len(namespace) == 1 and re.fullmatch(re.escape(release.namespace_prefix) + r"_(coordinator|r[01]_v[123])", namespace[0]),
             "node namespace is not fresh")
     for option, scheme in (("--scylla-db-url", "tcp"), ("--redis-url", "redis"), ("--nats-jetstream-url", "nats")):
         require(option in options, "missing infrastructure option")
@@ -302,8 +345,8 @@ def validate_unit(name, raw, keys, host):
         require(parsed.scheme == scheme and parsed.port is not None and not parsed.username
                 and not parsed.password and not parsed.path and not parsed.query and not parsed.fragment,
                 "unsafe infrastructure endpoint")
-    paths = {"--genesis-data-path": CONFIG / "genesis.json",
-             "--checkpoint-backup-path": STATE / "checkpoints", "--worker-whitelist-config": CONFIG / "config.json"}
+    paths = {"--genesis-data-path": release.config_dir / "genesis.json",
+             "--checkpoint-backup-path": release.state_dir / "checkpoints", "--worker-whitelist-config": release.config_dir / "config.json"}
     for option, expected in paths.items():
         require(option not in options or options[option] == [str(expected)], "node path escapes release")
     if role.endswith("processor"):
@@ -315,24 +358,24 @@ def validate_unit(name, raw, keys, host):
                    "--p2p-bls-key": "bls.key", "--p2p-zk-key": "zk.key"}
     required_keys = set()
     if role.startswith("realm"):
-        slot = name.removeprefix("psy-core-r3-").rsplit("-", 1)[0]
+        slot = name.removeprefix(release.unit_prefix).rsplit("-", 1)[0]
         realm, position = slot.split("-")[1:]
-        require(namespace == [f"fresh20261027r3_r{realm}_{position}"]
+        require(namespace == [f"{release.namespace_prefix}_r{realm}_{position}"]
                 and options.get("--realm-id") == [realm], "unit Realm/namespace mismatch")
         required_keys = {"--p2p-identity-key"}
         if role.endswith("processor"):
             required_keys.update(("--p2p-bls-key", "--p2p-zk-key"))
         for option in required_keys:
             relative = "keys/" + slot + "/" + key_options[option]
-            require(relative in keys and options.get(option) == [str(CONFIG / relative)], "incorrect per-host key path")
+            require(relative in keys and options.get(option) == [str(release.config_dir / relative)], "incorrect per-host key path")
     require(set(options) & set(key_options) == required_keys, "unexpected key option")
     if role.startswith("coordinator"):
-        require(namespace == ["fresh20261027r3_coordinator"]
+        require(namespace == [release.namespace_prefix + "_coordinator"]
                 and options.get("--coordinator-id") == ["0"]
                 and options.get("--coordinator-sub-id") == ["0"], "unit Coordinator/namespace mismatch")
     endpoints = {}
     if role == "coordinator-edge":
-        index = int(name.removeprefix("psy-core-r3-coordinator-edge-").removesuffix(".service"))
+        index = int(name.removeprefix(release.unit_prefix + "coordinator-edge-").removesuffix(".service"))
         endpoints = {"--listen": [HOSTS[host]], "--port": [str(15370 + index)]}
     elif role.startswith("realm"):
         realm_id, validator_position = int(realm), int(position.removeprefix("v"))
@@ -388,32 +431,34 @@ def get_runtime_user():
     return user.pw_uid, user.pw_gid
 
 
-def build_paths(payloads, user):
+def build_paths(payloads, user, release=None):
+    release = release or get_release()
     uid, gid = user if user is not None else (-1, -1)
     files = {}
     for name, raw in payloads.items():
         if name.startswith("bin/"):
-            target, mode, owner = RELEASE / name, 0o755, (ROOT_UID, ROOT_GID)
+            target, mode, owner = release.release_dir / name, 0o755, (ROOT_UID, ROOT_GID)
         elif name.startswith("units/"):
             target, mode, owner = UNITS / Path(name).name, 0o644, (ROOT_UID, ROOT_GID)
         else:
             secret = name.startswith("keys/")
-            target, mode, owner = CONFIG / name, 0o600 if secret else 0o644, (uid, gid) if secret else (ROOT_UID, ROOT_GID)
+            target, mode, owner = release.config_dir / name, 0o600 if secret else 0o644, (uid, gid) if secret else (ROOT_UID, ROOT_GID)
         files[target] = (raw, mode, *owner)
-    directories = {STATE: (0o700, uid, gid), STATE / "checkpoints": (0o700, uid, gid)}
+    directories = {release.state_dir: (0o700, uid, gid), release.state_dir / "checkpoints": (0o700, uid, gid)}
     for target in list(files) + list(directories):
         for parent in target.parents:
             if parent == Path("/"):
                 break
             directories.setdefault(parent, (0o755, ROOT_UID, ROOT_GID))
     for parent in directories:
-        if parent == CONFIG / "keys" or CONFIG / "keys" in parent.parents:
+        if parent == release.config_dir / "keys" or release.config_dir / "keys" in parent.parents:
             directories[parent] = (0o700, uid, gid)
     return files, directories
 
 
-def check_paths(files, directories):
-    managed = (RELEASE, CONFIG, STATE)
+def check_paths(files, directories, release=None):
+    release = release or get_release()
+    managed = (release.release_dir, release.config_dir, release.state_dir)
     for path, (mode, uid, gid) in sorted(directories.items(), key=lambda item: len(item[0].parts)):
         try:
             fd = directory(path)
@@ -428,7 +473,7 @@ def check_paths(files, directories):
             else:
                 require(info.st_uid in {0, ROOT_UID} and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX),
                         "unsafe destination ancestor: " + str(path))
-            if is_managed and path != STATE / "checkpoints":
+            if is_managed and path != release.state_dir / "checkpoints":
                 require(all(path / name in files or path / name in directories for name in os.listdir(fd)),
                         "unexpected existing release path: " + str(path))
         finally:
@@ -454,7 +499,8 @@ def check_paths(files, directories):
                     and not os.path.lexists("/run/systemd/system/" + path.name + ".d"), "runtime unit override conflict")
 
 
-def create_directory(path, mode, uid, gid):
+def create_directory(path, mode, uid, gid, release=None):
+    release = release or get_release()
     parent = directory(path.parent)
     try:
         try:
@@ -463,7 +509,7 @@ def create_directory(path, mode, uid, gid):
             fd = directory(path)
             try:
                 info = os.fstat(fd)
-                if any(path == root or root in path.parents for root in (RELEASE, CONFIG, STATE)):
+                if any(path == root or root in path.parents for root in (release.release_dir, release.config_dir, release.state_dir)):
                     require((stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid) == (mode, uid, gid),
                             "directory ownership/mode conflict: " + str(path))
                 else:
@@ -515,13 +561,14 @@ def install_file(path, raw, mode, uid, gid):
         os.close(parent)
 
 
-def install_host(package, check_only=False):
+def install_host(package, check_only=False, release=None):
+    release = release or get_release()
     require(os.geteuid() == 0, "run with sudo/root, including --check-only")
-    manifest, payloads = read_package(package)
+    manifest, payloads = read_package(package, release)
     check_host(manifest)
     user = get_runtime_user()
-    files, directories = build_paths(payloads, user)
-    check_paths(files, directories)
+    files, directories = build_paths(payloads, user, release)
+    check_paths(files, directories, release)
     if check_only:
         return {"mode": "check-only", "host": manifest["host"], "files": len(files)}
     if user is None:
@@ -529,10 +576,10 @@ def install_host(package, check_only=False):
                  "--no-create-home", "--shell", "/usr/sbin/nologin", "psy-core"])
         user = get_runtime_user()
         require(user is not None, "psy-core account creation failed")
-        files, directories = build_paths(payloads, user)
+        files, directories = build_paths(payloads, user, release)
     check_host(manifest)
     for path, attributes in sorted(directories.items(), key=lambda item: len(item[0].parts)):
-        create_directory(path, *attributes)
+        create_directory(path, *attributes, release=release)
     for path, attributes in files.items():
         install_file(path, *attributes)
     command(["systemctl", "daemon-reload"])
@@ -543,9 +590,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--package", required=True, type=Path, help="private per-host staging directory")
     parser.add_argument("--check-only", action="store_true", help="read-only preflight; no account/file changes or reload")
+    parser.add_argument("--cohort", choices=("r3", "sd192"), default="r3", help="explicit artifact cohort; default retains R3")
     args = parser.parse_args(argv)
     try:
-        report = install_host(args.package, args.check_only)
+        report = install_host(args.package, args.check_only, get_release(args.cohort))
     except (InstallError, OSError, ValueError, TypeError, KeyError) as error:
         message = str(error) if isinstance(error, InstallError) else "unreadable or malformed host input"
         print(json.dumps({"error": message}), file=sys.stderr)

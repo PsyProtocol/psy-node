@@ -14,7 +14,7 @@ import stat
 import time
 import types
 
-HELPER_SHA256 = "66cd657977d17d2188b28ceb1b7fc137ce5dcab69280922d3cf34c30b74b24c8"
+HELPER_SHA256 = "0c2b63f996fd1be7eb4909cb2a5b15c88b377405833cc8a15fd532951264a164"
 _path = Path(__file__).with_name("install_host.py")
 _raw = _path.read_bytes()
 if hashlib.sha256(_raw).hexdigest() != HELPER_SHA256:
