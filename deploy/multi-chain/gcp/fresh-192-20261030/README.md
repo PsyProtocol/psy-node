@@ -2,8 +2,9 @@
 
 This is the next source/config preparation profile, not an activation package.
 The published runtime candidate is
-`e28848127f4cef87bea4e63cc9fb9b79edc18d93`. Deployment scripts stay on
-`deploy/testnet`; runtime integration into `testnet-dev` remains a separate step.
+`15d6316d1bd28bb535698a4797e3c6261e6c9597`. Deployment scripts stay on
+`deploy/testnet`; the same runtime source is published on `testnet-dev` and
+`prepare/testnet-dev-runtime-20261031` without deployment history.
 Neither a successful preflight nor a Git push authorizes reset or activation.
 
 `release.json` is the preparation role inventory. Historical `fresh-topology/`

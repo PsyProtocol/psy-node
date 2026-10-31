@@ -1042,7 +1042,7 @@ mod op_type_contract_tests {
         let felts: Vec<SymFeltRef> = definition.to_felts();
         assert_eq!(<DPNIndexedVarDef as ToFelts<SymFeltRef>>::from_felts(&felts), definition);
 
-        let assertion = DPNAssertEqInfoIndexed { left: 1, right: 2, message: "边界".to_owned() };
+        let assertion = DPNAssertEqInfoIndexed { left: 1, right: 2, message: "boundary-\u{20ac}".to_owned() };
         let felts: Vec<SymFeltRef> = assertion.to_felts();
         assert_eq!(<DPNAssertEqInfoIndexed as ToFelts<SymFeltRef>>::from_felts(&felts), assertion);
 

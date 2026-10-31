@@ -4,8 +4,8 @@ PSY_CONFIG_PATH := $(CURDIR)/psy-genesis/config.json
 
 # psy-contracts is a sibling repository of psy-node; fall back to the legacy
 # nested checkout when the sibling is absent.
-CONTRACTS_DIR := $(if $(wildcard ../psy-contracts/package.json),../psy-contracts,psy-contracts)
-# 本机开发默认 localhost 阶段；部署构建在部署脚本里显式覆盖。
+CONTRACTS_DIR := $(if $(wildcard $(CURDIR)/../psy-contracts/package.json),$(CURDIR)/../psy-contracts,$(CURDIR)/psy-contracts)
+# Local development defaults to localhost; deployment builds override this explicitly.
 PSY_NETWORK ?= localhost
 export PSY_NETWORK
 ifneq (,$(wildcard ./.env))

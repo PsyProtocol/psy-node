@@ -76,8 +76,8 @@ import type {
 } from "./locSetupPolicy";
 
 /**
- * psy-contracts and psy-dapp are sibling repositories checked out next to
- * psy-node (their psy-node gitlinks were removed); the sibling checkout wins
+ * Some worktrees check out psy-contracts and psy-dapp beside psy-node.
+ * The sibling checkout wins
  * when present and the legacy nested path stays as the fallback so existing
  * checkouts keep working. Resolution is per call because callers pass
  * different roots (REPO_ROOT, repoCwd, and test-supervised temporary cwds).
@@ -87,11 +87,11 @@ function psySiblingRepoRoot(name: string, cwd: string): string | null {
     return fs.existsSync(path.join(sibling, "package.json")) ? sibling : null;
 }
 
-function psyContractsRoot(cwd: string): string {
+export function psyContractsRoot(cwd: string): string {
     return psySiblingRepoRoot("psy-contracts", cwd) ?? path.join(cwd, "psy-contracts");
 }
 
-function psyDappRoot(cwd: string): string {
+export function psyDappRoot(cwd: string): string {
     return psySiblingRepoRoot("psy-dapp", cwd) ?? path.join(cwd, "psy-dapp");
 }
 
@@ -4306,7 +4306,9 @@ export async function prepareGuardianService(cmds: readonly string[], cwd: strin
 
 const DEVNET_PURGE_PATHS = [
     "local_checkpoints", "db/anvil", "logs",
-    ...["localhost", "localhostBsc", "localhostBase", "sepolia", "ethereum"].map((network) => `psy-contracts/deployments/${network}`),
+    // Only devnet-owned deployment networks are purgeable; sepolia/ethereum
+    // deployments are tracked files of the sibling psy-contracts checkout.
+    ...["localhost", "localhostBsc", "localhostBase"].map((network) => `psy-contracts/deployments/${network}`),
 ];
 
 /**
@@ -4365,9 +4367,13 @@ function appendFreshHelperDiagnostic(error: unknown, stderrTail: Buffer): unknow
 /** One helper owns every database inode from prepare through finish. Config is read-only and is not snapshotted. */
 export async function prepareFreshDevnetState(cwd: string, guardianRoot: string, env: NodeJS.ProcessEnv): Promise<FreshDevnetState> {
     for (const target of ["db", "local_checkpoints", "logs"]) {
-        await chmodTree(path.join(cwd, target), 0o755, 0o644).catch(() => { });
+        await chmodTree(path.join(cwd, target), 0o755, 0o644).catch((error) => {
+            console.warn(`[DevNet] skipped chmod normalization of ${target}: ${error instanceof Error ? error.message : String(error)}`);
+        });
     }
-    await chmodTree(path.join(psyContractsRoot(cwd), "deployments"), 0o755, 0o644).catch(() => { });
+    await chmodTree(path.join(psyContractsRoot(cwd), "deployments"), 0o755, 0o644).catch((error) => {
+        console.warn(`[DevNet] skipped chmod normalization of psy-contracts/deployments: ${error instanceof Error ? error.message : String(error)}`);
+    });
     const generation = await planGenesisGeneration(cwd, env);
     const child = spawn(generation.args[0], ["fresh-devnet-state", "--repo-root", path.resolve(cwd),
         "--guardians-root", guardianRoot],
@@ -4687,27 +4693,30 @@ async function startEnvioIndexerForRelayer(
         parseTomlScalar(relayerRaw, "database_url") ||
         "postgres://postgres:testing@127.0.0.1:5433/envio-dev";
 
-    const readArtifactBlockNumber = async (network: string, artifactName: string): Promise<number | undefined> => {
+    const readArtifactBlockNumber = async (network: string, artifactName: string): Promise<number> => {
         const artifactPath = path.join(
-            repoCwd,
-            "psy-contracts",
+            psyContractsRoot(repoCwd),
             "deployments",
             network,
             `${artifactName}.json`,
         );
-        if (!(await exists(artifactPath))) return undefined;
-        try {
-            const artifact = JSON.parse(await Bun.file(artifactPath).text()) as any;
-            const raw = artifact?.receipt?.blockNumber;
-            if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-            if (typeof raw === "string" && raw.trim()) {
-                const n = Number(raw);
-                if (Number.isFinite(n)) return n;
-            }
-        } catch {
-            return undefined;
+        if (!(await exists(artifactPath))) {
+            throw new Error(`missing deployment artifact for the envio start block: ${artifactPath}`);
         }
-        return undefined;
+        let artifact: unknown;
+        try {
+            artifact = JSON.parse(await Bun.file(artifactPath).text());
+        } catch (error) {
+            throw new Error(`invalid deployment artifact ${artifactPath}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        const receipt = artifact && typeof artifact === "object" && "receipt" in artifact ? artifact.receipt : undefined;
+        const raw = receipt && typeof receipt === "object" && "blockNumber" in receipt ? receipt.blockNumber : undefined;
+        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
+        if (typeof raw === "string" && raw.trim()) {
+            const n = Number(raw);
+            if (Number.isFinite(n) && n > 0) return n;
+        }
+        throw new Error(`deployment artifact ${artifactPath} has no valid receipt.blockNumber`);
     };
     const targets = await Promise.all(cohort.map(async (target) => {
         const deployedPath = path.join(psyContractsRoot(repoCwd), "deployments", target.deploymentsNetwork, "deployed-contracts.json");
@@ -4721,8 +4730,7 @@ async function startEnvioIndexerForRelayer(
             readArtifactBlockNumber(target.deploymentsNetwork, "Bridge_Proxy"),
             readArtifactBlockNumber(target.deploymentsNetwork, "StateManager_Proxy"),
         ]);
-        const startBlock = blocks.filter((v): v is number => v != null && v > 0)
-            .reduce<number | undefined>((min, value) => min == null ? value : Math.min(min, value), undefined) ?? 1;
+        const startBlock = Math.min(...blocks);
         return { ...target, chainId, bridge, stateManager, startBlock };
     }));
 

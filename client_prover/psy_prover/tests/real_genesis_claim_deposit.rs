@@ -216,6 +216,38 @@ async fn session(
 }
 
 #[tokio::test]
+#[ignore = "requires an explicitly hash-pinned public Genesis; no proof generation"]
+async fn real_token4_claim_rejects_high_amount_words_without_claim_witness() -> anyhow::Result<()> {
+    let contracts = public_contracts("PSY_CLAIM_GENESIS", "PSY_CLAIM_GENESIS_SHA256")?;
+    let token = deploy(&contracts, TOKEN)?;
+    let deposit = deploy(&contracts, DEPOSIT_CONTRACT)?;
+    let token_layout = layout(&contracts, TOKEN)?;
+    let deposit_layout = layout(&contracts, DEPOSIT_CONTRACT)?;
+    let (_, definition) = method(&token)?;
+    let proof_tree = Tree::new(UPS_SESSION_PROOF_TREE_HEIGHT);
+    for word in 0..6 {
+        let mut input = deposit_input();
+        input.amount[word] = 1;
+        let args = claim_inputs(&input, &proof_tree);
+        let mut state = session(&token, &deposit, &token_layout, &deposit_layout, &input, proof_tree.get_root()).await?;
+        let before = state.get_contract_state_slot(field(TOKEN), F::ZERO).await?;
+        ensure!(before.value.0.elements[0] == field(BALANCE), "fixture balance differs: {:?}", before.value);
+        let error = PsyEvalSessionResult::new().exec_contract_call(&mut state, field(TOKEN), &definition, args)
+            .await.err().context("token accepted a high amount word")?;
+        ensure!(error.to_string().contains("amount exceeds uint64 range"),
+            "high amount word was rejected for an unrelated reason: {error}");
+        // VM assertions run after speculative writes. Discard the failed session;
+        // only its immutable checkpoint store is evidence of committed balance.
+        let balance = state.get_read_store().get_user_contract_state_tree_merkle_proof(
+            CHECKPOINT, USER, TOKEN as u32, u8::try_from(token.code_definition.state_tree_height)?, 0,
+        ).await?;
+        ensure!(balance.value == before.value && balance.root == before.root,
+            "failed claim changed checkpoint balance");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "expensive real Plonky2 proof; requires explicitly hash-pinned public new/old Genesis"]
 async fn real_token4_claim_deposit_new_passes_old_fingerprint_fails() -> anyhow::Result<()> {
     ensure!(std::env::var("PSY_NETWORK").as_deref() == Ok("testnet"), "set PSY_NETWORK=testnet at build and execution");

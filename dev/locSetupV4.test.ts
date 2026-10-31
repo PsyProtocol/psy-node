@@ -111,6 +111,8 @@ import {
     assertRetainedDevnet,
     resolveRetainedAnvilStatePlan,
     assertRetainedDependencies,
+    psyContractsRoot,
+    psyDappRoot,
 } from "./locSetupV4";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 import { retainedServicesDatabaseCommands, LEGACY_DEVNET_DB_NAMES, devnetDbVolumeNames } from "./locSetupPolicy";
@@ -1786,7 +1788,7 @@ password_env = "SYNTHETIC_PASSWORD"
         await fixture(async (cwd, env, ports) => {
             let virtualMs = 0;
             let probes = 0;
-            const fetchSpy = spyOn(globalThis, "fetch").mockRejectedValue(new Error("synthetic connection refused"));
+            const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("synthetic connection refused"); });
             const sleep = spyOn(Bun, "sleep").mockImplementation(async (ms) => {
                 probes += 1;
                 virtualMs += ms ?? 0;
@@ -2020,7 +2022,7 @@ password_env = "SYNTHETIC_PASSWORD"
                 lifecycle.pausedApplicationProcesses = [relayer];
             });
             const spawnSentinel = new Error("db preflight reached spawn sentinel");
-            const spawn = spyOn(RunningProcess, "spawn").mockRejectedValue(spawnSentinel);
+            const spawn = spyOn(RunningProcess, "spawn").mockImplementation(async () => { throw spawnSentinel; });
             try {
                 // The saved config matches, so this proves preflight reaches spawn rather than a config mismatch.
                 await expect(manager.restartApplications(cwd)).rejects.toBe(spawnSentinel);
@@ -3392,6 +3394,34 @@ describe("retained dependency preflight", () => {
         } finally {
             writes.mockRestore();
             await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("psyContractsRoot / psyDappRoot sibling resolution", () => {
+    it("prefers a sibling checkout with package.json over the nested path", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "psy-sibling-"));
+        try {
+            const repo = path.join(base, "repo");
+            mkdirSync(path.join(base, "psy-contracts"), { recursive: true });
+            writeFileSync(path.join(base, "psy-contracts", "package.json"), "{}\n");
+            expect(psyContractsRoot(repo)).toBe(path.join(base, "psy-contracts"));
+            expect(psyDappRoot(repo)).toBe(path.join(repo, "psy-dapp"));
+        } finally {
+            rmSync(base, { recursive: true, force: true });
+        }
+    });
+
+    it("falls back to the nested checkout when no sibling exists", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "psy-sibling-"));
+        try {
+            const repo = path.join(base, "repo");
+            mkdirSync(path.join(repo, "psy-contracts"), { recursive: true });
+            writeFileSync(path.join(repo, "psy-contracts", "package.json"), "{}\n");
+            expect(psyContractsRoot(repo)).toBe(path.join(repo, "psy-contracts"));
+            expect(psyDappRoot(repo)).toBe(path.join(repo, "psy-dapp"));
+        } finally {
+            rmSync(base, { recursive: true, force: true });
         }
     });
 });

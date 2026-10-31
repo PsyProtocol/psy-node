@@ -73,6 +73,8 @@ impl DepositInclusionGadget {
         ]);
 
 
+        // Bind all amount words to the relayer leaf. The token's claim_deposit
+        // checks its own uint64/Felt amount limit before any credit is applied.
         // Keep the exact field/u32 layout used by the relayer deposit leaf.
         // This proof must commit to the same leaf the receiver later claims.
         let shield_address_words: [Target; 8] = std::array::from_fn(|i| {

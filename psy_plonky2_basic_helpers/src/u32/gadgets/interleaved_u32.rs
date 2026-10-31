@@ -128,22 +128,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderB32<F, D>
         (x_evens, x_odds)
     }
 
-    /// Important! This function is unsafe!
-    /// It fails for 3+ inputs all set to 0xffffffff
-    ///
-    /// More generally, it fails if the sum of the three interleaved inputs for
-    /// a given iteration exceeds the Goldilocks field characteristic. Since
-    /// the uninterleave gate rejects any slot holding both bits, a fold where
-    /// three or more of the inputs share a 1-bit at any position is also
-    /// unprovable now (it used to mis-evaluate instead).
-    /// If we assume the outputs for a 3-way add of interleaved u32 inputs are uniformly distributed in [0, 2^64-1] (don't think this is actually true but I think close enough),
-    /// then the odds of this happening are 1 - ((2^64-2^32+1) / (2^64-1)) = 2.3283064e-10, so it's unlikely to inhibit an honest prover trying to prove something actually correct.
-    ///
-    /// However, please keep in mind that adversarially this makes it possible in some cases to prove an invalid input hashes to the same result as a valid input.
-    /// For example, this circuit can incorrectly prove that 0xffffffff XOR 0xffffffff XOR 0xffffffff is equal to 0x0000fffe.
-    /// If you have three inputs whose XOR actually *do* evaluate to 0x0000fffe, then a malicious prover can substitute 0xffffffff for the actual inputs and still produce a valid proof.
-    /// Cases like this basically require the first half of the real result to be all 0's, so odds of roughly 1/(2^16) per input triple that this exploit appears
-    /// Currently we haven't thought of any particular attacks that can exploit this, but once again should be kept in mind.
+    /// Up to three inputs use pairwise XOR, including operands with shared bits.
+    /// The optimized path for four or more inputs is unsafe: intermediate
+    /// three-way interleaved sums can overflow the field or produce unsupported
+    /// slot values. Do not use that path for unrestricted operands. Production
+    /// callers in this repository currently pass exactly three inputs.
     fn unsafe_xor_many_u32(&mut self, x: &[U32Target]) -> U32Target {
         match x.len() {
             0 => self.zero_u32(),
@@ -634,11 +623,11 @@ mod tests {
             vec![0x01234567, 0x89abcdef],
             vec![0x01234567, 0x01234567, 0x01234567],
             vec![0x01234567, 0x89abcdef, 0x0],
+            vec![0xffffffff, 0x89abcdef, 0x01234567],
+            vec![0xffffffff, 0xffffffff, 0xffffffff],
             vec![0x0u32, 0x0, 0x0, 0x0, 0x0],
-            // Vectors whose three-way fold needs a slot sum of 3 used to
-            // mis-evaluate here; the uninterleave gate now rejects those
-            // openings outright, so they have no provable output and are not
-            // listed.
+            // The pairwise three-input path is distinct from the unsafe
+            // optimized path used for four or more inputs.
         ];
 
         // build circuit once

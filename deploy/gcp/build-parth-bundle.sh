@@ -180,8 +180,8 @@ source, target, coordinator, realms_csv, prove_proxy, services, system_prove_pro
 with open(source, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-# 从前这里无条件改写 networks.localhost，于是 staging 实际跑的是 localhost 块。
-# 现在按阶段填，并把 defaultNetwork 一起写死，免得二进制与配置对不上。
+# Select the explicit stage and pin defaultNetwork with it; the former localhost-only
+# rewrite could leave staging binaries and configuration on different network blocks.
 networks = data.setdefault("networks", {})
 if stage not in networks:
     raise SystemExit(f"source config has no networks.{stage}")

@@ -46,6 +46,15 @@ remain separate gates. No overall deployment-ready claim follows from a pass.
 
 ## Main-Thread Invocation
 
+The separate ignored test
+`real_token4_claim_rejects_high_amount_words_without_claim_witness` executes the
+same public token4 bytecode for each of the six high amount words. It requires
+the exact uint64-range assertion failure, no returned claim witness, and an
+unchanged backing-checkpoint balance. VM assertions run after speculative local
+writes, so failed sessions must be discarded, not inspected as committed state
+or reused. This bounded check does not certify final-cohort token0/token4
+proofs or L1 admission limits; oversized L1 deposits may still be unclaimable.
+
 Only the owner of the build cache may compile/run this test. Use the checked-in
 test from the prepared, dependency-complete build cohort. Build against the
 unified Node/config/Genesis inputs, never localhost defaults

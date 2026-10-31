@@ -991,7 +991,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. Pass public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each category is policy-gated as claim / claim_deposit / private_claim. Withdraw legs reserve (destination chain index, authenticated sender, nonce) and check claimedNullifiers using the raw withdraw nonce bytes32 before burning. A consumed nonce, an in-process reservation, or an undeterminable check refuses the whole batch. The burn uses the raw nonce."
+        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. Pass public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each category is policy-gated as claim / claim_deposit / private_claim. Withdraw legs reserve the Poseidon leaf of the complete 35-word record and check claimedNullifiers using keccak256 of that record's 140-byte big-endian encoding before burning. A consumed identity, an in-process reservation, or an undeterminable check refuses the whole batch. The burn still carries the raw nonce."
     )]
     async fn claim_batch(&self, Parameters(a): Parameters<ClaimBatchArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;

@@ -277,9 +277,11 @@ that second, human-made call.
 anything burns, the destination chain's configured RPC and Bridge are resolved
 and the RPC must serve the configured chain id. The sender is the authenticated
 wallet user (never guessed, never a tool argument) and must fit in uint32. The
-reservation is `(destination chain index, sender user id, nonce)`; the token is
-not part of it, so the same user and nonce on two tokens still collide. The L1
-read is `claimedNullifiers(keccak256(4-byte big-endian uint32 sender || 32-byte nonce))`.
+reservation is the Poseidon leaf of the complete 35-word withdrawal record,
+including sender, recipient, token, amount, nonce, destination chain index and
+L2 token contract id. Reusing a nonce with different token or claim contents
+is a distinct identity. The L1 read is `claimedNullifiers(l1Key)`, where `l1Key`
+is keccak256 of the exact 140-byte big-endian u32 record, not the raw nonce.
 An already-consumed nullifier, an in-process reservation of that identity, or an
 undeterminable check refuses the burn (nothing submitted, policy refunded). A
 caller-pinned nonce is used verbatim — never re-randomized; a generated nonce

@@ -1,4 +1,4 @@
-# Preparation Status: 2026-10-30
+# Preparation Status: 2026-10-31
 
 This is an offline preparation checkpoint, not a completed deployment or an
 activation package. No database, live service, L1 contract, key or npm package
@@ -12,10 +12,10 @@ tests and independent review is not complete.
 
 | Task | Status | Acceptance |
 |---|---|---|
-| Faucet batch departure and safe retries | Locally committed; scoped tests/review passed | `b9c1cdd9`; ports `c4bf6e16`, `16d3b773`, `afc27728`; atomic bounded queue, policy-bound batch capacity, uncertain delivery never switches operator |
-| Relayer readiness and deposit admission | Locally committed; scoped tests/review passed | `c9a2dfe7`; Services read 2s, row 70s / round 75s to allow L1 pool failover; event-id cursor; root-not-yet-known spends no attempt; at most 32 finalized deposits per chain per round |
-| Worker reputation and fetch replay | Locally committed; scoped tests/review passed | `310d35c5`; port only reputation/replay of `876c1432`; preserve whitelist and PR30/IMT; real Redis replay tests 2/2 passed |
-| BSC fees | Locally committed; scoped tests/review passed | `1f1e2f0a`; port `c9105056` observed-history strategy and strict config parsing; no packed-deposit port |
+| Faucet batch departure and safe retries | Published in `15d6316d`; scoped tests/review passed | Port `b9c1cdd9` from `c4bf6e16`, `16d3b773`, `afc27728`; atomic bounded queue, policy-bound batch capacity, uncertain delivery never switches operator |
+| Relayer readiness and deposit admission | Published in `15d6316d`; scoped tests/review passed | Port `c9a2dfe7`; Services read 2s, row 70s / round 75s to allow L1 pool failover; event-id cursor; root-not-yet-known spends no attempt; at most 32 finalized deposits per chain per round |
+| Worker reputation and fetch replay | Published in `15d6316d`; scoped tests/review passed | Port `310d35c5`, reputation/replay only from `876c1432`; preserve whitelist and PR30/IMT; real Redis replay tests 2/2 passed |
+| BSC fees | Published in `15d6316d`; scoped tests/review passed | Port `1f1e2f0a` from `c9105056`, observed-history strategy and strict config parsing; no packed-deposit port |
 | Deployment inputs and Router | Partially complete | Fixed Router base `394153fa`; explicit reviewed contracts commit; role inventory, fresh core planning, internal Coordinator and epoch-32 build binding; 112 offline tests passed; installers remain pending |
 | Build isolation and consumer pins | Partially complete | Clean every local package from full locked metadata before compilation, including out-of-workspace path dependencies; final publication, consumer pins and immutable release build remain pending |
 
@@ -25,15 +25,22 @@ claim activation readiness while this checklist is incomplete.
 
 ### Current Work And Remaining Boundaries
 
-Runtime changes are isolated on local `fix/fresh-runtime-gaps-20261031`, based
-on `e2884812`, now at `b9c1cdd9`; deployment-only changes are separate. Neither
-is a new published release yet. The profile still identifies the last published
-runtime, not this local candidate. `runtime_inputs_frozen` is false and the v2
-builder enforces it before invoking Docker. Do not flip it until the accepted
-runtime is published and consumer/source/input checks are complete.
+The tested intermediate source was `b9c1cdd9`, based on `e2884812`. Its complete
+non-deployment tree was imported onto `testnet-dev` at `671093a2`, without
+merging deployment history backward. The final source is published as
+`15d6316d1bd28bb535698a4797e3c6261e6c9597` on both `testnet-dev` and
+`prepare/testnet-dev-runtime-20261031`. It also retains the six local-tool
+updates from Audit `dbcdc7c9`, English source comments, and focused review
+corrections. The restored epoch-32 prerequisite `psy-genesis` at `9ed70c1` was
+already published; it is not promotion of new final artifacts.
+
+The deployment merge's entire non-`deploy/` tree must be byte-identical to this
+source. `runtime_inputs_frozen` remains false and the v2 builder checks it before
+Docker. A source push does not certify the final artifact or configuration
+closure. Do not flip it until those checks are complete.
 
 The current preview profile SHA-256 is
-`5b065248c01e8f121a0cea72e104e24acf1e46fb1052eba1a60b56721bcc5111`.
+`256f965fbe69ba259d77b6892e9cc95b4d46e57e23942cbaa08277c5a7a730d2`.
 This is a preparation checkpoint, not the eventual final release hash. The CLI
 planner requires that hash and checks supplied config bytes against the profile.
 
@@ -62,6 +69,26 @@ fixes (unfrozen profile and uncached local dependency cleanup), then passed.
 These are scoped tests, not the full release DAG or real new-chain acceptance.
 Evidence logs are local `tmp/fresh-*-20261031.log`; no logs or generated binaries
 belong in this Git delivery. No live service was contacted or changed.
+
+Source-integration checks: lifecycle **181 passed**, config **16 passed**,
+CLI sibling-path test passed in both library and binary targets, wire validation
+**1 passed**, and the XOR gadget prove/verify test passed in each of its two
+crates on both baseline and final source. XOR production algorithms and gates
+were not changed. The real public-token4 bytecode rejected all six high amount
+words in the new ignored regression (**1 passed**). It returned no claim
+witness and preserved the immutable backing checkpoint. VM assertions follow
+speculative local writes, so failed sessions must be discarded; this is not
+transactional rollback of a failed temporary session. Final token0/token4
+Genesis/CFC/UPS acceptance and L1 oversized-admission caps remain pending.
+
+Expanded deployment checks: **506 run, 4 failures, 9 errors**. The unmodified
+published baseline `8db67eca` reproduces the same named **4 failures / 9 errors**
+in 496 tests. Four stale assertions require historical R2 pins; nine legacy
+placement tests build R3 unit fixtures while requesting R2 filenames. No tests
+were ignored or assertions weakened. These inherited failures still block
+release acceptance; preparation publication is not a passing full DAG. The
+changed fresh-profile tests pass **23/23**. Preserve both baseline and candidate
+logs under `tmp/deploy-core-*-tests-20261031.log`.
 
 Before enabling the reputation port, all Edges must share one private Redis
 database with `maxmemory-policy noeviction`. Every Edge and queue-creating unit
@@ -92,7 +119,32 @@ the old Faucet source/artifact pin must not be renamed to an unbuilt candidate.
 Finish their release/namespace/artifact migration after final hashes exist.
 The version-2 core plan is a preview, not an installation package.
 
-## Source And Consumers
+## Source And Consumers: Current Preparation
+
+Every active Node Cargo dependency in Compiler, SDK and Services now resolves
+the published source `15d6316d1bd28bb535698a4797e3c6261e6c9597`. The native
+release library checks passed for all three using locked/offline resolution,
+testnet selection, and the canonical epoch-32 config. These are not WASM or
+final generated-artifact checks. The exact staged TOML/lock deltas passed
+independent review: only Node SHA strings changed; package versions, registry
+checksums, features, aliases and dependency lists were preserved.
+
+| Repository | Preparation Commit | Destination |
+|---|---|---|
+| Node | `15d6316d1bd28bb535698a4797e3c6261e6c9597` | `testnet-dev`, `prepare/testnet-dev-runtime-20261031` |
+| Compiler | `81e0a022d7d323fa8707cd1cfa06a858943ad5aa` | `prepare/sd192-20261030` |
+| SDK | `b950dc65d049eb1fd453d19c9e61d541da43b5d1` | `prepare/sd192-20261030` |
+| Services | `e04493b70673e5d5314aa203ab293997c8c5e4fa` | `prepare/sd192-20261030` |
+
+Use the canonical `PsyProtocol` repositories. The local Services worktree's
+configured origin still points to `QEDProtocol`; publication uses the explicit
+authorized `PsyProtocol/psy-services` destination without changing shared Git
+configuration. The existing withdrawal-identity fix remains in its ancestry.
+No npm version was reserved or published. A new SDK/WASM and client cohort is
+still required. The historical generated Genesis below is not silently
+re-stamped as a result of these source-pin updates.
+
+## Historical October-30 Preparation
 
 The published Node candidate is
 `e28848127f4cef87bea4e63cc9fb9b79edc18d93`, on the historical topic
@@ -180,9 +232,10 @@ Host/key provenance and native acceptance are separate checks.
 
 ## Remaining Work
 
-1. Reconcile the published deployment and consumer candidate commits.
-   Runtime integration into `testnet-dev`
-   remains pending; do not merge deployment scripts backward.
+1. Keep the published source and deployment runtime trees aligned. Runtime
+   integration into `testnet-dev` is complete at `15d6316d`; never merge
+   deployment scripts backward. Resolve the inherited deployment-test failures
+   before release acceptance.
 2. Reconcile the generated Compiler artifacts below with the accepted cohort,
    rebuilding if the consumed library or generation inputs change. Rebuild
    compatible SDK/WASM; publish producer revisions before downstream gitlinks.

@@ -50,6 +50,7 @@ use crate::bridge::{
 const DEFAULT_PROOF_DIR: &str = "/tmp/psy_bridge_proofs";
 const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEFAULT_MAX_CHECKPOINT_BATCH: u64 = 64;
+const MAX_DEPOSITS_PER_L2_ROUND: u32 = 32;
 /// Per-round catchup truncation size; default 64 preserves prior daemon behavior.
 const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 
@@ -1017,6 +1018,7 @@ async fn run_multichain(
     let mut stalled_rounds: u64 = 0;
     let mut last_round_submitted_l2_work = false;
     let mut l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
+    let mut claim_readiness_starts: HashMap<u8, Option<i64>> = HashMap::new();
 
     loop {
         let mut state = load_multichain_state(&guardian.root, &guardian.db)?;
@@ -1280,8 +1282,12 @@ async fn run_multichain(
                 claims.retain(|withdrawal| withdrawal.destination_chain_index == u64::from(chain.chain_index));
                 claims.sort_by_key(|withdrawal| (withdrawal.destination_chain_index, withdrawal.event_id));
                 if claims.is_empty() { continue; }
+                let start = claim_readiness_starts.entry(chain.chain_index).or_default();
+                let index = start.and_then(|last| claims.iter().position(|claim| claim.event_id > last)).unwrap_or(0);
+                claims.rotate_left(index);
                 let hook = claim_broadcast_hook(&guardian.root, &guardian.db);
                 let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint, &guardian.root.network, Some(hook)).await;
+                *start = next_claim_readiness_start(&claims, &result);
                 if result.is_err() {
                     match persisted_claim_retry(&guardian.root, &guardian.db) {
                         Ok(persisted) => adopt_persisted_receipt_holds(&claims, &mut state.claim_retry, &persisted),
@@ -2524,6 +2530,19 @@ fn claims_to_attempt(
         .collect()
 }
 
+// Retain an event ID, not an index that shifts when completed claims disappear.
+// Outcomes are matched by identity, independently of report ordering.
+fn next_claim_readiness_start(
+    claims: &[propose_withdrawals::PendingWithdrawal],
+    result: &anyhow::Result<claim_withdrawals::BatchWithdrawalsReport>,
+) -> Option<i64> {
+    let Ok(report) = result else { return claims.first().map(|claim| claim.event_id) };
+    claims.iter().rev().find(|claim| report.outcomes.iter().any(|outcome| {
+        outcome.leaf_hash == claim.leaf_hash &&
+        !matches!(outcome.kind, claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred))
+    })).or_else(|| claims.first()).map(|claim| claim.event_id)
+}
+
 /// Replayed events must not automatically re-arm claims retired by the operator policy.
 fn insert_pending_claims(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
@@ -3210,6 +3229,10 @@ async fn build_l2_call_plan(
     })
 }
 
+fn finalized_deposit_append_target(l2_count: u32, pending: u32, finalized_pending: u32) -> u32 {
+    pending.min(finalized_pending).min(l2_count.saturating_add(MAX_DEPOSITS_PER_L2_ROUND))
+}
+
 async fn build_multichain_l2_plan(
     base: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
@@ -3271,7 +3294,12 @@ async fn build_multichain_l2_plan(
             }).await?;
             // Latest remains the backlog metric, not Guardian admission. A
             // later finalized read may advance past that earlier observation.
-            let deposit_append_target = pending.min(finalized_pending);
+            let deposit_append_target = finalized_deposit_append_target(l2_count, pending, finalized_pending);
+            if deposit_append_target < pending.min(finalized_pending) {
+                tracing::info!(chain_index=chain.chain_index, l2_count, pending, finalized_pending,
+                    deposit_append_target, max_deposits=MAX_DEPOSITS_PER_L2_ROUND,
+                    "finalized deposit admission limited for bounded L1 verification");
+            }
             if deposit_append_target > l2_count {
                 let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
                     &http,
@@ -4373,6 +4401,52 @@ mod tests {
         vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }]
     }
 
+    #[test]
+    fn finalized_deposit_append_target_bounds_the_live_backlog() {
+        assert_eq!(finalized_deposit_append_target(1221, 1862, 1844), 1253);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_retains_smaller_ready_prefixes() {
+        assert_eq!(finalized_deposit_append_target(100, 200, 117), 117);
+        assert_eq!(finalized_deposit_append_target(100, 115, 117), 115);
+        assert_eq!(finalized_deposit_append_target(100, 132, 132), 132);
+        assert_eq!(finalized_deposit_append_target(100, 133, 133), 132);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_keeps_waiting_chains_idle() {
+        assert_eq!(finalized_deposit_append_target(100, 200, 100), 100);
+        assert_eq!(finalized_deposit_append_target(100, 100, 100), 100);
+        assert_eq!(finalized_deposit_append_target(100, 200, 99), 99);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_is_per_chain() {
+        let targets = [(1221, 1862, 1844), (153, 166, 166), (13, 15, 15)]
+            .map(|(l2_count, pending, finalized_pending)| finalized_deposit_append_target(l2_count, pending, finalized_pending));
+        assert_eq!(targets, [1253, 166, 15]);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_retries_and_drains_without_gaps() {
+        let mut l2_count = 1221;
+        while l2_count < 1844 {
+            let target = finalized_deposit_append_target(l2_count, 1862, 1844);
+            assert!(target > l2_count && target - l2_count <= 32);
+            assert_eq!(finalized_deposit_append_target(l2_count, 1862, 1844), target);
+            l2_count = target;
+        }
+        assert_eq!(l2_count, 1844);
+    }
+
+    #[test]
+    fn finalized_deposit_append_target_does_not_overflow() {
+        assert_eq!(finalized_deposit_append_target(u32::MAX - 40, u32::MAX, u32::MAX), u32::MAX - 8);
+        assert_eq!(finalized_deposit_append_target(u32::MAX - 10, u32::MAX, u32::MAX), u32::MAX);
+        assert_eq!(finalized_deposit_append_target(u32::MAX, u32::MAX, u32::MAX), u32::MAX);
+    }
+
     async fn finalized_deposit_fixture(latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use serde_json::{json, Value};
@@ -5326,21 +5400,25 @@ mod tests {
         }
         assert!(retry.get("not-found").is_none(), "waiting for proof must not spend attempts");
         assert!(retired.get("not-found").is_none(), "waiting for proof must not retire claims");
-        assert!(retired.contains_key("root-mismatch"), "unauthorized root must spend attempts and retire");
-        assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
+        assert!(!retired.contains_key("root-mismatch"), "a root not yet known on L1 must not retire a claim");
+        assert_eq!(claims_to_attempt(&pending, &retry).len(), 2);
 
         let remaining: Vec<_> = pending.values().cloned().collect();
-        record_claim_outcome(&remaining, &failed("not-found", claim_withdrawals::ClaimCode::RpcUnavailable), &mut pending, &mut retry, &mut retired, 10);
+        let mut unavailable = report.clone();
+        unavailable.outcomes[0].kind = claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RpcUnavailable);
+        record_claim_outcome(&remaining, &unavailable, &mut pending, &mut retry, &mut retired, 10);
         assert!(retry.get("not-found").is_none(), "an unavailable read does not spend an attempt");
-        assert!(retired.contains_key("root-mismatch"));
+        assert!(!retired.contains_key("root-mismatch"));
 
-        let waiting = failed("not-found", claim_withdrawals::ClaimCode::ProofNotReady);
+        // Each attempted row must have an outcome. Missing outcomes are real
+        // execution failures, not evidence that the row is still waiting.
+        let waiting = report;
         for round in 11..15 {
             let remaining: Vec<_> = pending.values().cloned().collect();
             record_claim_outcome(&remaining, &waiting, &mut pending, &mut retry, &mut retired, round);
             assert!(retry.get("not-found").is_none(), "waiting after an unavailable read still spends nothing");
-            assert!(retired.contains_key("root-mismatch"));
-            assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
+            assert!(!retired.contains_key("root-mismatch"));
+            assert_eq!(claims_to_attempt(&pending, &retry).len(), 2);
         }
     }
 
@@ -5785,6 +5863,62 @@ mod tests {
         assert!(retry.get(&w3.leaf_hash).is_none(), "a Held proof-not-ready leaf writes no retry counter; it stays pending and unheld for the next readiness recheck");
         assert!(retired.contains_key(&w2.leaf_hash));
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn claim_readiness_cursor_resumes_after_checked_prefix() {
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: "slow".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RpcUnavailable), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "unread".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred), tx_hash: None },
+            ],
+            ..empty_report()
+        };
+        let mut slow = sample_withdrawal(1);
+        slow.leaf_hash = "slow".into();
+        slow.event_id = 10;
+        let mut unread = sample_withdrawal(2);
+        unread.leaf_hash = "unread".into();
+        unread.event_id = 30;
+        let claims = [slow, unread];
+        assert_eq!(next_claim_readiness_start(&claims, &Ok(report.clone())), Some(10));
+        let mut reordered = report;
+        reordered.outcomes.reverse();
+        assert_eq!(next_claim_readiness_start(&claims, &Ok(reordered)), Some(10));
+        assert_eq!(next_claim_readiness_start(&claims, &Err(anyhow::anyhow!("read outage"))), Some(10));
+        assert_eq!(next_claim_readiness_start(&[], &Ok(empty_report())), None);
+    }
+
+    #[test]
+    fn claim_readiness_budget_does_not_spend_attempts_or_serialize_a_new_hold() {
+        let withdrawal = sample_withdrawal(1);
+        let mut pending = HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![claim_withdrawals::ClaimOutcome {
+                leaf_hash: withdrawal.leaf_hash.clone(),
+                kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred),
+                tx_hash: None,
+            }],
+            ..empty_report()
+        };
+        record_claim_outcome(&[withdrawal.clone()], &report, &mut pending, &mut retry, &mut retired, 0);
+        assert!(pending.contains_key(&withdrawal.leaf_hash));
+        assert!(retry.is_empty());
+        assert!(retired.is_empty());
+        let state = DaemonState { pending_claim_withdrawals: pending, claim_retry: retry, retired_claim_withdrawals: retired };
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let config = crate::guardian::test_fixture::codec_guardian_config();
+        save_chain_state(&config, &db, 0, &state).unwrap();
+        drop(db);
+        let restarted = super::super::guardian_client::RelayerDb::open(&root).unwrap();
+        let saved = load_chain_state(&config, &restarted, 0).unwrap();
+        assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+        assert!(saved.claim_retry.is_empty());
+        assert!(saved.retired_claim_withdrawals.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7562,6 +7696,17 @@ rpc_urls = ["http://127.0.0.1:4"]
         assert_eq!(chains.len(), 3);
         let bsc = chains[1].effective_config(&config).unwrap();
         assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().min_priority_fee_wei, 1_000_000_000);
+        assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().quote_strategy,
+            super::super::l1_fees::BscQuoteStrategy::Conservative);
+        let mut economical = config.clone();
+        economical.chains[1].fee_policy.as_mut().unwrap().quote_strategy =
+            super::super::l1_fees::BscQuoteStrategy::RecentHistory;
+        let effective = economical.chains[1].effective_config(&economical).unwrap();
+        assert_eq!(effective.finalize.fee_policy.as_ref().unwrap().quote_strategy,
+            super::super::l1_fees::BscQuoteStrategy::RecentHistory);
+        for index in [0, 2] {
+            assert!(economical.chains[index].effective_config(&effective).unwrap().finalize.fee_policy.is_none());
+        }
         assert_eq!(bsc.finalize.l1_rpc_providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
         for index in [0, 2] {
             assert!(chains[index].effective_config(&bsc).unwrap().finalize.fee_policy.is_none());
