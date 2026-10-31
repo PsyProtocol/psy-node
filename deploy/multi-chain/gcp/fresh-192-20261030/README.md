@@ -7,6 +7,14 @@ The published runtime candidate is
 `prepare/testnet-dev-runtime-20261031` without deployment history.
 Neither a successful preflight nor a Git push authorizes reset or activation.
 
+The runtime inputs are now frozen for the offline version-2 build only: source
+`15d6316d`, the retained-membership epoch-32 config, and public contracts from
+Genesis `6ec29ad9` / Compiler `81e0a022`. `runtime_inputs_frozen: true` permits
+that build; it is not runtime approval or permission to reset/install/start.
+The build spec separately pins the exact bundle, provenance and profile bytes.
+New network Genesis, installer migration and all remaining acceptance gates
+below are still required.
+
 `release.json` is the preparation role inventory. Historical `fresh-topology/`
 and `live/components.json` describe older cohorts, not this deployment's inputs.
 For this cohort: Relayer stays on `gcp-coordinator-worker`, Faucet on `arc99x2`,

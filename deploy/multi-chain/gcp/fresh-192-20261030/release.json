@@ -3,7 +3,7 @@
   "release_id": "core-testnet-20261030-sd192",
   "deployment_branch": "deploy/testnet",
   "runtime_candidate_commit": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
-  "runtime_inputs_frozen": false,
+  "runtime_inputs_frozen": true,
   "network": "testnet",
   "cli_network": "psy-public-testnet",
   "network_magic": "0x1337CF514544CF69",

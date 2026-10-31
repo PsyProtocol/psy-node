@@ -35,12 +35,16 @@ corrections. The restored epoch-32 prerequisite `psy-genesis` at `9ed70c1` was
 already published; it is not promotion of new final artifacts.
 
 The deployment merge's entire non-`deploy/` tree must be byte-identical to this
-source. `runtime_inputs_frozen` remains false and the v2 builder checks it before
-Docker. A source push does not certify the final artifact or configuration
-closure. Do not flip it until those checks are complete.
+source. `runtime_inputs_frozen` is now true for the offline version-2 build:
+the published Node/consumer pins, clean regenerated public contracts and
+retained-membership config have been reviewed together. The build spec must
+separately bind the exact config, external bundle, stamp and release profile.
+This is build-input approval only, not runtime, installation or activation
+approval. Actual network Genesis, final binary/host packages, resource tests,
+SDK/WASM, setup, runtime review holds and E2E remain open.
 
 The current preview profile SHA-256 is
-`256f965fbe69ba259d77b6892e9cc95b4d46e57e23942cbaa08277c5a7a730d2`.
+`8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282`.
 This is a preparation checkpoint, not the eventual final release hash. The CLI
 planner requires that hash and checks supplied config bytes against the profile.
 
