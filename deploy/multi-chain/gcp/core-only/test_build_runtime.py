@@ -150,6 +150,8 @@ class RuntimeBuildTests(unittest.TestCase):
         self.assertTrue(runs)
         for argv in runs:
             self.assertEqual(argv[argv.index("--network") + 1], "none")
+            self.assertEqual(argv[argv.index("--memory") + 1], "96g")
+            self.assertEqual(argv[argv.index("--memory-swap") + 1], "96g")
             self.assertEqual(argv[argv.index("--pull") + 1], "never")
             self.assertEqual(argv[argv.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
             mounts = [argv[i + 1] for i, x in enumerate(argv) if x == "--mount"]

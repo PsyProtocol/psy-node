@@ -56,6 +56,11 @@ features, network selector or fallback config can be supplied through the spec.
 
 ## Build Boundary
 
+The operator-approved local build ceiling is 96 GiB on the 128 GiB host.
+Docker receives both `--memory=96g` and `--memory-swap=96g`, so it does not
+add swap allowance beyond that memory ceiling. This neither reserves memory
+nor changes online service limits; check competing host workloads separately.
+
 - The source, Git metadata, external Genesis, canonical config and output are
   read-only container mounts. Four selected caches are writable. Cache/output
   paths must not overlap one another, inputs or Git metadata.

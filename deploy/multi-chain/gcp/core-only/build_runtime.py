@@ -229,6 +229,7 @@ def container(spec, metadata):
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
     }
     argv = ["docker", "run", "--rm", "--pull", "never", "--network", "none",
+            "--memory", "96g", "--memory-swap", "96g",
             "--user", f"{os.getuid()}:{os.getgid()}"]
     for key, value in environment.items():
         argv += ["-e", key + "=" + value]
