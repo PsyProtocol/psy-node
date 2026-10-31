@@ -74,14 +74,17 @@ def overlaps(a, b):
 def load_spec(path):
     spec = document(absolute_path(path))
     fields(spec, ("schema_version", "source", "inputs", "builder_image", "caches", "output", "jobs"))
-    require(type(spec["schema_version"]) is int and spec["schema_version"] == 1, "unsupported spec")
+    require(type(spec["schema_version"]) is int and spec["schema_version"] in (1, 2), "unsupported spec")
     fields(spec["source"], ("path", "commit"))
     require(isinstance(spec["source"]["commit"], str) and re.fullmatch(r"[0-9a-f]{40}", spec["source"]["commit"]),
             "full source commit required")
     require(isinstance(spec["builder_image"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", spec["builder_image"]),
             "immutable local image ID required")
     require(type(spec["jobs"]) is int and 1 <= spec["jobs"] <= 256, "invalid jobs")
-    fields(spec["inputs"], ("config", "bundle", "bundle_stamp"))
+    input_names = ("config", "bundle", "bundle_stamp")
+    if spec["schema_version"] == 2:
+        input_names += ("release_profile",)
+    fields(spec["inputs"], input_names)
     for entry in spec["inputs"].values():
         fields(entry, ("path", "sha256"))
         require(isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]), "invalid SHA256")
@@ -110,6 +113,19 @@ def load_spec(path):
     require(int(network["magic"], 0) == 0x1337CF514544CF69, "testnet magic mismatch")
     period = network["p2p"]["checkpoints_per_epoch"]
     require(type(period) is int and period > 0, "invalid testnet checkpoint period")
+    if spec["schema_version"] == 2:
+        profile = document(Path(spec["inputs"]["release_profile"]["path"]))
+        require(profile.get("runtime_inputs_frozen") is True, "fresh runtime inputs are not frozen")
+        require(profile["network"] == "testnet" and config.get("defaultNetwork") == "testnet",
+                "fresh build must select testnet")
+        require(profile["runtime_candidate_commit"] == spec["source"]["commit"], "release source mismatch")
+        require(profile["runtime_config_sha256"] == spec["inputs"]["config"]["sha256"], "release config hash mismatch")
+        require(profile["network_magic"] == network["magic"] and
+                type(profile["checkpoints_per_epoch"]) is int and profile["checkpoints_per_epoch"] == period == 32,
+                "fresh build requires release-bound epoch 32")
+        require(profile["proving_backend"] == "plonky2-poseidon-goldilocks", "fresh build requires Plonky2")
+    else:
+        require(period == 10, "non-R3 builds require a version-2 release-bound spec")
     stamp = document(Path(spec["inputs"]["bundle_stamp"]["path"]))
     require(stamp["artifactSha256"] == spec["inputs"]["bundle"]["sha256"] and
             stamp["artifactByteSize"] == Path(spec["inputs"]["bundle"]["path"]).stat().st_size,
@@ -236,6 +252,26 @@ def build_runtime(spec_path):
             return result
         versions = logged(["rustc", "--version", "--verbose"], "rustc.log")
         go_version = logged(["go", "version"], "go.log")
+        # Every worktree is mounted at /psy-node. Cargo's source mtimes alone
+        # cannot distinguish an older checkout from newer cached local objects.
+        workspace = json.loads(logged(["cargo", "metadata", "--offline", "--locked",
+            "--format-version", "1", "--quiet"], "cargo-metadata.log"))
+        packages = {package["id"]: package for package in workspace["packages"]}
+        package_specs = []
+        require(all(packages[member].get("source") is None for member in workspace["workspace_members"]),
+                "workspace package must be local")
+        for package in packages.values():
+            if package.get("source") is not None:
+                continue
+            require(re.fullmatch(r"[A-Za-z0-9_-]+", package["name"]) and
+                    re.fullmatch(r"[A-Za-z0-9.+-]+", package["version"]), "invalid workspace package")
+            package_specs.append(package["name"] + "@" + package["version"])
+        require(package_specs, "empty workspace package set")
+        package_specs = sorted(set(package_specs))
+        clean = ["cargo", "clean", "--offline", "--locked", "--release"]
+        for package in package_specs:
+            clean += ["-p", package]
+        logged(clean, "workspace-clean.log")
         build = ["cargo", "build", "--offline", "--locked", "--release", "--message-format=json-render-diagnostics"]
         for binary in BINS:
             build += ["--bin", binary]
@@ -261,7 +297,7 @@ def build_runtime(spec_path):
             require(digest(dst) == source_sha, "packaged binary changed during verification")
         phase_gate()
         manifest = {
-            "schema_version": 1, "source_commit": spec["source"]["commit"], **before,
+            "schema_version": 1, "build_spec_version": spec["schema_version"], "source_commit": spec["source"]["commit"], **before,
             "source_directory": spec["source"]["path"], "source_clean_before_and_after_build": True,
             "source_mount_read_only": True, "external_genesis_directory": str(Path(spec["inputs"]["bundle"]["path"]).parent),
             "inputs": spec["inputs"], "genesis_contracts_sha256": spec["inputs"]["bundle"]["sha256"],
@@ -271,7 +307,9 @@ def build_runtime(spec_path):
             "cached_circuit_library_sha256": before["source_files"]["psy_plonky2_circuits/src/generated/cached_circuit_library.rs"],
             "cached_common_data_sha256": before["source_files"]["psy_plonky2_circuits/src/generated/cached_common_data.rs"],
             "network_magic": "0x1337CF514544CF69",
+            "checkpoints_per_epoch": document(Path(spec["inputs"]["config"]["path"]))["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"],
             "build_network": "none", "environment": environment, "build_command": build,
+            "local_clean_command": clean, "local_package_specs": package_specs,
             "compiler_revision": document(Path(spec["inputs"]["bundle_stamp"]["path"]))["compilerRevision"],
             "rustc_version": versions.strip(), "go_version": go_version.strip(), "binaries": hashes,
             "glibc_maximums": glibc, "spec_sha256": spec_sha, "recipe_sha256": digest(Path(__file__).resolve()),

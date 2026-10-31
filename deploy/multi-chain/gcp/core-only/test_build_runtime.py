@@ -58,6 +58,7 @@ class RuntimeBuildTests(unittest.TestCase):
         self.glibc = "2.36"
         self.fail_help = False
         self.change_input = False
+        self.fail_clean = False
         self.actual_commit = self.spec["source"]["commit"]
 
     def save_spec(self):
@@ -81,7 +82,15 @@ class RuntimeBuildTests(unittest.TestCase):
         if argv[:3] == ["docker", "image", "inspect"]:
             return self.spec["builder_image"] + " linux/amd64"
         if argv[:2] == ["docker", "run"]:
-            if "cargo" in argv:
+            if "cargo" in argv and "metadata" in argv:
+                return json.dumps({"packages": [{"id": "node", "name": "psy_node_cli", "version": "0.1.0", "source": None},
+                    {"id": "relayer", "name": "psy_relayer_cli", "version": "0.1.0", "source": None},
+                    {"id": "external", "name": "local_dependency", "version": "0.2.0", "source": None},
+                    {"id": "registry", "name": "registry_dependency", "version": "1.0.0", "source": "registry+fixture"}],
+                    "workspace_members": ["node", "relayer"]})
+            if "cargo" in argv and "clean" in argv and self.fail_clean:
+                raise RuntimeError("mock workspace clean failed")
+            if "cargo" in argv and "build" in argv:
                 release = Path(self.spec["caches"]["target"]) / "release"
                 release.mkdir()
                 for binary in build.BINS:
@@ -143,7 +152,7 @@ class RuntimeBuildTests(unittest.TestCase):
             self.assertEqual(len(writable), 4)
             self.assertNotIn("psy-services", " ".join(argv))
             self.assertNotIn("SSH_AUTH_SOCK", " ".join(argv))
-        cargo = next(c for c in runs if "cargo" in c)
+        cargo = next(c for c in runs if "cargo" in c and "build" in c)
         self.assertIn("--offline", cargo)
         self.assertIn("--locked", cargo)
         self.assertIn("--message-format=json-render-diagnostics", cargo)
@@ -154,6 +163,35 @@ class RuntimeBuildTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_build()
         self.assertFalse(self.commands)
+
+    def test_workspace_outputs_are_cleaned_before_building_another_source(self):
+        self.run_build()
+        runs = [argv for argv in self.commands if argv[:2] == ["docker", "run"]]
+        clean = next((i for i, argv in enumerate(runs) if "cargo" in argv and "clean" in argv), None)
+        compile_index = next(i for i, argv in enumerate(runs) if "cargo" in argv and "build" in argv)
+        self.assertIsNotNone(clean, "same /psy-node mount can reuse stale workspace objects from another worktree")
+        self.assertLess(clean, compile_index)
+        self.assertIn("psy_node_cli@0.1.0", runs[clean])
+        self.assertIn("psy_relayer_cli@0.1.0", runs[clean])
+
+    def test_clean_includes_local_path_dependencies_outside_workspace(self):
+        self.run_build()
+        clean = next(argv for argv in self.commands if "cargo" in argv and "clean" in argv)
+        self.assertIn("local_dependency@0.2.0", clean)
+        self.assertNotIn("registry_dependency@1.0.0", clean)
+        self.assertIn("--offline", clean)
+        self.assertIn("--locked", clean)
+        metadata = next(argv for argv in self.commands if "cargo" in argv and "metadata" in argv)
+        self.assertNotIn("--no-deps", metadata)
+        self.assertIn("--offline", metadata)
+        self.assertIn("--locked", metadata)
+
+    def test_clean_failure_never_builds_or_publishes_manifest(self):
+        self.fail_clean = True
+        with self.assertRaisesRegex(RuntimeError, "workspace clean"):
+            self.run_build()
+        self.assertFalse(any("cargo" in argv and "build" in argv for argv in self.commands))
+        self.assertFalse((Path(self.spec["output"])/"manifest.json").exists())
 
     def test_bad_pin_or_unknown_spec_field_rejected(self):
         for change in ("sha", "image", "extra", "network"):
@@ -173,6 +211,34 @@ class RuntimeBuildTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_build()
         self.assertFalse(Path(self.spec["output"]).exists())
+
+    def test_fresh_build_binds_epoch_source_and_config_to_release_profile(self):
+        config_path = Path(self.inputs["config"]["path"])
+        config = json.loads(config_path.read_text())
+        config["defaultNetwork"] = "testnet"
+        config["networks"]["testnet"]["p2p"]["checkpoints_per_epoch"] = 32
+        config_path.write_text(json.dumps(config))
+        self.inputs["config"]["sha256"] = build.digest(config_path)
+        profile = {"network": "testnet", "runtime_candidate_commit": self.actual_commit,
+                   "runtime_inputs_frozen": True,
+                   "network_magic": "0x1337CF514544CF69", "checkpoints_per_epoch": 32,
+                   "proving_backend": "plonky2-poseidon-goldilocks",
+                   "runtime_config_sha256": self.inputs["config"]["sha256"]}
+        profile_path = self.root / "release-profile.json"
+        profile_path.write_text(json.dumps(profile))
+        self.spec["schema_version"] = 2
+        self.inputs["release_profile"] = {"path": str(profile_path), "sha256": build.digest(profile_path)}
+        self.save_spec()
+        build.load_spec(self.spec_path)
+        for field, wrong in (("checkpoints_per_epoch", 10), ("runtime_candidate_commit", "f" * 40),
+                             ("runtime_config_sha256", "0" * 64), ("proving_backend", "jtmb"),
+                             ("runtime_inputs_frozen", False)):
+            broken = {**profile, field: wrong}
+            profile_path.write_text(json.dumps(broken))
+            self.inputs["release_profile"]["sha256"] = build.digest(profile_path)
+            self.save_spec()
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                build.load_spec(self.spec_path)
 
     def test_wrong_source_commit_rejected(self):
         self.actual_commit = "f" * 40

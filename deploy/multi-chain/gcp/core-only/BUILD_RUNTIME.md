@@ -21,14 +21,21 @@ runtime environments. Python 3.11+, Git and local Docker are prerequisites.
 
 | Field | Value |
 | --- | --- |
-| `schema_version` | Integer `1` |
+| `schema_version` | Integer `1` for historical epoch-10 R3; integer `2` for the fresh epoch-32 cohort |
 | `source` | Object with `path` and full lowercase 40-hex `commit` |
-| `inputs` | Object with exactly `config`, `bundle`, `bundle_stamp` |
+| `inputs` | `config`, `bundle`, `bundle_stamp`; version 2 also requires `release_profile` |
 | Each input | Object with `path` and lowercase 64-hex `sha256` |
 | `builder_image` | Already available local `sha256:` image ID, 64 lowercase hex digits, linux/amd64 |
 | `caches` | Object with existing directory paths `cargo`, `target`, `go`, `go_build` |
 | `output` | New directory; existing owned parent, not group/world writable |
 | `jobs` | Positive integer, at most 256 |
+
+Version 2 binds the full source commit, selected testnet config SHA-256, magic,
+epoch **32** and `plonky2-poseidon-goldilocks` to the separately hash-pinned release
+profile. The profile needs `runtime_config_sha256` from the final accepted config
+and an explicit `runtime_inputs_frozen: true`. The preparation profile stays false
+until source publication, consumer alignment and input review; it cannot build a release. Version 1
+cannot build epoch 32. Profile/config hashes are checked around every phase.
 
 The selected source must match its commit and be clean, including initialized
 submodules. An existing **empty** `source/psy-genesis` directory is supported;
@@ -59,6 +66,11 @@ features, network selector or fallback config can be supplied through the spec.
   caches with `GOPROXY=off` and `GOSUMDB=off`. The dated Rust toolchain comes from
   the pinned source. Cargo, Rust and Go caches are trusted operator inputs;
   this is not protection against malicious cache contents or build scripts.
+- All local packages discovered from full locked Cargo metadata, including path
+  dependencies outside the workspace, are cleaned before compilation with
+  `--offline --locked`; registry/Git dependencies remain reusable. The clean command and package
+  list are recorded. This prevents a different checkout at `/psy-node` from
+  inheriting newer workspace objects solely because of file mtimes.
 - Advisory locks are held in all four caches. Active Rust/Go build processes or
   running containers with overlapping writable mounts cause refusal. Other
   build operators must honor exclusive cache ownership for the whole run;
