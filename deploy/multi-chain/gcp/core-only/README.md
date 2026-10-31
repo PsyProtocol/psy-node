@@ -50,11 +50,14 @@ with 21 GiB available before adding Realm 1. Individual Realm Processors consume
 approximately 4 GiB after startup; two do not fit safely on the original 8 GB VMs.
 
 `place_realm1_on_coordinator.py` prepares a small private package from the retained
-original packages. Only Realm 1 `processor_addresses` change to the Coordinator's
+original R3 packages accepted by `install_host.py`. Its unit names and slice are
+R3-scoped; it rejects R2 and new SD192 package provenance before staging files.
+It is not an installer for the next fresh release. Only Realm 1
+`processor_addresses` change to the Coordinator's
 private IP; identities, ports, namespaces, Genesis and consensus parameters do not
 change. The three new Processor units and the three Realm 1 Edge drop-ins select
 `realm1-cp-ce-config.json`. Other processes retain the original config. The three
-temporary Processors share `psy-realm1.slice` with `MemoryHigh=16G` and
+temporary Processors share `psy-realm1-r3.slice` with `MemoryHigh=16G` and
 `MemoryMax=18G`; this bounds their aggregate memory, but does not guarantee
 availability if that limit is reached. Start them sequentially and inspect logs,
 memory, P2P connections and checkpoint synchronization before each next start.

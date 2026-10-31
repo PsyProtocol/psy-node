@@ -113,8 +113,8 @@ class PlacementTests(unittest.TestCase):
                 if host == "gcp-cp-ce":
                     unit = payloads["units/" + placement.unit_name(position, "processor")].decode()
                     self.assertIn("Slice=" + placement.SLICE, unit)
-                    self.assertIn(f'"fresh20261026r2_r1_v{position}"', unit)
-                    self.assertIn("/core-testnet-20261026-r2/checkpoints", unit)
+                    self.assertIn(f'"fresh20261027r3_r1_v{position}"', unit)
+                    self.assertIn("/core-testnet-20261027-r3/checkpoints", unit)
                     self.assertIn(f"/ip4/10.148.0.25/tcp/{41020 + position}", unit)
                     self.assertIn(str(install.CONFIG / placement.CONFIG_NAME), unit)
                 else:
@@ -136,6 +136,20 @@ class PlacementTests(unittest.TestCase):
                 placement.prepare(self.sources, self.root / "failed")
         self.assertFalse((self.root / "failed").exists())
         self.assertFalse(list(self.root.glob(".realm1-placement-*")))
+
+    def test_other_release_manifests_are_rejected_before_deriving_or_writing(self):
+        manifest_path = self.sources / "gcp-cp-ce" / "manifest.json"
+        original = json.loads(manifest_path.read_bytes())
+        for release, source in (("core-testnet-20261026-r2", "5d38eefc07b0925ed9875b74805d9c3fea73d998"),
+                                ("core-testnet-20261030-sd192", "15d6316d1bd28bb535698a4797e3c6261e6c9597")):
+            manifest = dict(original, release_id=release, source_commit=source)
+            manifest_path.write_bytes(json.dumps(manifest).encode())
+            with self.subTest(release=release), patch.object(placement, "build_payloads") as build:
+                with self.assertRaisesRegex(install.InstallError, "original package provenance mismatch"):
+                    self.prepare()
+                build.assert_not_called()
+                self.assertFalse(self.output.exists())
+                self.assertFalse(list(self.root.glob(".realm1-placement-*")))
 
     def test_source_hash_and_private_directory_fail_closed(self):
         key = self.sources / install.PROCESSORS[0] / "keys/realm-1-v1/bls.key"

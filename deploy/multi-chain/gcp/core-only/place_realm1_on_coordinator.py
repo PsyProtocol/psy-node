@@ -6,7 +6,9 @@ apply --package <new-directory>/gcp-cp-ce [--check-only]
 apply --package <new-directory>/gcp-edge-2 [--check-only]
 rollback --package <host-package> [--check-only]
 
-Host actions require root and the existing psy-core account. Original config,
+This adapter accepts only the pinned R3 packages supported by install_host.py;
+it is not the next fresh-release installer. Host actions require root and the
+existing psy-core account. Original config,
 Genesis, binaries, old-host units, existing keys and all state stay unchanged.
 Rollback removes only this placement's exact config/units/drop-ins/slice; copied
 keys and state remain. The operator must stop/mask the three old-host processors
@@ -31,7 +33,7 @@ import prepare_host_packages as packages
 
 
 CONFIG_NAME = "realm1-cp-ce-config.json"
-SLICE = "psy-realm1-r2.slice"
+SLICE = "psy-realm1-r3.slice"
 DROPIN = "50-realm1-cp-ce.conf"
 HOSTS = ("gcp-cp-ce", "gcp-edge-2")
 KEY_NAMES = ("processor_identity.key", "bls.key", "zk.key")
@@ -39,7 +41,7 @@ require = install.require
 
 
 def unit_name(position, role):
-    return f"psy-core-r2-realm-1-v{position}-{role}.service"
+    return f"psy-core-r3-realm-1-v{position}-{role}.service"
 
 
 def read_private(root, name):

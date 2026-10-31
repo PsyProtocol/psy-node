@@ -81,14 +81,22 @@ speculative local writes, so failed sessions must be discarded; this is not
 transactional rollback of a failed temporary session. Final token0/token4
 Genesis/CFC/UPS acceptance and L1 oversized-admission caps remain pending.
 
-Expanded deployment checks: **506 run, 4 failures, 9 errors**. The unmodified
-published baseline `8db67eca` reproduces the same named **4 failures / 9 errors**
-in 496 tests. Four stale assertions require historical R2 pins; nine legacy
-placement tests build R3 unit fixtures while requesting R2 filenames. No tests
-were ignored or assertions weakened. These inherited failures still block
-release acceptance; preparation publication is not a passing full DAG. The
-changed fresh-profile tests pass **23/23**. Preserve both baseline and candidate
-logs under `tmp/deploy-core-*-tests-20261031.log`.
+Expanded deployment checks initially had **506 run, 4 failures, 9 errors**;
+the unmodified published baseline `8db67eca` reproduced the same named failures
+in 496 tests. Follow-up inspection confirmed a real adapter defect, not merely
+a fixture error: `place_realm1_on_coordinator.py` required R3 package provenance
+but requested R2 unit names and slice. Its unit names/slice now match the pinned
+R3 installer. It still rejects both R2 and fresh SD192 package provenance before
+deriving or writing output. The restart tests assert each component's actual
+historical cohort independently: core/Workers are R3, while the old Proxy
+packager deliberately remains R2. No artifact pin or runtime guard was relaxed.
+
+After this correction, **507 core deployment tests passed**, including the new
+cross-cohort refusal regression; the focused placement/restart suite passed
+**15/15**. The fresh-profile tests also pass **23/23**. Preserve the earlier
+baseline/failure logs, `tmp/deploy-legacy-isolation-red-20261031.log`, its green
+counterpart and `tmp/deploy-core-all-tests-r2-20261031.log`. This closes those
+13 historical failures, not the complete runtime/proof/E2E release DAG.
 
 Before enabling the reputation port, all Edges must share one private Redis
 database with `maxmemory-policy noeviction`. Every Edge and queue-creating unit
@@ -268,8 +276,8 @@ Host/key provenance and native acceptance are separate checks.
 
 1. Keep the published source and deployment runtime trees aligned. Runtime
    integration into `testnet-dev` is complete at `15d6316d`; never merge
-   deployment scripts backward. Resolve the inherited deployment-test failures
-   before release acceptance.
+   deployment scripts backward. The historical deployment-test failures are
+   resolved above; the remaining runtime and actual-artifact gates still apply.
 2. Public contract regeneration is complete as recorded above; rebuild again
    if the consumed library or generation inputs change. Rebuild
    compatible SDK/WASM; publish producer revisions before downstream gitlinks.
