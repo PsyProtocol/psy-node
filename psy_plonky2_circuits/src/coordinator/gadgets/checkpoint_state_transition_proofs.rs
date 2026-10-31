@@ -15,6 +15,7 @@ use psy_data::{
     agg::AggStateTransition,
     guta::header::GlobalUserTreeAggregatorHeader,
     guta::realm_finalize::VALIDATOR_TREE_HEIGHT,
+    protocol::circuit_inputs::checkpoint_transition::CHECKPOINT_RANDOM_SEED_DOMAIN,
     v1::qdata::checkpoint::PQEDCheckpointLeafStats,
 };
 use psy_plonky2_basic_helpers::builder::{
@@ -31,13 +32,19 @@ use crate::{
     }, tag_tree::hash_tag_tree_node_single_circuit},
 };
 
+pub fn derive_checkpoint_random_seed_target<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, old_seed: HashOutTarget, new_state_roots_hash: HashOutTarget) -> HashOutTarget {
+    let domain = builder.constant(F::from_canonical_u64(CHECKPOINT_RANDOM_SEED_DOMAIN));
+    let old = old_seed.elements;
+    let roots = new_state_roots_hash.elements;
+    builder.hash_n_to_hash_no_pad::<H>(vec![domain, old[0], old[1], old[2], old[3], roots[0], roots[1], roots[2], roots[3]])
+}
+
 #[derive(Debug, Clone)]
 pub struct QEDPart1StateDeltaResultGadget {
     pub part_1_header: VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget,
 
     pub old_stats: QEDCheckpointLeafStatsGadget,
     pub block_time: Target,
-    pub final_random_seed_contribution: HashOutTarget,
     pub validator_tree_root: HashOutTarget,
 
     // computed
@@ -80,10 +87,10 @@ impl QEDPart1StateDeltaResultGadget {
 
         let old_stats = QEDCheckpointLeafStatsGadget::create_virtual(builder);
         let block_time = builder.add_virtual_target();
-        let final_random_seed_contribution = builder.add_virtual_hash();
 
         let old_state_roots_hash = old_state_roots.to_hash::<H, F, D>(builder);
         let new_state_roots_hash = new_state_roots.to_hash::<H, F, D>(builder);
+        let random_seed = derive_checkpoint_random_seed_target::<H, F, D>(builder, old_stats.random_seed, new_state_roots_hash);
 
         let zero = builder.zero();
 
@@ -97,7 +104,7 @@ impl QEDPart1StateDeltaResultGadget {
             slots_modified: part_1_header.global_user_tree_delta.stats.slots_modified,
             pm_jobs_completed: part_1_header.combined_pm_jobs_completed,
             block_time,
-            random_seed: final_random_seed_contribution,//builder.hash_two_to_one::<H>(old_stats.random_seed, final_random_seed_contribution),
+            random_seed,
             pm_rewards_commitment: PMRewardCommitmentGadget {
                 register_users_root: rewards_tree_tag_tree_root,
                 gutas_root: rewards_tree_tag_tree_root,
@@ -123,7 +130,6 @@ impl QEDPart1StateDeltaResultGadget {
             new_state_roots,
             old_stats,
             block_time,
-            final_random_seed_contribution,
             validator_tree_root,
             new_stats,
             old_checkpoint_leaf,
@@ -141,14 +147,12 @@ impl QEDPart1StateDeltaResultGadget {
         register_users_completed: F,
         old_stats: &PQEDCheckpointLeafStats<F, QHashOut<F>>,
         block_time: F,
-        final_random_seed_contribution: QHashOut<F>,
         validator_tree_root: QHashOut<F>,
     ) -> anyhow::Result<()> {
         self.part_1_header
             .set_witness_params(witness, user_registration_tree_delta, global_contract_tree_delta, global_user_tree_delta, deploy_contracts_completed, register_users_completed)?;
         self.old_stats.set_witness(witness, old_stats)?;
         witness.set_target(self.block_time, block_time)?;
-        witness.set_hash_target(self.final_random_seed_contribution, final_random_seed_contribution.0)?;
         witness.set_hash_target(self.validator_tree_root, validator_tree_root.0)?;
         Ok(())
     }
@@ -223,7 +227,6 @@ impl<const D: usize> CheckpointStateTransitionChildProofsGadget<D> {
         register_users_completed: F,
         old_stats: &PQEDCheckpointLeafStats<F, QHashOut<F>>,
         block_time: F,
-        final_random_seed_contribution: QHashOut<F>,
         validator_tree_root: QHashOut<F>,
         part_1_worker_reward_tree_value: QHashOut<F>,
         part_1_proof: &ProofWithPublicInputs<F, C, D>,
@@ -244,9 +247,131 @@ impl<const D: usize> CheckpointStateTransitionChildProofsGadget<D> {
             register_users_completed,
             old_stats,
             block_time,
-            final_random_seed_contribution,
             validator_tree_root,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod random_seed_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::PoseidonHasher, PF};
+    use parth_core::crypto::hash::traits::QFieldHashable as NodeQFieldHashable;
+    use psy_crypto::hash::traits::qhashable::QFieldHashable as ClientQFieldHashable;
+    use plonky2::field::extension::FieldExtension;
+    use plonky2::{field::{extension::quadratic::QuadraticExtension, types::Field}, gates::{gate::Gate, poseidon::PoseidonGate}, hash::{hash_types::HashOut, poseidon::PoseidonHash}, iop::{generator::generate_partial_witness, witness::{PartialWitness, WitnessWrite}}, plonk::{circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig, vars::EvaluationVars}};
+    use psy_data::protocol::circuit_inputs::checkpoint_transition::derive_checkpoint_random_seed;
+
+    #[test]
+    fn random_seed_node_time_and_reward_independence() {
+        use parth_core::utils::QPGenRandom;
+        use psy_data::{protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInputPartial, v1::qdata::{pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment}};
+        let mut input = QCQEDCheckpointStateTransitionInputPartial::<PF, QHashOut<PF>>::qp_rand_gen();
+        let original = input.get_new_checkpoint_leaf::<PoseidonHasher>(QHashOut::qp_rand_gen());
+        input.block_time = PF::qp_rand_gen();
+        input.pm_jobs_completed = PPMJobsCompletedStats::qp_rand_gen();
+        input.old_stats.pm_rewards_commitment = PPMRewardCommitment::qp_rand_gen();
+        input.part_1_header.guta_proof_header.stats.guta_fees_collected = PF::qp_rand_gen();
+        input.part_1_header.guta_proof_header.stats.da_fees_collected = PF::qp_rand_gen();
+        let changed = input.get_new_checkpoint_leaf::<PoseidonHasher>(QHashOut::qp_rand_gen());
+        assert_eq!(original.global_chain_root, changed.global_chain_root);
+        assert_eq!(original.stats.random_seed, changed.stats.random_seed);
+        let mut client = psy_client_data::protocol::circuit_inputs::checkpoint_transition::QCPsyCheckpointStateTransitionInputPartial::<PF>::default();
+        let original = client.get_new_checkpoint_leaf::<PoseidonHash>();
+        client.block_time = PF::from_canonical_u64(123);
+        client.pm_jobs_completed.deploy_contracts_completed = PF::ONE;
+        client.pm_rewards_commitment.register_users_root = psy_client_common::data::qhashout::QHashOut(HashOut { elements: [PF::ONE; 4] });
+        client.part_1_header.guta_proof_header.stats.guta_fees_collected = PF::ONE;
+        client.part_1_header.guta_proof_header.stats.da_fees_collected = PF::ONE;
+        let changed = client.get_new_checkpoint_leaf::<PoseidonHash>();
+        assert_eq!(original.global_chain_root, changed.global_chain_root);
+        assert_eq!(original.stats.random_seed, changed.stats.random_seed);
+    }
+
+    #[test]
+    fn random_seed_native_circuit_equality_and_replaced_seed_rejection() -> anyhow::Result<()> {
+        let old = QHashOut(HashOut { elements: [1, 2, 3, 4].map(PF::from_canonical_u64) });
+        let roots = QHashOut(HashOut { elements: [5, 6, 7, 8].map(PF::from_canonical_u64) });
+        let expected = derive_checkpoint_random_seed::<PF, QHashOut<PF>, PoseidonHasher>(old, roots);
+        assert_eq!(
+            expected.0.elements,
+            [0x3fa86564640496ebu64, 0x6dec7f0c86d49a9b, 0xa25eb3f99503eaeb, 0xcc2289274427ca26].map(PF::from_canonical_u64),
+            "the pinned seed vector changed; regenerate it and resync the psy_data behavior test"
+        );
+        let mut builder = CircuitBuilder::<PF, 2>::new(CircuitConfig::standard_recursion_config());
+        let old_target = builder.add_virtual_hash();
+        let roots_target = builder.add_virtual_hash();
+        let seed = derive_checkpoint_random_seed_target::<PoseidonHash, PF, 2>(&mut builder, old_target, roots_target);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut inputs = PartialWitness::new();
+        inputs.set_hash_target(old_target, old.0)?;
+        inputs.set_hash_target(roots_target, roots.0)?;
+        let witness = generate_partial_witness(inputs, &data.prover_only, &data.common)?;
+        assert_eq!(witness.get_hash_target(seed), expected.0);
+        let Target::Wire(output_wire) = seed.elements[0] else { panic!("seed must be a Poseidon output wire") };
+        let gate = PoseidonGate::<PF, 2>::new();
+        let mut wires: Vec<QuadraticExtension<PF>> = (0..gate.num_wires()).map(|column| <QuadraticExtension<PF> as FieldExtension<2>>::from_basefield(witness.get_target(Target::wire(output_wire.row, column)))).collect();
+        let public_inputs_hash = HashOut::ZERO;
+        assert!(gate.eval_unfiltered(EvaluationVars { local_constants: &[], local_wires: &wires, public_inputs_hash: &public_inputs_hash }).iter().all(|value| value.is_zero()));
+        wires[output_wire.column] += QuadraticExtension::ONE;
+        assert!(gate.eval_unfiltered(EvaluationVars { local_constants: &[], local_wires: &wires, public_inputs_hash: &public_inputs_hash }).iter().any(|value| !value.is_zero()));
+        Ok(())
+    }
+
+    #[test]
+    fn random_seed_node_client_twins_match() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..128 {
+            let old = HashOut { elements: std::array::from_fn(|_| PF::from_noncanonical_u64(rng.gen())) };
+            let roots = HashOut { elements: std::array::from_fn(|_| PF::from_noncanonical_u64(rng.gen())) };
+            let node = derive_checkpoint_random_seed::<PF, QHashOut<PF>, PoseidonHasher>(QHashOut(old), QHashOut(roots));
+            let client = psy_client_data::protocol::circuit_inputs::checkpoint_transition::derive_checkpoint_random_seed::<PF, PoseidonHash>(psy_client_common::data::qhashout::QHashOut(old), psy_client_common::data::qhashout::QHashOut(roots));
+            assert_eq!(node.0, client.0);
+        }
+    }
+
+    #[test]
+    fn checkpoint_leaf_twins_agree_in_empty_validator_tree_domain() {
+        use parth_core::crypto::hash::traits::MerkleZeroHasher;
+        use parth_core::utils::QPGenRandom;
+        use psy_client_data::qdata::pm_jobs_completed_stats::PMJobsCompletedStats as ClientPMJobs;
+        use psy_client_data::qdata::pm_reward_commitment::PMRewardCommitment as ClientRewards;
+        use psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT;
+        use psy_data::protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInputPartial;
+
+        type H = QHashOut<PF>;
+        let contract_root = H::qp_rand_gen();
+        let reward_root = H::qp_rand_gen();
+        let mut node = QCQEDCheckpointStateTransitionInputPartial::<PF, H>::qp_rand_gen();
+        node.validator_tree_root = PoseidonHasher::get_zero_hash(VALIDATOR_TREE_HEIGHT);
+        node.part_1_header.deploy_contracts_state_transition.state_transition_end = contract_root;
+        node.part_1_header.update_contracts_state_transition.state_transition_end = contract_root;
+        let node_leaf = node.get_new_checkpoint_leaf::<PoseidonHasher>(reward_root);
+
+        let mut client = psy_client_data::protocol::circuit_inputs::checkpoint_transition::QCPsyCheckpointStateTransitionInputPartial::<PF>::default();
+        client.part_1_header.deploy_contracts_state_transition.state_transition_end = psy_client_common::data::qhashout::QHashOut(contract_root.0);
+        client.part_1_header.register_users_state_transition.state_transition_end = psy_client_common::data::qhashout::QHashOut(node.part_1_header.register_users_state_transition.state_transition_end.0);
+        client.part_1_header.guta_proof_header.state_transition.new_node_value = psy_client_common::data::qhashout::QHashOut(node.part_1_header.guta_proof_header.state_transition.new_node_value.0);
+        client.part_1_header.guta_proof_header.stats.guta_fees_collected = node.part_1_header.guta_proof_header.stats.guta_fees_collected;
+        client.part_1_header.guta_proof_header.stats.da_fees_collected = node.part_1_header.guta_proof_header.stats.da_fees_collected;
+        client.part_1_header.guta_proof_header.stats.user_ops_processed = node.part_1_header.guta_proof_header.stats.user_ops_processed;
+        client.part_1_header.guta_proof_header.stats.total_transactions = node.part_1_header.guta_proof_header.stats.total_transactions;
+        client.part_1_header.guta_proof_header.stats.slots_modified = node.part_1_header.guta_proof_header.stats.slots_modified;
+        client.old_stats.random_seed = psy_client_common::data::qhashout::QHashOut(node.old_stats.random_seed.0);
+        client.pm_jobs_completed = ClientPMJobs {
+            deploy_contracts_completed: node.pm_jobs_completed.deploy_contracts_completed,
+            register_users_completed: node.pm_jobs_completed.register_users_completed,
+            gutas_completed: node.pm_jobs_completed.gutas_completed,
+        };
+        client.block_time = node.block_time;
+        client.pm_rewards_commitment = ClientRewards {
+            register_users_root: psy_client_common::data::qhashout::QHashOut(reward_root.0),
+            gutas_root: psy_client_common::data::qhashout::QHashOut(reward_root.0),
+            deploy_contracts_root: psy_client_common::data::qhashout::QHashOut(reward_root.0),
+        };
+        let client_leaf = client.get_new_checkpoint_leaf::<PoseidonHash>();
+        assert_eq!(node_leaf.qfhash::<PoseidonHasher>().0, client_leaf.qfhash::<PoseidonHash>().0);
     }
 }

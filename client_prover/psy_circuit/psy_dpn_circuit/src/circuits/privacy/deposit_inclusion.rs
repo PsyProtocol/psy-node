@@ -59,7 +59,6 @@ impl DepositInclusionGadget {
         let token_address_words = std::array::from_fn(|_| builder.add_virtual_target());
         let l2_token_contract_id_words = std::array::from_fn(|_| builder.add_virtual_target());
         let amount_words = std::array::from_fn(|_| builder.add_virtual_target());
-        let zero = builder.zero();
 
         let nullifier_hash = builder.hash_n_to_hash_no_pad::<H>(nullifier_secret.to_vec());
         let note_commitment = builder.hash_n_to_hash_no_pad::<H>(vec![
@@ -73,10 +72,9 @@ impl DepositInclusionGadget {
             note_secret[3],
         ]);
 
-        for word in amount_words.iter().take(6) {
-            builder.connect(*word, zero);
-        }
 
+        // Bind all amount words to the relayer leaf. The token's claim_deposit
+        // checks its own uint64/Felt amount limit before any credit is applied.
         // Keep the exact field/u32 layout used by the relayer deposit leaf.
         // This proof must commit to the same leaf the receiver later claims.
         let shield_address_words: [Target; 8] = std::array::from_fn(|i| {
@@ -458,6 +456,8 @@ mod tests {
         assert_eq!(circuit.circuit_data.common.num_public_inputs, 4);
         assert_eq!(circuit.get_common_circuit_data_ref().num_public_inputs, 4);
         println!("deposit inclusion fingerprint: {:?}", circuit.get_fingerprint());
+        let expected = QHashOut::from_values(10300675757615779284, 7959431029994071658, 2858758774398267815, 15642499089729770720);
+        assert_eq!(circuit.get_fingerprint(), expected);
     }
 
     /// build -> serialize (incl. minifier chain) -> deserialize, asserting

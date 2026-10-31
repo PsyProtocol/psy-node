@@ -24,7 +24,7 @@ JSON-RPC edge API for the Coordinator node. All methods use namespace `psy`.
 | RPC method | Parameters |
 |---|---|
 | `psy_deploy_contract` | `deploy_contract`: `PQBCDeployContractV2<Hash>` |
-| `psy_update_contract` | `update_contract`: `PQBCUpdateContract<Hash>` |
+| `psy_update_contract` | `update_contract`: `PQBCUpdateContract<Hash>`, `authorization`: `PContractUpdateAuthorization` (deployer signature over the update digest; genesis contracts are immutable) |
 | `psy_get_contract_leaf_data` | `contract_id`: `u64` |
 | `psy_get_contract_code_definition` | `contract_id`: `u64` |
 

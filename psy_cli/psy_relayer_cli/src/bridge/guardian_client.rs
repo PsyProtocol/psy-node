@@ -54,8 +54,11 @@ impl GuardianClient {
             Ok(url)
         }).collect::<anyhow::Result<Vec<_>>>()?;
         ensure!(endpoints[0] != endpoints[1] && endpoints[0] != endpoints[2] && endpoints[1] != endpoints[2], "guardian origins must be distinct");
+        // No total request deadline: the sign POST waits out the guardian's unbounded signing
+        // phase. Connection establishment stays transport-bounded; the history GET re-applies
+        // its own per-request deadline.
         let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(620)).no_gzip().no_brotli().no_deflate().no_zstd().build()?;
+            .connect_timeout(Duration::from_secs(10)).no_gzip().no_brotli().no_deflate().no_zstd().build()?;
         Ok(Self { http, endpoints: endpoints.try_into().map_err(|_| anyhow::anyhow!("three guardian endpoints required"))? })
     }
 
@@ -67,7 +70,8 @@ impl GuardianClient {
             let mut url = origin.clone();
             url.set_path("/v1/sessions");
             url.query_pairs_mut().append_pair("after_nonce", &after_nonce.to_string()).append_pair("limit", "1");
-            let Ok(mut response) = self.http.get(url).header(reqwest::header::ACCEPT, GUARDIAN_RECORD).send().await else { continue };
+            // Same whole-request bound the shared client previously applied to this GET.
+            let Ok(mut response) = self.http.get(url).timeout(Duration::from_secs(620)).header(reqwest::header::ACCEPT, GUARDIAN_RECORD).send().await else { continue };
             if !response.status().is_success() { continue; }
             let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(|value| value.split(';').next().unwrap_or("").trim().to_owned()) else { continue };
             if !content_type.eq_ignore_ascii_case(GUARDIAN_RECORD) && !content_type.eq_ignore_ascii_case("application/json") { continue; }
@@ -106,6 +110,7 @@ impl GuardianClient {
 
     pub async fn collect(&self, request_json: &JsonText<GuardianSignRequest>, policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> anyhow::Result<MultisigSignatures> {
         let request = request_json.decode()?;
+        ensure!(request.operation == protocol::GuardianOperation::Bridge, "policy signatures require explicit local operator approval");
         // Cutover gate: retained schema-2 rows stay readable but are never posted, even to an
         // old guardian. Reject locally before any network I/O; the stored row is untouched.
         ensure!(request.schema_version == 3, "schema 2 signing obligation must be included before upgrading; retained request is unchanged");
@@ -126,8 +131,8 @@ impl GuardianClient {
                 SignAttempt::Signed(response) => {
                     let signature = match verify_response(&request, policy, message, &response) {
                         Ok(signature) => signature,
-                        Err(error) => {
-                            tracing::warn!(guardian, member = response.member_index, error = %error, "guardian sign response failed local verification");
+                        Err(_) => {
+                            tracing::warn!(guardian, member = response.member_index, verified = false, "guardian sign response failed local verification");
                             continue;
                         }
                     };
@@ -153,11 +158,13 @@ enum SignAttempt {
 }
 
 async fn request_signature(http: &reqwest::Client, guardian: usize, url: url::Url, bytes: &str) -> anyhow::Result<SignAttempt> {
+    let started = std::time::Instant::now();
     let frame = protocol::encode_record(bytes.as_bytes()).map_err(|error| anyhow::anyhow!(error))?;
     let mut response = match http.post(url).header(reqwest::header::CONTENT_TYPE, GUARDIAN_RECORD).body(frame).send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(guardian, error = %error, "guardian sign transport failed");
+            tracing::warn!(guardian, is_timeout = error.is_timeout(), is_connect = error.is_connect(), is_body = error.is_body(), is_decode = error.is_decode(), "guardian sign transport failed");
+            tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "transport", "guardian sign-session endpoint finished");
             return Ok(SignAttempt::Missing);
         }
     };
@@ -168,21 +175,27 @@ async fn request_signature(http: &reqwest::Client, guardian: usize, url: url::Ur
             Ok(Some(chunk)) => {
                 if body.try_reserve(chunk.len()).is_err() {
                     tracing::warn!(guardian, status = status.as_u16(), "guardian response collection failed");
+                    tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "collect_failed", "guardian sign-session endpoint finished");
                     return Ok(SignAttempt::Missing);
                 }
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             Err(error) => {
-                tracing::warn!(guardian, error = %error, "guardian sign transport failed");
+                tracing::warn!(guardian, is_timeout = error.is_timeout(), is_connect = error.is_connect(), is_body = error.is_body(), is_decode = error.is_decode(), "guardian sign transport failed");
+                tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "transport", "guardian sign-session endpoint finished");
                 return Ok(SignAttempt::Missing);
             }
         }
     }
     if status.is_success() {
         return match protocol::parse_canonical_json::<GuardianSignResponse>(&body) {
-            Ok(response) => Ok(SignAttempt::Signed(response)),
+            Ok(response) => {
+                tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "signed", "guardian sign-session endpoint finished");
+                Ok(SignAttempt::Signed(response))
+            }
             Err(_) => {
+                tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "unreadable", "guardian sign-session endpoint finished");
                 tracing::warn!(guardian, status = status.as_u16(), "guardian sign response unreadable");
                 Ok(SignAttempt::Missing)
             }
@@ -191,20 +204,23 @@ async fn request_signature(http: &reqwest::Client, guardian: usize, url: url::Ur
     match protocol::parse_canonical_json::<GuardianSignErrorResponse>(&body) {
         Ok(error) if hard_refusal(error.code) => {
             tracing::warn!(guardian, code = %error.code, "guardian refused sign request");
+            tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "hard_refusal", "guardian sign-session endpoint finished");
             Ok(SignAttempt::Hard(error.code))
         }
         Ok(error) => {
             tracing::warn!(guardian, code = %error.code, "guardian sign refusal is retryable");
+            tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "retryable", "guardian sign-session endpoint finished");
             Ok(SignAttempt::Missing)
         }
         Err(_) => {
             tracing::warn!(guardian, status = status.as_u16(), "guardian sign error response unreadable");
+            tracing::debug!(guardian, elapsed_ms = started.elapsed().as_millis() as u64, outcome = "unreadable", "guardian sign-session endpoint finished");
             Ok(SignAttempt::Missing)
         }
     }
 }
 
-fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Option<MultisigSignatures> {
+pub(crate) fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Option<MultisigSignatures> {
     accepted.sort_by_key(|member| member.0);
     for first in 0..accepted.len() {
         for second in first + 1..accepted.len() {
@@ -218,7 +234,7 @@ fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], pol
     None
 }
 
-fn verify_response(request: &GuardianSignRequest, policy: &MultisigPolicy, message: Hash256, response: &GuardianSignResponse) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+pub(crate) fn verify_response(request: &GuardianSignRequest, policy: &MultisigPolicy, message: Hash256, response: &GuardianSignResponse) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
     ensure!(response.request_id == request.request_id()? && response.network_magic == request.network_magic && response.user_id == request.user_id && response.session_nonce == request.session_nonce, "guardian response context mismatch");
     ensure!(response.policy_commitment == policy.commitment()? && response.member_index < 3 && response.message.0 == message.0, "guardian response policy/message mismatch");
     Ok(PsyCompressedSecp256K1Signature { public_key: response.public_key.0, signature: response.signature.0, message })
@@ -231,6 +247,14 @@ const INCLUDED_WITHDRAWAL_BURNS: TableDefinition<WithdrawalBurnKey, u64> = Table
 const WITHDRAWAL_NONCE: TableDefinition<NonceKey, u64> = TableDefinition::new("guardian_withdrawal_nonce");
 const CHAIN_CLAIMS: TableDefinition<u8, &[u8]> = TableDefinition::new("chain_claims");
 const FINALIZATION_BATCH: TableDefinition<(), &[u8]> = TableDefinition::new("finalization_batch");
+const WITHDRAWAL_QUARANTINE: TableDefinition<(u8, i64), &[u8]> = TableDefinition::new("withdrawal_quarantine");
+
+/// Why an indexed withdrawal is held out of the append/claim set: the Router
+/// mapping for its (token, contract id) pair failed the same dual check the
+/// guardians apply at signing time. The check is deterministic, so a marker
+/// stays for the life of the journal; a transient L1 failure never writes one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WithdrawalQuarantine { pub reason: String, pub quarantined_at_unix: u64 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChainClaims {
@@ -281,10 +305,11 @@ pub(crate) struct FinalizationRange {
 }
 
 const JOURNAL_SCHEMA: TableDefinition<(), u64> = TableDefinition::new("journal_schema");
-const JOURNAL_SCHEMA_VERSION: u64 = 3;
+const JOURNAL_SCHEMA_VERSION: u64 = 4;
+const JOURNAL_SCHEMA_V3: u64 = 3;
 const JOURNAL_SCHEMA_V2: u64 = 2;
 const GUARDIAN_RECORD: &str = "application/vnd.psy.guardian-record+zstd";
-const RELAYER_TABLES: [&str; 8] = ["journal_schema", "chain_claims", "finalization_batch", "guardian_account", "deposit_tree_states", "included_withdrawal_burns", "guardian_withdrawal_nonce", "relayer_request"];
+const RELAYER_TABLES: [&str; 9] = ["journal_schema", "chain_claims", "finalization_batch", "guardian_account", "deposit_tree_states", "included_withdrawal_burns", "guardian_withdrawal_nonce", "relayer_request", "withdrawal_quarantine"];
 const LEGACY_JOURNAL: &str = "incompatible legacy journal schema; explicit operator-controlled migration is required";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,6 +445,7 @@ impl RelayerDb {
             tx.open_table(WITHDRAWAL_NONCE)?;
             tx.open_table(CHAIN_CLAIMS)?;
             tx.open_table(FINALIZATION_BATCH)?;
+            tx.open_table(WITHDRAWAL_QUARANTINE)?;
             tx.commit()?;
         } else {
             ensure!(names == RELAYER_TABLES.into_iter().map(str::to_owned).collect::<std::collections::BTreeSet<String>>(), "{LEGACY_JOURNAL}");
@@ -555,6 +581,41 @@ impl RelayerDb {
         if let Some(row) = table.get(())? { decode_progress::<FinalizationBatch>(row.value())?; }
         table.insert((), encode_progress(batch)?.as_slice())?;
         Ok(())
+    }
+
+    /// Quarantine markers for indexed withdrawals whose Router token binding is
+    /// wrong, keyed by (destination chain, global services event id).
+    pub(crate) fn quarantined_withdrawals(&self) -> anyhow::Result<BTreeMap<(u8, i64), WithdrawalQuarantine>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(WITHDRAWAL_QUARANTINE)?;
+        table.iter()?.map(|row| {
+            let (key, value) = row?;
+            Ok((key.value(), decode_progress::<WithdrawalQuarantine>(value.value())?))
+        }).collect()
+    }
+
+    /// Writes new quarantine markers; a key already present keeps its original reason.
+    pub(crate) fn quarantine_withdrawals(&self, quarantines: &BTreeMap<(u8, i64), WithdrawalQuarantine>) -> anyhow::Result<()> {
+        if quarantines.is_empty() { return Ok(()); }
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(WITHDRAWAL_QUARANTINE)?;
+            for (key, quarantine) in quarantines {
+                if table.get(*key)?.is_some() { continue; }
+                table.insert(*key, encode_progress(quarantine)?.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Number of quarantine markers for one destination chain. Together with
+    /// the on-chain L2 append cursor this is the services stream position the
+    /// next fetch starts from: every fetched event either appends or is marked.
+    pub(crate) fn quarantine_marker_count(&self, chain: u8) -> anyhow::Result<u64> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(WITHDRAWAL_QUARANTINE)?;
+        Ok(table.range::<(u8, i64)>((chain, i64::MIN)..=(chain, i64::MAX))?.count() as u64)
     }
 
     #[cfg(test)]
@@ -1008,7 +1069,7 @@ impl RelayerDb {
                 amount: append.burn.amount,
                 recipient: append.burn.recipient,
                 nonce: append.burn.nonce,
-                leaf_hash: crate::bridge::propose_withdrawals::compute_withdrawal_leaf_hash(u64::from(append.burn.sender_user_id), append.burn.recipient, append.burn.token, append.burn.amount, append.burn.nonce, u64::from(append.burn.destination_chain_index))?,
+                leaf_hash: crate::bridge::propose_withdrawals::compute_withdrawal_leaf_hash(u64::from(append.burn.sender_user_id), append.burn.recipient, append.burn.token, append.burn.amount, append.burn.nonce, u64::from(append.burn.destination_chain_index), u64::from(append.burn.token_contract_id))?,
             })).collect::<anyhow::Result<Vec<_>>>()?;
             self.insert_chain_claims(&tx, &claims)?;
         }
@@ -1082,13 +1143,22 @@ fn validate_request(value: &Request, config: &protocol::GuardianConfig, nonce: u
 }
 
 /// Offline schema migration. The caller holds the exclusive database. Marker 2 rewrites every
-/// `relayer_request` row in one transaction; marker 3 keeps every byte and validates the retained
-/// suffix against the authoritative account cursor. Neither marker prunes: older rows only leave
-/// with the next authenticated import, so a transitional journal may still hold the full history.
+/// `relayer_request` row in one transaction; marker 3 keeps every byte and only adds the empty
+/// withdrawal quarantine table; marker 4 additionally validates the retained suffix against the
+/// authoritative account cursor. Neither migration prunes: older rows only leave with the next
+/// authenticated import, so a transitional journal may still hold the full history.
 /// Keys are collected first and each value is replaced before the next row is read.
 pub(crate) fn migrate_relayer_journal(db: &redb::Database, config: &protocol::GuardianConfig) -> anyhow::Result<u64> {
     let marker = journal_marker(db)?;
     if marker == JOURNAL_SCHEMA_VERSION { return Ok(validate_current_requests(db, config)?); }
+    if marker == JOURNAL_SCHEMA_V3 {
+        let tx = db.begin_write()?;
+        if journal_marker_in_write(&tx)? != JOURNAL_SCHEMA_V3 { anyhow::bail!("{LEGACY_JOURNAL}"); }
+        tx.open_table(WITHDRAWAL_QUARANTINE)?;
+        tx.open_table(JOURNAL_SCHEMA)?.insert((), JOURNAL_SCHEMA_VERSION)?;
+        tx.commit()?;
+        return Ok(validate_current_requests(db, config)?);
+    }
     if marker != JOURNAL_SCHEMA_V2 { anyhow::bail!("{LEGACY_JOURNAL}"); }
     let keys = request_keys(db)?;
     let tx = db.begin_write()?;
@@ -1098,6 +1168,7 @@ pub(crate) fn migrate_relayer_journal(db: &redb::Database, config: &protocol::Gu
     // history leaves the marker bump and every rewritten row uncommitted.
     let checked = validate_retained_suffix(&tx.open_table(GUARDIAN_ACCOUNT)?, &tx.open_table(RELAYER_REQUEST)?, config)?;
     ensure!(checked == count, "relayer request migration count mismatch");
+    tx.open_table(WITHDRAWAL_QUARANTINE)?;
     tx.open_table(JOURNAL_SCHEMA)?.insert((), JOURNAL_SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(count)
@@ -1107,11 +1178,23 @@ fn journal_marker(db: &redb::Database) -> anyhow::Result<u64> {
     let tx = db.begin_read()?;
     ensure!(tx.list_multimap_tables()?.next().is_none(), "{LEGACY_JOURNAL}");
     let names = tx.list_tables()?.map(|table| table.name().to_owned()).collect::<std::collections::BTreeSet<_>>();
-    ensure!(names == RELAYER_TABLES.into_iter().map(str::to_owned).collect(), "{LEGACY_JOURNAL}");
+    // The table set must match the marker: "eight tables with marker 4" and
+    // "nine tables with marker 3" are both broken journals, not migrations.
+    // Marker 2 shares the schema 3 set: its migration rewrites rows only.
+    let full: std::collections::BTreeSet<String> = RELAYER_TABLES.into_iter().map(str::to_owned).collect();
     let schema = tx.open_table(JOURNAL_SCHEMA)?;
     ensure!(schema.len()? == 1, "{LEGACY_JOURNAL}");
-    let value = schema.get(())?;
-    match value { Some(row) => Ok(row.value()), None => anyhow::bail!("{LEGACY_JOURNAL}") }
+    let marker = match schema.get(())? { Some(row) => row.value(), None => anyhow::bail!("{LEGACY_JOURNAL}") };
+    match marker {
+        JOURNAL_SCHEMA_VERSION => ensure!(names == full, "{LEGACY_JOURNAL}"),
+        JOURNAL_SCHEMA_V3 | JOURNAL_SCHEMA_V2 => {
+            let mut without_quarantine = full;
+            without_quarantine.remove("withdrawal_quarantine");
+            ensure!(names == without_quarantine, "{LEGACY_JOURNAL}");
+        }
+        _ => anyhow::bail!("{LEGACY_JOURNAL}"),
+    }
+    Ok(marker)
 }
 
 fn journal_marker_in_write(tx: &redb::WriteTransaction) -> anyhow::Result<u64> {
@@ -1308,11 +1391,12 @@ pub(crate) async fn prove_pending_request(
     archive.save_request(config, request_json, deposit_tree_states, &[])?;
     let signatures = match archive.signatures(request.session_nonce)? {
         Some(signatures) => signatures,
-        None => {
+        None if request.operation == protocol::GuardianOperation::Bridge => {
             let signatures = client.collect(request_json, &policy, trace.finalization.sig_hash).await?;
             archive.save_signatures(request.session_nonce, &signatures)?;
             signatures
         }
+        None => anyhow::bail!("local operator signatures are required for the frozen policy request"),
     };
     validate_policy_signatures(&signatures, &policy, trace.finalization.sig_hash)?;
     wallet.inject_multisig_signatures(trace.meta.public_key, signatures).await?;
@@ -1680,6 +1764,53 @@ mod tests {
         inspect(&db);
         drop(db);
         inspect(&RelayerDb::open(&path).unwrap());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn quarantine_markers_persist_and_keep_the_first_reason() {
+        let path = protected_root("quarantine");
+        let db = RelayerDb::open(&path).unwrap();
+        assert!(db.quarantined_withdrawals().unwrap().is_empty());
+        let mut markers = BTreeMap::new();
+        markers.insert((0u8, 33i64), WithdrawalQuarantine { reason: "WithdrawalMismatch".to_owned(), quarantined_at_unix: 100 });
+        db.quarantine_withdrawals(&markers).unwrap();
+        // A second write must not displace the original reason or timestamp.
+        let mut repeat = BTreeMap::new();
+        repeat.insert((0u8, 33i64), WithdrawalQuarantine { reason: "RewriteAttempt".to_owned(), quarantined_at_unix: 200 });
+        repeat.insert((1u8, 34i64), WithdrawalQuarantine { reason: "WithdrawalMismatch".to_owned(), quarantined_at_unix: 300 });
+        db.quarantine_withdrawals(&repeat).unwrap();
+        let saved = db.quarantined_withdrawals().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[&(0, 33)].reason, "WithdrawalMismatch");
+        assert_eq!(saved[&(0, 33)].quarantined_at_unix, 100);
+        assert_eq!(saved[&(1, 34)].reason, "WithdrawalMismatch");
+        drop(db);
+        let reopened = RelayerDb::open(&path).unwrap();
+        assert_eq!(reopened.quarantined_withdrawals().unwrap(), saved);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn schema3_journal_migrates_by_adding_the_quarantine_table() {
+        let path = protected_root("schema3");
+        let db = RelayerDb::open(&path).unwrap();
+        {
+            // Regress the journal to the pre-quarantine schema 3 shape.
+            let tx = db.db.begin_write().unwrap();
+            tx.delete_table(WITHDRAWAL_QUARANTINE).unwrap();
+            tx.open_table(JOURNAL_SCHEMA).unwrap().insert((), JOURNAL_SCHEMA_V3).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(db);
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path.join("db").join("relayer.redb")).unwrap();
+        let raw = redb::Database::builder().create_file(file).unwrap();
+        assert_eq!(migrate_relayer_journal(&raw, &fixture_config()).unwrap(), 0);
+        let schema = { let tx = raw.begin_read().unwrap(); tx.open_table(JOURNAL_SCHEMA).unwrap().get(()).unwrap().unwrap().value() };
+        assert_eq!(schema, JOURNAL_SCHEMA_VERSION);
+        drop(raw);
+        let reopened = RelayerDb::open(&path).unwrap();
+        assert!(reopened.quarantined_withdrawals().unwrap().is_empty());
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -2160,6 +2291,14 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
     }
 
+    fn bridge_collect_request() -> GuardianSignRequest {
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        request.operation = protocol::GuardianOperation::Bridge;
+        request.withdrawal_records = vec![protocol::WithdrawalBurnRecord { sender_user_id: 1, token_contract_id: 3, destination_chain_index: 0, token: [0, 0, 0, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0, 0, 0, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c], nonce: [0; 8] }];
+        request.validate().unwrap();
+        request
+    }
+
     fn authorized_signatures() -> (QHashOut<GoldilocksField>, MultisigPolicy, [PsyCompressedSecp256K1Signature; 3]) {
         use plonky2::hash::poseidon::PoseidonPermutation;
         use psy_client_common::data::secp256k1::CompressedPublicKey;
@@ -2245,7 +2384,7 @@ mod tests {
     #[test]
     fn quorum_succeeds_when_one_guardian_refuses() {
         let (sighash, policy, signatures) = authorized_signatures();
-        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let request = bridge_collect_request();
         let json = JsonText::from_value(&request).unwrap();
         let later = Duration::from_millis(300);
         let origins = [
@@ -2261,9 +2400,23 @@ mod tests {
     }
 
     #[test]
+    fn collect_refuses_policy_before_any_network_request() {
+        let (sighash, policy, _) = authorized_signatures();
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        request.operation = protocol::GuardianOperation::ReplacePolicy;
+        let json = JsonText::from_value(&request).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origins = [format!("http://{}/", listener.local_addr().unwrap()), refused_origin(), refused_origin()];
+        let error = drive(async { GuardianClient::new(&origins).unwrap().collect(&json, &policy, sighash).await.unwrap_err() });
+        drop(listener);
+        assert!(error.to_string().contains("explicit local operator approval"), "{error:?}");
+    }
+
+    #[test]
     fn transport_and_retryable_failures_are_signature_quorum_unavailable() {
         let (sighash, policy, _) = authorized_signatures();
-        let json = JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap();
+        let request = bridge_collect_request();
+        let json = JsonText::from_value(&request).unwrap();
         let missing = [refused_origin(), refused_origin(), refused_origin()];
         let error = drive(async {
             GuardianClient::new(&missing).unwrap().collect(&json, &policy, sighash).await.unwrap_err()
@@ -2292,7 +2445,7 @@ mod tests {
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
         let (sighash, policy, signatures) = authorized_signatures();
-        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let request = bridge_collect_request();
         let json = JsonText::from_value(&request).unwrap();
         let mut halt_id = [0u8; 32];
         halt_id[..4].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
@@ -2322,7 +2475,7 @@ mod tests {
         let recipient = [0, 0, 0, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c];
         let mut nonce_words = [0; 8];
         nonce_words[7] = nonce;
-        let leaf_hash = crate::bridge::propose_withdrawals::compute_withdrawal_leaf_hash(1, recipient, token, [0, 0, 0, 0, 0, 0, 0, 1], nonce_words, u64::from(chain)).unwrap();
+        let leaf_hash = crate::bridge::propose_withdrawals::compute_withdrawal_leaf_hash(1, recipient, token, [0, 0, 0, 0, 0, 0, 0, 1], nonce_words, u64::from(chain), 3).unwrap();
         crate::bridge::propose_withdrawals::PendingWithdrawal {
             event_id: i64::from(nonce), checkpoint_id: 4, user_id: 1, sender_user_id: 1, contract_id: 3,
             destination_chain_index: u64::from(chain), token_address: token, amount: [0, 0, 0, 0, 0, 0, 0, 1],
@@ -2456,7 +2609,8 @@ mod tests {
     #[test]
     fn hard_refusal_follows_guardian_id_not_arrival() {
         let (sighash, policy, _) = authorized_signatures();
-        let json = JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap();
+        let request = bridge_collect_request();
+        let json = JsonText::from_value(&request).unwrap();
         let origins = [
             serve_once(GuardianSignError::ProofMismatch.http_status(), refusal_body(GuardianSignError::ProofMismatch), Duration::from_millis(400)),
             refused_origin(),

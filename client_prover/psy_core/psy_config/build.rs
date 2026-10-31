@@ -38,8 +38,8 @@ fn main() {
         }
     });
 
-    // 不再有隐式默认值：构建必须说明自己属于哪个阶段。
-    // 从前这里默认 localhost，于是 testnet 部署一直在用 localhost 那个块。
+    // Builds must select their stage explicitly. The former localhost default
+    // silently selected localhost configuration for testnet builds.
     let network = env::var("PSY_NETWORK").unwrap_or_else(|_| {
         panic!(
             "PSY_NETWORK is required and must be one of: {}. \

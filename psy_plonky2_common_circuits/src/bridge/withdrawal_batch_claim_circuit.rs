@@ -21,7 +21,12 @@ use crate::hash::keccak::keccak256_u32_words_be_abi;
 
 const WORDS_PER_BYTES32: usize = 8;
 pub const MAX_WITHDRAWAL_CLAIM_BATCH_SIZE: usize = 32;
-pub const WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS: usize = 34;
+// Slot words 0..35 are the L1 Bridge slot: sender_user_id, recipient[8],
+// token[8], amount[8], nonce[8], destination_chain_index, token_contract_id
+// (word 34). The 35-felt Merkle leaf is Poseidon over exactly these slot
+// words; the leaf hash itself is not a slot word and does not enter the
+// keccak slot commitment.
+pub const WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS: usize = 35;
 pub const WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS: usize =
     WORDS_PER_BYTES32 + 2 + WORDS_PER_BYTES32;
 
@@ -33,6 +38,7 @@ pub struct WithdrawalBatchClaimSlotInputs<F: RichField> {
     pub amount: [u32; WORDS_PER_BYTES32],
     pub nonce: [u32; WORDS_PER_BYTES32],
     pub destination_chain_index: u32,
+    pub token_contract_id: u32,
     pub leaf_index: u32,
     pub siblings: Vec<QHashOut<F>>,
 }
@@ -52,6 +58,7 @@ pub struct WithdrawalBatchClaimSlotTargets {
     pub amount: [U32Target; WORDS_PER_BYTES32],
     pub nonce: [U32Target; WORDS_PER_BYTES32],
     pub destination_chain_index: U32Target,
+    pub token_contract_id: U32Target,
     pub leaf_index: U32Target,
     pub leaf_hash: HashOutTarget,
 }
@@ -100,6 +107,7 @@ where
             let amount = add_virtual_u32x8(&mut builder);
             let nonce = add_virtual_u32x8(&mut builder);
             let destination_chain_index = builder.add_virtual_u32_target();
+            let token_contract_id = builder.add_virtual_u32_target();
             let leaf_index = builder.add_virtual_u32_target();
 
             let leaf_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(
@@ -109,14 +117,22 @@ where
                     .chain(amount.iter().map(|v| v.0))
                     .chain(nonce.iter().map(|v| v.0))
                     .chain(std::iter::once(destination_chain_index.0))
+                    .chain(std::iter::once(token_contract_id.0))
                     .collect::<Vec<_>>(),
             );
+            let slot_index = builder.constant(C::F::from_noncanonical_u64(i as u64));
+            let is_active = builder.is_less_than(32, slot_index, real_count_target.0);
+            let is_inactive = builder.not(is_active);
+
+            // The keccak commitment covers all 35 L1 slot words, binding the
+            // token contract id (word 34) into the batch claim.
             let slot_data_words = std::iter::once(sender_user_id.0)
                 .chain(recipient.iter().map(|v| v.0))
                 .chain(token.iter().map(|v| v.0))
                 .chain(amount.iter().map(|v| v.0))
                 .chain(nonce.iter().map(|v| v.0))
                 .chain(std::iter::once(destination_chain_index.0))
+                .chain(std::iter::once(token_contract_id.0))
                 .collect::<Vec<_>>();
 
             let merkle_proof = MerkleProofGadget::add_virtual_to_with_options::<PoseidonHash, C::F, D>(
@@ -129,10 +145,6 @@ where
                     siblings: None,
                 },
             );
-
-            let slot_index = builder.constant(C::F::from_noncanonical_u64(i as u64));
-            let is_active = builder.is_less_than(32, slot_index, real_count_target.0);
-            let is_inactive = builder.not(is_active);
 
             builder.connect_hashes_if_true(is_active, merkle_proof.root, withdrawal_root_target);
 
@@ -148,6 +160,7 @@ where
                 builder.connect_zero_if_true(is_inactive, word.0);
             }
             builder.connect_zero_if_true(is_inactive, destination_chain_index.0);
+            builder.connect_zero_if_true(is_inactive, token_contract_id.0);
             builder.connect_zero_if_true(is_inactive, leaf_index.0);
             for sibling in &merkle_proof.siblings {
                 builder.connect_hashes_if_false(is_active, *sibling, zero_hash);
@@ -162,6 +175,7 @@ where
                 amount,
                 nonce,
                 destination_chain_index,
+                token_contract_id,
                 leaf_index,
                 leaf_hash,
             });
@@ -224,6 +238,7 @@ where
                     slot.destination_chain_index.0,
                     C::F::from_canonical_u32(real.destination_chain_index),
                 )?;
+                pw.set_target(slot.token_contract_id.0, C::F::from_canonical_u32(real.token_contract_id))?;
                 pw.set_target(slot.leaf_index.0, C::F::from_canonical_u32(real.leaf_index))?;
                 merkle_proof.set_witness(
                     &mut pw,
@@ -234,7 +249,8 @@ where
                             .chain(real.token.iter().copied().map(|v| v as u64))
                             .chain(real.amount.iter().copied().map(|v| v as u64))
                             .chain(real.nonce.iter().copied().map(|v| v as u64))
-                            .chain(std::iter::once(real.destination_chain_index as u64)),
+                            .chain(std::iter::once(real.destination_chain_index as u64))
+                            .chain(std::iter::once(real.token_contract_id as u64)),
                     ),
                     &real.siblings,
                 )?;
@@ -247,11 +263,12 @@ where
                 set_u32x8_targets::<C::F>(&mut pw, &slot.amount, &zero_words)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.nonce, &zero_words)?;
                 pw.set_target(slot.destination_chain_index.0, C::F::ZERO)?;
+                pw.set_target(slot.token_contract_id.0, C::F::ZERO)?;
                 pw.set_target(slot.leaf_index.0, C::F::ZERO)?;
                 merkle_proof.set_witness(
                     &mut pw,
                     C::F::ZERO,
-                    poseidon_hash_u32_words(std::iter::empty()),
+                    poseidon_hash_u32_words([0u64; WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS]),
                     &zero_siblings,
                 )?;
             }
@@ -306,6 +323,8 @@ fn hash_target_to_u32x8_internal<F: RichField + Extendable<D>, const D: usize>(
     ]
 }
 
+
+
 fn poseidon_hash_u32_words<F: RichField>(words: impl IntoIterator<Item = u64>) -> QHashOut<F> {
     let felts = words
         .into_iter()
@@ -321,14 +340,16 @@ mod tests {
         pgoldilocks::QHashOut,
     };
     use plonky2::{
-        field::types::{Field, PrimeField64},
+        field::types::PrimeField64,
         hash::poseidon::PoseidonHash,
         plonk::config::PoseidonGoldilocksConfig,
     };
+    use tiny_keccak::{Hasher as _, Keccak};
 
     use super::{
         poseidon_hash_u32_words, WithdrawalBatchClaimCircuit, WithdrawalBatchClaimInputs,
         WithdrawalBatchClaimSlotInputs, WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS,
+        MAX_WITHDRAWAL_CLAIM_BATCH_SIZE, WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS,
     };
 
     const D: usize = 2;
@@ -358,6 +379,7 @@ mod tests {
         let sender_user_id = 42;
         let nonce = sample_words(77);
         let destination_chain_index = 0;
+        let token_contract_id = 4;
         let leaf_index = 0;
         let siblings = zero_siblings(32);
         let leaf = poseidon_hash_u32_words(
@@ -366,7 +388,8 @@ mod tests {
                 .chain(token.iter().copied().map(|v| v as u64))
                 .chain(amount.iter().copied().map(|v| v as u64))
                 .chain(nonce.iter().copied().map(|v| v as u64))
-                .chain(std::iter::once(destination_chain_index as u64)),
+                .chain(std::iter::once(destination_chain_index as u64))
+                .chain(std::iter::once(token_contract_id as u64)),
         );
         let root = compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(
             leaf,
@@ -383,6 +406,7 @@ mod tests {
                 amount,
                 nonce,
                 destination_chain_index,
+                token_contract_id,
                 leaf_index,
                 siblings,
             }],
@@ -393,6 +417,16 @@ mod tests {
             proof.public_inputs.len(),
             WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS
         );
+        circuit.circuit_data.verify(proof).unwrap();
+
+        // Keep the authenticated root/path fixed and substitute only the source ID.
+        let mut tampered = inputs;
+        tampered.withdrawals[0].token_contract_id = 0;
+        let rejected = match circuit.generate_proof(&tampered) {
+            Err(_) => true, // Unsatisfied constraints may reject during witness generation/proving.
+            Ok(proof) => circuit.circuit_data.verify(proof).is_err(),
+        };
+        assert!(rejected, "changing only the source contract ID must not yield a valid proof");
     }
 
     #[test]
@@ -404,6 +438,7 @@ mod tests {
         let sender_user_id = 7;
         let nonce = sample_words(1);
         let destination_chain_index = 0;
+        let token_contract_id = 4;
         let siblings = zero_siblings(32);
         let leaf = poseidon_hash_u32_words(
             std::iter::once(sender_user_id as u64)
@@ -411,7 +446,8 @@ mod tests {
                 .chain(token.iter().copied().map(|v| v as u64))
                 .chain(amount.iter().copied().map(|v| v as u64))
                 .chain(nonce.iter().copied().map(|v| v as u64))
-                .chain(std::iter::once(destination_chain_index as u64)),
+                .chain(std::iter::once(destination_chain_index as u64))
+                .chain(std::iter::once(token_contract_id as u64)),
         );
         let root = compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(leaf, 0, &siblings);
         let inputs = WithdrawalBatchClaimInputs::<F> {
@@ -424,11 +460,67 @@ mod tests {
                 amount,
                 nonce,
                 destination_chain_index,
+                token_contract_id,
                 leaf_index: 0,
                 siblings,
             }],
         };
         let proof = circuit.generate_proof(&inputs).unwrap();
         assert_eq!(proof.public_inputs.len(), WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS);
+        // The slot commitment is exactly the 35 L1 slot words, token contract
+        // id included at word 34; the withdrawal leaf hash limbs are NOT
+        // committed.
+        let mut words = vec![0u32; MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS];
+        assert_eq!(words.len(), 1120);
+        words[0] = sender_user_id;
+        words[1..9].copy_from_slice(&recipient);
+        words[9..17].copy_from_slice(&token);
+        words[17..25].copy_from_slice(&amount);
+        words[25..33].copy_from_slice(&nonce);
+        words[33] = destination_chain_index;
+        words[34] = token_contract_id;
+        // Slot 1 is inactive: every one of its 35 words (words 35..70) is zero.
+        assert_eq!(words[35], 0, "inactive slot 1 must contribute zero words");
+        assert_eq!(words[69], 0, "inactive slot 1's last word must be zero");
+        let mut hasher = Keccak::v256();
+        for word in words {
+            hasher.update(&word.to_be_bytes());
+        }
+        let mut expected = [0u8; 32];
+        hasher.finalize(&mut expected);
+        for (actual, bytes) in proof.public_inputs[10..18].iter().zip(expected.chunks_exact(4)) {
+            assert_eq!(actual.to_canonical_u64(), u32::from_be_bytes(bytes.try_into().unwrap()) as u64);
+        }
+        circuit.circuit_data.verify(proof).unwrap();
     }
+
+    /// Frozen cross-team vector (L1 contracts): keccak256 over the 35 slot
+    /// words, each big-endian u32 — the exact batch-commit preimage per slot.
+    #[test]
+    fn withdrawal_slot_keccak_matches_frozen_l1_vector() {
+        let words: [u32; 35] = [
+            42,
+            0, 0, 0, 0x1111_1111, 0x1111_1111, 0x1111_1111, 0x1111_1111, 0x1111_1111,
+            0, 0, 0, 0x2222_2222, 0x2222_2222, 0x2222_2222, 0x2222_2222, 0x2222_2222,
+            0x8000_0001, 2, 3, 4, 5, 6, 7, 0x89ab_cdef,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            7,
+            4,
+        ];
+        assert_eq!(words.len(), WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS);
+        let mut hasher = Keccak::v256();
+        for word in words {
+            hasher.update(&word.to_be_bytes());
+        }
+        let mut got = [0u8; 32];
+        hasher.finalize(&mut got);
+        let expected_words: [u32; 8] = [
+            0xebd7_9fac, 0x7e97_aa1d, 0xcc98_ee05, 0x33e6_b9b0,
+            0x5804_7d29, 0x3f48_6fbd, 0xe3da_7af8, 0x7db7_55d2,
+        ];
+        for (actual, expected) in got.chunks_exact(4).zip(expected_words) {
+            assert_eq!(u32::from_be_bytes(actual.try_into().unwrap()), expected);
+        }
+    }
+
 }

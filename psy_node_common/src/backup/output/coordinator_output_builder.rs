@@ -17,7 +17,7 @@ use psy_data::{
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
     protocol::circuit_inputs::{
         agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
-        checkpoint_transition::{QCQEDCheckpointStateTransitionInput, QCQEDCheckpointStateTransitionInputPartial},
+        checkpoint_transition::{derive_checkpoint_random_seed, QCQEDCheckpointStateTransitionInput, QCQEDCheckpointStateTransitionInputPartial},
     },
     v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
@@ -338,7 +338,10 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 gutas_completed: N::F::from_u64_value(self.total_guta_jobs as u64),
             },
             block_time: N::F::from_u64_value(block_time),
-            random_seed: self.guta_gatherer_result.random_seed_guta,
+            random_seed: derive_checkpoint_random_seed::<N::F, N::QHash, N::HasherBase>(
+                last_committed.checkpoint_leaf_stats.random_seed,
+                checkpoint_state_roots.qfhash::<N::HasherBase>(),
+            ),
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: reward_tree_root,
                 gutas_root: reward_tree_root,
@@ -377,7 +380,6 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 part_1_header: self.get_part_1_header(last_committed, circuit_fingerprint_config),
                 old_stats: last_committed.checkpoint_leaf_stats.clone(),
                 block_time: N::F::from_u64_value(block_time),
-                final_random_seed_contribution: self.guta_gatherer_result.random_seed_guta,
                 validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
             },
             append_checkpoint_tree_proof,
@@ -500,7 +502,10 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 gutas_completed: N::F::from_u64_value(self.total_guta_jobs as u64),
             },
             block_time: N::F::from_u64_value(block_time),
-            random_seed: self.guta_gatherer_result.random_seed_guta,
+            random_seed: derive_checkpoint_random_seed::<N::F, N::QHash, N::HasherBase>(
+                last_committed.checkpoint_leaf_stats.random_seed,
+                checkpoint_state_roots.qfhash::<N::HasherBase>(),
+            ),
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: reward_tree_root,
                 gutas_root: reward_tree_root,
@@ -613,12 +618,14 @@ mod output_builder_tests {
     use psy_core::constants::protocol::{TODO_DEPOSIT_TREE_HEIGHT, TODO_WITHDRAWAL_TREE_HEIGHT};
     use psy_data::{
         guta::stats::GUTAStats,
+        protocol::circuit_inputs::checkpoint_transition::derive_checkpoint_random_seed,
         protocol::checkpoint_transition_hash::CheckpointStateHashTransition,
     };
 
     use crate::coordinator::processor::gatherers::{
         deploy_contract_gatherer::DeployContractGathererOutput, update_contract_gatherer::UpdateContractGathererOutput,
     };
+    use crate::test_common::fixture_validator_tree_root;
 
     use super::*;
 
@@ -715,7 +722,6 @@ mod output_builder_tests {
             start_global_user_tree_root: zh(1),
             end_global_user_tree_root: zh(2),
             root_guta_header: None,
-            random_seed_guta: zh(51),
         }
     }
 
@@ -793,7 +799,10 @@ mod output_builder_tests {
             },
             checkpoint_leaf_stats: stats,
             checkpoint_leaf: PQEDCheckpointLeaf::qp_rand_gen(),
-            checkpoint_state_roots: PQEDCheckpointGlobalStateRoots::qp_rand_gen(),
+            checkpoint_state_roots: PQEDCheckpointGlobalStateRoots {
+                validator_tree_root: fixture_validator_tree_root(1, 2),
+                ..PQEDCheckpointGlobalStateRoots::qp_rand_gen()
+            },
             checkpoint_state_transition: CheckpointStateHashTransition {
                 old_checkpoint_tree_root: PHash::qp_rand_gen(),
                 new_checkpoint_tree_root: PHash::qp_rand_gen(),
@@ -968,7 +977,13 @@ mod output_builder_tests {
 
         // leaf stats: job counts, reward commitments, seed and block time
         assert_eq!(output.new_base.checkpoint_leaf.stats.block_time, PF::from_u64_value(block_time));
-        assert_eq!(output.new_base.checkpoint_leaf.stats.random_seed, zh(51));
+        assert_eq!(
+            output.new_base.checkpoint_leaf.stats.random_seed,
+            derive_checkpoint_random_seed::<PF, PHash, PoseidonHasher>(
+                last_committed.checkpoint_leaf_stats.random_seed,
+                output.new_base.checkpoint_leaf.global_state_roots.qfhash::<PoseidonHasher>(),
+            )
+        );
         assert_eq!(output.new_base.checkpoint_leaf.stats.pm_rewards_commitment.register_users_root, reward_root);
         assert_eq!(output.new_base.checkpoint_leaf.stats.pm_rewards_commitment.gutas_root, reward_root);
         assert_eq!(output.new_base.checkpoint_leaf.stats.pm_rewards_commitment.deploy_contracts_root, reward_root);
@@ -1256,7 +1271,7 @@ mod output_builder_tests {
             user_tree_root: zh(1),
             withdrawal_tree_root: PoseidonHasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: zh(3),
-            validator_tree_root: last_committed.checkpoint_state_roots.validator_tree_root,
+            validator_tree_root: fixture_validator_tree_root(1, 2),
         };
         last_committed.checkpoint_state_roots = old_state_roots;
         let old_leaf = PQEDCheckpointLeaf::<PF, PHash> {
@@ -1300,7 +1315,6 @@ mod output_builder_tests {
         assert_eq!(witness.genesis_checkpoint_state_transition_hash, zh(60));
         assert_eq!(witness.checkpoint_state_transition_circuit_fingerprint, zh(25));
         assert_eq!(witness.partial.block_time, PF::from_u64_value(999));
-        assert_eq!(witness.partial.final_random_seed_contribution, zh(51));
         assert_eq!(witness.partial.old_stats.random_seed, last_committed.checkpoint_leaf_stats.random_seed);
         assert_eq!(witness.partial.validator_tree_root, last_committed.checkpoint_state_roots.validator_tree_root);
 

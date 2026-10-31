@@ -1,7 +1,11 @@
 PROVING_BACKEND := plonky2-poseidon-goldilocks
 BIN_PREFIX   := ./target/release/
 PSY_CONFIG_PATH := $(CURDIR)/psy-genesis/config.json
-# 本机开发默认 localhost 阶段；部署构建在部署脚本里显式覆盖。
+
+# psy-contracts is a sibling repository of psy-node; fall back to the legacy
+# nested checkout when the sibling is absent.
+CONTRACTS_DIR := $(if $(wildcard $(CURDIR)/../psy-contracts/package.json),$(CURDIR)/../psy-contracts,$(CURDIR)/psy-contracts)
+# Local development defaults to localhost; deployment builds override this explicitly.
 PSY_NETWORK ?= localhost
 export PSY_NETWORK
 ifneq (,$(wildcard ./.env))
@@ -19,7 +23,7 @@ PSY_SKIP_BUILD ?= 1
 PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
+.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
 
 all: build
 
@@ -67,16 +71,16 @@ psy-prover-coverage-online:
 	PSY_PROVER_TEST_NETWORK=$(PSY_PROVER_TEST_NETWORK) cargo llvm-cov $(PSY_PROVER_COV_ARGS) --summary-only -- session::session::async_split_tests --test-threads=1
 
 verify-contracts:
-	@cd psy-contracts && npx hardhat verify-contracts --network ${NETWORK}
+	@cd $(CONTRACTS_DIR) && npx hardhat verify-contracts --network ${NETWORK}
 
 verify-contracts-localhost:
-	@cd psy-contracts && npx hardhat verify-contracts --network localhost
+	@cd $(CONTRACTS_DIR) && npx hardhat verify-contracts --network localhost
 
 verify-contracts-sepolia:
-	@cd psy-contracts && npx hardhat verify-contracts --network sepolia
+	@cd $(CONTRACTS_DIR) && npx hardhat verify-contracts --network sepolia
 
 verify-contracts-ethereum:
-	@cd psy-contracts && npx hardhat verify-contracts --network ethereum
+	@cd $(CONTRACTS_DIR) && npx hardhat verify-contracts --network ethereum
 
 deploy-contracts:
 	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/examples/deploy_contracts
@@ -93,10 +97,19 @@ staging-server:
 LOCSETUP_START_ARGS = --all --proving-backend ${PROVING_BACKEND} --db --coordinator --realms-count 2 --coordinator-workers 2 --realm-workers 1 --prove-proxy 1 --faucet-server --l1 --relayer --psy-privacy-bridge --ide --explorer --mode-a-web-wallet-bridge --env RUST_LOG=${LOG_LEVEL}
 
 
+# Localhost devnet only: the documented test passwords (genesis-generation.md §1.2.2)
+# and the checked-in daemon template (bridge-common-operations.md). Non-localhost
+# networks must supply their own guardian keystore passwords and daemon config.
+ifeq ($(VITE_NETWORK),localhost)
+GUARDIAN_PASSWORDS = GUARDIAN_1_KEYSTORE_PASSWORD=devnet GUARDIAN_2_KEYSTORE_PASSWORD=devnet GUARDIAN_3_KEYSTORE_PASSWORD=devnet
+PSY_BRIDGE_DAEMON_CONFIG ?= $(CURDIR)/psy_cli/psy_relayer_cli/config/local.toml
+PSY_GUARDIAN_ROOT ?= $(CURDIR)/db/guardians
+endif
+
 run-all:
 	@if [ "$(VITE_NETWORK)" = "ethereum" ] && [ -z "$$ETH_RPC_URL" ]; then echo "ETH_RPC_URL is required when VITE_NETWORK=ethereum" >&2; exit 1; fi
 	@if [ "$(VITE_NETWORK)" = "sepolia" ] && [ -z "$(SEPOLIA_RPC_URL)" ]; then echo "SEPOLIA_RPC_URL is required when VITE_NETWORK=sepolia. Use a private RPC endpoint." >&2; exit 1; fi
-	VITE_NETWORK=$(VITE_NETWORK) VITE_FORK=$(VITE_FORK) SEPOLIA_RPC_URL=$(SEPOLIA_RPC_URL) ETH_RPC_URL=$(ETH_RPC_URL) REDEPLOY_L1=$(REDEPLOY_L1) PSY_SKIP_BRANCH_CHECK=$(PSY_SKIP_BRANCH_CHECK) PSY_SKIP_KEYSTORE=$(PSY_SKIP_KEYSTORE) PSY_SKIP_BUILD=$(PSY_SKIP_BUILD) bun run dev/locSetupV4.ts $(LOCSETUP_START_ARGS)
+	PSY_BRIDGE_DAEMON_CONFIG=$(PSY_BRIDGE_DAEMON_CONFIG) PSY_GUARDIAN_ROOT=$(PSY_GUARDIAN_ROOT) VITE_NETWORK=$(VITE_NETWORK) VITE_FORK=$(VITE_FORK) SEPOLIA_RPC_URL=$(SEPOLIA_RPC_URL) ETH_RPC_URL=$(ETH_RPC_URL) REDEPLOY_L1=$(REDEPLOY_L1) PSY_SKIP_BRANCH_CHECK=$(PSY_SKIP_BRANCH_CHECK) PSY_SKIP_KEYSTORE=$(PSY_SKIP_KEYSTORE) PSY_SKIP_BUILD=$(PSY_SKIP_BUILD) $(GUARDIAN_PASSWORDS) bun run dev/locSetupV4.ts $(LOCSETUP_START_ARGS)
 
 restart:
 	bun run dev/locSetupV4.ts --control restart
@@ -112,8 +125,8 @@ run-dummy-prover:
 	@./dev/dummy_prover.sh prove_random -p ${PROVING_BACKEND}
 
 deposit:
-	@TOKEN_ADDR=$${TOKEN_ADDRESS:-$$(python3 -c 'import json; print(json.load(open("psy-contracts/deployments/localhost/deployed-contracts.json"))["core"].get("PsyToken", json.load(open("psy-contracts/deployments/localhost/deployed-contracts.json"))["core"].get("USDTToken", "")))' 2>/dev/null || echo "")}; \
-	ROUTER_ADDR=$$(python3 -c 'import json; print(json.load(open("psy-contracts/deployments/localhost/deployed-contracts.json"))["core"]["Router"])' 2>/dev/null); \
+	@TOKEN_ADDR=$${TOKEN_ADDRESS:-$$(python3 -c 'import json; print(json.load(open("$(CONTRACTS_DIR)/deployments/localhost/deployed-contracts.json"))["core"].get("PsyToken", json.load(open("$(CONTRACTS_DIR)/deployments/localhost/deployed-contracts.json"))["core"].get("USDTToken", "")))' 2>/dev/null || echo "")}; \
+	ROUTER_ADDR=$$(python3 -c 'import json; print(json.load(open("$(CONTRACTS_DIR)/deployments/localhost/deployed-contracts.json"))["core"]["Router"])' 2>/dev/null); \
 	if [ -z "$${NOTE_COMMITMENT}" ]; then echo "NOTE_COMMITMENT is required; for claimable deposits derive hash(nullifier_secret, raw note_secret)." >&2; exit 1; fi; \
 	NC=$${NOTE_COMMITMENT}; \
 	RUST_LOG=$${RUST_LOG:-info} ./target/release/psy_user_cli deposit \
@@ -166,15 +179,15 @@ regen-bridge-agg-keystore:
 
 keystore := $(KEYSTORE_DIR)
 export-solidity-verifier:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore} ./psy-contracts/src/GnarkGroth16Verifier.sol
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore} $(CONTRACTS_DIR)/src/GnarkGroth16Verifier.sol
 
 export-solidity-verifier-deposit:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/deposit_append ./psy-contracts/src/DepositBatchVerifier.sol
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/deposit_append $(CONTRACTS_DIR)/src/DepositBatchVerifier.sol
 
 export-solidity-verifier-withdrawal:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim $(CONTRACTS_DIR)/src/WithdrawalClaimVerifier.sol
 
 export-solidity-verifier-reward:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/reward_claim ./psy-contracts/src/RewardClaimVerifier.sol
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/reward_claim $(CONTRACTS_DIR)/src/RewardClaimVerifier.sol
 
 export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward

@@ -10,7 +10,7 @@ Create one linked worktree per cohort repository on one new branch, check out ev
 
 ## Background
 
-A cohort worktree is an additional checkout of an existing local repository, not a fresh `git clone` and not a copy of dirty source contents. `psy-node/.gitmodules:8-12` sets `psy-dapp` to `update = none`, so a recursive submodule update from the node worktree skips DApp. SDK, Wallet, node, and DApp each record their own child SHAs. Those gitlinks are independent of the matching sibling repository `HEAD`.
+A cohort worktree is an additional checkout of an existing local repository, not a fresh `git clone` and not a copy of dirty source contents. `psy-node` records only `psy-genesis` as a submodule; `psy-contracts` and `psy-dapp` are sibling repositories of the workspace, not gitlinks of `psy-node`. SDK and Wallet each record their own `psy-genesis` child SHA, and DApp records `psy-genesis` and `psy-contracts`. Those gitlinks are independent of the matching sibling repository `HEAD`.
 
 Release publication order stays [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §8. Section 6 here is local mode only: path and `file:` edits inside the new worktrees. Sibling ownership is `AGENTS.md:27,87-102`.
 
@@ -51,7 +51,7 @@ from a remote, does not edit Cargo or npm pins, and does not commit. Creation
 checks all repositories first and creates real topic branches from committed
 base refs; it never copies dirty files, secrets, ledgers, or local
 configuration. Missing repositories use the documented official origin. Recorded
-submodules are initialized, including node's `update = none` DApp gitlink. A
+submodules are initialized (`psy-node` records only `psy-genesis` now). A
 create failure exits nonzero and keeps every directory already created.
 
 `commit` requires exactly one repository, a message, and either literal paths
@@ -282,8 +282,8 @@ the sibling repository directly into that nested checkout's object database
 (`refs/prefetch/workspace/<sha>`, empty refmap, no fetch head, no remote), the
 superproject index is staged with `update-index --cacheinfo 160000`, then the
 path is checked out with `git submodule update --checkout --no-fetch`.
-`--no-fetch` blocks falling back to the nested origin. `update = none` (node's
-DApp gitlink) is overridden for that one invocation. The index stays staged.
+`--no-fetch` blocks falling back to the nested origin. An `update = none`
+gitlink is overridden for that one invocation. The index stays staged.
 Commit it yourself with `commit --staged` after review.
 
 ## Table of Contents
@@ -394,20 +394,18 @@ done
 
 ## 4. Gitlinks
 
-Seven gitlink edges are recorded: node to genesis, node to contracts, node to dapp, dapp to genesis, dapp to contracts, sdk to genesis, and wallet to genesis. Contracts records `lib/forge-std`, and the DApp contracts gitlink records it again. Recursive checkout follows those nested links. It does not move a gitlink to the sibling repository `HEAD`.
+Five gitlink edges are recorded: node to genesis, dapp to genesis, dapp to contracts, sdk to genesis, and wallet to genesis. Contracts records `lib/forge-std`, and the DApp contracts gitlink records it again. `psy-contracts` and `psy-dapp` themselves are sibling repositories of the workspace, not gitlinks of `psy-node`. Recursive checkout follows those nested links. It does not move a gitlink to the sibling repository `HEAD`.
 
-`update = none` makes a recursive node update skip `psy-dapp`. Initialize the other seven edges recursively, then check out the node DApp gitlink explicitly and recurse from there:
+Initialize each checkout's recorded submodules recursively:
 
 ```bash
 set -euo pipefail
 for name in "${repos[@]}"; do
   git -C "$DESTINATION_ROOT/$name" submodule update --init --recursive
 done
-git -C "$DESTINATION_ROOT/psy-node" submodule update --init --checkout -- psy-dapp
-git -C "$DESTINATION_ROOT/psy-node/psy-dapp" submodule update --init --recursive
 ```
 
-Do not use `--remote`. The node DApp checkout is the recorded gitlink, not `$DESTINATION_ROOT/psy-dapp`.
+Do not use `--remote`. The `psy-contracts` and `psy-dapp` checkouts are the workspace sibling repositories at `$DESTINATION_ROOT/psy-contracts` and `$DESTINATION_ROOT/psy-dapp`, not nested checkouts of `psy-node`.
 
 ## 5. Verify
 

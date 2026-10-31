@@ -1306,22 +1306,24 @@ mod tests {
         leaf
     }
 
+    const EPOCH_LEN: u64 = 32;
+
     #[test]
     fn realm_finalize_rotation_matches_native_poseidon_shuffle() -> anyhow::Result<()> {
         let validator_sub_ids = [1, 2];
         let leaf = rotation_leaf([1, 2, 3, 4]);
         let native = RealmRotationConfig {
-            checkpoints_per_epoch: 10,
+            checkpoints_per_epoch: EPOCH_LEN,
             validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let seed = leaf.stats.random_seed.to_u64x4();
-        for checkpoint_id in [0, 9, 10, 17, 19, 20] {
+        for checkpoint_id in [0, 30, 31, 62, 63] {
             let expected = native
                 .proposer_sub_id(42, checkpoint_id + 1, seed)?
                 .expect("rotation enabled");
-            prove_rotation(checkpoint_id, 42, &leaf, expected, 10, &validator_sub_ids)?;
+            prove_rotation(checkpoint_id, 42, &leaf, expected, EPOCH_LEN, &validator_sub_ids)?;
             let wrong = if expected == 1 { 2 } else { 1 };
-            assert!(prove_rotation(checkpoint_id, 42, &leaf, wrong, 10, &validator_sub_ids).is_err());
+            assert!(prove_rotation(checkpoint_id, 42, &leaf, wrong, EPOCH_LEN, &validator_sub_ids).is_err());
         }
         Ok(())
     }
@@ -1332,17 +1334,17 @@ mod tests {
         let first = rotation_leaf([1, 2, 3, 4]);
         let second = rotation_leaf([5, 8, 13, 21]);
         let native = RealmRotationConfig {
-            checkpoints_per_epoch: 10,
+            checkpoints_per_epoch: EPOCH_LEN,
             validator_sub_ids: validator_sub_ids.to_vec(),
         };
         let first_expected = native
-            .proposer_sub_id(42, 18, first.stats.random_seed.to_u64x4())?
+            .proposer_sub_id(42, 33, first.stats.random_seed.to_u64x4())?
             .unwrap();
         let second_expected = native
-            .proposer_sub_id(42, 18, second.stats.random_seed.to_u64x4())?
+            .proposer_sub_id(42, 33, second.stats.random_seed.to_u64x4())?
             .unwrap();
-        prove_rotation(17, 42, &first, first_expected, 10, &validator_sub_ids)?;
-        prove_rotation(17, 42, &second, second_expected, 10, &validator_sub_ids)?;
+        prove_rotation(32, 42, &first, first_expected, EPOCH_LEN, &validator_sub_ids)?;
+        prove_rotation(32, 42, &second, second_expected, EPOCH_LEN, &validator_sub_ids)?;
         Ok(())
     }
 

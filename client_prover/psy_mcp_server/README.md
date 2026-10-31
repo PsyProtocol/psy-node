@@ -273,6 +273,26 @@ that second, human-made call.
 | 4.3 | "Withdraw 0.005 PSY to 0xd307...10EF" then execute | `submitted=true` + txHash |
 | 4.4 | "Withdraw to 0x000...0" | Error: "zero address — would burn the funds" |
 
+**Withdraw identity preflight (`withdraw` + `claim_batch` withdraw legs):** before
+anything burns, the destination chain's configured RPC and Bridge are resolved
+and the RPC must serve the configured chain id. The sender is the authenticated
+wallet user (never guessed, never a tool argument) and must fit in uint32. The
+reservation is the Poseidon leaf of the complete 35-word withdrawal record,
+including sender, recipient, token, amount, nonce, destination chain index and
+L2 token contract id. Reusing a nonce with different token or claim contents
+is a distinct identity. The L1 read is `claimedNullifiers(l1Key)`, where `l1Key`
+is keccak256 of the exact 140-byte big-endian u32 record, not the raw nonce.
+An already-consumed nullifier, an in-process reservation of that identity, or an
+undeterminable check refuses the burn (nothing submitted, policy refunded). A
+caller-pinned nonce is used verbatim — never re-randomized; a generated nonce
+redraws only consumed or reserved draws, at most 8, then refuses. The burn and
+the returned `nonce` stay the raw 32-byte nonce; `nullifier` is the L1 key only.
+If a submission ends in an unknown state the result still carries that exact
+nonce, sender, chain index, and nullifier — preserve them for status
+investigation; do not resubmit until the prior outcome is resolved.
+The L1 preflight narrows wasted burns; it does **not** prove the L2 leg is
+not already in flight.
+
 ### Group 5 — Contracts (~20 min)
 
 | # | Prompt | Expected |

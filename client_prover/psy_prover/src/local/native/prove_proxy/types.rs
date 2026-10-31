@@ -19,6 +19,7 @@ pub struct BridgeWithdrawalWitnessInput {
     pub leaf_index: u32,
     pub bridge_user_id: u32,
     pub siblings: Vec<String>,
+    pub token_contract_id: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

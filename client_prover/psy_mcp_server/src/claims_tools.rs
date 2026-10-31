@@ -65,6 +65,29 @@ async fn probe_endpoints(summary: crate::wallet::EndpointSummary) -> Vec<serde_j
     .await
 }
 
+/// Builds the keyless read-only client for a destination chain and refuses a
+/// preflight whose RPC does not serve the configured chain id — a
+/// misconfigured rpc_url must not let us read the WRONG chain's bridge and
+/// report "unclaimed". Shared by the single withdraw and every batch leg.
+async fn destination_l1_client(
+    l1_rpc: String,
+    bridge: alloy_primitives::Address,
+    chain_index: u32,
+    configured_chain_id: u64,
+) -> Result<(crate::l1::L1Client, alloy_primitives::Address), String> {
+    let client = crate::l1::L1Client::read_only(l1_rpc);
+    let actual = client
+        .chain_id()
+        .await
+        .map_err(|e| format!("destination chain {chain_index} rpc unreachable: {e:#}"))?;
+    if actual != configured_chain_id {
+        return Err(format!(
+            "destination chain {chain_index} rpc serves chain id {actual} but the config says chain id {configured_chain_id} — refusing to preflight the bridge of the wrong chain"
+        ));
+    }
+    Ok((client, bridge))
+}
+
 #[tool_router(router = claims_tools_router, vis = "pub(crate)")]
 impl PsyWalletServer {
     #[tool(
@@ -968,7 +991,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. The chain primitive has always accepted mixed items; this is the tool that builds that mixed batch. Pass any combination of public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each present category is policy-gated as claim / claim_deposit / private_claim (amount 0 — claiming folds in funds already addressed to this wallet)."
+        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. Pass public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each category is policy-gated as claim / claim_deposit / private_claim. Withdraw legs reserve the Poseidon leaf of the complete 35-word record and check claimedNullifiers using keccak256 of that record's 140-byte big-endian encoding before burning. A consumed identity, an in-process reservation, or an undeterminable check refuses the whole batch. The burn still carries the raw nonce."
     )]
     async fn claim_batch(&self, Parameters(a): Parameters<ClaimBatchArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
@@ -1020,7 +1043,17 @@ impl PsyWalletServer {
         // the standalone tools. The batch is all-or-nothing: any refused leg
         // refunds every leg authorized before it and nothing is sent.
         let mut spent_auths: Vec<(policy::Authorization, u64)> = Vec::new(); // (auth, charge) for refund
+        let mut withdraw_senders: Vec<u64> = Vec::new();
+        // A pre-submit refusal releases every reservation. A submitted burn, or a
+        // submit whose delivery is unknown, keeps its reservation.
+        let reserved_withdrawals = std::sync::Mutex::new(Vec::<crate::wallet::WithdrawalReservation>::new());
+        let release_unsent = |reserved: &std::sync::Mutex<Vec<crate::wallet::WithdrawalReservation>>| {
+            for record in reserved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..) {
+                crate::wallet::release_withdrawal_reservation(&record);
+            }
+        };
         let refund_all = |auths: &mut Vec<(policy::Authorization, u64)>| {
+            release_unsent(&reserved_withdrawals);
             for (auth, chg) in auths.drain(..) {
                 self.policy.lock().unwrap().refund(&auth, chg);
             }
@@ -1065,7 +1098,17 @@ impl PsyWalletServer {
                 );
             };
             match self.authorize_wallet(&network, &a.session, &spec.l1_recipient, charge, "withdraw").await {
-                Ok(auth) => spent_auths.push((auth, charge)),
+                Ok(auth) => {
+                    let Some(sender_user_id) = auth.user_id else {
+                        refund_all(&mut spent_auths);
+                        return err_json(
+                            "authorization did not bind a wallet identity".to_string(),
+                            json!({ "gate": "auth" }),
+                        );
+                    };
+                    withdraw_senders.push(sender_user_id);
+                    spent_auths.push((auth, charge));
+                }
                 Err(e) => {
                     refund_all(&mut spent_auths);
                     return err_json(
@@ -1093,7 +1136,15 @@ impl PsyWalletServer {
             transfer_items.push((spec.to_user_id, spec.amount_nano, contract));
         }
         let mut withdraw_legs: Vec<crate::wallet::WithdrawLeg> = Vec::new();
-        for spec in &a.withdraws {
+        let mut withdraw_nullifiers: Vec<String> = Vec::new();
+        if withdraw_senders.len() != a.withdraws.len() {
+            refund_all(&mut spent_auths);
+            return err_json(
+                "withdraw authorization did not bind a sender for every leg".to_string(),
+                json!({ "gate": "auth" }),
+            );
+        }
+        for (spec, sender_user_id) in a.withdraws.iter().zip(withdraw_senders.iter().copied()) {
             let Some(contract) = contract_for(&spec.token) else {
                 refund_all(&mut spent_auths);
                 return err_json(format!("unknown token {}", spec.token), json!({ "gate": "args" }));
@@ -1118,23 +1169,109 @@ impl PsyWalletServer {
                 refund_all(&mut spent_auths);
                 return err_json("a withdraw leg has the zero L1 token address — the bridge routes it into the WETH branch, which reverts and stalls the relayer. Nothing was submitted.".to_string(), json!({ "gate": "args" }));
             }
-            let nonce = match spec.nonce.as_deref() {
+            let pinned = match spec.nonce.as_deref() {
                 // A caller-pinned nonce is used verbatim — never re-randomized.
                 Some(pinned) => match crate::wallet::parse_withdraw_nonce(pinned) {
-                    Ok(n) => n,
+                    Ok(n) => Some(n),
                     Err(e) => {
                         refund_all(&mut spent_auths);
                         return err_json(format!("{e:#}"), json!({ "gate": "args" }));
                     }
                 },
-                None => match crate::wallet::random_withdraw_nonce() {
-                    Ok(n) => n,
+                None => None,
+            };
+            let destination_chain_index = match u32::try_from(spec.dest_chain_index) {
+                Ok(value) => value,
+                Err(_) => {
+                    refund_all(&mut spent_auths);
+                    return err_json(
+                        format!("a withdraw leg's destination chain index {} exceeds u32", spec.dest_chain_index),
+                        json!({ "gate": "args" }),
+                    );
+                }
+            };
+            let (l1_chain_id, _l1_chain_name) = match state.wallet.l1_chain_identity(&network, destination_chain_index) {
+                Some(identity) => identity,
+                None => {
+                    refund_all(&mut spent_auths);
+                    return err_json(
+                        format!("unknown L1 destination chain index {} for a withdraw leg", spec.dest_chain_index),
+                        json!({ "gate": "config", "destinationChainIndex": spec.dest_chain_index }),
+                    );
+                }
+            };
+            let l1_rpc = match network_l1_rpc(&state.wallet, &network, destination_chain_index) {
+                Ok(url) => url,
+                Err(e) => {
+                    refund_all(&mut spent_auths);
+                    return err_json(e, json!({ "gate": "config", "destinationChainIndex": spec.dest_chain_index, "field": "l1_rpc_urls" }));
+                }
+            };
+            let dest_bridge: alloy_primitives::Address = match network_bridge(&state.wallet, &network, destination_chain_index) {
+                Ok(value) => match value.parse() {
+                    Ok(bridge) => bridge,
                     Err(e) => {
                         refund_all(&mut spent_auths);
-                        return err_json(format!("{e:#}"), json!({ "gate": "wallet" }));
+                        return err_json(format!("bad destination bridge address {value}: {e}"), json!({ "gate": "config", "field": "l1_bridge_address" }));
                     }
                 },
+                Err(e) => {
+                    refund_all(&mut spent_auths);
+                    return err_json(e, json!({ "gate": "config", "field": "l1_bridge_address" }));
+                }
             };
+            let (l1_client, dest_bridge) =
+                match destination_l1_client(l1_rpc, dest_bridge, destination_chain_index, l1_chain_id).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        refund_all(&mut spent_auths);
+                        return err_json(
+                            e,
+                            json!({ "gate": "preflight", "destinationChainIndex": spec.dest_chain_index, "l1ChainId": l1_chain_id, "submitted": false }),
+                        );
+                    }
+                };
+            let nonce = match crate::wallet::reserve_withdrawal_nonce(
+                &l1_client,
+                dest_bridge,
+                sender_user_id,
+                &spec.l1_recipient,
+                &token_addr,
+                spec.amount_nano,
+                spec.dest_chain_index,
+                contract,
+                pinned,
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    refund_all(&mut spent_auths);
+                    return err_json(
+                        format!("withdraw leg to {} for {} was refused: {e:#}", spec.l1_recipient, spec.amount_nano),
+                        json!({
+                            "gate": "preflight",
+                            "l1Recipient": spec.l1_recipient, "amount": spec.amount_nano,
+                            "destinationChainIndex": spec.dest_chain_index, "l1ChainId": l1_chain_id,
+                            "senderUserId": sender_user_id,
+                            "submitted": false,
+                        }),
+                    );
+                }
+            };
+            reserved_withdrawals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(crate::wallet::WithdrawalReservation {
+                    sender_user_id,
+                    l1_recipient: spec.l1_recipient.trim().to_string(),
+                    l1_token_address: token_addr.clone(),
+                    amount_nano: spec.amount_nano,
+                    dest_chain_index: spec.dest_chain_index,
+                    contract_id: contract,
+                    nonce,
+                });
+            withdraw_nullifiers.push(crate::wallet::withdraw_nonce_to_hex(&nonce));
             withdraw_legs.push(crate::wallet::WithdrawLeg {
                 dest_chain_index: spec.dest_chain_index,
                 l1_token_address: token_addr,
@@ -1306,7 +1443,11 @@ impl PsyWalletServer {
                     "endUserLeafHash": leaf,
                     "publicClaimedFrom": public_items.iter().map(|(s, _)| s).copied().collect::<Vec<_>>(),
                     "transfersSent": transfer_items.iter().map(|(to, amt, _)| json!({"toUserId": to, "amount": amt})).collect::<Vec<_>>(),
-                    "withdrawsBurned": withdraw_legs.iter().map(|w| json!({"l1Recipient": w.l1_recipient, "amount": w.amount_nano, "nonce": crate::wallet::withdraw_nonce_to_hex(&w.nonce)})).collect::<Vec<_>>(),
+                    "withdrawsBurned": withdraw_legs.iter().zip(withdraw_senders.iter()).zip(withdraw_nullifiers.iter()).map(|((w, sender), nullifier)| json!({
+                        "l1Recipient": w.l1_recipient, "amount": w.amount_nano,
+                        "nonce": crate::wallet::withdraw_nonce_to_hex(&w.nonce),
+                        "senderUserId": sender, "destinationChainIndex": w.dest_chain_index, "nullifier": nullifier,
+                    })).collect::<Vec<_>>(),
                     "depositsClaimed": claimed_deposits,
                     "alreadyClaimed": skipped_claimed,
                     "privateClaimed": private_parsed.len(),
@@ -1315,18 +1456,26 @@ impl PsyWalletServer {
                 }))
             }
             Err(e) => {
-                // Nothing settled — the spends in this batch must give the
-                // headroom back, or a flaky chain burns the budget with failures.
-                refund_all(&mut spent_auths);
+                // EndCapSubmissionError means the batch may already be in flight.
+                // Keep every reserved burn; only a proven pre-submit failure is reusable.
+                let submitted = crate::wallet::withdrawal_submission_is_uncertain(&e);
+                if !submitted {
+                    release_unsent(&reserved_withdrawals);
+                }
+                for (auth, chg) in spent_auths.drain(..) {
+                    self.policy.lock().unwrap().refund(&auth, chg);
+                }
                 err_json(
                     format!("claim_batch failed: {e:#}"),
                     json!({
                         "gate": "execute",
-                        // Nothing settled, but the nonces are returned so a
-                        // retry of the same operation can pin exactly these.
-                        "withdraws": withdraw_legs.iter().map(|w| json!({
+                        // Pre-submit failures may pin these nonces again. An uncertain
+                        // submission keeps the reservation, so pinning them again is refused.
+                        "withdrawReservationHeld": submitted,
+                        "withdraws": withdraw_legs.iter().zip(withdraw_senders.iter()).zip(withdraw_nullifiers.iter()).map(|((w, sender), nullifier)| json!({
                             "l1Recipient": w.l1_recipient, "amount": w.amount_nano,
                             "nonce": crate::wallet::withdraw_nonce_to_hex(&w.nonce),
+                            "senderUserId": sender, "destinationChainIndex": w.dest_chain_index, "nullifier": nullifier,
                         })).collect::<Vec<_>>(),
                     }),
                 )
@@ -1335,7 +1484,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Withdraw to an address on a configured EVM chain: select it with dest_chain_index from wallet_status.l1Chains. Burns the amount on Psy and the bridge relayer settles the destination-chain leg, so the agent needs no EVM gas. Policy-gated at the amount like any other spend."
+        description = "Withdraw to an address on a configured EVM chain selected by dest_chain_index from wallet_status.l1Chains. Burns the amount on Psy; the bridge relayer registers the destination-chain payout. Policy-gated at the spend amount. The sender is the authenticated wallet user. The in-process reservation is the withdrawal's full Poseidon leaf identity over the 35 slot words (sender, recipient, token, amount, nonce, destination chain, contract id). The L1 claimedNullifiers key is the keccak256 of those same 35 words, big-endian — never the raw nonce alone, and the Poseidon leaf hash stays the services-side lookup identity. A consumed claim identity, an in-process reservation, or an undeterminable check refuses the withdrawal. The burn uses the raw nonce."
     )]
     async fn withdraw(&self, Parameters(a): Parameters<WithdrawArgs>) -> Result<CallToolResult, McpError> {
         // ZERO RECIPIENT = burned money. The L1 leg is settled by the relayer
@@ -1411,58 +1560,155 @@ impl PsyWalletServer {
                 json!({ "gate": "args" }),
             );
         }
-        // A withdrawal is irreversible once burned, so the nonce must be unique
-        // per withdrawal. A caller-pinned nonce is used verbatim — never
-        // re-randomized; otherwise a fresh one is drawn from OS entropy and
-        // returned so the caller can track (and, if needed, retry) the same
-        // operation with the identical nonce.
-        let nonce_bytes = match a.nonce.as_deref() {
+        // A withdrawal is irreversible once burned. A caller-pinned nonce is
+        // used verbatim; otherwise a fresh one is drawn. The reservation is
+        // (destination chain index, authenticated sender, nonce). The L1 key
+        // is the raw withdraw nonce bytes32, not the leaf hash.
+        let pinned = match a.nonce.as_deref() {
             Some(pinned) => match crate::wallet::parse_withdraw_nonce(pinned) {
-                Ok(n) => n,
+                Ok(n) => Some(n),
                 Err(e) => {
                     self.policy.lock().unwrap().refund(&auth, charge);
                     return err_json(format!("{e:#}"), json!({ "gate": "args" }));
                 }
             },
-            None => match crate::wallet::random_withdraw_nonce() {
-                Ok(n) => n,
+            None => None,
+        };
+        let l1_rpc = match network_l1_rpc(&state.wallet, &network, destination_chain_index) {
+            Ok(url) => url,
+            Err(e) => {
+                self.policy.lock().unwrap().refund(&auth, charge);
+                return err_json(e, json!({ "gate": "config", "destinationChainIndex": a.dest_chain_index, "field": "l1_rpc_urls" }));
+            }
+        };
+        let dest_bridge: alloy_primitives::Address = match network_bridge(&state.wallet, &network, destination_chain_index) {
+            Ok(value) => match value.parse() {
+                Ok(bridge) => bridge,
                 Err(e) => {
                     self.policy.lock().unwrap().refund(&auth, charge);
-                    return err_json(format!("{e:#}"), json!({ "gate": "wallet" }));
+                    return err_json(format!("bad destination bridge address {value}: {e}"), json!({ "gate": "config", "field": "l1_bridge_address" }));
                 }
             },
+            Err(e) => {
+                self.policy.lock().unwrap().refund(&auth, charge);
+                return err_json(e, json!({ "gate": "config", "field": "l1_bridge_address" }));
+            }
+        };
+        let (l1_client, dest_bridge) =
+            match destination_l1_client(l1_rpc, dest_bridge, destination_chain_index, l1_chain_id).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.policy.lock().unwrap().refund(&auth, charge);
+                    return err_json(
+                        e,
+                        json!({ "gate": "preflight", "destinationChainIndex": a.dest_chain_index, "l1ChainId": l1_chain_id, "submitted": false }),
+                    );
+                }
+            };
+        let Some(sender_user_id) = auth.user_id else {
+            self.policy.lock().unwrap().refund(&auth, charge);
+            return err_json(
+                "authorization did not bind a wallet identity".to_string(),
+                json!({ "gate": "auth" }),
+            );
+        };
+        match u32::try_from(sender_user_id) {
+            Ok(_) => {}
+            Err(_) => {
+                self.policy.lock().unwrap().refund(&auth, charge);
+                return err_json(
+                    format!("authenticated sender_user_id {sender_user_id} exceeds u32; the L1 nullifier domain is not truncated"),
+                    json!({ "gate": "auth", "senderUserId": sender_user_id }),
+                );
+            }
+        };
+        match u32::try_from(contract) {
+            Ok(_) => {}
+            Err(_) => {
+                self.policy.lock().unwrap().refund(&auth, charge);
+                return err_json(
+                    format!("token contract id {contract} exceeds u32; the burn contract domain is not truncated"),
+                    json!({ "gate": "args", "tokenContractId": contract }),
+                );
+            }
+        };
+        let nonce_bytes = match crate::wallet::reserve_withdrawal_nonce(
+            &l1_client,
+            dest_bridge,
+            sender_user_id,
+            &a.l1_recipient,
+            &token_addr,
+            a.amount_nano,
+            a.dest_chain_index,
+            contract,
+            pinned,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.policy.lock().unwrap().refund(&auth, charge);
+                return err_json(
+                    format!("{e:#}"),
+                    json!({
+                        "gate": "preflight",
+                        "destinationChainIndex": a.dest_chain_index, "l1ChainId": l1_chain_id,
+                        "senderUserId": sender_user_id,
+                        "submitted": false,
+                    }),
+                );
+            }
         };
         let nonce = crate::wallet::withdraw_nonce_to_hex(&nonce_bytes);
-        let execution = match auth.user_id {
-            Some(user_id) => {
-                state
-                    .wallet
-                    .withdraw_for(
-                        &network,
-                        user_id,
-                        a.dest_chain_index,
-                        &token_addr,
-                        a.amount_nano,
-                        &a.l1_recipient,
-                        nonce_bytes,
-                        contract,
-                    )
-                    .await
-            }
-            None => Err(anyhow::anyhow!("authorization did not bind a wallet identity")),
-        };
+        let nullifier = crate::wallet::withdraw_nonce_to_hex(&nonce_bytes);
+        let execution = state
+            .wallet
+            .withdraw_for(
+                &network,
+                sender_user_id,
+                a.dest_chain_index,
+                &token_addr,
+                a.amount_nano,
+                &a.l1_recipient,
+                nonce_bytes,
+                contract,
+            )
+            .await;
         match execution {
             Ok(leaf) => ok_json(json!({
                 "status": "ok", "submitted": true, "amount": a.amount_nano, "token": a.token,
                 "l1Recipient": a.l1_recipient, "l1TokenAddress": token_addr, "nonce": nonce,
+                "senderUserId": sender_user_id, "nullifier": nullifier,
                 "destinationChainIndex": a.dest_chain_index, "l1ChainId": l1_chain_id,
                 "l1ChainName": l1_chain_name,
                 "txHash": leaf,
-                "note": "Burned on Psy. The bridge relayer settles the Ethereum leg; watch the L1 recipient.",
+                "note": "Burned on Psy. The bridge relayer settles the Ethereum leg; watch the L1 recipient. The L1 claim key is the keccak256 over the withdrawal's 35 slot words.",
             })),
             Err(e) => {
-                self.policy.lock().unwrap().refund(&auth, charge);
-                err_json(format!("withdraw failed: {e:#}"), json!({ "gate": "execute", "nonce": nonce }))
+                let submitted = crate::wallet::withdrawal_submission_is_uncertain(&e);
+                if !submitted {
+                    crate::wallet::release_withdrawal_reservation(&crate::wallet::WithdrawalReservation {
+                        sender_user_id,
+                        l1_recipient: a.l1_recipient.clone(),
+                        l1_token_address: token_addr.clone(),
+                        amount_nano: a.amount_nano,
+                        dest_chain_index: a.dest_chain_index,
+                        contract_id: contract,
+                        nonce: nonce_bytes,
+                    });
+                    self.policy.lock().unwrap().refund(&auth, charge);
+                }
+                err_json(
+                    format!("withdraw failed: {e:#}"),
+                    json!({
+                        "gate": "execute",
+                        "withdrawReservationHeld": submitted,
+                        "nonce": nonce,
+                        "senderUserId": sender_user_id,
+                        "nullifier": nullifier,
+                        "destinationChainIndex": a.dest_chain_index,
+                    }),
+                )
             }
         }
     }
@@ -1483,5 +1729,41 @@ impl PsyWalletServer {
             })),
             Err(e) => err_json(format!("{e:#}"), json!({ "gate": "wallet" })),
         }
+    }
+}
+
+#[cfg(test)]
+mod destination_preflight_tests {
+    use super::*;
+    use crate::l1::tests::{rpc_ok, spawn_json_rpc_fixture};
+    use std::sync::atomic::Ordering;
+
+    const TEST_BRIDGE: &str = "0x00000000000000000000000000000000000000b2";
+
+    #[tokio::test]
+    async fn a_destination_rpc_on_the_wrong_chain_is_refused_before_preflight() {
+        let (url, _) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!("0x5")));
+        let err = destination_l1_client(url.into(), TEST_BRIDGE.parse().unwrap(), 0, 1)
+            .await
+            .err().expect("a mismatching chain id must be refused");
+        assert!(err.contains("serves chain id 5"), "{err}");
+        assert!(err.contains("chain id 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_destination_rpc_on_the_configured_chain_passes() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!("0x1")));
+        destination_l1_client(url.into(), TEST_BRIDGE.parse().unwrap(), 0, 1)
+            .await
+            .expect("a matching chain id passes");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the check costs exactly one eth_chainId");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_destination_rpc_is_an_error_not_a_pass() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener); // free the port so the connect fails
+        assert!(destination_l1_client(url, TEST_BRIDGE.parse().unwrap(), 0, 1).await.is_err());
     }
 }

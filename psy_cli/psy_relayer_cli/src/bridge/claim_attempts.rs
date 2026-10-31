@@ -19,9 +19,8 @@
 //!
 //! Two things make a plain count safe enough without any backoff:
 //!
-//! * A round already absorbs short outages on its own. `claim_withdrawals`
-//!   polls psy-services for the claim proof 12 times at 5s intervals before it
-//!   reports failure, so a minute of unavailability costs no attempts at all.
+//! * Each round bounds its read-only claim readiness work. Unavailable reads
+//!   and rows left unread by the budget defer without spending attempts.
 //! * Waiting for bridge liquidity, a proof, a fee quote, or an operator change
 //!   is reported as a hold rather than a failure, so a withdrawal parked behind
 //!   one of those does not spend its attempts while it waits.

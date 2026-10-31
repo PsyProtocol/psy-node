@@ -1,6 +1,8 @@
-guardian_root = "guardians-root"
+guardian_root = "db/guardians"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 3055054724
+rpc_config = "psy-genesis/config.json"
 # Operator-supplied reference template. The launcher forwards PSY_BRIDGE_DAEMON_CONFIG unchanged
 # and does not generate daemon.toml. Legacy Envio dependency paths remain distinct from that daemon config.
-rpc_config = "psy-genesis/config.json"
+[finalize]
+password_env = "WALLET_PASSWORD"

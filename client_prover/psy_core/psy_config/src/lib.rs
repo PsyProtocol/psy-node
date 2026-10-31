@@ -679,10 +679,10 @@ impl<F: RichField> PsyConfig<F> {
         PsyConfigBuilder::new()
     }
 
-    /// 当前网络的 magic 必须等于编译进本二进制的 magic。
+    /// The selected network magic must match the magic compiled into this binary.
     ///
-    /// 比的是 magic 而不是网络名：localhost 与 testnet 共用同一个 magic，
-    /// 一套产物可以同时服务两者；mainnet 的 magic 不同，会在这里被挡住。
+    /// Match magic rather than names: localhost and testnet share one magic,
+    /// while mainnet has a distinct magic and is rejected by this artifact.
     pub fn verify_chain_identity(&self) -> Result<(), ConfigError> {
         let network = self.get_current_network()?;
         let config_magic = parse_magic_hex(&network.magic).map_err(ConfigError::InvalidConfig)?;
@@ -698,7 +698,7 @@ impl<F: RichField> PsyConfig<F> {
         Ok(())
     }
 
-    /// 切换网络但不做链身份校验。只给查看类工具用（例如 `psy_dev_cli chain-info`）。
+    /// Selects a network without identity checks, for read-only tools such as chain-info.
     pub fn use_network_unchecked(&mut self, network_name: &str) -> Result<(), ConfigError> {
         if !self.config.networks.contains_key(network_name) {
             return Err(ConfigError::NetworkNotFound(network_name.to_string()));
@@ -999,8 +999,8 @@ mod tests {
         "0x1337CF514544C069"
     };
 
-    /// 一个能被 `NetworkConfig` 正确反序列化的最小网络块。
-    /// 真实结构是平铺的：没有 `"network"` 这层包装，`magic` 与 `fees.da_fee` 都是必填。
+    /// Minimal deserializable NetworkConfig; fields are flat, without a network wrapper.
+    /// Both magic and fees.da_fee are required.
     fn network_json(magic: &str, users_per_realm: u64, currency: &str) -> String {
         format!(
             r#"{{
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_error_handling() {
-        // defaultNetwork 指向一个不存在的网络。
+        // defaultNetwork names a missing network.
         let json = config_json(
             "missing_network",
             &[("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0"))],
@@ -1175,8 +1175,8 @@ mod tests {
 
     #[test]
     fn stage_magic_table_matches_the_protocol_constants() {
-        // psy_core/src/constants/protocol.rs 定义的三个值。
-        // testnet 沿用 REGTEST 的值：现网就是这么跑的，换它需要一次全新部署。
+        // Values defined in psy_core/src/constants/protocol.rs. Testnet retains
+        // the deployed REGTEST magic; changing it requires a fresh deployment.
         assert_eq!(magic_for_stage("localhost"), Some(0x1337CF514544CF69));
         assert_eq!(magic_for_stage("testnet"), Some(0x1337CF514544CF69));
         assert_eq!(magic_for_stage("mainnet"), Some(0x1337CF514544C069));
@@ -1230,9 +1230,9 @@ mod tests {
             config.use_network("mainnet").unwrap_err(),
             ConfigError::ChainIdentityMismatch { .. }
         ));
-        assert_eq!(config.current_network_name(), "localhost", "失败的切换不应该改变当前网络");
+        assert_eq!(config.current_network_name(), "localhost", "a rejected switch must preserve the selected network");
 
-        // 查看用的入口不校验，chain-info 这类工具靠它。
+        // Read-only tools such as chain-info use the unchecked selector.
         config.use_network_unchecked("mainnet").unwrap();
         assert_eq!(config.current_network_name(), "mainnet");
     }

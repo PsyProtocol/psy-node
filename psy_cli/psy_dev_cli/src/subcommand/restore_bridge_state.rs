@@ -311,6 +311,7 @@ fn replace_snapshot(database: &redb::Database, relayer: bool, snapshot: &BridgeJ
         transaction.open_table(RELAYER_REQUEST)?;
         transaction.open_table(CHAIN_CLAIMS)?;
         transaction.open_table(FINALIZATION_BATCH)?;
+        transaction.open_table(WITHDRAWAL_QUARANTINE)?;
         let mut deposits = transaction.open_table(RELAYER_DEPOSIT_TREE_STATES)?;
         let mut burns = transaction.open_table(RELAYER_INCLUDED_WITHDRAWAL_BURNS)?;
         let mut nonces = transaction.open_table(RELAYER_WITHDRAWAL_NONCE)?;

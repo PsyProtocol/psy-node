@@ -2271,7 +2271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dpn_function_transaction_input_word_rejects_calldata_over_128_felts() {
+    async fn dpn_function_transaction_input_word_rejects_calldata_over_capacity() {
         let dpn_def = build_dpn_transaction_input_word_function(0, 0, 11);
         let sd_config = one_transaction_sd_key_config();
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
@@ -2287,15 +2287,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dpn_function_transaction_input_word_accepts_exactly_128_felts() {
-        let dpn_def = build_dpn_transaction_input_word_function(0, SDKEY_MAX_CALLDATA_WORDS as u64 - 1, 127);
+    async fn dpn_function_transaction_input_word_accepts_exactly_192_felts() {
+        let dpn_def = build_dpn_transaction_input_word_function(0, 191, 191);
         let sd_config = one_transaction_sd_key_config();
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
 
-        let calldata = (0..SDKEY_MAX_CALLDATA_WORDS as u64).collect::<Vec<_>>();
+        let calldata = (0..192).collect::<Vec<_>>();
         let (tx_info, inputs) = make_tx_info(5, 42, &calldata);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
+        let proof = gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
+        gadget.minifier_chain.as_ref().unwrap().verify(proof).unwrap();
+    }
+
+    #[test]
+    fn dpn_function_transaction_input_word_rejects_oversized_length_in_circuit() {
+        use super::{CircuitBuilder, PartialWitness, PoseidonHash, C, D};
+        use plonky2::{iop::witness::WitnessWrite, plonk::config::Hasher};
+
+        let mut builder = CircuitBuilder::<GF, D>::new(plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config());
+        let active = builder._true();
+        let length = builder.add_virtual_target();
+        let inputs = builder.add_virtual_targets(SDKEY_MAX_CALLDATA_WORDS as usize);
+        let inputs_hash = builder.add_virtual_hash();
+        SDKeyDpnCircuitGadget::bind_inputs_hash_to_inputs(&mut builder, active, length, &inputs, inputs_hash);
+        let data = builder.build::<C>();
+
+        // Write raw targets, bypassing set_tx_introspection_witness's length guard.
+        for declared_length in [192, 193] {
+            let mut witness = PartialWitness::new();
+            let length_value = GF::from_canonical_u64(declared_length);
+            witness.set_target(length, length_value).unwrap();
+            for input in &inputs {
+                witness.set_target(*input, GF::from_canonical_u64(11)).unwrap();
+            }
+            let hash = if declared_length == 192 {
+                let mut preimage = vec![length_value];
+                preimage.extend(vec![GF::from_canonical_u64(11); 192]);
+                preimage.push(length_value);
+                PoseidonHash::hash_no_pad(&preimage)
+            } else {
+                // Match the selector's fall-through hash to isolate the length guards.
+                PoseidonHash::hash_no_pad(&[GF::ZERO, GF::ZERO])
+            };
+            witness.set_hash_target(inputs_hash, hash).unwrap();
+            let proof = data.prove(witness);
+            if declared_length == 192 {
+                data.verify(proof.unwrap()).unwrap();
+            } else {
+                assert!(proof.is_err(), "the circuit accepted 193 calldata words");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dpn_function_transaction_input_word_accepts_legacy_and_batch_calldata() {
+        let dpn_def = build_dpn_transaction_input_word_function(0, 0, 11);
+        let sd_config = one_transaction_sd_key_config();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
+
+        for length in [128, 176] {
+            let calldata = vec![11; length];
+            let (tx_info, inputs) = make_tx_info(5, 42, &calldata);
+            let witness = build_witness(vec![tx_info], vec![inputs], 1);
+            let proof = gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
+            gadget.minifier_chain.as_ref().unwrap().verify(proof).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2329,7 +2385,7 @@ mod tests {
     }
 
     /// Explicit capacity/performance test for the protocol maximum. This is
-    /// expensive because constructing 64 slots with 128 calldata
+    /// expensive because constructing 64 slots with full-capacity calldata
     /// targets each is intentionally expensive.
     #[tokio::test]
     async fn dpn_function_transaction_input_word_accepts_last_transaction_at_max_count() {

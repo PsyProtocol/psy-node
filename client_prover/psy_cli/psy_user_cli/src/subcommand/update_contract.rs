@@ -1,11 +1,17 @@
 use std::{fs, path::Path, str::FromStr};
 
 use plonky2::{field::types::PrimeField64, plonk::proof::ProofWithPublicInputs};
+use kvq::traits::KVQSerializable;
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyHasher, C, D, F};
 use psy_client_data::{qdata::contract::PsyContractLeaf, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
 use psy_compiler::{abi::Abi, output::serialize::{CompilationArtifact, ContractOutput}};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
+use sha2::Digest;
+use psy_crypto::hash::tx_hash::{
+    compute_deploy_contract_content_hash, compute_update_contract_auth_hash,
+    compute_update_contract_content_hash,
+};
 use psy_prover::{
     session::{compile_bridge::build_layout_aware_update_command, gen_contract_update_and_circuits_for_functions},
     wallet::memory_wallet::{get_public_key_info, get_zk_fingerprint},
@@ -14,6 +20,8 @@ use psy_provider::{
     provider::{QUserRpcProvider, RpcProvider},
     request::QUpdateContractRPCRequest,
 };
+use psy_client_data::qblock::cmds::deploy_contract::PContractUpdateAuthorization;
+use psy_common_circuit::circuits::zk_signature3::manager::SimplePsyZKSignatureManager;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
 use super::{args::UpdateContractArgs, contract_abi_upload, resolve_deployer_user_id};
@@ -91,6 +99,8 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
     };
     let update_cmd = build_layout_aware_update_command(&old_output, &new_output, update_cmd)?;
     update_cmd.validate_shape()?;
+    // set in the `is_update` branch below; the non-update path never submits
+    let mut authorization: Option<PContractUpdateAuthorization> = None;
 
     if args.is_update {
         let on_chain_leaf: PsyContractLeaf<F> = rpc_provider.get_contract_leaf_data(args.contract_id).await?;
@@ -99,6 +109,30 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
             args.contract_id,
             &on_chain_leaf,
         )?;
+
+        // Prove the deployer authorization over a digest of every piece the
+        // coordinator re-hashes, then send it with the update envelope.
+        let update_with_root = update_cmd.clone().into_with_whitelist_root::<PsyHasher>()?;
+        let update_content_hash = compute_update_contract_content_hash(
+            update_with_root.contract_id,
+            update_with_root.deployer,
+            &update_with_root.function_whitelist_root.to_le_bytes(),
+            update_with_root.code_definition.state_tree_height as u64,
+        );
+        // bincode bytes match the coordinator's code-definition encoding
+        let code_definition_bytes = update_cmd.code_definition.to_bytes()?;
+        let auth_hash = compute_update_contract_auth_hash(
+            psy_config::PSY_NETWORK_MAGIC,
+            &update_content_hash,
+            &on_chain_leaf.qfhash::<PsyHasher>().to_le_bytes(),
+            &update_cmd.code_root.to_le_bytes(),
+            &sha2::Sha256::digest(&code_definition_bytes).into(),
+            &sha2::Sha256::digest(&update_cmd.canonical_layout_proof).into(),
+        );
+        let sig_hash = QHashOut::<F>::from_bytes(&auth_hash)?;
+        let signer = SimplePsyZKSignatureManager::<C, D>::new();
+        let proof = signer.zk_sign_for_private_key_value(private_key, sig_hash)?;
+        authorization = Some(PContractUpdateAuthorization::ZkSignature { proof_json: serde_json::to_string(&proof)? });
     }
 
     match args.output_path {
@@ -125,7 +159,7 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
             uploaded_content_hash
         );
         let update_content_hash = rpc_provider
-            .update_contract(QUpdateContractRPCRequest { update_contract: update_cmd })
+            .update_contract(QUpdateContractRPCRequest { update_contract: update_cmd, authorization: authorization.ok_or_else(|| anyhow::anyhow!("update authorization was not produced"))? })
             .await?;
         tracing::info!("contract updated: {}", update_content_hash);
         return Ok(CommandResult::Update(UpdateResult {

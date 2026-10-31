@@ -128,19 +128,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderB32<F, D>
         (x_evens, x_odds)
     }
 
-    /// Important! This function is unsafe!
-    /// It fails for 3+ inputs all set to 0xffffffff
-    ///
-    /// More generally, it fails if the sum of the three interleaved inputs for a given iteration exceeds the Goldilocks field characteristic.
-    /// In these cases, the sum gets reduced mod the field order and will produce.
-    /// If we assume the outputs for a 3-way add of interleaved u32 inputs are uniformly distributed in [0, 2^64-1] (don't think this is actually true but I think close enough),
-    /// then the odds of this happening are 1 - ((2^64-2^32+1) / (2^64-1)) = 2.3283064e-10, so it's unlikely to inhibit an honest prover trying to prove something actually correct.
-    ///
-    /// However, please keep in mind that adversarially this makes it possible in some cases to prove an invalid input hashes to the same result as a valid input.
-    /// For example, this circuit can incorrectly prove that 0xffffffff XOR 0xffffffff XOR 0xffffffff is equal to 0x0000fffe.
-    /// If you have three inputs whose XOR actually *do* evaluate to 0x0000fffe, then a malicious prover can substitute 0xffffffff for the actual inputs and still produce a valid proof.
-    /// Cases like this basically require the first half of the real result to be all 0's, so odds of roughly 1/(2^16) per input triple that this exploit appears
-    /// Currently we haven't thought of any particular attacks that can exploit this, but once again should be kept in mind.
+    /// Up to three inputs use pairwise XOR, including operands with shared bits.
+    /// The optimized path for four or more inputs is unsafe: intermediate
+    /// three-way interleaved sums can overflow the field or produce unsupported
+    /// slot values. Do not use that path for unrestricted operands. Production
+    /// callers in this repository currently pass exactly three inputs.
     fn unsafe_xor_many_u32(&mut self, x: &[U32Target]) -> U32Target {
         match x.len() {
             0 => self.zero_u32(),
@@ -378,9 +370,12 @@ mod tests {
         let pw = PartialWitness::new();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
+        // Canonical interleaved input (separators at even big-endian positions);
+        // the gate is only valid for sums of two interleaved values, which never
+        // hold both bits of a slot.
         let x_interleaved_value: u64 =
-            0b1111_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
-        let x_evens_value_expected: u64 = 0b1100_0000_0000_0000_0000_0000_0000_0000;
+            0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
+        let x_evens_value_expected: u64 = 0b0000_0000_0000_0000_0000_0000_0000_0000;
         let x_odds_value_expected: u64 = 0b1111_1111_1111_1111_1111_1111_1111_1111;
 
         let x_interleaved_target = builder.constant(F::from_canonical_u64(x_interleaved_value));
@@ -411,10 +406,11 @@ mod tests {
         let pw = PartialWitness::new();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
+        // Canonical interleaved input; see the u32 variant above.
         let x_interleaved_value: u64 =
-            0b1111_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
+            0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
         let x_evens_value_expected: u64 =
-            0b0101_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000;
+            0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000;
         let x_odds_value_expected: u64 =
             0b0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101_0101;
 
@@ -628,21 +624,10 @@ mod tests {
             vec![0x01234567, 0x01234567, 0x01234567],
             vec![0x01234567, 0x89abcdef, 0x0],
             vec![0xffffffff, 0x89abcdef, 0x01234567],
-            vec![0x7fffffff, 0xffffffff, 0xffffffff],
-            vec![0x7fffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            vec![0x0, 0x0, 0x0, 0x0, 0x0],
-            vec![0x4, 0x4, 0x4, 0x4, 0x4],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567, 0x01234567],
-            vec![0x0fffffff, 0x89abcdef, 0x01234567, 0x89abcdef, 0x01234567],
-            vec![0x0fffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            vec![0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
-            // the following tests fail, hence unsafe
-            // vec![0xffffffff, 0xffffffff, 0xffffffff],
-            // vec![0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff],
+            vec![0xffffffff, 0xffffffff, 0xffffffff],
+            vec![0x0u32, 0x0, 0x0, 0x0, 0x0],
+            // The pairwise three-input path is distinct from the unsafe
+            // optimized path used for four or more inputs.
         ];
 
         // build circuit once

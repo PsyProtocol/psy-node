@@ -99,7 +99,7 @@ where
         previous_checkpoint_id: u64,
         updates: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
     ) -> anyhow::Result<()> {
-        let changed_leaves_on_imt_indexed_trees = crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(self.db.as_ref(), previous_checkpoint_id, updates)
+        let changed_leaves_on_imt_indexed_trees = crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash, N::HasherBase>(self.db.as_ref(), previous_checkpoint_id, updates)
             .await?;
         let mut trees = load_realm_memory_trees_from_db::<N, _>(
             &*self.db,

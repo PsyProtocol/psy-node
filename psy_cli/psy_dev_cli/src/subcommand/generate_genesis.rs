@@ -20,7 +20,7 @@ use psy_core::{
     user_id::{UserIdBitsStrategy5, UserIdGeneratorStrategy},
 };
 use psy_data::{
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    genesis::genesis_block_setup::{PsyGenesisBlockSetupData, PsyGenesisContract},
     user::complete_user_record::PsyCompactUserDefinition,
     v1::qdata::{
         checkpoint::PQEDCheckpointLeafStats,
@@ -34,6 +34,7 @@ use psy_plonky2_circuits::node::config::networks::local_devnet::{
     get_public_key_param, ZK_FINGERPRINT_U64,
 };
 
+mod accounts;
 mod guardians_root;
 pub use guardians_root::preflight_fresh_devnet_inputs;
 
@@ -104,6 +105,28 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long, help = "Generate validator and faucet private keys from OS entropy; required outside localhost")]
     pub random_private_keys: bool,
 
+    /// Existing dense private-key array; reuse identities without generating keys.
+    #[arg(long = "private-keys-in", requires_all = ["private_keys_sha256", "accounts_genesis_in", "accounts_genesis_sha256"], conflicts_with = "random_private_keys")]
+    pub private_keys_in: Option<PathBuf>,
+
+    #[arg(long = "private-keys-sha256", requires = "private_keys_in")]
+    pub private_keys_sha256: Option<String>,
+
+    /// Public Genesis whose account identities and validator roles must be retained.
+    #[arg(long = "accounts-genesis-in", requires_all = ["private_keys_in", "accounts_genesis_sha256"])]
+    pub accounts_genesis_in: Option<PathBuf>,
+
+    #[arg(long = "accounts-genesis-sha256", requires = "accounts_genesis_in")]
+    pub accounts_genesis_sha256: Option<String>,
+
+    /// Fresh Genesis only: retain imported keys and roles but update Faucet fingerprints.
+    #[arg(long = "fresh-faucet-identities", requires = "private_keys_in")]
+    pub fresh_faucet_identities: bool,
+
+    /// Fresh Genesis only: update registration 2 to the compiled multisig fingerprint.
+    #[arg(long = "fresh-relayer-fingerprint", requires = "private_keys_in")]
+    pub fresh_relayer_fingerprint: bool,
+
     /// Optional assertion against the fingerprint derived from the faucet SDKey policy.
     #[arg(long = "sd-key-fingerprint", default_value = "")]
     pub sd_key_fingerprint: String,
@@ -164,15 +187,17 @@ pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
     generate_local_devnet_genesis(&args)
 }
 
-fn ensure_private_key_mode(network: &str, random_private_keys: bool) -> anyhow::Result<()> {
-    ensure!(network == "localhost" || random_private_keys,
-        "network {network} requires --random-private-keys; deterministic Genesis private keys are localhost-only");
+fn ensure_private_key_mode(network: &str, random_private_keys: bool, has_existing_private_keys: bool) -> anyhow::Result<()> {
+    ensure!(!(random_private_keys && has_existing_private_keys),
+        "existing private keys and random private keys are mutually exclusive");
+    ensure!(network == "localhost" || random_private_keys || has_existing_private_keys,
+        "network {network} requires --random-private-keys or --private-keys-in; deterministic Genesis private keys are localhost-only");
     Ok(())
 }
 
 fn ensure_faucet_output(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    ensure!(!args.random_private_keys || args.skip_faucet_operators || args.faucet_operators_out.is_some(),
-        "--random-private-keys requires --skip-faucet-operators or an explicit --faucet-operators-out");
+    ensure!(!(args.random_private_keys || args.private_keys_in.is_some()) || args.skip_faucet_operators || args.faucet_operators_out.is_some(),
+        "secure private-key modes require --skip-faucet-operators or --faucet-operators-out");
     Ok(())
 }
 
@@ -292,9 +317,13 @@ fn require_abi_method_agreement(compiled: &CompiledContract) -> anyhow::Result<(
     ensure!(compiled.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(u64::from(compiled.state_tree_height)),
         "compiler ABI height differs from the artifact height");
     let methods = abi_methods(&compiled.abi)?;
+    ensure!(!compiled.circuit_definitions.is_empty() && methods.len() == compiled.circuit_definitions.len(),
+        "compiler ABI and compiled method counts must agree and be nonempty");
     let mut seen = std::collections::BTreeSet::new();
+    let mut method_ids = std::collections::BTreeSet::new();
     for definition in &compiled.circuit_definitions {
         ensure!(seen.insert(definition.name.as_str()), "compiled method {} is duplicated", definition.name);
+        ensure!(method_ids.insert(definition.method_id), "compiled method id {} is duplicated", definition.method_id);
         let mut matches = methods.iter().filter(|method| method["name"].as_str() == Some(definition.name.as_str()));
         let method = matches.next().with_context(|| format!("compiler ABI omits method {}", definition.name))?;
         ensure!(matches.next().is_none(), "compiler ABI method {} is duplicated", definition.name);
@@ -381,12 +410,76 @@ fn load_contracts(path: &Path) -> anyhow::Result<Vec<PQBCDeployContract<Hash>>> 
         deployment: PQBCDeployContract<Hash>,
     }
     let named: Vec<NamedDeployment> = serde_json::from_slice(json).context("parsing flat named Genesis deployments")?;
-    let mut names = std::collections::HashSet::with_capacity(named.len());
-    for entry in &named {
-        ensure!(!entry.name.trim().is_empty() && names.insert(entry.name.as_str()), "Genesis contract names must be nonempty and unique");
-    }
-    ensure!(named.get(MULTISIG_POLICY_CONTRACT_ID as usize).map(|entry| entry.name.as_str()) == Some("multisig_policy"), "Genesis contract 1 must be multisig_policy");
+    ensure!(named.iter().map(|entry| entry.name.as_str()).eq(GENESIS_CONTRACT_NAMES),
+        "Genesis requires token, multisig_policy, deposit_tree, withdrawal_tree, usdt_token, faucet in that order");
     Ok(named.into_iter().map(|entry| entry.deployment).collect())
+}
+
+const GENESIS_CONTRACT_NAMES: [&str; 6] = [
+    "token", "multisig_policy", "deposit_tree", "withdrawal_tree", "usdt_token", "faucet",
+];
+
+fn require_full_token_methods(compiled: &CompiledContract) -> anyhow::Result<()> {
+    const METHODS: [(&str, u32); 10] = [
+        ("withdraw", 3055054724), ("claim_deposit", 1577908089),
+        ("mint", 3374273625), ("transfer", 2789897329), ("claim", 3824212239),
+        ("batch_transfer_2", 1656917177), ("batch_transfer_5", 1394667333),
+        ("burn", 3998182541), ("private_transfer", 1325380837), ("private_claim", 635905178),
+    ];
+    ensure!(compiled.circuit_definitions.iter().map(|definition|
+        (definition.name.as_str(), definition.method_id)).eq(METHODS),
+        "Genesis token requires the complete ordered methods including mint and fee burn");
+    Ok(())
+}
+
+fn genesis_contract_from_compiled(
+    contract_id: usize,
+    deployment: PQBCDeployContract<Hash>,
+    compiled: &CompiledContract,
+) -> anyhow::Result<PsyGenesisContract<Hash>> {
+    use psy_data::v1::qdata::contract::{
+        canonical_layout_manifest_from_compiler_abi_json,
+        CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT,
+    };
+    require_abi_method_agreement(compiled)?;
+    if contract_id == 0 || contract_id == 4 {
+        require_full_token_methods(compiled)?;
+    }
+    if contract_id == MULTISIG_POLICY_CONTRACT_ID as usize {
+        require_policy_contract(compiled)?;
+    }
+    let state_layout = canonical_layout_manifest_from_compiler_abi_json::<PoseidonHasher, F, Hash>(
+        &serde_json::to_string(&compiled.abi)?,
+        psy_core::constants::protocol::STATE_LAYOUT_TREE_HEIGHT,
+        CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT,
+    )?;
+    let layout = state_layout.validate::<PoseidonHasher, F>()?;
+    ensure!(layout.state_layout_field_count > 0, "Genesis precompile must declare its nonempty state layout");
+    let abi_state = compiled.abi.pointer("/contract/state").and_then(serde_json::Value::as_array)
+        .context("compiler ABI state fields are missing")?;
+    let layout_fields = compiled.abi.pointer("/contract/state_layout/fields").and_then(serde_json::Value::as_array)
+        .context("compiler ABI canonical layout fields are missing")?;
+    ensure!(abi_state.len() == layout.fields.len(), "compiler ABI state and canonical layout field counts differ");
+    for ((state, declared), field) in abi_state.iter().zip(layout_fields).zip(&layout.fields) {
+        ensure!(state["type"] == declared["type"]
+            && state["offset"].as_u64() == field.start_slot.checked_add(field.payload_offset)
+            && state["felt_size"].as_u64() == field.slot_count.checked_sub(field.payload_offset),
+            "compiler ABI state does not match canonical layout payload");
+    }
+    require_deployment_roots(compiled, &deployment)?;
+    ensure!(state_layout.state_tree_height == deployment.code_definition.state_tree_height,
+        "Genesis canonical layout height differs from deployment");
+    Ok(PsyGenesisContract { deploy_contract: deployment, state_layout })
+}
+
+fn load_genesis_contracts(path: &Path, compiler_root: &Path) -> anyhow::Result<Vec<PsyGenesisContract<Hash>>> {
+    let contracts = load_contracts(path)?;
+    contracts.into_iter().zip(GENESIS_CONTRACT_NAMES).enumerate()
+        .map(|(id, (deployment, name))| {
+            let compiled = read_compiler_contract(compiler_root, name)?;
+            genesis_contract_from_compiled(id, deployment, &compiled)
+                .with_context(|| format!("validating Genesis contract {id} ({name})"))
+        }).collect()
 }
 
 fn parse_qhash(hex: &str) -> anyhow::Result<QHashOut<F>> {
@@ -459,6 +552,22 @@ fn genesis_users(
     ensure!(validator_slots.len() >= 2, "dense registration 2 requires preceding validator registrations");
     let mut relayer = Some(relayer);
     let special_zk_user_count = validator_slots.len() + 1;
+    let imported = match (&args.private_keys_in, &args.private_keys_sha256) {
+        (Some(path), Some(digest)) => Some(accounts::read_private_keys(
+            path, digest, special_zk_user_count + args.faucet_operator_count,
+            usize::try_from(args.relayer_registration_id)?,
+        )?),
+        (None, None) => None,
+        _ => anyhow::bail!("existing private keys require both input path and SHA-256"),
+    };
+    let mut get_private_key = |registration: u64| -> anyhow::Result<Hash> {
+        match &imported {
+            Some(keys) => keys.get(usize::try_from(registration)?).copied().flatten()
+                .context("existing private key registration is missing"),
+            None if args.random_private_keys => random_private_key(rng),
+            None => Ok(deterministic_private_key(registration)),
+        }
+    };
     let mut users = Vec::with_capacity(special_zk_user_count + args.faucet_operator_count);
     let mut private_keys: Vec<Option<Hash>> = Vec::with_capacity(special_zk_user_count + args.faucet_operator_count);
 
@@ -487,7 +596,7 @@ fn genesis_users(
             "validator slot registration {} does not match dense cursor {next_registration}",
             slot.registration_id
         );
-        let private_key = if args.random_private_keys { random_private_key(rng)? } else { deterministic_private_key(slot.registration_id) };
+        let private_key = get_private_key(slot.registration_id)?;
         ensure!(!private_keys.contains(&Some(private_key)), "duplicate Genesis private key");
         private_keys.push(Some(private_key));
         users.push(compact_user(zk_fingerprint, private_key, args.initial_fee_balance));
@@ -507,7 +616,7 @@ fn genesis_users(
 
     for i in 0..args.faucet_operator_count {
         let slot = special_zk_user_count + i;
-        let private_key = if args.random_private_keys { random_private_key(rng)? } else { deterministic_private_key(slot as u64) };
+        let private_key = get_private_key(slot as u64)?;
         ensure!(!private_keys.contains(&Some(private_key)), "duplicate Genesis private key");
         private_keys.push(Some(private_key));
         users.push(compact_user(sd_key_fingerprint, private_key, args.initial_fee_balance));
@@ -540,8 +649,63 @@ fn faucet_sd_key_fingerprint(args: &GenerateGenesisDataArgs) -> anyhow::Result<H
     Ok(sd_key_fingerprint)
 }
 
+fn validate_imported_accounts(args: &GenerateGenesisDataArgs, users: &[PsyCompactUserDefinition<Hash>]) -> anyhow::Result<()> {
+    if args.private_keys_in.is_none() {
+        ensure!(!args.fresh_faucet_identities && !args.fresh_relayer_fingerprint,
+            "fresh account fingerprints require imported private keys");
+        ensure!(args.accounts_genesis_in.is_none() && args.accounts_genesis_sha256.is_none(),
+            "account identity source requires imported private keys");
+        return Ok(());
+    }
+    let path = args.accounts_genesis_in.as_ref().context("import requires the public account Genesis")?;
+    let digest = args.accounts_genesis_sha256.as_deref().context("import requires the account Genesis SHA-256")?;
+    let (retained, validators) = accounts::read_genesis_accounts(path, digest)?;
+    ensure!(retained.len() == users.len(), "imported account role/count mismatch");
+    let slots = parse_validator_slots(&args.validator_slots)?;
+    let operator_start = users.len().checked_sub(args.faucet_operator_count)
+        .context("imported Faucet account count exceeds registration count")?;
+    ensure!(operator_start == slots.len() + 1, "imported account role/count mismatch");
+    let transition = if args.fresh_faucet_identities {
+        let before = retained.get(operator_start).context("fresh Faucet identities require operators")?.public_key_info.fingerprint;
+        let after = users[operator_start].public_key_info.fingerprint;
+        ensure!(before != after && after != Hash::get_zero_value(),
+            "fresh Faucet identities require a changed nonzero policy fingerprint");
+        Some((before, after))
+    } else {
+        None
+    };
+    if args.fresh_relayer_fingerprint {
+        ensure!(args.relayer_registration_id == 2, "fresh Relayer fingerprint requires registration 2");
+        let old = retained.get(2).context("missing retained Relayer account")?.public_key_info.fingerprint;
+        let new = users.get(2).context("missing fresh Relayer account")?.public_key_info.fingerprint;
+        let compiled = QHashOut(guardian_common::protocol::multisig_fingerprint()
+            .map_err(|error| anyhow::anyhow!("multisig fingerprint: {error}"))?.0);
+        ensure!(old != new && new == compiled && new != Hash::get_zero_value(),
+            "fresh Relayer must change to the compiled multisig fingerprint");
+    }
+    for (registration, (before, after)) in retained.iter().zip(users).enumerate() {
+        ensure!(before.public_key_info.public_key_param == after.public_key_info.public_key_param,
+            "imported account public key parameter changed");
+        if let Some((old_fingerprint, new_fingerprint)) = transition.filter(|_| registration >= operator_start) {
+            ensure!(before.public_key_info.fingerprint == old_fingerprint
+                && after.public_key_info.fingerprint == new_fingerprint,
+                "fresh Faucet policy transition must cover every operator consistently");
+        } else if !(args.fresh_relayer_fingerprint && registration == 2) {
+            ensure!(before.public_key_info.fingerprint == after.public_key_info.fingerprint,
+                "imported non-Faucet fingerprint changed or fresh Faucet transition was not selected");
+        }
+    }
+    let requested = slots.iter().map(|slot| (slot.realm_id, user_id_for(args, slot.registration_id)))
+        .collect::<std::collections::BTreeSet<_>>();
+    let previous = validators.iter().map(|validator| (u64::from(validator.realm_id), validator.validator_user_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(requested.len() == slots.len() && previous.len() == validators.len() && requested == previous,
+        "imported validator registration or Realm roles changed");
+    Ok(())
+}
+
 fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    ensure_private_key_mode(psy_config::CURRENT_NETWORK, args.random_private_keys)?;
+    ensure_private_key_mode(psy_config::CURRENT_NETWORK, args.random_private_keys, args.private_keys_in.is_some())?;
     ensure_faucet_output(args)?;
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
@@ -553,11 +717,11 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
-    let contracts = load_contracts(&contracts_path)?;
+    let contracts = load_genesis_contracts(&contracts_path, &compiler_checkout(&repo_root)?)?;
     let sd_key_fingerprint = faucet_sd_key_fingerprint(args)?;
-    validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
     let relayer = initialized_multisig_user(&account, args.initial_fee_balance)?;
     let (users, private_keys) = genesis_users(args, relayer, sd_key_fingerprint, &mut rand::rngs::OsRng)?;
+    validate_imported_accounts(args, &users)?;
     let special_zk_user_count = users.len() - args.faucet_operator_count;
 
     let genesis_data = PsyGenesisBlockSetupData {
@@ -600,7 +764,7 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let faucet_body = faucet_operators_path.as_ref().map(|_| faucet_operators_body(args, &private_keys, special_zk_user_count, sd_key_fingerprint)).transpose()?;
 
     save_genesis_outputs(
-        args.random_private_keys,
+        args.random_private_keys || args.private_keys_in.is_some(),
         (&genesis_path, &genesis_body),
         (&private_keys_path, &private_keys_body),
         faucet_operators_path.as_deref().zip(faucet_body.as_deref()),
@@ -858,14 +1022,14 @@ mod tests {
     fn public_network_requires_random_private_keys() {
         let default = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
         assert!(!default.random_private_keys);
-        assert!(ensure_private_key_mode("localhost", default.random_private_keys).is_ok());
+        assert!(ensure_private_key_mode("localhost", default.random_private_keys, false).is_ok());
         for network in ["testnet", "mainnet", "unknown", ""] {
-            assert!(ensure_private_key_mode(network, default.random_private_keys).unwrap_err().to_string().contains("--random-private-keys"));
+            assert!(ensure_private_key_mode(network, default.random_private_keys, false).unwrap_err().to_string().contains("--random-private-keys"));
         }
         let random = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--random-private-keys"]).unwrap();
         assert!(random.random_private_keys);
         for network in ["localhost", "testnet", "mainnet"] {
-            assert!(ensure_private_key_mode(network, random.random_private_keys).is_ok());
+            assert!(ensure_private_key_mode(network, random.random_private_keys, false).is_ok());
         }
         if psy_config::CURRENT_NETWORK != "localhost" {
             assert!(generate_local_devnet_genesis(&default).unwrap_err().to_string().contains("--random-private-keys"));
@@ -883,6 +1047,232 @@ mod tests {
         random.skip_faucet_operators = false;
         random.faucet_operators_out = Some(PathBuf::from("explicit-faucet.json"));
         assert!(ensure_faucet_output(&random).is_ok());
+    }
+
+    #[test]
+    fn imported_private_keys_require_hash_and_exclude_random_generation() {
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--private-keys-in", "keys.json",
+        ]).is_err());
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--private-keys-sha256", &"0".repeat(64),
+        ]).is_err());
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--private-keys-in", "keys.json",
+            "--private-keys-sha256", &"0".repeat(64), "--random-private-keys",
+        ]).is_err());
+        assert!(ensure_private_key_mode("testnet", false, true).is_ok());
+        assert!(ensure_private_key_mode("testnet", true, true).is_err());
+    }
+
+    #[test]
+    fn imported_genesis_keys_preserve_all_accounts_without_entropy() {
+        use std::os::unix::fs::DirBuilderExt;
+        use sha2::{Digest, Sha256};
+        let root = std::env::current_dir().unwrap().join(format!(".genesis-import-{}", rand::random::<u64>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("keys.json");
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--validator-slot", "0,1,0;1,1,1;1,2,3;0,2,4;1,3,5;0,3,6",
+        ]).unwrap();
+        let keys: Vec<Option<Hash>> = (0..107u64).map(|registration|
+            (registration != 2).then(|| Hash::from_values(registration + 1, 2, 3, 4)),
+        ).collect();
+        let bytes = serde_json::to_vec(&keys).unwrap();
+        write_exclusive(&path, &bytes).unwrap();
+        args.private_keys_in = Some(path.clone());
+        args.private_keys_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
+        let fingerprint = Hash::from_values(21, 22, 23, 24);
+        let (users, imported) = genesis_users(
+            &args, relayer_fixture(), fingerprint, &mut KeyBytesRng(Default::default()),
+        ).unwrap();
+        assert!(imported == keys);
+        assert_eq!(users.len(), 107);
+        for (registration, key) in keys.iter().enumerate() {
+            if let Some(key) = key {
+                assert!(users[registration].public_key_info.public_key_param
+                    == get_public_key_param::<F, PoseidonHash>(*key));
+            }
+        }
+        assert!(std::fs::read(&path).unwrap() == bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_accounts_reject_fingerprint_and_role_changes() {
+        use std::os::unix::fs::DirBuilderExt;
+        use sha2::{Digest, Sha256};
+        let root = std::env::current_dir().unwrap().join(format!(".genesis-identity-{}", rand::random::<u64>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("public-genesis.json");
+        let mut args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        let fingerprint = Hash::from_values(21, 22, 23, 24);
+        let (users, _) = genesis_users(&args, relayer_fixture(), fingerprint, &mut KeyBytesRng(Default::default())).unwrap();
+        let slots = parse_validator_slots(&args.validator_slots).unwrap();
+        let validators = slots.iter().map(|slot| serde_json::json!({
+            "realm_id": slot.realm_id, "validator_user_id": user_id_for(&args, slot.registration_id),
+        })).collect::<Vec<_>>();
+        let source = serde_json::json!({"users": users, "validators": validators, "contracts": "ignored"});
+        let bytes = serde_json::to_vec(&source).unwrap();
+        write_exclusive(&path, &bytes).unwrap();
+        args.private_keys_in = Some(root.join("keys-not-opened-by-identity-check.json"));
+        args.accounts_genesis_in = Some(path);
+        args.accounts_genesis_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
+        validate_imported_accounts(&args, &users).unwrap();
+        let mut changed = users.clone();
+        changed[5].public_key_info.fingerprint = Hash::from_values(1, 2, 3, 4);
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        args.validator_slots[0] = "1,1,0".to_string();
+        assert!(validate_imported_accounts(&args, &users).is_err());
+        assert!(std::fs::read(&args.accounts_genesis_in.unwrap()).unwrap() == bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_faucet_identities_only_change_imported_operator_fingerprints() {
+        use std::os::unix::fs::DirBuilderExt;
+        use sha2::{Digest, Sha256};
+        let root = std::env::current_dir().unwrap().join(format!(".genesis-fresh-faucet-{}", rand::random::<u64>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("public-genesis.json");
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--validator-slot", "0,1,0;1,1,1;1,2,3;0,2,4;1,3,5;0,3,6",
+        ]).unwrap();
+        let old_fingerprint = Hash::from_values(21, 22, 23, 24);
+        let new_fingerprint = Hash::from_values(31, 32, 33, 34);
+        let (users, _) = genesis_users(&args, relayer_fixture(), old_fingerprint,
+            &mut KeyBytesRng(Default::default())).unwrap();
+        let slots = parse_validator_slots(&args.validator_slots).unwrap();
+        let validators = slots.iter().map(|slot| serde_json::json!({
+            "realm_id": slot.realm_id, "validator_user_id": user_id_for(&args, slot.registration_id),
+        })).collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&serde_json::json!({"users": users, "validators": validators})).unwrap();
+        write_exclusive(&path, &bytes).unwrap();
+        args.private_keys_in = Some(root.join("keys-not-opened-by-identity-check.json"));
+        args.accounts_genesis_in = Some(path.clone());
+        args.accounts_genesis_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
+        let mut changed = users.clone();
+        for user in &mut changed[7..] {
+            user.public_key_info.fingerprint = new_fingerprint;
+        }
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        let parsed = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-faucet-identities",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]);
+        assert!(parsed.is_ok(), "explicit fresh Faucet transition is not available");
+        // The parser result supplies only the explicit opt-in; the pinned fixture stays intact.
+        args.fresh_faucet_identities = parsed.unwrap().fresh_faucet_identities;
+        validate_imported_accounts(&args, &changed).unwrap();
+        for registration in [0usize, 1, 2, 3, 4, 5, 6] {
+            let mut invalid = changed.clone();
+            invalid[registration].public_key_info.fingerprint = new_fingerprint;
+            assert!(validate_imported_accounts(&args, &invalid).is_err());
+        }
+        let mut invalid = changed.clone();
+        invalid[7].public_key_info.public_key_param = Hash::from_values(41, 42, 43, 44);
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        invalid = changed.clone();
+        invalid[8].public_key_info.fingerprint = old_fingerprint;
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        assert!(validate_imported_accounts(&args, &users).is_err());
+        args.validator_slots[0] = "1,1,0".to_string();
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_faucet_identities_require_pinned_import_and_reject_random_keys() {
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-faucet-identities",
+        ]).is_err());
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-faucet-identities", "--random-private-keys",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]).is_err());
+        let mut args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        args.fresh_faucet_identities = true;
+        assert!(validate_imported_accounts(&args, &[]).is_err());
+    }
+
+    #[test]
+    fn fresh_relayer_fingerprint_keeps_guardian_policy_and_every_other_account() {
+        use std::os::unix::fs::DirBuilderExt;
+        use sha2::{Digest, Sha256};
+        let root = std::env::current_dir().unwrap().join(format!(".genesis-fresh-relayer-{}", rand::random::<u64>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("public-genesis.json");
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--validator-slot", "0,1,0;1,1,1;1,2,3;0,2,4;1,3,5;0,3,6",
+        ]).unwrap();
+        let mut old_relayer = relayer_fixture();
+        old_relayer.public_key_info.fingerprint = parse_qhash("a8e0dc9f01f1f20f0bf8e92644a346e8876b8cbb48aaaed8d91813ea17ea53bb").unwrap();
+        let faucet_fingerprint = Hash::from_values(21, 22, 23, 24);
+        let (users, _) = genesis_users(&args, old_relayer, faucet_fingerprint,
+            &mut KeyBytesRng(Default::default())).unwrap();
+        let validators = parse_validator_slots(&args.validator_slots).unwrap().iter().map(|slot| serde_json::json!({
+            "realm_id": slot.realm_id, "validator_user_id": user_id_for(&args, slot.registration_id),
+        })).collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&serde_json::json!({"users": users, "validators": validators})).unwrap();
+        write_exclusive(&path, &bytes).unwrap();
+        args.private_keys_in = Some(root.join("keys-not-opened-by-identity-check.json"));
+        args.accounts_genesis_in = Some(path.clone());
+        args.accounts_genesis_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
+        let mut changed = users.clone();
+        changed[2] = initialized_multisig_user(&account_fixture(), args.initial_fee_balance).unwrap();
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        args.fresh_relayer_fingerprint = true;
+        validate_imported_accounts(&args, &changed).unwrap();
+        assert!(validate_imported_accounts(&args, &users).is_err());
+        let mut invalid = changed.clone();
+        invalid[2].public_key_info.public_key_param = Hash::from_values(41, 42, 43, 44);
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        invalid = changed.clone();
+        invalid[2].public_key_info.fingerprint = Hash::from_values(31, 32, 33, 34);
+        assert!(validate_imported_accounts(&args, &invalid).is_err());
+        for registration in [0usize, 1, 3, 4, 5, 6, 7, 106] {
+            invalid = changed.clone();
+            invalid[registration].public_key_info.fingerprint = changed[2].public_key_info.fingerprint;
+            assert!(validate_imported_accounts(&args, &invalid).is_err());
+        }
+        let mut both = changed.clone();
+        for user in &mut both[7..] {
+            user.public_key_info.fingerprint = Hash::from_values(51, 52, 53, 54);
+        }
+        assert!(validate_imported_accounts(&args, &both).is_err());
+        args.fresh_faucet_identities = true;
+        validate_imported_accounts(&args, &both).unwrap();
+        args.fresh_faucet_identities = false;
+        args.relayer_registration_id = 3;
+        assert!(validate_imported_accounts(&args, &changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_relayer_fingerprint_requires_hash_pinned_import() {
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint",
+        ]).is_err());
+        assert!(GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint", "--random-private-keys",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]).is_err());
+        let mut args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--fresh-relayer-fingerprint",
+            "--private-keys-in", "keys.json", "--private-keys-sha256", &"0".repeat(64),
+            "--accounts-genesis-in", "prior.json", "--accounts-genesis-sha256", &"1".repeat(64),
+        ]).unwrap();
+        assert!(args.fresh_relayer_fingerprint);
+        args.private_keys_in = None;
+        assert!(validate_imported_accounts(&args, &[]).is_err());
     }
 
     #[test]
@@ -1003,8 +1393,8 @@ mod tests {
     fn contract_loader_preserves_flat_deployments_and_order() {
         let root = std::env::temp_dir().join(format!("psy-genesis-flat-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
-        let entries: Vec<_> = (0..7).map(|index| serde_json::json!({
-            "name": if index == u64::from(MULTISIG_POLICY_CONTRACT_ID) { "multisig_policy".to_string() } else { format!("contract{index}") },
+        let entries: Vec<_> = GENESIS_CONTRACT_NAMES.iter().enumerate().map(|(index, name)| serde_json::json!({
+            "name": name,
             "deployer": index,
             "code_definition": {"state_tree_height":4,"functions":[]},
             "function_whitelist":[],"code_root":Hash::get_zero_value()
@@ -1090,6 +1480,72 @@ mod tests {
     }
 
     #[test]
+    fn default_faucet_policy_circuit_matches_genesis_and_exported_identity() {
+        use plonky2::field::types::PrimeField64;
+        use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
+        use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
+
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--faucet-operator-count", "100",
+            "--relayer-registration-id", "2", "--relayer-user-id", "524288",
+            "--validator-slot", "0,1,0", "--validator-slot", "1,1,1",
+            "--validator-slot", "1,2,3", "--validator-slot", "0,2,4",
+            "--validator-slot", "1,3,5", "--validator-slot", "0,3,6",
+        ]).unwrap();
+        let relayer = PsyCompactUserDefinition {
+            public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account_fixture().public_key_param().unwrap().0) },
+            balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
+        };
+        let sd_key_fingerprint = faucet_sd_key_fingerprint(&args).unwrap();
+        let (users, keys) = genesis_users(&args, relayer, sd_key_fingerprint, &mut KeyBytesRng(Default::default())).unwrap();
+        let first_operator = users.len() - args.faucet_operator_count;
+        let config: serde_json::Value = serde_json::from_slice(&faucet_operators_body(
+            &args, &keys, first_operator, sd_key_fingerprint,
+        ).unwrap()).unwrap();
+        let contracts: Vec<u64> = serde_json::from_value(config["sdKeyAllowedContractIds"].clone()).unwrap();
+        let methods: Vec<u32> = serde_json::from_value(config["sdKeyAllowedMethodIds"].clone()).unwrap();
+        let callers: Vec<u64> = serde_json::from_value(config["sdKeyAllowedCallerContractIds"].clone()).unwrap();
+        let min_count = config["sdKeyMinTxCount"].as_u64().unwrap();
+        let max_count = config["sdKeyMaxTxCount"].as_u64().unwrap();
+        assert_eq!(contracts, [5, 0, 0]);
+        assert_eq!(methods, [3375543263, 2789897329, 3998182541]);
+        assert_eq!(min_count, 1);
+        assert_eq!(max_count, 64);
+        assert_eq!(callers, [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64, 5, psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64]);
+        // Build the same policy circuit as faucet runtime, not another copy of its pin.
+        let (function, policy) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            &callers, &contracts, &methods, min_count, max_count,
+        ).unwrap();
+        let circuit = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &policy).unwrap();
+        let fingerprint = circuit.get_fingerprint();
+        println!("default faucet policy circuit fingerprint: {fingerprint}");
+        println!("default faucet policy circuit fingerprint_u64x4: {:?}", fingerprint.0.elements.map(|value| value.to_canonical_u64()));
+        println!("default faucet policy base degree_bits: {}", circuit.circuit_data.as_ref().unwrap().common.degree_bits());
+        assert_eq!(users.len(), 107);
+        assert_eq!(first_operator, 7);
+        assert_eq!(user_id_for(&args, first_operator as u64), 1_835_008);
+        let operators = config["operators"].as_array().unwrap();
+        assert_eq!(operators.len(), args.faucet_operator_count);
+        for (index, operator) in operators.iter().enumerate() {
+            let registration = first_operator + index;
+            let private_key = ClientHash(keys[registration].unwrap().0);
+            let info = ZKPublicKeyInfo {
+                fingerprint,
+                public_key_param: get_sd_key_public_key_param(&private_key),
+            };
+            let address = info.qfhash::<PoseidonHash>();
+            assert_eq!(users[registration].public_key_info.fingerprint.0, fingerprint.0,
+                "genesis faucet fingerprint must match the constructed policy circuit");
+            assert_eq!(users[registration].public_key_info.public_key_param.0, info.public_key_param.0);
+            assert_eq!(users[registration].public_key_info.to_hash::<PoseidonHasher>().0, address.0);
+            assert_eq!(parse_qhash(operator["fingerprint"].as_str().unwrap()).unwrap().0, fingerprint.0);
+            assert_eq!(parse_qhash(operator["address"].as_str().unwrap()).unwrap().0, address.0);
+            assert_eq!(operator["userId"].as_str().unwrap(), user_id_for(&args, registration as u64).to_string());
+            assert_eq!(operator["signType"], "sd-key");
+        }
+    }
+
+    #[test]
     #[ignore = "requires approved PSY_GENESIS_CONTRACTS and the sibling compiler checkout; run explicitly in QA"]
     fn initialized_genesis_roots_authorize_first_ordinary_nonce_one() {
         use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
@@ -1124,6 +1580,9 @@ mod tests {
         let mut wrong_code = contracts.clone();
         wrong_code[MULTISIG_POLICY_CONTRACT_ID as usize].code_root = Hash::get_zero_value();
         assert!(validate_multisig_policy_artifact(&wrong_code, &compiled).is_err());
+        let contracts = load_genesis_contracts(
+            Path::new(&contracts_path), &compiler_checkout(Path::new("..")).unwrap(),
+        ).unwrap();
         let stats = PQEDCheckpointLeafStats::<F, Hash>::new_empty();
         let genesis: PsyGenesisBlockSetupData<F, Hash> = serde_json::from_value(serde_json::json!({
             "contracts": contracts,

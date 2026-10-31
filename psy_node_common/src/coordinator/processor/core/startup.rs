@@ -315,7 +315,7 @@ pub(crate) mod startup_tests {
         // commit exactly those roots or the first block's witness consistency
         // check fails
         PsyGenesisBlockSetupData {
-            contracts: vec![contract],
+            contracts: vec![psy_data::genesis::genesis_block_setup::genesis_contract_with_empty_layout_fixture(contract)],
             users: vec![],
             validators: vec![genesis_validator()],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
@@ -381,7 +381,7 @@ pub(crate) mod startup_tests {
             let proof_work_queue = Arc::new(FakeWorkerQueue::new());
             let (processor, guta_gatherer_handle, register_gatherer_handle, deploy_gatherer_handle) =
                 create_coordinator_processor::<N, _, _, _, _, _, _, _, _, _>(
-                    psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(),
+                    psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
                     genesis_data,
                     Arc::clone(&file_system),
                     "coord_test_deploy_backups".to_string(),

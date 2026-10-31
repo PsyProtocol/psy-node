@@ -97,6 +97,12 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         collect_contracts: bool,
     ) -> anyhow::Result<()> {
         let mut contract_function_tree_nodes_serializer = SingleIdMerkleNodeBatchSerializer::<Hash>::new();
+        // Validate every contract before changing any builder state.
+        let layouts = genesis_block.contracts.iter().map(|contract| {
+            anyhow::ensure!(contract.state_layout.state_tree_height == contract.code_definition.state_tree_height,
+                "Genesis layout height does not match deployment height");
+            contract.state_layout.validate::<Hasher, F>()
+        }).collect::<anyhow::Result<Vec<_>>>()?;
         let mut global_contract_tree_merkle_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(genesis_block.contracts.len());
         if collect_contracts {
             self.contract_leaves_ffs = Vec::with_capacity(
@@ -127,13 +133,9 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 function_tree_root,
                 code_root: contract.code_root,
                 state_tree_height: F::from_u16_value(contract.code_definition.state_tree_height),
-                // Genesis contracts are supplied in the legacy deploy format and
-                // do not carry compiler-generated layout metadata.  They use the
-                // canonical empty layout until an explicit layout-aware deploy
-                // is introduced for genesis.
-                state_layout_root: Hash::get_zero_value(),
-                state_layout_field_count: F::ZERO_VALUE,
-                state_layout_slot_count: F::ZERO_VALUE,
+                state_layout_root: layouts[contract_id as usize].state_layout_root,
+                state_layout_field_count: F::from_u64_value(layouts[contract_id as usize].state_layout_field_count),
+                state_layout_slot_count: F::from_u64_value(layouts[contract_id as usize].state_layout_slot_count),
             };
 
             let contract_leaf_hash = contract_leaf.qfhash::<Hasher>();

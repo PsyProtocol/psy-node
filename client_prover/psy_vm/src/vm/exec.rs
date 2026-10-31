@@ -1596,6 +1596,7 @@ impl<
                         result,
                     });
                 }
+                anyhow::ensure!(key_hash != QHashOut::ZERO, "IMT key zero is reserved for the sentinel");
 
                 let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
                     key: c.key,

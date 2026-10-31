@@ -19,6 +19,7 @@ use plonky2::{
 use crate::u32::{
     arithmetic_u32::{CircuitBuilderU32, U32Target},
     multiple_comparison::list_lte_u32_circuit,
+    range_check::range_check_u32_circuit,
     witness::{GeneratedValuesU32, WitnessU32},
 };
 
@@ -72,6 +73,16 @@ pub trait CircuitBuilderBiguint<F: RichField + Extendable<D>, const D: usize> {
     fn div_biguint(&mut self, a: &BigUintTarget, b: &BigUintTarget) -> BigUintTarget;
 
     fn rem_biguint(&mut self, a: &BigUintTarget, b: &BigUintTarget) -> BigUintTarget;
+
+    /// Constrain `a == div * b + rem` with `rem < b`. A zero divisor leaves no
+    /// satisfying assignment.
+    fn constrain_biguint_div_rem(
+        &mut self,
+        a: &BigUintTarget,
+        div: &BigUintTarget,
+        rem: &BigUintTarget,
+        b: &BigUintTarget,
+    );
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D> for CircuitBuilder<F, D> {
@@ -180,7 +191,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D> f
             result_limbs.push(result);
             borrow = new_borrow;
         }
-        // Borrow should be zero here.
+        // A final borrow of one means b > a; without this check the gadget
+        // silently returns a wrapped value instead of failing.
+        self.assert_zero_u32(borrow);
 
         BigUintTarget { limbs: result_limbs }
     }
@@ -242,15 +255,35 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D> f
             _phantom: PhantomData,
         });
 
-        let div_b = self.mul_biguint(&div, b);
-        let div_b_plus_rem = self.add_biguint(&div_b, &rem);
-        self.connect_biguint(a, &div_b_plus_rem);
-
-        let cmp_rem_b = self.cmp_biguint(&rem, b);
-        self.assert_one(cmp_rem_b.target);
+        self.constrain_biguint_div_rem(a, &div, &rem, b);
 
         (div, rem)
     }
+
+    fn constrain_biguint_div_rem(
+        &mut self,
+        a: &BigUintTarget,
+        div: &BigUintTarget,
+        rem: &BigUintTarget,
+        b: &BigUintTarget,
+    ) {
+        let div_b = self.mul_biguint(div, b);
+        let div_b_plus_rem = self.add_biguint(&div_b, rem);
+        self.connect_biguint(a, &div_b_plus_rem);
+
+        // A free quotient limb can be p-aliased while the product still matches
+        // modulo p. Range-check every quotient limb before accepting it as a u32.
+        range_check_u32_circuit(self, div.limbs.clone());
+
+        // rem <= b alone admits the degenerate division rem == b (and with it a
+        // quotient one too small whenever b divides a); the remainder must be
+        // strictly below the divisor. A zero divisor fails both checks.
+        let cmp_rem_b = self.cmp_biguint(rem, b);
+        self.assert_one(cmp_rem_b.target);
+        let rem_eq_b = self.is_equal_biguint(rem, b);
+        self.assert_zero(rem_eq_b.target);
+    }
+
 
     fn div_biguint(&mut self, a: &BigUintTarget, b: &BigUintTarget) -> BigUintTarget {
         let (div, _rem) = self.div_rem_biguint(a, b);
@@ -385,7 +418,11 @@ mod tests {
     use anyhow::Result;
     use num::{BigUint, FromPrimitive, Integer};
     use plonky2::{
-        iop::witness::PartialWitness,
+        field::{
+            extension::Extendable,
+            types::{Field, PrimeField64},
+        },
+        iop::witness::{PartialWitness, WitnessWrite},
         plonk::{
             circuit_builder::CircuitBuilder,
             circuit_data::CircuitConfig,
@@ -395,6 +432,7 @@ mod tests {
     use rand::{rngs::OsRng, Rng};
 
     use super::super::super::gadgets::biguint::{CircuitBuilderBiguint, WitnessBigUint};
+    use crate::u32::witness::WitnessU32;
 
     #[test]
     fn test_biguint_add() -> Result<()> {
@@ -539,6 +577,145 @@ mod tests {
 
         builder.connect_biguint(&div, &expected_div);
         builder.connect_biguint(&rem, &expected_rem);
+
+        let data = builder.build::<C>();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof)
+    }
+
+    /// The degenerate witness `a = 6, b = 2, div = 2, rem = 2` satisfies
+    /// `a == div*b + rem` and `rem <= b`, so only the strict-inequality check
+    /// rejects it. The witness targets are set by hand because the production
+    /// path registers a generator that overwrites `div`/`rem` with honest
+    /// values and would mask the distinction in every `prove()` run.
+    #[test]
+    fn test_biguint_div_rem_rejects_remainder_equal_to_divisor() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut pw = PartialWitness::new();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let a = builder.add_virtual_biguint_target(1);
+        let b = builder.add_virtual_biguint_target(1);
+        let div = builder.add_virtual_biguint_target(1);
+        let rem = builder.add_virtual_biguint_target(1);
+        pw.set_u32_target(a.limbs[0], 6);
+        pw.set_u32_target(b.limbs[0], 2);
+        pw.set_u32_target(div.limbs[0], 2);
+        pw.set_u32_target(rem.limbs[0], 2);
+
+        builder.constrain_biguint_div_rem(&a, &div, &rem, &b);
+
+        let data = builder.build::<C>();
+        assert!(data.prove(pw).is_err(), "rem == b must not be provable");
+        Ok(())
+    }
+
+    /// `div = (p + 5) / 2, rem = 1` satisfies `6 == div*2 + 1 (mod p)`, but
+    /// the quotient is not a u32. `prove()` returns an object without checking
+    /// it, so the regression must reject `prove` followed by `verify`.
+    #[test]
+    fn test_biguint_div_rem_rejects_field_aliased_quotient() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut pw = PartialWitness::new();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let a = builder.add_virtual_biguint_target(1);
+        let b = builder.add_virtual_biguint_target(1);
+        let div = builder.add_virtual_biguint_target(1);
+        let rem = builder.add_virtual_biguint_target(1);
+        pw.set_target(a.limbs[0].0, F::from_canonical_u32(6))?;
+        pw.set_target(b.limbs[0].0, F::from_canonical_u32(2))?;
+        pw.set_target(div.limbs[0].0, F::from_canonical_u64(0x7fff_ffff_8000_0003))?;
+        pw.set_target(rem.limbs[0].0, F::from_canonical_u32(1))?;
+        builder.constrain_biguint_div_rem(&a, &div, &rem, &b);
+
+        let data = builder.build::<C>();
+        assert!(data.prove(pw).and_then(|proof| data.verify(proof)).is_err(), "field-aliased quotient must not produce a valid proof");
+        Ok(())
+    }
+
+    /// The honest witness for the same divisor proves.
+    #[test]
+    fn test_biguint_div_rem_accepts_strict_remainder() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut pw = PartialWitness::new();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let a = builder.add_virtual_biguint_target(1);
+        let b = builder.add_virtual_biguint_target(1);
+        let div = builder.add_virtual_biguint_target(1);
+        let rem = builder.add_virtual_biguint_target(1);
+        pw.set_u32_target(a.limbs[0], 6);
+        pw.set_u32_target(b.limbs[0], 2);
+        pw.set_u32_target(div.limbs[0], 3);
+        pw.set_u32_target(rem.limbs[0], 0);
+
+        builder.constrain_biguint_div_rem(&a, &div, &rem, &b);
+
+        let data = builder.build::<C>();
+        let proof = data.prove(pw).unwrap();
+        data.verify(proof)
+    }
+
+    /// `b > a` must fail the gadget instead of returning `a - b` modulo
+    /// `2^(32*limbs)`. Witness targets are set by hand: `sub_biguint` has no
+    /// generator, so `prove()` exercises the real constraint either way.
+    #[test]
+    fn test_biguint_sub_rejects_underflow() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut pw = PartialWitness::new();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let a = builder.add_virtual_biguint_target(1);
+        let b = builder.add_virtual_biguint_target(1);
+        let z = builder.add_virtual_biguint_target(1);
+        pw.set_u32_target(a.limbs[0], 2);
+        pw.set_u32_target(b.limbs[0], 5);
+        pw.set_u32_target(z.limbs[0], 4294967293);
+
+        let diff = builder.sub_biguint(&a, &b);
+        builder.connect_biguint(&diff, &z);
+
+        let data = builder.build::<C>();
+        assert!(data.prove(pw).is_err(), "underflow must not be provable");
+        Ok(())
+    }
+
+    /// The in-range witness for the same operands proves.
+    #[test]
+    fn test_biguint_sub_accepts_in_range() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut pw = PartialWitness::new();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let a = builder.add_virtual_biguint_target(1);
+        let b = builder.add_virtual_biguint_target(1);
+        let z = builder.add_virtual_biguint_target(1);
+        pw.set_u32_target(a.limbs[0], 5);
+        pw.set_u32_target(b.limbs[0], 2);
+        pw.set_u32_target(z.limbs[0], 3);
+
+        let diff = builder.sub_biguint(&a, &b);
+        builder.connect_biguint(&diff, &z);
 
         let data = builder.build::<C>();
         let proof = data.prove(pw).unwrap();

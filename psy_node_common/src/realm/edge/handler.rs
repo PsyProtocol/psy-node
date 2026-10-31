@@ -25,11 +25,11 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::{ContractStateUpdate, SubmitUserEndCapNonProofInput}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTMembershipProof,
+            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTContractStateUpdate, IMTMembershipProof,
                 IMTNonMembershipProof, IMTPredecessorResult, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
@@ -118,11 +118,6 @@ fn end_cap_generation_target(generation: GatheringGeneration) -> anyhow::Result<
         .ok_or_else(|| anyhow::anyhow!("gathering checkpoint ID overflow at EndCap routing"))
 }
 
-fn ensure_forwarded_end_cap_target(header_checkpoint_id: u64, generation: GatheringGeneration) -> anyhow::Result<u64> {
-    let target = end_cap_generation_target(generation)?;
-    anyhow::ensure!(header_checkpoint_id == target, "forwarded EndCap checkpoint {} is not the admissible target {}", header_checkpoint_id, target);
-    Ok(target)
-}
 
 
 /// Sparse subtree reads are only safe inside the realm half of the user tree.
@@ -354,21 +349,23 @@ impl<
         )
     }
 
-    async fn ensure_local_is_scheduled_end_cap_receiver(&self, header_checkpoint_id: u64, generation: GatheringGeneration) -> anyhow::Result<()> {
-        let admissible_target = ensure_forwarded_end_cap_target(header_checkpoint_id, generation)?;
+    async fn ensure_local_is_scheduled_end_cap_receiver(&self, generation: GatheringGeneration) -> anyhow::Result<()> {
         if self.p2p.is_none() {
             return Ok(());
         }
         self.proposer_edge_node_ids
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Realm edge proposer identities are missing"))?;
-        if let Some((proposer, _)) = self.scheduled_proposer_dest(admissible_target).await? {
+        let local_target = end_cap_generation_target(generation)?;
+        if let Some((proposer, _)) = self.scheduled_proposer_dest(local_target).await? {
             anyhow::bail!(
-                "forwarded EndCap rejected: local edge is not primary for scheduled proposer {proposer} at target {admissible_target}"
+                "forwarded EndCap rejected: local edge is not primary for scheduled proposer {proposer} at local target {local_target}"
             );
         }
         Ok(())
     }
+
+
     async fn accept_forwarded_end_cap(
         &self,
         source: NodeId,
@@ -815,8 +812,8 @@ impl<
         let mut timer = DebugTimer::new("handle_user_end_cap_proof_submission");
         let generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
         let target = end_cap_generation_target(generation)?;
-        let destination = if let Some(header_target) = forwarded_target {
-            self.ensure_local_is_scheduled_end_cap_receiver(header_target, generation).await?;
+        let destination = if forwarded_target.is_some() {
+            self.ensure_local_is_scheduled_end_cap_receiver(generation).await?;
             None
         } else {
             self.scheduled_proposer_dest(target).await?
@@ -954,6 +951,10 @@ impl<
         user_end_cap_input.ensure_declared_slots_modified()?;
         timer.lap_micros("ensure_declared_slots_modified");
 
+        self.ensure_imt_leaf_record_coverage(&user_end_cap_input, user_id, current_checkpoint_id)
+            .await?;
+        timer.lap_micros("ensure_imt_leaf_record_coverage");
+
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking(move || {
             proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
@@ -997,6 +998,67 @@ impl<
             );
             generation = next_generation;
         }
+    }
+
+    /// Require IMT records for changed existing IMT leaves before admission,
+    /// matching commit-path coverage; unchanged leaves remain exempt.
+    async fn ensure_imt_leaf_record_coverage(
+        &self,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        user_id: u64,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<()> {
+        let empty_leaf = N::QHash::from_owned_32bytes([0u8; 32]);
+        // Group coverage across histories of each contract, matching aggregated FFS.
+        let mut recorded_imt_leaves: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut final_positional_values = HashMap::new();
+        for csu in user_end_cap_input.contract_state_updates.iter() {
+            let contract_id = csu.user_contract_tree_update_proof.index;
+            for update in csu.updates.iter() {
+                if let ContractStateUpdate::Positional { delta_proof } = update {
+                    final_positional_values.insert((contract_id, delta_proof.index), delta_proof.new_value);
+                }
+                if let ContractStateUpdate::IMT { update } = update {
+                    let leaves = recorded_imt_leaves.entry(contract_id).or_default();
+                    match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => {
+                            leaves.insert(delta_proof.index);
+                        }
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            new_leaf_delta_proof,
+                            ..
+                        } => {
+                            leaves.insert(predecessor_delta_proof.index);
+                            leaves.insert(new_leaf_delta_proof.index);
+                        }
+                    }
+                }
+            }
+        }
+        // Intermediate values may restore or clear an IMT leaf later in the EndCap.
+        for ((contract_id, index), new_value) in final_positional_values {
+            if new_value == empty_leaf {
+                continue;
+            }
+            if recorded_imt_leaves
+                .get(&contract_id)
+                .is_some_and(|leaves| leaves.contains(&index))
+            {
+                continue;
+            }
+            if let Some(previous_preimage) = self
+                .db_reader
+                .contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, contract_id, index)
+                .await?
+            {
+                anyhow::ensure!(
+                    previous_preimage.qfhash::<N::HasherBase>() == new_value,
+                    "InvalidEndCapUpdates: contract-state leaf contract={contract_id} index={index} re-declares an existing IMT leaf with a changed value but no IMT record",
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn forward_end_cap_to_scheduled_proposer(
@@ -1823,12 +1885,9 @@ mod mainnet_tests {
     }
 
     #[test]
-    fn forwarded_header_must_match_current_generation_target() {
+    fn generation_target_is_local_and_checked() {
         let current = generation();
-        assert_eq!(ensure_forwarded_end_cap_target(25, current).unwrap(), 25);
-        assert!(ensure_forwarded_end_cap_target(24, current).is_err());
-        assert!(ensure_forwarded_end_cap_target(26, current).is_err());
-        assert!(ensure_forwarded_end_cap_target(25, GatheringGeneration { checkpoint_id: 25, ..current }).is_err());
+        assert_eq!(end_cap_generation_target(current).unwrap(), 25);
         assert!(end_cap_generation_target(GatheringGeneration { checkpoint_id: u64::MAX, ..current }).is_err());
     }
 
@@ -2293,6 +2352,10 @@ mod mainnet_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
+        PsyNodeValidatorTreeDatabaseReader, PsyNodeValidatorTreeDatabaseWriter,
+    };
     use crate::test_common::{
         create_test_unified_db, FakeEphemeralQueuePublisher, FakeWorkerQueueSubscriber, TestNetworkConfig,
         TestUnifiedDatabaseStore, TestZKVerifier,
@@ -2323,7 +2386,7 @@ pub(crate) mod tests {
         psy_core_db::traits::full::{
             PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeCheckpointTreeDatabaseReader,
             PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
-            PsyNodeGlobalUserTreeDatabaseWriter,
+            PsyNodeContractStateIMTDatabaseWriter,
         },
         psy_temp_db::{
             QTempDBJobStatsStore, QTempDBPendingIdWriter, QTempDBSubmitStatusWriter,
@@ -2335,7 +2398,7 @@ pub(crate) mod tests {
 
     pub(crate) type N = TestNetworkConfig;
 
-    pub(crate) const TEST_CHAIN_ID: u32 = 9;
+    pub(crate) const TEST_CHAIN_ID: u64 = 9;
     pub(crate) const TEST_NODE_ID: u32 = 4;
     pub(crate) const TEST_REALM_ID: u64 = 1;
     pub(crate) const TEST_REALM_SUB_ID: u64 = 2;
@@ -2509,7 +2572,7 @@ pub(crate) mod tests {
                 Arc::clone(&work_queue),
                 test_realm_identifier(),
                 worker_whitelist,
-                TEST_CHAIN_ID as u64,
+                TEST_CHAIN_ID,
                 TEST_NODE_ID,
                 proof_verifier,
             );
@@ -2635,6 +2698,320 @@ pub(crate) mod tests {
             .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT);
         let proof_bytes = expected_hash.into_owned_32bytes().to_vec();
         Ok((input, proof_bytes))
+    }
+
+    fn forward_test_node(seed: u8) -> NodeId {
+        let mut bytes = [seed; 32];
+        let key = libp2p_identity::Keypair::ed25519_from_bytes(&mut bytes).unwrap();
+        NodeId::from_keypair(&key).unwrap()
+    }
+
+    async fn seed_forward_base(env: &EndCapEnv, checkpoint: u64) -> anyhow::Result<()> {
+        let top = env.db.global_user_tree_get_merkle_proof_sub_tree(
+            checkpoint, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, TEST_REALM_ID,
+        ).await?;
+        let zero = PHash::get_zero_value();
+        env.db.set_checkpoint_global_state_roots(checkpoint, &PQEDCheckpointGlobalStateRoots {
+            contract_tree_root: zero,
+            deposit_tree_root: zero,
+            user_tree_root: top.root,
+            withdrawal_tree_root: zero,
+            user_registration_tree_root: zero,
+            validator_tree_root: env.db.validator_tree_get_root_hash(checkpoint).await?,
+        }).await?;
+        env.db.global_user_tree_set_top_tree_merkle_proof(checkpoint, &top).await?;
+        env.db.set_checkpoint_leaf_data(checkpoint, &PQEDCheckpointLeaf {
+            global_chain_root: zero,
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        }).await?;
+        Ok(())
+    }
+
+    async fn forward_end_cap_env(local_base: u64, primary: bool) -> anyhow::Result<EndCapEnv> {
+        use psy_data::p2p::{BlsSecretKey, ValidatorLeafPreimage};
+        let mut env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let node = forward_test_node(1);
+        let validator = ValidatorLeafPreimage {
+            chain_id: TEST_CHAIN_ID,
+            realm_id: TEST_REALM_ID as u32,
+            realm_sub_id: TEST_REALM_SUB_ID as u16,
+            validator_user_id: REALM_USER_ID + 1,
+            node_id: node.to_raw(),
+            bls_public_key: BlsSecretKey::key_gen(&[1; 32])?.public_key().to_bytes(),
+        };
+        env.db.validator_tree_set_leaf_hash(0, validator.tree_index()?, PHash::from_owned_32bytes(validator.leaf_hash()?)).await?;
+        env.db.validator_tree_set_leaf_preimage(0, validator.tree_index()?, &validator).await?;
+        for checkpoint in 0..=local_base + 1 {
+            seed_forward_base(&env, checkpoint).await?;
+        }
+        env.temp_db.set_gathering_generation(&test_realm_identifier(), GatheringGeneration {
+            checkpoint_id: local_base,
+            unique_pending_id: 42,
+            proc_checkpoint_unique_id: 103,
+        }).await?;
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        env.handler.p2p = Some(RealmNetworkCommands::from_channel(commands, if primary { node } else { forward_test_node(2) }));
+        env.handler.proposer_edge_node_ids = Some(HashMap::from([(TEST_REALM_SUB_ID as u16, node)]));
+        env.handler.realm_edge_node_ids = Some(HashSet::from([node]));
+        Ok(env)
+    }
+
+    async fn submit_test_forward(env: &EndCapEnv, target: u64) -> anyhow::Result<[u8; 32]> {
+        let (input, proof) = valid_end_cap_submission(env).await?;
+        // The user's checkpoint stays zero, independently of either routing target.
+        assert_eq!(input.core.checkpoint_id.to_u64_value(), 0);
+        submit_test_forward_input(env, target, input, proof).await
+    }
+
+    async fn submit_test_forward_input(
+        env: &EndCapEnv,
+        target: u64,
+        input: SubmitUserEndCapNonProofInput<PF, PHash>,
+        proof: Vec<u8>,
+    ) -> anyhow::Result<[u8; 32]> {
+        let input = input.psy_ser_to_bytes_vec()?;
+        let header = EndCapForwardHeader {
+            chain_id: TEST_CHAIN_ID,
+            realm_id: TEST_REALM_ID as u32,
+            checkpoint_id: target,
+            end_cap_id: compute_end_cap_id(TEST_CHAIN_ID, TEST_REALM_ID as u32, target, &sha256(&input), &sha256(&proof)),
+            end_cap_input_len: input.len() as u32,
+            proof_len: proof.len() as u32,
+        };
+        env.handler.accept_forwarded_end_cap(forward_test_node(1), header, input, proof).await
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_old_and_new_targets_use_local_generation() -> anyhow::Result<()> {
+        for target in [4, 6] {
+            let env = forward_end_cap_env(4, true).await?;
+            submit_test_forward(&env, target).await?;
+            assert_eq!(env.user_update_queue.published_count(), 1);
+            let published = env.user_update_queue.published_bytes_for(103);
+            assert_eq!(published.len(), 1);
+            let item = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&published[0])?;
+            assert_eq!(item.job_id.goal_id, 42);
+            let updates = env.handler.get_user_end_cap_slot_updates_internal(42, REALM_USER_ID).await?.unwrap();
+            assert_eq!(updates.unique_pending_id, 42);
+            let job = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(REALM_USER_ID, N::GLOBAL_USER_TREE_HEIGHT, 42)?;
+            assert!(env.temp_db.contains_proof_for_job_id(job, 42).await?);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_changed_realm_root_keeps_unchanged_user() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        env.db.global_user_tree_set_leaf_hash(5, REALM_USER_ID + 7, PHash::from_values(77, 0, 0, 0)).await?;
+        seed_forward_base(&env, 5).await?;
+        submit_test_forward(&env, 6).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_epoch_thirty_one_to_thirty_two_accepted_for_unchanged_user() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(31, true).await?;
+        submit_test_forward(&env, 31).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_wrong_primary_rejected() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, false).await?;
+        let err = submit_test_forward(&env, 6).await.unwrap_err();
+        assert!(err.to_string().contains("not primary for scheduled proposer"), "{err}");
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_two_targets_deduplicate_same_generation() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        submit_test_forward(&env, 5).await?;
+        let err = submit_test_forward(&env, 6).await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<EndCapSubmitError>(), Some(EndCapSubmitError::AlreadySubmitted { user_id: REALM_USER_ID, unique_pending_id: 42 })));
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        assert_eq!(env.user_update_queue.published_bytes_for(103).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_unknown_header_base_uses_user_leaf() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        submit_test_forward(&env, 7).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_unauthenticated_header_root_uses_user_leaf() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        let mut roots = env.db.get_checkpoint_global_state_roots(5).await?;
+        roots.user_tree_root = PHash::from_values(999, 0, 0, 0);
+        env.db.set_checkpoint_global_state_roots(5, &roots).await?;
+        submit_test_forward(&env, 6).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_wrong_header_top_height_uses_user_leaf() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        let top = env.db.global_user_tree_get_merkle_proof_sub_tree(
+            5, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT - 1, TEST_REALM_ID,
+        ).await?;
+        assert!(top.verify::<PoseidonHasher>());
+        let mut roots = env.db.get_checkpoint_global_state_roots(5).await?;
+        roots.user_tree_root = top.root;
+        env.db.set_checkpoint_global_state_roots(5, &roots).await?;
+        env.db.global_user_tree_set_top_tree_merkle_proof(5, &top).await?;
+        submit_test_forward(&env, 6).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_changed_validator_set_rejects_wrong_local_primary() -> anyhow::Result<()> {
+        use psy_data::p2p::{BlsSecretKey, ValidatorLeafPreimage};
+        let mut env = forward_end_cap_env(4, true).await?;
+        let next = ValidatorLeafPreimage {
+            chain_id: TEST_CHAIN_ID,
+            realm_id: TEST_REALM_ID as u32,
+            realm_sub_id: 3,
+            validator_user_id: REALM_USER_ID + 2,
+            node_id: forward_test_node(2).to_raw(),
+            bls_public_key: BlsSecretKey::key_gen(&[2; 32])?.public_key().to_bytes(),
+        };
+        let old_index = (TEST_REALM_ID << 8) | TEST_REALM_SUB_ID;
+        env.db.validator_tree_set_leaf_hash(4, old_index, zh(0)).await?;
+        env.db.validator_tree_set_leaf_hash(4, next.tree_index()?, PHash::from_owned_32bytes(next.leaf_hash()?)).await?;
+        env.db.validator_tree_set_leaf_preimage(4, next.tree_index()?, &next).await?;
+        seed_forward_base(&env, 4).await?;
+        env.handler.proposer_edge_node_ids.as_mut().unwrap().insert(3, forward_test_node(2));
+        assert!(env.handler.scheduled_proposer_dest(4).await?.is_none());
+        assert_eq!(env.handler.scheduled_proposer_dest(5).await?, Some((3, forward_test_node(2))));
+        let err = submit_test_forward(&env, 4).await.unwrap_err();
+        assert!(err.to_string().contains("at local target 5"), "{err}");
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_end_cap_wrong_start_leaf_rejected() -> anyhow::Result<()> {
+        let env = forward_end_cap_env(4, true).await?;
+        let (mut input, _) = valid_end_cap_submission(&env).await?;
+        input.core.state_transition.start_user_leaf_hash = PHash::from_values(4242, 0, 0, 0);
+        let proof = input.core.get_proof_public_inputs_hash::<PoseidonHasher>(N::GLOBAL_USER_TREE_HEIGHT)
+            .into_owned_32bytes().to_vec();
+        let err = submit_test_forward_input(&env, 6, input, proof).await.unwrap_err();
+        assert!(err.to_string().contains("Invalid start_user_leaf_hash"), "{err}");
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_rejects_changed_leaf_without_record() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (input, _) = valid_end_cap_submission(&env).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        let error = env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0)
+            .await.expect_err("changed existing IMT leaf needs a record before admission");
+        assert!(error.to_string().contains("contract=0 index=0"), "{error}");
+        assert!(error.to_string().contains("no IMT record"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_allows_unchanged_cleared_and_positional_leaves() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (mut input, _) = valid_end_cap_submission(&env).await?;
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        for value in [hash, PHash::from_owned_32bytes([0; 32])] {
+            let ContractStateUpdate::Positional { delta_proof } = &mut input.contract_state_updates[0].updates[0] else {
+                panic!("fixture must contain a positional update");
+            };
+            delta_proof.new_value = value;
+            env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_groups_records_by_contract_across_histories() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let (mut input, _) = valid_end_cap_submission(&env).await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        let ContractStateUpdate::Positional { delta_proof } = input.contract_state_updates[0].updates[0].clone() else {
+            panic!("fixture must contain a positional update");
+        };
+        let mut history = input.contract_state_updates[0].clone();
+        history.updates = vec![ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: leaf, new_preimage: leaf, delta_proof: delta_proof.clone(),
+            },
+        }];
+        input.contract_state_updates.push(history);
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        let history = input.contract_state_updates.last_mut().unwrap();
+        history.updates = vec![ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Insert {
+                predecessor_old_preimage: leaf, predecessor_new_preimage: leaf, new_leaf_preimage: leaf,
+                predecessor_delta_proof: delta_proof.clone(), new_leaf_delta_proof: delta_proof,
+            },
+        }];
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        input.contract_state_updates.last_mut().unwrap().user_contract_tree_update_proof.index = 1;
+        env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await
+            .expect_err("another contract's IMT record must not cover this leaf");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imt_admission_allows_restored_and_finally_cleared_histories() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let hash = leaf.qfhash::<PoseidonHasher>();
+        let record = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            REALM_USER_ID, 0, 0, &hash, &leaf.key, &leaf.value, &leaf.next_key, leaf.next_index.to_u64_value(), false,
+        );
+        env.db.contract_state_imt_set_leaves_ffs(0, &record).await?;
+        for final_value in [hash, PHash::from_owned_32bytes([0; 32])] {
+            let (mut input, _) = valid_end_cap_submission(&env).await?;
+            let mut tree = SimpleMemoryMerkleStoreV3::<PoseidonHasher, PHash>::new(CONTRACT_TREE_HEIGHT);
+            tree.set_leaf(0, hash);
+            let changed = tree.set_leaf(0, PHash::from_values(1000, 0, 0, 0));
+            let unrelated = tree.set_leaf(1, PHash::from_values(2000, 0, 0, 0));
+            let restored = tree.set_leaf(0, final_value);
+            let mut first = input.contract_state_updates[0].clone();
+            first.updates = vec![ContractStateUpdate::Positional { delta_proof: changed }];
+            let mut second = first.clone();
+            second.updates = vec![
+                ContractStateUpdate::Positional { delta_proof: unrelated },
+                ContractStateUpdate::Positional { delta_proof: restored },
+            ];
+            input.contract_state_updates = vec![first, second];
+            env.handler.ensure_imt_leaf_record_coverage(&input, REALM_USER_ID, 0).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

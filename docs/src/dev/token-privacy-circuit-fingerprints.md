@@ -10,7 +10,7 @@
 
 ## Background
 
-The contracts cannot embed a full Plonky2 verifier. The UPS session proof tree already commits to `(circuit_fingerprint, public_inputs_hash)` when the wallet inserts the external proof. The contract therefore only needs the same fingerprint the minifier advertises. A stale constant produces `proof tree root mismatch` on an otherwise valid claim. `psy-services` does not store a second copy of the limbs: it constructs the same circuits from its pinned `psy-node` revision. The compiler pin, Genesis bytecode, wallet `local_circuits.json`, and services pin must still refer to one `R_node`.
+The contracts cannot embed a full Plonky2 verifier. The UPS session proof tree already commits to `(circuit_fingerprint, public_inputs_hash)` when the wallet inserts the external proof. The contract therefore only needs the same fingerprint the minifier advertises. A stale constant produces `proof tree root mismatch` on an otherwise valid claim. `psy-services` does not store a second copy of the limbs: it constructs the same circuits from its pinned `psy-node` revision. The compiler pin, Genesis bytecode, wallet `local_circuits.json`, and services pin must still resolve to one `psy-node` source cohort.
 
 ## Table of Contents
 
@@ -40,7 +40,7 @@ The contracts cannot embed a full Plonky2 verifier. The UPS session proof tree a
 | `DepositInclusionCircuit` | Compiled shield-deposit circuit. Source: `deposit_inclusion.rs`. |
 | `ShieldDepositClaimCircuit` | Type alias of `DepositInclusionCircuit` (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:332`). Protocol/UPS import name via `privacy::shield_deposit_claim` (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/mod.rs:1-2`). |
 | Minifier fingerprint | `QStandardCircuit::get_fingerprint()` of the minified circuit, not the wallet base/inner circuit. |
-| `R_node` | The frozen, pushed `psy-node` source revision used for compiler and services Cargo pins. |
+| `R_node` | The frozen `psy-node` source revision named by compiler and services Cargo pins; local-devnet cohorts resolve those pinned packages to the sibling checkout through the committed path patch. |
 | PI preimage | Ordered field list hashed into `public_inputs_hash` inside the circuit. |
 
 `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/shield_deposit_claim.rs` is **not** declared in `privacy/mod.rs` and is not compiled. Do not measure, edit, or copy limbs from that file.
@@ -186,7 +186,7 @@ cargo test --release -p psy_dpn_circuit \
 Require:
 
 1. The note test prints `fingerprint:` then a `QHashOut` (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/private_note_inclusion.rs:699-702`) and currently `assert_eq`s the four limbs that must equal `private_note_inclusion_fingerprint`.
-2. The deposit test prints `deposit inclusion fingerprint:` (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:454-459`). If that test does not yet `assert_eq` the four limbs to `shield_claim_fingerprint`, add that assertion in the same atomic set as the contract constants so the next change cannot drift.
+2. The deposit test prints `deposit inclusion fingerprint:` and already `assert_eq`s the minifier's four limbs to an expected `QHashOut::from_values(...)` that must equal `shield_claim_fingerprint` (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:450-458`). That asserted value and the printed `actual` are the measurement; do not add a second assertion or hand-enter a limb.
 3. After promotion, both compiled tests' expected/printed four limbs, both `.psy` constants, and `circuit.get_fingerprint()` are the same four decimal `u64` values in the same order.
 4. Copy limbs from `QHashOut::from_values(a, b, c, d)` / the four ordered field elements in index order `0..3`. Do not convert a hex display hash, reorder limbs, or drop a limb to `u32`.
 5. Ignore any expected value in uncompiled `shield_deposit_claim.rs`.
@@ -204,12 +204,12 @@ Treat this as one atomic set. A partial update is invalid.
    - `<workspace>/psy-compiler/psy-precompiles/usdt_token/src/main.psy`
 2. Replace the matching expected values in the **compiled** tests:
    - `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/private_note_inclusion.rs` (`test_private_note_inclusion_circuit_builds`)
-   - `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs` (`deposit_inclusion_circuit_builds`; add `assert_eq` if missing)
+   - `client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs` (`deposit_inclusion_circuit_builds`, which already asserts the minifier fingerprint)
 3. If §4 item 1 applies, replace the `hash([...])` argument lists in both token files from the compiled circuit preimage.
 4. If §4 item 2 applies, replace both `0u32..16u32` loops to the new height in both token files.
 5. If §6.2 of [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) triggers, run `make generate-local-circuits` and commit `client_prover/psy_prover/src/wallet/local_circuits.json` with the circuit source.
 6. Re-run both measurement tests. Require pass.
-7. Freeze and push `R_node` before compiler or services pins move (`AGENTS.md` release DAG).
+7. Keep the limbs consistent with the resolved `psy-node` cohort the compiler builds against, not the manifest `rev` alone (§7). A limb edit needs no dependency bump and no push to build or generate; publishing a revised `R_node` and moving consumer pins is the separate release DAG ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §8).
 
 Do not edit `DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED`, EndCap fingerprints, Groth16 Solidity verifiers, or uncompiled `shield_deposit_claim.rs` as part of this set.
 
@@ -217,7 +217,7 @@ Do not edit `DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED`, EndCap fingerprints, G
 
 Follow the applicability gate. This class is a compiler / precompile / Genesis change.
 
-From `<workspace>/psy-compiler`, after the compiler Cargo pins use pushed `R_node`:
+From `<workspace>/psy-compiler`, on a clean committed tree whose resolved `psy-node` cohort is the one being verified:
 
 ```bash
 make gen-deploy-json
@@ -225,20 +225,22 @@ make gen-deploy-json
 
 The workspace recipe is `<workspace>/psy-compiler/Makefile:270-309`. It compiles the precompiles, copies `token.json` and `token.update.json` into `psy-genesis`, regenerates `genesis_contracts.json` and `genesis_abi/`, writes the compiler provenance stamp at `:308`, and does not write the node's root `genesis.json`. Require the generated token bytecode to contain the new limbs.
 
+Generate only from a clean committed compiler tree: `:308` derives `compilerRevision` and `compilerSourcesHash` from `HEAD`, and the node generator checks those fixed-width identities plus the bundle byte size and SHA-256, so an uncommitted `.psy` edit would produce artifacts whose recorded provenance is not their source. Commit the pin change before generating. The compiler builds against the resolved cohort, not the manifest `rev` alone: the committed `[patch."https://github.com/PsyProtocol/psy-node.git"]` table maps those pinned packages to the sibling `psy-node` checkout, so the limbs must match that checkout's compiled minifier while the `rev` stays put. Keep that patch as committed; it is the local-devnet verification boundary, and an artifact generated through it proves only the local cohort, not a published release. The run writes the `psy-genesis` artifact set that becomes `R_genesis` only after the user reviews and publishes those bytes; this step does not push, and no trusted setup is regenerated because these pins are minifier fingerprints, not Groth16 wrapper material.
+
 Then:
 
 1. If `psy-genesis/genesis_contracts.json` content changed, run Genesis generation per [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §6.1.
-2. Pin `psy-services` to the same pushed `R_node`. Do not add a hardcoded fingerprint there.
+2. Keep `psy-services` built from the same resolved node cohort; do not add a hardcoded fingerprint there, and do not treat a stale pinned build as evidence for the new limbs.
 3. For a new local chain, the next authorized purge restart loads the new Genesis bytecode. Fingerprint-only source edits do not take effect on an already-deployed token until `update_contract` with `token.update.json` (or an equivalent authorized redeploy).
 4. `claim_deposit` and `private_claim` on a live chain with previously deployed bytecode keep the previously deployed fingerprints. Mixing new wallet proofs with that bytecode fails closed at `proof tree root mismatch`.
 
 ## 8. Verification
 
-1. Both compiled `psy_dpn_circuit` tests in §5 pass on `R_node`.
+1. Both compiled `psy_dpn_circuit` tests in §5 pass on the same resolved node cohort.
 2. The four new decimal limbs appear in `token/src/main.psy`, `usdt_token/src/main.psy`, and the matching compiled test expected values, and the previous limbs are gone from those four places.
-3. `make gen-deploy-json` completed on compiler HEAD pinned to that `R_node`.
+3. `make gen-deploy-json` completed from the clean compiler commit with that resolved cohort.
 4. A real `private_claim` (when the note circuit changed) and/or a real `claim_deposit` (when the deposit-inclusion circuit changed) is included as an EndCap. `proof tree root mismatch` is a release failure.
-5. `psy-services` Nostr verification of the corresponding proof type succeeds against the same `R_node` pin (`<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:217-236` for private transfer).
+5. `psy-services` Nostr verification of the corresponding proof type succeeds against the same resolved cohort (`<workspace>/psy-services/src/indexer/nostr/proof_verifier.rs:217-236` for private transfer).
 
 Compilation of the `.psy` files or HTTP admission of an EndCap without the matching claim method is not evidence.
 
@@ -253,7 +255,7 @@ Compilation of the `.psy` files or HTTP admission of an EndCap without the match
 | Generated replace | `client_prover/psy_prover/src/wallet/local_circuits.json` | §6.2 trigger only |
 | Generated replace | `psy-genesis/token.json`, `token.update.json`, `genesis_contracts.json`, `genesis_abi/` | `make gen-deploy-json` |
 | Conditional | root `genesis.json` | §6.1 trigger only |
-| Pin replace | `<workspace>/psy-compiler/Cargo.toml` and `<workspace>/psy-services/Cargo.toml` | Same pushed `R_node` |
+| Pin replace | `<workspace>/psy-compiler/Cargo.toml` and `<workspace>/psy-services/Cargo.toml` | Published-release DAG only ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §8); the local committed path-patched compiler and already-tested services need no dependency bump |
 
 ## 10. Failure Handling
 

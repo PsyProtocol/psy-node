@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use parth_core::{
@@ -59,6 +60,38 @@ use crate::{
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::utils::persisted_artifact::wait_for_persisted_artifact;
+
+/// How often a live Realm vote wait rechecks processor shutdown.
+/// The `wait_votes` future stays pinned across ticks.
+const REALM_VOTE_SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+
+/// Poll one `wait_votes` future until it completes.
+///
+/// Shutdown is sampled every `poll_every` without dropping `wait`. Dropping the
+/// future on each sample would close the waiter, lose votes already collected,
+/// and hold vote-auth capacity until the network reaps it.
+async fn poll_realm_vote_wait<F, R>(
+    wait: F,
+    poll_every: Duration,
+    mut running: R,
+) -> anyhow::Result<Vec<psy_data::p2p::Vote>>
+where
+    F: Future<Output = Result<Vec<psy_data::p2p::Vote>, crate::realm::network::NetworkError>>,
+    R: FnMut() -> bool,
+{
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            biased;
+            received = &mut wait => return Ok(received?),
+            _ = tokio::time::sleep(poll_every) => {
+                if !running() {
+                    anyhow::bail!("Realm vote wait aborted: processor stopping");
+                }
+            }
+        }
+    }
+}
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -194,7 +227,7 @@ where
         // the previous genesis branch did — would advance unique_pending_id by two for
         // the first block and silently drop the genesis-time finalize output.
         self.db
-            .set_new_unique_ids(Some(self.db.state.processing_realm_end_root))
+            .set_new_unique_ids(Some(self.db.state.gathering_realm_start_root))
             .await?;
 
         // Sync the gatherer's queue key to the new gathering proc ID so the
@@ -215,6 +248,7 @@ where
             .guta_queue_gatherer
             .finalize_gathering_and_update_queue_key(self.db.state.gathering_proc_checkpoint_unique_id)
             .await?;
+        self.db.state = self.db.shared_state.load_core_state().await?;
 
         Ok(guta_result)
     }
@@ -237,16 +271,19 @@ where
             let _ = request.reply.send(result);
         }
         self.db.sync_with_coordinator().await?;
-        self.apply_proposal_ffs().await?;
-        self.db.ensure_db_matches_coordinator_head().await
+        // The coordinator may publish C+1 while this round still verifies C.
+        // Keep the checkpoint the tree sync just persisted; the next round reads the newer head.
+        let pinned_checkpoint_id = self.db.state.coordinator_head_synced_checkpoint_id;
+        self.apply_proposal_ffs(pinned_checkpoint_id).await?;
+        self.db.ensure_db_matches_coordinator_checkpoint(pinned_checkpoint_id).await
     }
 
 
-    async fn apply_proposal_ffs(&mut self) -> anyhow::Result<()>
+    async fn apply_proposal_ffs(&mut self, pinned_checkpoint_id: u64) -> anyhow::Result<()>
     where
         N::HasherBase: MerkleZeroHasher<N::QHash>,
     {
-        let latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        let latest_checkpoint_id = pinned_checkpoint_id;
         self.db.set_last_committed_realm_root_from_db().await?;
         let mut coordinator_realm_state = self.db.coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(latest_checkpoint_id, self.db.state.realm_id_u64)
@@ -402,19 +439,37 @@ where
                 included_checkpoint_id
             );
         }
+        // Producer identity is authenticated by history verification, not inferred
+        // from checkpoint timing or the speculative tree's current root.
+        if updates.realm_sub_id == self.db.state.realm_sub_id_u64 {
+            anyhow::ensure!(gathering_start == updates.new_realm_root,
+                "own included proposal does not match the live gathering baseline");
+            self.db.publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id).await?;
+            return self.db.sync_to_coordinator_checkpoint_id(self.db.state.last_committed_checkpoint_id).await;
+        }
 
+        // commit_state has persisted this transition. Publish the new start
+        // root only together with the gatherer tree update; roll it back if
+        // that update fails. Own inclusion above leaves the next cycle untouched.
         self.db.state.gathering_realm_start_root = updates.new_realm_root;
         self.db.shared_state.update_from_core_state(&self.db.state).await?;
-        if gathering_start != updates.old_realm_root && gathering_start != updates.new_realm_root {
-            self.recreate_guta_gatherer().await?;
-        } else if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
-            if let Err(error) = self.guta_queue_gatherer.fast_forward(updates_bytes).await {
-                let Some(mismatch) = error.downcast_ref::<RealmFastForwardBaseMismatch<N::QHash>>() else {
-                    return Err(error);
-                };
-                tracing::warn!("Rebuilding GUTA gatherer from the database after a lost local candidate: {mismatch}");
-                self.recreate_guta_gatherer().await?;
+        let tree_update = if gathering_start == updates.old_realm_root && updates.old_realm_root != updates.new_realm_root {
+            match self.guta_queue_gatherer.fast_forward(updates_bytes).await {
+                Err(error) if error.downcast_ref::<RealmFastForwardBaseMismatch<N::QHash>>().is_some() => {
+                    tracing::warn!("Rebuilding GUTA gatherer from the database after a lost local candidate: {error}");
+                    self.recreate_guta_gatherer().await
+                }
+                result => result,
             }
+        } else if gathering_start != updates.old_realm_root && gathering_start != updates.new_realm_root {
+            self.recreate_guta_gatherer().await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = tree_update {
+            self.db.state.gathering_realm_start_root = gathering_start;
+            let _ = self.db.shared_state.update_from_core_state(&self.db.state).await;
+            return Err(error);
         }
         self.db
             .publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id)
@@ -604,6 +659,16 @@ where
             update_global_user_tree_nodes_ffs: guta_update.update_global_user_tree_nodes_ffs,
             update_contract_state_imt_leaves_ffs: guta_update.update_contract_state_imt_leaves_ffs,
         };
+        // Verify the aggregated updates against the local baseline BEFORE the
+        // coordinator can include the new realm root. A coverage/replay failure
+        // must abort the block here; discovering it only in commit_state (after
+        // coordinator inclusion) strands the checkpoint locally.
+        let baseline_checkpoint_id = self.db.state.processing_checkpoint_id;
+        self.db
+            .verify_state_updates_from_baseline(baseline_checkpoint_id, &db_output)
+            .await?;
+        timer.lap("verify_state_updates_from_baseline");
+
         let mut p2p_submission = None;
         if self.p2p.is_some() && self.rotation.as_ref().is_some_and(|rotation| rotation.is_enabled()) {
             p2p_submission = self
@@ -718,7 +783,7 @@ where
     /// This runs the full P2P proposer sequence: epoch-of-target
     /// scheduled-proposer check, in-band FFS encode, 410-byte actual
     /// finalizer-output encode, proposal publish, own-vote sign + publish,
-    /// blocking `wait_votes` until `ceil(n/2)` replication, and
+    /// blocking `wait_votes` until `ceil(n/2)` replication or processor shutdown, and
     /// `form_certificate`.
     async fn publish_realm_p2p_proposal(
         &mut self,
@@ -813,17 +878,18 @@ where
         let n = validator_sub_ids.len();
         let mut all_votes = vec![(own_vote.signer_sub_id, own_vote.signature)];
         let mut seen = std::collections::HashSet::from([local_sub_id]);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         while !votes_meet_wait(
             n,
             &all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>(),
         ) {
-            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
-            anyhow::ensure!(!remaining_time.is_zero(), "timed out waiting for valid Realm votes");
             let remaining = replication_threshold(n).saturating_sub(seen.len()).max(1);
-            let received = cmds
-                .wait_votes(proposal.proposal_id, remaining, remaining_time)
-                .await?;
+            // One future for this batch. Shutdown ticks borrow it; only a stop drops it.
+            let received = poll_realm_vote_wait(
+                cmds.wait_votes(proposal.proposal_id, remaining),
+                REALM_VOTE_SHUTDOWN_POLL,
+                || self.db.status.should_run(),
+            )
+            .await?;
             for vote in received {
                 if seen.contains(&vote.signer_sub_id) {
                     continue;
@@ -1011,6 +1077,99 @@ mod process_block_tests {
         db::realm_db_test_env::{build_realm_genesis, checkpoint_tree_root_for_leaves, zh, N},
     };
 
+    use std::future::Future;
+
+    /// One constructed vote wait. `select!` may poll it many times; replacing it
+    /// would construct another and drop this one before shutdown.
+    struct ShutdownProbe {
+        id: usize,
+        constructions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        counter: usize,
+        retained: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for ShutdownProbe {
+        fn drop(&mut self) {
+            self.retained.store(self.counter, std::sync::atomic::Ordering::SeqCst);
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Future for ShutdownProbe {
+        type Output = Result<Vec<psy_data::p2p::Vote>, crate::realm::network::NetworkError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let probe = self.get_mut();
+            probe.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            probe.counter = probe.counter.saturating_add(1);
+            probe.seen.lock().expect("seen ids").push(probe.id);
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancel_keeps_the_same_vote_wait_across_ticks() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let retained = Arc::new(AtomicUsize::new(0));
+        let built = constructions.clone();
+        let probe = ShutdownProbe {
+            id: 7,
+            constructions: constructions.clone(),
+            polls: polls.clone(),
+            seen: seen.clone(),
+            counter: 0,
+            retained: retained.clone(),
+            dropped: dropped.clone(),
+        };
+        built.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(built.load(Ordering::SeqCst), 1, "the vote wait is constructed once");
+        let dropped_during = dropped.clone();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_for_stop = ticks.clone();
+        let error = super::poll_realm_vote_wait(probe, std::time::Duration::from_millis(5), move || {
+            assert!(
+                !dropped_during.load(Ordering::SeqCst),
+                "vote wait dropped before processor shutdown"
+            );
+            ticks_for_stop.fetch_add(1, Ordering::SeqCst) < 3
+        })
+        .await
+        .expect_err("shutdown must cancel the vote wait");
+        let ticks = ticks.load(Ordering::SeqCst);
+        let polls = polls.load(Ordering::SeqCst);
+        let seen = seen.lock().expect("seen ids").clone();
+        assert!(error.to_string().contains("processor stopping"), "{error}");
+        assert!(ticks >= 4, "shutdown is sampled across ticks, got {ticks}");
+        assert_eq!(constructions.load(Ordering::SeqCst), 1, "no replacement vote wait was constructed");
+        assert!(polls >= ticks, "the same future is polled at least once per shutdown tick: polls={polls} ticks={ticks}");
+        assert_eq!(seen.len(), polls, "every poll recorded the same instance");
+        assert!(seen.iter().all(|id| *id == 7), "polls stayed on the constructed future: {seen:?}");
+        assert_eq!(retained.load(Ordering::SeqCst), polls, "instance counter survived every poll until drop");
+        assert!(dropped.load(Ordering::SeqCst), "shutdown drops the vote wait");
+    }
+
+    #[tokio::test]
+    async fn completed_vote_wait_is_not_cancelled_by_shutdown_poll() {
+        let wait = async { Ok::<Vec<psy_data::p2p::Vote>, crate::realm::network::NetworkError>(Vec::new()) };
+        let votes = super::poll_realm_vote_wait(wait, std::time::Duration::from_secs(60), || false)
+            .await
+            .expect("a completed wait is not cancelled by a later shutdown sample");
+        assert!(votes.is_empty());
+    }
+
+
     type TestJobs = Vec<Vec<PsyProvingJobMetadataWithJobId<parth_core::PHash, QProvingJobDataID>>>;
 
     fn job(
@@ -1165,6 +1324,164 @@ mod process_block_tests {
         assert!(output.job_ids.is_empty());
         assert!(output.db_output.is_noop());
         assert_eq!(output.db_output.total_users_updated, 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    async fn publish_checkpoint_after_sync() -> anyhow::Result<RealmProcessorTestEnv> {
+        use parth_core::crypto::hash::merkle_proof::MerkleProofCore;
+
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let realm_root = env.db_env.local_realm_root().await?;
+        let mut update = env.db_env.make_checkpoint_one_update();
+        let mut siblings = vec![env.db_env.genesis_leaf_hash()];
+        siblings.extend((1..N::CHECKPOINT_TREE_HEIGHT_USIZE).map(zh));
+        let membership = MerkleProofCore::new_from_params::<PoseidonHasher>(
+            1, update.checkpoint_sync_info.checkpoint_leaf_hash, siblings,
+        );
+        update.checkpoint_sync_info.checkpoint_tree_root = membership.root;
+        let expected_tree_root = membership.root;
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        *env.db_env.coordinator.after_sync_realm_query.lock().unwrap() = Some(Box::new(
+            move |coordinator, queried_checkpoint| {
+                assert_eq!(queried_checkpoint, 0);
+                coordinator.push_checkpoint_leaf(update.checkpoint_sync_info.checkpoint_leaf_hash);
+                coordinator.seed_checkpoint_tree_proof(1, membership);
+                coordinator.seed_realm_sync_info(update);
+                coordinator.seed_realm_root(1, realm_root);
+                coordinator.set_latest_checkpoint_id(1);
+                published_tx.send(()).expect("publication receiver is alive");
+            },
+        ));
+
+        // The hook publishes C+1 at the first realm query, after the real tree
+        // sync returned C. No sleeps, task scheduling or RPC call counts decide it.
+        let result = env.processor.sync_and_verify().await;
+        env.abort_gatherers();
+        result?;
+        published_rx.await?;
+        assert_eq!(*env.db_env.coordinator.latest_checkpoint_id.lock().unwrap(), 1);
+        assert_eq!(env.processor.db.state.coordinator_head_synced_checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.processing_checkpoint_id, 0);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.processor.db.get_realm_root_from_db().await?, realm_root);
+        // The metadata path may prefetch headers, but cannot advance this round's
+        // verified checkpoint. Confirm the new header really is available.
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 1);
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head(), expected_tree_root);
+        Ok(env)
+    }
+
+    #[tokio::test]
+    async fn pinned_sync_round_defers_published_head_until_next_round() -> anyhow::Result<()> {
+        let mut env = publish_checkpoint_after_sync().await?;
+        // This is the old final check: re-reading head now rejects the otherwise
+        // consistent C round. Keeping this assertion makes the regression explicit.
+        let error = env.processor.db.ensure_db_matches_coordinator_head().await.unwrap_err();
+        assert!(error.to_string().contains("Local database is stale"), "{error:#}");
+
+        env.processor.sync_and_verify().await?;
+        assert_eq!(env.processor.db.state.coordinator_head_synced_checkpoint_id, 1);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 1);
+        assert_eq!(env.processor.db.state.processing_checkpoint_id, 1);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.processor.db.get_realm_root_from_db().await?, env.db_env.local_realm_root().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_sync_round_rejects_unauthenticated_next_checkpoint() -> anyhow::Result<()> {
+        let mut env = publish_checkpoint_after_sync().await?;
+        env.db_env.coordinator.checkpoint_tree_proofs.lock().unwrap().get_mut(&1).unwrap().value = zh(99);
+
+        let error = env.processor.sync_and_verify().await.unwrap_err();
+        assert!(error.to_string().contains("membership value does not match checkpoint leaf hash"), "{error:#}");
+        assert_eq!(env.processor.db.state.coordinator_head_synced_checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_sync_round_still_rejects_pinned_realm_root_mismatch() -> anyhow::Result<()> {
+        let env = publish_checkpoint_after_sync().await?;
+        env.db_env.coordinator.seed_realm_root(0, zh(99));
+
+        let error = env.processor.db.ensure_db_matches_coordinator_checkpoint(0).await.unwrap_err();
+        assert!(error.to_string().contains("Realm Root mismatch"), "{error:#}");
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_ffs_keeps_synchronized_checkpoint_when_coordinator_advances() -> anyhow::Result<()> {
+        use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
+        let mut env = publish_checkpoint_after_sync().await?;
+        let old_realm_root = env.db_env.local_realm_root().await?;
+        assert_eq!(env.processor.db.state.coordinator_head_synced_checkpoint_id, 0);
+        let pinned_checkpoint_id = env.processor.db.state.coordinator_head_synced_checkpoint_id;
+
+        // The fixture publishes checkpoint 1 after the authenticated round pins 0.
+        // A newly reported realm transition must likewise remain outside this pass.
+        env.db_env.coordinator.seed_realm_root(1, zh(3));
+        assert_ne!(old_realm_root, zh(3));
+
+        env.processor.apply_proposal_ffs(pinned_checkpoint_id).await?;
+
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db_env.db.get_latest_l2_block_state().await?.checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_checkpoint_id, 0);
+        assert_eq!(env.processor.db.state.last_committed_realm_end_root, old_realm_root);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_verification_reproduces_checkpoint_advance_after_sync() -> anyhow::Result<()> {
+        use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+        use parth_core::protocol::core_types::Q256BitHash;
+        use psy_data::p2p::Proposal;
+        use crate::realm::processor::ffs::CheckpointIdentity;
+
+        let mut env = RealmProcessorTestEnv::create().await?;
+        env.processor.db.sync_with_coordinator().await?;
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+
+        // Deterministically advance between sync_with_coordinator and history verification.
+        let update = env.db_env.make_checkpoint_one_update();
+        let included = CheckpointIdentity {
+            checkpoint_id: 1,
+            checkpoint_leaf_hash: update.checkpoint_sync_info.checkpoint_leaf_hash.into_owned_32bytes(),
+        };
+        env.db_env.seed_checkpoint_one(update.clone(), update.merkle_proof_to_realm_root.value);
+        let proposal = Proposal {
+            chain_id: env.processor.db.state.chain_id,
+            realm_id: env.processor.db.state.realm_id_u64 as u32,
+            base_checkpoint_id: 0,
+            proposer_sub_id: 1,
+            validator_tree_root: [0; 32],
+            proposal_id: [0; 32],
+            public_output_hash: [0; 32],
+            finalizer_proof_hash: [0; 32],
+            backup_hash: [0; 32],
+            body_hash: [0; 32],
+        };
+        // Body/proof validation happens later; this fixture isolates checkpoint authentication.
+        let error = env.processor.db.verify_history_proposal(&included, &proposal, &[]).await.unwrap_err();
+        assert!(error.to_string().contains(
+            "MissingHistoryProof at C=1: included.checkpoint_leaf_hash does not match the authenticated checkpoint tree leaf"
+        ), "unexpected error: {error:#}");
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 0);
+        assert_eq!(env.db_env.db.get_latest_checkpoint_id().await?, 0);
+
+        // Appending the missing checkpoint removes this exact failure without changing coordinator data.
+        env.processor.db.sync_with_coordinator().await?;
+        assert_eq!(env.processor.db.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(), 1);
+        let authenticated_leaf = env.processor.db.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(1);
+        assert_eq!(authenticated_leaf.value.into_owned_32bytes(), included.checkpoint_leaf_hash);
+        let error = env.processor.db.verify_history_proposal(&included, &proposal, &[]).await.unwrap_err();
+        assert!(!error.to_string().contains("authenticated checkpoint tree leaf"), "unexpected error: {error:#}");
         env.abort_gatherers();
         Ok(())
     }

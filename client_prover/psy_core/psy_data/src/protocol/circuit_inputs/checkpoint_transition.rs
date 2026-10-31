@@ -18,13 +18,20 @@ use crate::qdata::{
     pm_reward_commitment::PMRewardCommitment,
 };
 
+pub const CHECKPOINT_RANDOM_SEED_DOMAIN: u64 = u64::from_le_bytes(*b"PSYSEED1");
+
+pub fn derive_checkpoint_random_seed<F: RichField, H: FieldQHasher<F>>(old_seed: QHashOut<F>, new_state_roots_hash: QHashOut<F>) -> QHashOut<F> {
+    let old = old_seed.0.elements;
+    let roots = new_state_roots_hash.0.elements;
+    H::q_hash_many(&[F::from_canonical_u64(CHECKPOINT_RANDOM_SEED_DOMAIN), old[0], old[1], old[2], old[3], roots[0], roots[1], roots[2], roots[3]])
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct QCPsyCheckpointStateTransitionInputPartial<F: RichField> {
     pub part_1_header: QCAggUserRegistartionDeployContractsGUTAInput<F>,
     pub old_stats: PsyCheckpointLeafStats<F>,
     pub block_time: F,
-    pub final_random_seed_contribution: QHashOut<F>,
     pub pm_rewards_commitment: PMRewardCommitment<F>,
     pub pm_jobs_completed: PMJobsCompletedStats<F>,
 }
@@ -47,6 +54,12 @@ impl<F: RichField> KVQSerializable for QCPsyCheckpointStateTransitionInput<F> {
 }
 
 impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
+    // Divergence from the node twin (psy_data QCQEDCheckpointStateTransitionInputPartial):
+    // the contract end is read from `deploy_contracts_state_transition` (node: `update_contracts_state_transition`)
+    // and the validator tree root is pinned to the empty-tree zero hash (node: witnessed
+    // `validator_tree_root`). Full parity requires adding those fields to this client wire struct;
+    // today they agree in the honest domain where the validator tree is empty and both
+    // transitions end at the same contract root.
     pub fn get_new_checkpoint_leaf<H: FieldQHasher<F> + MerkleZeroHasher<QHashOut<F>>>(&self) -> PsyCheckpointLeaf<F> {
         let new_state_roots = PsyCheckpointGlobalStateRoots {
             contract_tree_root: self.part_1_header.deploy_contracts_state_transition.state_transition_end,
@@ -70,8 +83,9 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
             user_registration_tree_root: self.part_1_header.register_users_state_transition.state_transition_end,
             validator_tree_root: H::get_zero_hash(crate::qdata::checkpoint::VALIDATOR_TREE_HEIGHT),
         };
+        let new_state_roots_hash = new_state_roots.qfhash::<H>();
         PsyCheckpointLeaf {
-            global_chain_root: new_state_roots.qfhash::<H>(),
+            global_chain_root: new_state_roots_hash,
             stats: PsyCheckpointLeafStats {
                 guta_fees_collected: self.part_1_header.guta_proof_header.stats.guta_fees_collected,
                 da_fees_collected: self.part_1_header.guta_proof_header.stats.da_fees_collected,
@@ -80,7 +94,7 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
                 slots_modified: self.part_1_header.guta_proof_header.stats.slots_modified,
                 pm_jobs_completed: self.pm_jobs_completed,
                 block_time: self.block_time,
-                random_seed: H::q_two_to_one(self.old_stats.random_seed, self.final_random_seed_contribution),
+                random_seed: derive_checkpoint_random_seed::<F, H>(self.old_stats.random_seed, new_state_roots_hash),
                 pm_rewards_commitment: self.pm_rewards_commitment.clone(),
                 da_challenges_claimed: [F::ZERO; DA_CHALLENGE_WINDOW],
             },
@@ -118,5 +132,26 @@ impl<F: RichField> QCPsyCheckpointStateTransitionInputPartial<F> {
             validator_tree_root: H::get_zero_hash(crate::qdata::checkpoint::VALIDATOR_TREE_HEIGHT),
         };
         old_state_roots
+    }
+}
+
+#[cfg(test)]
+mod random_seed_tests {
+    use super::*;
+    use plonky2::{field::{goldilocks_field::GoldilocksField, types::Field}, hash::poseidon::PoseidonHash};
+
+    #[test]
+    fn random_seed_is_independent_of_time_and_rewards() {
+        type F = GoldilocksField;
+        let mut input = QCPsyCheckpointStateTransitionInputPartial::<F>::default();
+        let original = input.get_new_checkpoint_leaf::<PoseidonHash>();
+        input.block_time = F::from_canonical_u64(123);
+        input.pm_jobs_completed.deploy_contracts_completed = F::ONE;
+        input.pm_rewards_commitment.register_users_root = QHashOut(HashOut { elements: [F::ONE; 4] });
+        input.part_1_header.guta_proof_header.stats.guta_fees_collected = F::ONE;
+        input.part_1_header.guta_proof_header.stats.da_fees_collected = F::ONE;
+        let changed = input.get_new_checkpoint_leaf::<PoseidonHash>();
+        assert_eq!(original.global_chain_root, changed.global_chain_root);
+        assert_eq!(original.stats.random_seed, changed.stats.random_seed);
     }
 }
