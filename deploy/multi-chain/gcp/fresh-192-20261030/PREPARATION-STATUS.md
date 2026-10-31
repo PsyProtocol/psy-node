@@ -16,8 +16,8 @@ tests and independent review is not complete.
 | Relayer readiness and deposit admission | Published in `15d6316d`; scoped tests/review passed | Port `c9a2dfe7`; Services read 2s, row 70s / round 75s to allow L1 pool failover; event-id cursor; root-not-yet-known spends no attempt; at most 32 finalized deposits per chain per round |
 | Worker reputation and fetch replay | Published in `15d6316d`; scoped tests/review passed | Port `310d35c5`, reputation/replay only from `876c1432`; preserve whitelist and PR30/IMT; real Redis replay tests 2/2 passed |
 | BSC fees | Published in `15d6316d`; scoped tests/review passed | Port `1f1e2f0a` from `c9105056`, observed-history strategy and strict config parsing; no packed-deposit port |
-| Deployment inputs and Router | Partially complete | Fixed Router base `394153fa`; explicit reviewed contracts commit; role inventory, fresh core planning, internal Coordinator and epoch-32 build binding; 112 offline tests passed; installers remain pending |
-| Build isolation and consumer pins | Source pins published; final artifacts pending | Clean every local package from full locked metadata, including out-of-workspace path dependencies; all three consumer Cargo pins are aligned; immutable release build and final gitlink closure remain pending |
+| Deployment inputs and Router | Core packages complete; peripheral installers pending | Fixed Router base `394153fa`; role inventory, internal Coordinator and epoch-32 binding; six private core packages / 16 units verified; 532 core deployment tests and 23 fresh-profile tests passed |
+| Build isolation and consumer pins | Native CLIs, actual Genesis and SDK/WASM prepared | Isolated CLI and WASM builds; immutable source `15d6316d`; published SDK `a2e3dc8c`; final Genesis gitlinks integrated after child publication; full proving/client/runtime acceptance remains pending |
 
 The complete fleet package, proving setup and real E2E
 acceptance remain separate release gates below. Do not advance their pins or
@@ -34,14 +34,18 @@ updates from Audit `dbcdc7c9`, English source comments, and focused review
 corrections. The restored epoch-32 prerequisite `psy-genesis` at `9ed70c1` was
 already published; it is not promotion of new final artifacts.
 
-The deployment merge's entire non-`deploy/` tree must be byte-identical to this
-source. `runtime_inputs_frozen` is now true for the offline version-2 build:
+The deployment merge's non-`deploy/` tree must be byte-identical to this source
+except the explicitly integrated `psy-genesis` gitlink at `8346116`. Parent
+integration `a515b950` changes only that gitlink; downstream Cargo pins and the
+immutable runtime build worktree remain at `15d6316d`.
+`runtime_inputs_frozen` is now true for the offline version-2 build:
 the published Node/consumer pins, clean regenerated public contracts and
 retained-membership config have been reviewed together. The build spec must
 separately bind the exact config, external bundle, stamp and release profile.
 This is build-input approval only, not runtime, installation or activation
 approval. Actual-key Genesis and its native bootstrap replay are now verified
-offline, as recorded below. Host packages, resource tests, SDK/WASM, setup,
+offline, as recorded below. Core host packages and SDK/WASM build/init checks
+are also complete; peripheral packages, full proving/resource tests, setup,
 runtime review holds and E2E remain open.
 
 The current preview profile SHA-256 is
@@ -146,7 +150,7 @@ checksums, features, aliases and dependency lists were preserved.
 |---|---|---|
 | Node | `15d6316d1bd28bb535698a4797e3c6261e6c9597` | `testnet-dev`, `prepare/testnet-dev-runtime-20261031` |
 | Compiler | `e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f` | `prepare/sd192-20261030` |
-| SDK | `b950dc65d049eb1fd453d19c9e61d541da43b5d1` | `prepare/sd192-20261030` |
+| SDK | `a2e3dc8c59e11465208f43e45250b74d96983032` | `prepare/sd192-20261030` |
 | Services | `e04493b70673e5d5314aa203ab293997c8c5e4fa` | `prepare/sd192-20261030` |
 | Genesis contract artifacts | `8346116acce272196bcfeb4d9885a9e9f790f171` | `prepare/sd192-20261030` |
 
@@ -154,10 +158,66 @@ Use the canonical `PsyProtocol` repositories. The local Services worktree's
 configured origin still points to `QEDProtocol`; publication uses the explicit
 authorized `PsyProtocol/psy-services` destination without changing shared Git
 configuration. The existing withdrawal-identity fix remains in its ancestry.
-No npm version was reserved or published. A new SDK/WASM and client cohort is
-still required. Node and SDK parent gitlinks have not been promoted to the new
-Genesis child; do that only through the accepted artifact closure, not by
-moving a Cargo consumer away from the immutable source `15d6316d`.
+No npm version was reserved or published. SDK release WASM/TypeScript and dry
+packing are complete, as detailed below. The SDK and Node parent Genesis
+gitlinks now reference published `8346116`; Node integration is `a515b950`.
+The new client cohort and full proving acceptance remain pending. No Cargo
+consumer moved away from immutable source `15d6316d`.
+
+### SDK Build And Core Packages: October 31
+
+SDK `a2e3dc8c` was built through the existing `pnpm` build and `publish:check`
+entrypoints, not manual replacement of generated bindings. Web and Node.js
+prover WASM, compiler WASM and TypeScript builds passed; all three packages
+passed dry packing without npm publication. Nine offline SDK test suites passed
+**62 tests**. Actual initialization of both prover modules and the compiler
+module passed; both provers report `testnet`, identical constants and bigint
+fees. This is build/initialization evidence, not full EndCap proving acceptance.
+
+The SDK uses the public canonical config (`7274eebb...07b9db9`), not the retained
+private-topology runtime config (`04d3056c...72f8024d`). Both use epoch 32 and
+the same consensus constants. Private Guardian/P2P custody and private runtime
+endpoints are not copied into public WASM. Compiler provenance is clean
+`e9cc57fe`, and both SDK and Genesis stamps were regenerated by their owning
+scripts. Package versions remain unchanged; these candidate bytes are not a
+newly published npm `2.1.0` release.
+
+The pinned Bookworm builder ran offline with a 96 GiB memory limit, no extra
+container swap and a dedicated SDK target directory. It used Rust
+`nightly-2025-09-20`, Node `22.23.4`, pnpm `10.34.5` and official wasm-pack
+`0.13.1` musl (archive SHA-256
+`c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539`).
+SDK/Compiler use their respective locked wasm-bindgen `0.2.126`/`0.2.125`
+executables; no version or lockfile was falsified to bypass tool selection.
+The host glibc-linked wasm-pack and two incomplete npm mounts failed before
+the successful runs. These environment failures are retained separately.
+
+Core preparation commit `79286147` adds explicit `--cohort sd192` packaging
+and installation. Historical R3 remains the default; its activation and
+temporary placement tools remain R3-only. Independent review approved the
+delivery. Its conditional compatibility question was checked: shipped R3
+`topology.json` already has the exact R3 release/source fields, and all old
+tests still pass. The complete core suite passed **532 tests**, including
+**13** new cohort tests; fresh-profile tests passed **23 tests**.
+
+The real six host packages are local-only under
+`.private/core-testnet-20261031-sd192-packages/`. They contain **16 units** and
+only each host's required keys (**24 scoped key files** total). Every package
+passed the installer's read-only payload/permissions/hash validation. The
+builder reused the successful actual-key Genesis and 100-operator export;
+it neither regenerated identities nor distributed the full key/operator list.
+Nothing was transferred, installed, enabled or started. See
+[the core packaging procedure](../core-only/README.md#fresh-sd192-preparation).
+
+Public package-manifest and WASM hashes are in [artifacts.json](artifacts.json).
+Local evidence: `tmp/fresh-host-packages-20261031.log`,
+`tmp/fresh-host-packages-verified-20261031.json`,
+`tmp/sdk-sd192-build-r4-20261031.log`,
+`tmp/sdk-sd192-drypack-r3-20261031.log`, `tmp/sdk-sd192-unit-20261031.log`,
+and `tmp/sdk-sd192-wasm-smoke-r2-20261031.log`. The first smoke invocation did
+not attach stdin to Docker and executed no assertions; only the second log is
+acceptance evidence. Hashes in the public receipt refer only to successful
+runs. Private package contents and binaries are deliberately not committed.
 
 ### Current Full Contract Generation
 
@@ -389,7 +449,8 @@ Host/key provenance and native acceptance are separate checks.
    resolved above; the remaining runtime and actual-artifact gates still apply.
 2. Public contract regeneration is complete as recorded above; rebuild again
    if the consumed library or generation inputs change. Rebuild
-   compatible SDK/WASM; publish producer revisions before downstream gitlinks.
+   compatible SDK/WASM if inputs change; the current build/init and parent
+   gitlink milestones are complete. Publish producers before downstream pins.
 3. Actual-key Genesis and the 100-operator export are complete using spec v2 and
    explicit `fresh-faucet-and-relayer` mode. The retained R3 Genesis has the
    old registration-2 multisig fingerprint. The separate Relayer opt-in accepts
@@ -398,9 +459,9 @@ Host/key provenance and native acceptance are separate checks.
    overwrite the old Genesis. Keep the successful output and both failure
    directories as evidence; do not generate another set just for packaging.
 4. Five CLIs, typed Genesis checks and production-builder replay are complete.
-   Close parent gitlinks and compatible SDK/WASM artifacts on this accepted
-   cohort, without moving downstream Cargo pins off source `15d6316d`.
-5. Prepare matching Bridge setup/verifiers, host packages and isolated state;
+   Keep completed parent gitlinks and SDK artifacts on this accepted cohort,
+   without moving downstream Cargo pins off source `15d6316d`.
+5. Prepare matching Bridge setup/verifiers, peripheral packages and isolated state;
    measure full-policy proving/memory and pass real five-withdrawal and
    three-chain deposit/claim/withdrawal acceptance before activation.
 

@@ -7,7 +7,7 @@
   "preparation_commits": {
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
-    "sdk": "b950dc65d049eb1fd453d19c9e61d541da43b5d1",
+    "sdk": "a2e3dc8c59e11465208f43e45250b74d96983032",
     "services": "e04493b70673e5d5314aa203ab293997c8c5e4fa"
   },
   "network": "testnet",
@@ -32,7 +32,12 @@
     "tools_manifest_sha256": "c61c14f9c37c97befe6fe21407eea95be99cda4f3afe8ad8e12e6b7ebc0af092",
     "privacy_measurements_sha256": "d2fdb8bc4d715adc17722a62d5511f18652b59768d676579ca73fd20eb7a258a",
     "genesis_spec_sha256": "2ea5bdcd4e6f523cef5949ab81d8795b8e146b5133963c299d048cfc430fd951",
-    "native_bootstrap_log_sha256": "9c7705f9fde2d0652ecd4621b2fdf1dd63c1f585eeda5278e7b72a0e75e0caff"
+    "native_bootstrap_log_sha256": "9c7705f9fde2d0652ecd4621b2fdf1dd63c1f585eeda5278e7b72a0e75e0caff",
+    "core_host_packages_report_sha256": "ea405b53ba582242ab5c76a46c1ce280fec51a7313d65020cded4d55badb5c1e",
+    "sdk_release_build_log_sha256": "8db72a86baab2a651c11a436807e01a854af0f0c637e64ee52e41a7a0a6ac861",
+    "sdk_dry_pack_log_sha256": "34771890ad88a65e5d87d8da451cde951262b46deb11f34b33384c74848a95d2",
+    "sdk_unit_tests_log_sha256": "7febd0c3aa8720e8a6a9c026ba63f638062a7f89d6cfd9038866c91f5237e60d",
+    "sdk_wasm_init_log_sha256": "2fb00b9a4d2d2cf120cc6eab587d4f3f28c03cdaabf1b5274a08b7eb3f20fa06"
   },
   "verification": {
     "cli_help_passed": 5,
@@ -44,13 +49,38 @@
     "faucet_operators": 100,
     "faucet_fingerprint": "d48255a10a5b3049b6aad5169603336ed6b80b9358b2da78527b385bca95a109"
   },
-  "parent_genesis_gitlinks_promoted": false,
-  "sdk_wasm_verified": false,
+  "node_parent_integration_commit": "a515b95059d3561f14e7d182871b49cd97cf8eb9",
+  "parent_genesis_gitlinks_promoted": true,
+  "sdk_wasm_verified": true,
+  "sdk_build": {
+    "verification_scope": "release build, dry pack, unit tests and actual WASM initialization; not full proving",
+    "config_sha256": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
+    "web_prover_wasm_sha256": "4a494a27e6c0520af16ba464d08af84276059358fbfaf6a542a4d4916b646871",
+    "node_prover_wasm_sha256": "4a494a27e6c0520af16ba464d08af84276059358fbfaf6a542a4d4916b646871",
+    "compiler_wasm_sha256": "25f88047911d07ffdf1e342a5377d4ec25dc9d79763d0ac97c960293613bdb73",
+    "compiler_stamp_sha256": "4bde3fa1c857a167750936850ed89accbc433c5e7bc4e4f53fb3352c6226798e",
+    "unit_tests_passed": 62,
+    "npm_published": false
+  },
+  "core_host_packages": {
+    "prepared": 6,
+    "services": 16,
+    "installed": false,
+    "started": false,
+    "manifest_sha256": {
+      "gcp-cp-ce": "89fd0917bd37cdafa762dba08c146277abc046547ca6a29c26c752ffd6376dc8",
+      "gcp-edge-1": "1b6b9a20a8dc09277390bb9c9157627ab6e4bbe18707556a8cc676f2a490f039",
+      "gcp-edge-2": "38cb8b9ccaf95db28d2e38ede99e3aba59e6ce02d2b981a10f63cdc37ec9107d",
+      "gcp-realm-processor": "a7482b0624ed7e28594cd5735377b4190ef86ac5b5a0e9fed06a59d3cec58c2f",
+      "realm-processors-b": "5496c5a8817998393942d06c9bb8a36c4673945c9592f187dbd9332d121dd8be",
+      "realm-processors-c": "ceb0e736e6fc0e72211f433d11e6fcfdd2742ead4c87929a16e1edcfcacc7c0d"
+    }
+  },
   "runtime_approved": false,
   "deployment_ready": false,
   "remaining_gates": [
-    "Parent gitlink and SDK/WASM/client artifact closure",
-    "Fresh host packages, installers and isolated runtime state",
+    "Client artifact closure and full SDK proving acceptance",
+    "Peripheral host packages, activation adapters and isolated runtime state acceptance",
     "Full SD-key proof and Faucet batch memory acceptance",
     "Five-entry withdrawal Guardian and EndCap acceptance",
     "Matching bridge setup/verifiers and three-chain E2E",
