@@ -19,7 +19,7 @@ tests and independent review is not complete.
 | Deployment inputs and Router | Partially complete | Fixed Router base `394153fa`; explicit reviewed contracts commit; role inventory, fresh core planning, internal Coordinator and epoch-32 build binding; 112 offline tests passed; installers remain pending |
 | Build isolation and consumer pins | Source pins published; final artifacts pending | Clean every local package from full locked metadata, including out-of-workspace path dependencies; all three consumer Cargo pins are aligned; immutable release build and final gitlink closure remain pending |
 
-The complete fleet package, new actual-key Genesis, proving setup and real E2E
+The complete fleet package, proving setup and real E2E
 acceptance remain separate release gates below. Do not advance their pins or
 claim activation readiness while this checklist is incomplete.
 
@@ -40,8 +40,9 @@ the published Node/consumer pins, clean regenerated public contracts and
 retained-membership config have been reviewed together. The build spec must
 separately bind the exact config, external bundle, stamp and release profile.
 This is build-input approval only, not runtime, installation or activation
-approval. Actual network Genesis, final binary/host packages, resource tests,
-SDK/WASM, setup, runtime review holds and E2E remain open.
+approval. Actual-key Genesis and its native bootstrap replay are now verified
+offline, as recorded below. Host packages, resource tests, SDK/WASM, setup,
+runtime review holds and E2E remain open.
 
 The current preview profile SHA-256 is
 `8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282`.
@@ -144,10 +145,10 @@ checksums, features, aliases and dependency lists were preserved.
 | Repository | Preparation Commit | Destination |
 |---|---|---|
 | Node | `15d6316d1bd28bb535698a4797e3c6261e6c9597` | `testnet-dev`, `prepare/testnet-dev-runtime-20261031` |
-| Compiler | `81e0a022d7d323fa8707cd1cfa06a858943ad5aa` | `prepare/sd192-20261030` |
+| Compiler | `e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f` | `prepare/sd192-20261030` |
 | SDK | `b950dc65d049eb1fd453d19c9e61d541da43b5d1` | `prepare/sd192-20261030` |
 | Services | `e04493b70673e5d5314aa203ab293997c8c5e4fa` | `prepare/sd192-20261030` |
-| Genesis contract artifacts | `6ec29ad967be9099fd7a79c3bc0ff9a40fd2bf33` | `prepare/sd192-20261030` |
+| Genesis contract artifacts | `8346116acce272196bcfeb4d9885a9e9f790f171` | `prepare/sd192-20261030` |
 
 Use the canonical `PsyProtocol` repositories. The local Services worktree's
 configured origin still points to `QEDProtocol`; publication uses the explicit
@@ -159,6 +160,28 @@ Genesis child; do that only through the accepted artifact closure, not by
 moving a Cargo consumer away from the immutable source `15d6316d`.
 
 ### Current Full Contract Generation
+
+The current producer is published Compiler `e9cc57fe`, still consuming Node
+`15d6316d`, with published Genesis artifacts `8346116`. The full original Make
+recipe exited zero again after the canonical-layout correction below. All six
+compiler artifacts and exported ABIs now carry `contract.state_layout`.
+Lossless JSON comparison against `6ec29ad9` confirms every non-layout value in
+the two token artifacts and six ABIs is unchanged. The ABI index and compressed
+contract bundle are byte-identical. The current token hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| `token.json` | `0a7ace149a23f2380c1dff715b4e2bad204ccd900bfdb43a44d4962418e255df` |
+| `token.update.json` | `895df2389d9d2108fcd2cfff8484ef4a3b5becfe6892105600b695062c8b9f57` |
+| Compiler stamp | `4b22bb7aed61caf4156f1709a52ccc43999737f6bf29342f58d8c63cea4d8c61` |
+
+The constructor process approached the initial 32 GiB container ceiling, which
+was increased to 48 GiB during this successful offline recipe. This is not a
+runtime service sizing result or an exact peak-memory measurement. The operator
+subsequently approved a **96 GiB** local build ceiling; the maintained pinned
+CLI builder now applies it, without extra swap allowance or preallocation.
+
+#### Retained Earlier Contract Generation
 
 Clean published Compiler `81e0a022`, consuming Node `15d6316d`, completed the
 entire original `make gen-deploy-json` recipe in the pinned Bookworm image:
@@ -189,6 +212,88 @@ changed in `6ec29ad9`. Their exact staged diff passed independent review.
 This closes public contract regeneration, not actual-key network Genesis,
 native bootstrap, full-policy SD-key proof/memory, five-entry EndCap,
 SDK/WASM, bridge setup or three-chain E2E gates.
+
+### Actual Genesis Attempt And Layout Correction
+
+The first real spec-v2 import attempt used the final measured privacy circuits,
+the retained 107-slot key array, old public Genesis `f839b453...`, and config
+`04d3056c...`. It failed closed at token0 before native account-output writes:
+the Compiler ABI lacked `contract.state_layout`. Public bundle regeneration
+and its provenance alone had not established native input compatibility.
+The protected failed directory and private child log were retained; the log
+contents were not published. No key was regenerated and no old file overwritten.
+
+The missing producer change was the already-published `4579984c` canonical ABI
+export, omitted from the newer preparation branch. Its narrow port `e9cc57fe`
+changes only ABI extraction/types/tests, not Cargo pins, token source, circuit
+logic or storage footprints. All **25 `psy-abi` release tests passed**, including
+six layout regressions using both real token ASTs, map padding and refusal cases.
+The full staged source port and generated artifact diffs passed independent
+review before publication. Source Node `15d6316d` remains unchanged.
+
+Genesis native children now receive fixed `RAYON_NUM_THREADS=4`, even when the
+shell supplies 128. The regression failed before this change and all **22**
+Genesis-adapter tests pass after it. The complete core deployment suite passed
+**519/519** after that correction; the subsequent 96 GiB container change passed
+all **21** build-runtime tests. These are not real proof/E2E acceptance.
+
+Fresh CLI/tool manifests must bind the new compiler stamp rather than rewriting
+the older receipts. The earlier five-CLI builds were byte-identical and passed
+five help/GLIBC checks, but their stamp points to superseded Compiler `81e0a022`.
+Keep those artifacts as evidence, not the final package.
+
+The refreshed build completed against Compiler `e9cc57fe`, config `04d3056c...`
+and the new stamp `4b22bb7a...`. All five CLIs again passed help checks and require
+at most GLIBC 2.34. Their executable bytes are identical to the two earlier
+clean builds; the new receipt records the changed provenance and 720 release
+library hashes rather than rewriting an old manifest.
+
+| Local Receipt | SHA-256 |
+|---|---|
+| CLI build `fresh-runtime-release-r3-20261031/manifest.json` | `b0bc11e35553a3fb71c068e05b9aeadb478366290fb38adfa370a8dd2284064c` |
+| Linked tools `fresh-genesis-tools-r5-20261031/manifest.json` | `c61c14f9c37c97befe6fe21407eea95be99cda4f3afe8ad8e12e6b7ebc0af092` |
+| Final privacy measurement JSON | `d2fdb8bc4d715adc17722a62d5511f18652b59768d676579ca73fd20eb7a258a` |
+
+These directory suffixes identify local build attempts, not the deployed R3
+chain. The measurement constructed both real minifier circuits and matched the
+previously recorded deposit/private-note limbs. The tool linker also passed
+two invalid-argument checks; its Rust unit harness was not run or counted.
+Both receipts still report `deployment_ready=false`.
+
+The next actual import reached the account-input guard after contract checks,
+then correctly refused an environment ownership mismatch: this managed shell's
+directory descriptors reported root ancestors as UID 65534, while path-based
+stat displayed UID 0. Public path permissions and retained key bytes were not
+the defect. That FAILED directory was retained too; no account output was
+written. A read-only-root, network-disabled builder container was verified to
+report descriptor UID 0 with effective UID 1000. The unchanged preparation
+script completed there with the same spec/inputs, read-only custody mounts,
+a separate writable private output parent, and the approved 96 GiB ceiling.
+No importer permission check was weakened. The environment-wrapper procedure
+is in [GENESIS.md](../core-only/GENESIS.md#managed-shell-directory-ownership).
+
+The real import and typed validator both exited zero. The result is
+`READY_STATIC`, not deployment approval. The final public Genesis SHA-256 is
+`a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f`.
+The original 107-slot private-key array and new protected export are byte-identical;
+the inventory contains 100 distinct Faucet user IDs. All operators use the
+measured SD192 full-policy fingerprint `d48255a1...ca95a109`, min/max transaction
+counts 1/64, with the expected caller restrictions. Validator identities and
+Guardian policy parameters passed the strict retained-account checks; only
+the explicitly opted-in Faucet/Relayer fingerprints changed.
+
+The existing `retained_genesis_token_layout_must_be_nonempty` test then replayed
+that exact public artifact through the production Genesis builder in release
+testnet mode: **1 passed, 0 failed**. It checked both token layouts (8 fields,
+8,594,128,984 felt slots each), all 107 registrations and six memberships,
+nonempty global roots, and the checkpoint-0 base. The public replay log SHA-256
+is `9c7705f9fde2d0652ecd4621b2fdf1dd63c1f585eeda5278e7b72a0e75e0caff`.
+This initializes trees without opening a database/network or producing a proof.
+
+Local retained output: `.private/core-testnet-20261031-sd192-genesis-container/attempt1`.
+Key exports and both child logs remain protected and are not Git artifacts.
+The public [artifact receipt](artifacts.json) records only identities/hashes,
+checks and remaining holds. Old installers do not consume or approve this receipt.
 
 ## Historical October-30 Preparation
 
@@ -285,15 +390,16 @@ Host/key provenance and native acceptance are separate checks.
 2. Public contract regeneration is complete as recorded above; rebuild again
    if the consumed library or generation inputs change. Rebuild
    compatible SDK/WASM; publish producer revisions before downstream gitlinks.
-3. Generate the actual-key Genesis and 100-operator export using spec v2 and
+3. Actual-key Genesis and the 100-operator export are complete using spec v2 and
    explicit `fresh-faucet-and-relayer` mode. The retained R3 Genesis has the
    old registration-2 multisig fingerprint. The separate Relayer opt-in accepts
    only the current compiled fingerprint; every public-key parameter, Guardian
    policy and Validator identity stays strict. Never widen the Faucet flag or
-   overwrite the old Genesis. No actual-key Genesis has been generated yet.
-4. Verify generated layouts/methods/token bindings, rebuild final caches and
-   five CLIs against the accepted config and final bundle, and validate native
-   Genesis construction. No actual-key new Genesis was generated in this step.
+   overwrite the old Genesis. Keep the successful output and both failure
+   directories as evidence; do not generate another set just for packaging.
+4. Five CLIs, typed Genesis checks and production-builder replay are complete.
+   Close parent gitlinks and compatible SDK/WASM artifacts on this accepted
+   cohort, without moving downstream Cargo pins off source `15d6316d`.
 5. Prepare matching Bridge setup/verifiers, host packages and isolated state;
    measure full-policy proving/memory and pass real five-withdrawal and
    three-chain deposit/claim/withdrawal acceptance before activation.

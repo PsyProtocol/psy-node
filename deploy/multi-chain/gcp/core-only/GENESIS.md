@@ -203,6 +203,46 @@ Both native children use a fixed `RAYON_NUM_THREADS=4`, independent of inherited
 shell settings. This bounds circuit-construction parallelism, not total memory;
 measure available memory separately before starting full-contract validation.
 
+### Managed-Shell Directory Ownership
+
+Some managed shells report root-owned ancestors as UID 65534 through `fstat`
+even when path-based `stat` displays UID 0. The native account importer correctly
+rejects that descriptor ownership. Do not change its checks, chown system
+directories, regenerate keys or retry into a failed output directory.
+
+Use the same preparation script in the approved offline builder image instead.
+Keep all input paths unchanged and bind only their required directories/files
+read-only. `RETAINED_KEYS_DIR` must be the original owned mode-0700 parent, not
+a Docker-created parent of a separately mounted key file. Its mounted contents
+are trusted custody inputs, never image layers or generated public packages.
+Create a new owned mode-0700 `GENESIS_OUTPUT_PARENT` first; `GENESIS_OUTPUT`
+must be a missing child. Retain any earlier FAILED directories unchanged.
+
+```sh
+docker run --rm --pull never --network none --read-only \
+  --memory 96g --memory-swap 96g --user "$(id -u):$(id -g)" \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+  --mount "type=bind,src=$CORE_TOOLS,dst=$CORE_TOOLS,readonly" \
+  --mount "type=bind,src=$GENESIS_SPEC_DIR,dst=$GENESIS_SPEC_DIR,readonly" \
+  --mount "type=bind,src=$RUNTIME_BUILD,dst=$RUNTIME_BUILD,readonly" \
+  --mount "type=bind,src=$NEW_GENESIS_TOOLS,dst=$NEW_GENESIS_TOOLS,readonly" \
+  --mount "type=bind,src=$CONFIG_DIR,dst=$CONFIG_DIR,readonly" \
+  --mount "type=bind,src=$GENESIS_ARTIFACTS,dst=$GENESIS_ARTIFACTS,readonly" \
+  --mount "type=bind,src=$COMPILER_SOURCE,dst=$COMPILER_SOURCE,readonly" \
+  --mount "type=bind,src=$NEW_MEASUREMENTS_JSON,dst=$NEW_MEASUREMENTS_JSON,readonly" \
+  --mount "type=bind,src=$RETAINED_KEYS_DIR,dst=$RETAINED_KEYS_DIR,readonly" \
+  --mount "type=bind,src=$GENESIS_OUTPUT_PARENT,dst=$GENESIS_OUTPUT_PARENT" \
+  "$BUILDER_IMAGE" python3 -B "$CORE_TOOLS/prepare_genesis.py" generate \
+  --spec "$GENESIS_SPEC" --private-keys-in "$GENESIS_KEYS" \
+  --private-keys-sha256 "$GENESIS_KEYS_SHA256" --output "$GENESIS_OUTPUT"
+```
+
+The explicit paths include the build-identity and prior-Genesis inputs from the
+spec. Check that the approved image contains Python and reports UID 0 for the
+root directory descriptor before starting expensive circuit construction.
+This is an environment wrapper, not a different generator or a release gate
+exception. It starts no chain service and has no network access.
+
 ## Outputs And Failure Handling
 
 - `genesis.json`: final membership-injected candidate.

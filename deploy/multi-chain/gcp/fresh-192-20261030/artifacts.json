@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "release_id": "core-testnet-20261030-sd192",
+  "prepared_on": "2026-10-31",
+  "status": "READY_STATIC",
+  "source_commit": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
+  "preparation_commits": {
+    "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
+    "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
+    "sdk": "b950dc65d049eb1fd453d19c9e61d541da43b5d1",
+    "services": "e04493b70673e5d5314aa203ab293997c8c5e4fa"
+  },
+  "network": "testnet",
+  "network_magic": "0x1337CF514544CF69",
+  "proving_backend": "plonky2-poseidon-goldilocks",
+  "checkpoints_per_epoch": 32,
+  "sd_key_max_calldata_words": 192,
+  "sd_key_max_tx_count": 64,
+  "runtime_config_sha256": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
+  "genesis_contracts_sha256": "0f4a4a8cbeaff5621d05fa795b6aa157809eb5753fde1c5da62027753bbb9c9f",
+  "compiler_stamp_sha256": "4b22bb7aed61caf4156f1709a52ccc43999737f6bf29342f58d8c63cea4d8c61",
+  "genesis_sha256": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
+  "binaries": {
+    "psy_dev_cli": "ec29b42b125f9b4cf574e5211841882094b0bdeaeab171871ca0956af4be1e23",
+    "psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
+    "psy_relayer_cli": "a5bb1076fe274d8ac839552d7d298259f91d6dbb94e2bc0a0455cfd5ad52b4f5",
+    "psy_user_cli": "8e6d1eb75033cd896e15acc9e541ca82142fc8cb4a691df16b00d0e9a125482f",
+    "psy_worker_cli": "20d67f8578097f8526468c7f172ea6759aba201037a44840f0587855f9aa025c"
+  },
+  "receipts": {
+    "runtime_manifest_sha256": "b0bc11e35553a3fb71c068e05b9aeadb478366290fb38adfa370a8dd2284064c",
+    "tools_manifest_sha256": "c61c14f9c37c97befe6fe21407eea95be99cda4f3afe8ad8e12e6b7ebc0af092",
+    "privacy_measurements_sha256": "d2fdb8bc4d715adc17722a62d5511f18652b59768d676579ca73fd20eb7a258a",
+    "genesis_spec_sha256": "2ea5bdcd4e6f523cef5949ab81d8795b8e146b5133963c299d048cfc430fd951",
+    "native_bootstrap_log_sha256": "9c7705f9fde2d0652ecd4621b2fdf1dd63c1f585eeda5278e7b72a0e75e0caff"
+  },
+  "verification": {
+    "cli_help_passed": 5,
+    "typed_genesis_passed": true,
+    "native_bootstrap_tests_passed": 1,
+    "private_key_inventory_retained": true,
+    "registered_accounts": 107,
+    "validators": 6,
+    "faucet_operators": 100,
+    "faucet_fingerprint": "d48255a10a5b3049b6aad5169603336ed6b80b9358b2da78527b385bca95a109"
+  },
+  "parent_genesis_gitlinks_promoted": false,
+  "sdk_wasm_verified": false,
+  "runtime_approved": false,
+  "deployment_ready": false,
+  "remaining_gates": [
+    "Parent gitlink and SDK/WASM/client artifact closure",
+    "Fresh host packages, installers and isolated runtime state",
+    "Full SD-key proof and Faucet batch memory acceptance",
+    "Five-entry withdrawal Guardian and EndCap acceptance",
+    "Matching bridge setup/verifiers and three-chain E2E",
+    "Outstanding independent runtime release holds"
+  ]
+}

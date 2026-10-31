@@ -9,11 +9,13 @@ Neither a successful preflight nor a Git push authorizes reset or activation.
 
 The runtime inputs are now frozen for the offline version-2 build only: source
 `15d6316d`, the retained-membership epoch-32 config, and public contracts from
-Genesis `6ec29ad9` / Compiler `81e0a022`. `runtime_inputs_frozen: true` permits
+Genesis `8346116` / Compiler `e9cc57fe`. `runtime_inputs_frozen: true` permits
 that build; it is not runtime approval or permission to reset/install/start.
 The build spec separately pins the exact bundle, provenance and profile bytes.
-New network Genesis, installer migration and all remaining acceptance gates
-below are still required.
+Actual-key Genesis and production-builder replay are complete; the public
+[artifact receipt](artifacts.json) records their hashes without private data.
+Installer migration and all remaining acceptance gates below are still required.
+The receipt is not an activation package and is not consumed by old installers.
 
 `release.json` is the preparation role inventory. Historical `fresh-topology/`
 and `live/components.json` describe older cohorts, not this deployment's inputs.
@@ -101,7 +103,8 @@ renamed inputs or replace only their version strings. Likewise, the historical
    at `15d6316d`; retain that immutable source during final artifact integration.
 2. Rebuild Compiler and full contract artifacts, measuring affected fingerprints
    and checking token0/token4 layouts, methods and privacy bindings. Public
-   contract regeneration completed at Genesis `6ec29ad9`; final native
+   contract regeneration completed at Genesis `8346116`, including canonical
+   ABI layouts missing from the predecessor; final native
    actual-key network acceptance is still required.
 3. Prepare a fresh Genesis and 100 Faucet public identities. Retain Guardian,
    P2P, worker and operator private-key material; the changed Faucet fingerprint

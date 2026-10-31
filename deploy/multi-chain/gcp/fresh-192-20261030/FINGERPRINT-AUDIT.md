@@ -28,6 +28,15 @@ the retained Guardian policy. Never substitute a fingerprint in an existing leaf
 
 ## Results
 
+Current-source closure on October 31: Node `15d6316d` re-measured both real
+privacy minifier circuits using the final config and library-bound tools;
+the limbs below are unchanged. Real retained-key Genesis `a448ef86...` then
+passed the typed contract/layout/fingerprint checks and production bootstrap
+replay. Its 100 operators all carry the full-policy fingerprint recorded below,
+with min/max transaction counts 1/64. This supplements, rather than relabels,
+the historical synthetic tests. Full SD-key proving/memory, setup, SDK/WASM
+and bridge E2E gates remain pending; see [the current receipt](artifacts.json).
+
 | Item | Result | Evidence |
 |---|---|---|
 | `local_circuits.json` | All three embedded circuits match fresh construction | `embedded_local_circuits_match_current_sources` passed |
