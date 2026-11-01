@@ -40,7 +40,7 @@
   },
   "bundle_sites": {"app": true, "account": false},
   "workflows": ["Deploy Testnet Frontends", "Deploy Testnet Wallet Site", "Deploy Testnet IDE", "Deploy Testnet Account"],
-  "dapp": {"branch": "deploy/testnet", "l1_file": "deploy/common/public-l1-r3.json", "client_file": "deploy/common/public-client-r3.json",
+  "dapp": {"branch": "deploy/testnet", "l1_file": "deploy/common/public-l1-r3.json", "client_file": "deploy/common/public-client-r3.json", "policy_file": "deploy/common/stable-release.json",
            "page_source": "apps/config"},
   "wallet": {"r2_bucket": "psy-wallet-assets-stg", "public_base_url": "https://wallet-assets-stg.psy-protocol.xyz",
              "package_mode": "staging", "script": "scripts/publish-wallet-r2-stg.sh"}

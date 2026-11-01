@@ -365,10 +365,16 @@ class FrontendTests(PublicWorld):
         git("init", "--bare", "-b", "deploy/testnet", str(self.origin), cwd=root)
         self.dapp = root / "dapp"
         git("clone", str(self.origin), str(self.dapp), cwd=root)
+        (self.dapp / "app").mkdir()
+        (self.dapp / "app/index.txt").write_text("application\n")
+        git("add", ".", cwd=self.dapp)
+        git("commit", "-m", "application", cwd=self.dapp)
+        self.source = git("rev-parse", "HEAD", cwd=self.dapp)
+        git("push", "origin", "HEAD:refs/heads/release/testnet", cwd=self.dapp)
         (self.dapp / "deploy/common").mkdir(parents=True)
         (self.dapp / "deploy/common/public-l1-r3.json").write_text('{"old": true}\n')
         (self.dapp / "deploy/common/public-client-r3.json").write_text('{"networks": {"testnet": {"p2p": {"checkpoints_per_epoch": 10}}}}\n')
-        (self.dapp / "deploy/common/stable-release.json").write_text('{"releaseScope": {"l1DepositsPaused": true}}\n')
+        (self.dapp / "deploy/common/stable-release.json").write_text(self.policy(self.source))
         (self.dapp / "deploy/common/staging-env.sh").write_text("export VITE_L1_DEPOSITS_PAUSED=true\n")
         git("add", ".", cwd=self.dapp)
         git("commit", "-m", "base", cwd=self.dapp)
@@ -384,6 +390,18 @@ class FrontendTests(PublicWorld):
         self.ws.write_local()
         self.serve(self.public["frontends"]["config"].rstrip("/") + "/config.json", self.config_raw)
         self.step = steps.PUBLIC_STEPS["publish_frontends"]
+
+    @staticmethod
+    def policy(commit):
+        return json.dumps({"sourceBranch": "release/testnet", "sourceCommit": commit, "publishEnabled": True,
+                           "releaseScope": {"l1DepositsPaused": True}}, indent=2) + "\n"
+
+    def commit_pin(self, commit):
+        (self.dapp / "deploy/common/stable-release.json").write_text(self.policy(commit))
+        git("commit", "-am", "pin", cwd=self.dapp)
+
+    def pin(self):
+        return json.loads(git("show", "HEAD:deploy/common/stable-release.json", cwd=self.dapp))["sourceCommit"]
 
     def remote_head(self):
         return git("rev-parse", "deploy/testnet", cwd=self.origin)
@@ -428,9 +446,51 @@ class FrontendTests(PublicWorld):
         self.assertEqual(self.remote_head(), before)
 
     def test_uncommitted_changes_outside_the_two_deploy_files_are_refused(self):
-        (self.dapp / "deploy/common/stable-release.json").write_text("{}\n")
-        with self.assertRaisesRegex(ValueError, "outside the two deploy files"):
+        (self.dapp / "deploy/common/staging-env.sh").write_text("changed\n")
+        with self.assertRaisesRegex(ValueError, "outside the deploy files"):
             self.step.apply(self.ctx)
+
+    def test_a_valid_source_pin_is_kept_and_the_commit_touches_no_policy_file(self):
+        self.allow()
+        self.step.apply(self.ctx)
+        self.assertEqual(self.pin(), self.source)
+        changed = git("diff", "--name-only", "HEAD~1", "HEAD", cwd=self.dapp).splitlines()
+        self.assertEqual(sorted(changed), ["deploy/common/public-client-r3.json", "deploy/common/public-l1-r3.json"])
+
+    def test_a_stale_source_pin_is_moved_to_the_source_branch_head_in_the_same_deploy_only_commit(self):
+        base = git("rev-parse", "HEAD", cwd=self.dapp)
+        self.commit_pin(base)
+        self.allow()
+        self.step.apply(self.ctx)
+        self.assertEqual(self.pin(), self.source)
+        changed = git("diff", "--name-only", self.source, "HEAD", cwd=self.dapp).splitlines()
+        self.assertTrue(changed and all(path.startswith("deploy/") for path in changed), changed)
+        self.assertEqual(self.remote_head(), git("rev-parse", "HEAD", cwd=self.dapp))
+
+    def test_a_source_branch_head_missing_from_the_deploy_branch_refuses_before_any_push(self):
+        base = git("rev-parse", "HEAD", cwd=self.dapp)
+        self.commit_pin(base)
+        other = self.ws.root / "other-release"
+        git("clone", "-b", "release/testnet", str(self.origin), str(other), cwd=self.ws.root)
+        (other / "app/index.txt").write_text("newer application\n")
+        git("commit", "-am", "newer source", cwd=other)
+        git("push", "origin", "HEAD:refs/heads/release/testnet", cwd=other)
+        before = self.remote_head()
+        self.allow()
+        with self.assertRaisesRegex(ValueError, "stable-release pin cannot be made valid"):
+            self.step.apply(self.ctx)
+        self.assertEqual(self.remote_head(), before)
+        self.assertFalse((self.ws.state_dir / "publish_frontends.json").exists())
+
+    def test_application_paths_changed_since_the_source_refuse_before_any_push(self):
+        (self.dapp / "app/index.txt").write_text("edited on the deploy branch\n")
+        git("commit", "-am", "application change on deploy", cwd=self.dapp)
+        self.commit_pin(git("rev-parse", "HEAD", cwd=self.dapp))
+        before = self.remote_head()
+        self.allow()
+        with self.assertRaisesRegex(ValueError, "stable-release pin cannot be made valid"):
+            self.step.apply(self.ctx)
+        self.assertEqual(self.remote_head(), before)
 
     def test_check_refuses_when_the_live_config_is_not_the_published_one(self):
         self.serve(self.public["frontends"]["config"].rstrip("/") + "/config.json", b"{}")

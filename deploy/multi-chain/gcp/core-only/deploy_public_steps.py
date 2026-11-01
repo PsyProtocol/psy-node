@@ -247,20 +247,58 @@ def release_epoch(ctx):
     return int(release_lock.read_document(ctx.release_dir / "release.json")["checkpoints_per_epoch"])
 
 
+FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+POLICY_PATHS = ("deploy/", ".github/workflows/")
+
+
+def pin_is_valid(repo, commit, source_branch):
+    """The rule of psy-dapp check-stable-release.mjs: a full commit on origin/<source branch>, an ancestor of HEAD, and
+    nothing but deploy/ and workflow files changed since."""
+    if not (isinstance(commit, str) and FULL_COMMIT.fullmatch(commit)):
+        return False
+    for tip in (f"refs/remotes/origin/{source_branch}", "HEAD"):
+        if run_local(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, tip], GIT_SECONDS).returncode != 0:
+            return False
+    changed = git(repo, "diff", "--name-only", commit, "HEAD", "--").splitlines()
+    return all(path.startswith(POLICY_PATHS) for path in changed)
+
+
+def resolve_source_pin(repo, public):
+    """The stable-release pin that CI will accept: the current one when valid, else the head of the source branch
+    when that is valid, else a refusal before anything is pushed."""
+    policy_file = repo / public["dapp"]["policy_file"]
+    policy = json.loads(policy_file.read_text())
+    require(isinstance(policy.get("sourceBranch"), str) and "sourceCommit" in policy, "the stable-release policy has no source pin")
+    branch = policy["sourceBranch"]
+    git(repo, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    if pin_is_valid(repo, policy["sourceCommit"], branch):
+        return None
+    candidate = git(repo, "rev-parse", f"refs/remotes/origin/{branch}")
+    require(pin_is_valid(repo, candidate, branch),
+            f"the stable-release pin cannot be made valid: land the source commit on origin/{branch} first, "
+            "then rebuild the deploy branch so only deploy/ paths differ from it")
+    return candidate
+
+
 def apply_dapp_files(repo, public, config_raw, epoch):
-    """Write the config and the client epoch into the two deploy files; refuse any other uncommitted change."""
-    l1_file, client_file = public["dapp"]["l1_file"], public["dapp"]["client_file"]
+    """Write the config, the client epoch and, when stale, the source pin; refuse any other uncommitted change."""
+    l1_file, client_file, policy_file = public["dapp"]["l1_file"], public["dapp"]["client_file"], public["dapp"]["policy_file"]
     other = [line for line in git(repo, "status", "--porcelain", "--untracked-files=no").splitlines()
-             if line[3:] not in (l1_file, client_file)]
-    require(not other, "the dapp checkout has uncommitted changes outside the two deploy files")
+             if line[3:] not in (l1_file, client_file, policy_file)]
+    require(not other, "the dapp checkout has uncommitted changes outside the deploy files")
+    new_pin = resolve_source_pin(repo, public)
     (repo / l1_file).write_bytes(config_raw)
     text = (repo / client_file).read_text()
     updated = CLIENT_EPOCH.sub(lambda found: f"{found.group(1)}{epoch}", text)
     require(updated != text or CLIENT_EPOCH.search(text), "the client config has no checkpoints_per_epoch to align")
     json.loads(updated)
     (repo / client_file).write_text(updated)
+    if new_pin is not None:
+        policy_text = (repo / policy_file).read_text()
+        policy = json.loads(policy_text)
+        (repo / policy_file).write_text(policy_text.replace(policy["sourceCommit"], new_pin, 1))
     if git(repo, "status", "--porcelain", "--untracked-files=no"):
-        git(repo, "add", "--", l1_file, client_file)
+        git(repo, "add", "--", l1_file, client_file, policy_file)
         git(repo, "commit", "-m", COMMIT_MESSAGE)
     return git(repo, "rev-parse", "HEAD")
 
