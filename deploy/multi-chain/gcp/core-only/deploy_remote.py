@@ -26,6 +26,8 @@ HERE_DOCUMENT_MARKER = "PSY_ROOT_STDIN_END"
 # Broad pattern for free-form text where a false positive only hides a line.
 SECRET_TEXT = re.compile(r"private|secret|passw|passphrase|token|mnemonic|credential|cookie", re.IGNORECASE)
 USERINFO_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s@]*@")
+# A bare 32-byte key (64 hex digits, optionally 0x), a Bearer credential or a JWT carries no tell-tale name.
+BARE_SECRET = re.compile(r"(?<![0-9A-Za-z])(?:0x)?[0-9a-fA-F]{64}(?![0-9A-Za-z])|\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", re.IGNORECASE)
 PEM_HEADER = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 NAMED_VALUE = re.compile(r"""(?<![A-Za-z0-9_-])-*([A-Za-z][A-Za-z0-9_-]*)["']?\s*[=:]\s*\S""")
 SAFE_LAST_WORDS = frozenset(("sha256", "hash", "digest", "fingerprint", "address", "addresses", "id", "ids", "count",
@@ -53,7 +55,7 @@ class ResultRefused(ValueError):
 
 
 def looks_secret(text):
-    return bool(SECRET_TEXT.search(text) or USERINFO_URL.search(text))
+    return bool(SECRET_TEXT.search(text) or USERINFO_URL.search(text) or BARE_SECRET.search(text))
 
 
 def redact_tail(text, limit=ERROR_TAIL_CHARS):

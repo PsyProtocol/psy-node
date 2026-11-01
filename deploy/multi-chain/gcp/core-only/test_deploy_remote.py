@@ -187,6 +187,20 @@ class RemoteTests(unittest.TestCase):
             self.assertIn(expected, str(caught.exception))
         self.assertNotIn("visible diagnostic", str(RemoteError("h: exit 2: details withheld")))
 
+    def test_bare_keys_and_bearer_credentials_are_redacted_from_a_failure_tail(self):
+        key = "ab" * 32
+        for line in (key, "0x" + key, f"cast failed with {key} in argv", "Authorization: Bearer abc.def", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig"):
+            runner = FakeRunner(returncode=1, stderr=f"first line\n{line}\nlast line\n")
+            with self.subTest(line=line[:12]), self.assertRaises(RemoteError) as caught:
+                remote_with(runner).run_root_text("inner", ["x"], 30)
+            self.assertNotIn(key, str(caught.exception))
+            self.assertNotIn("abc.def", str(caught.exception))
+            self.assertNotIn("eyJhbGci", str(caught.exception))
+            self.assertIn("first line", str(caught.exception))
+        short = FakeRunner(returncode=1, stderr="exit reason " + "ab" * 31 + "\n")
+        with self.assertRaisesRegex(RemoteError, "exit reason"):
+            remote_with(short).run_root_text("inner", ["x"], 30)
+
     def test_failure_reason_is_shown_by_default_and_falls_back_to_stdout(self):
         runner = FakeRunner(returncode=1, stdout='{"component": "valkey", "error": "write refused", "ok": false}\n')
         with self.assertRaisesRegex(RemoteError, "write refused"):
