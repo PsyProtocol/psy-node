@@ -486,6 +486,74 @@ class PackageBuilderTests(PrepareTestCase):
         self.assertNotIn("/out/", json.dumps(result))
 
 
+class StalePackageTests(PrepareTestCase):
+    def package(self, name, files):
+        output = self.ws.root / f"{name}-out"
+        for relative, content in files.items():
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content if isinstance(content, str) else json.dumps(content))
+        return output
+
+    def apply_with(self, builder, output):
+        built = []
+        replaced = steps.PackageBuilder(builder.name, ("output",), lambda ctx, inputs: built.append(1) or Path(inputs["output"]),
+                                        lambda ctx, inputs, path: {}, is_stale=builder.is_stale)
+        self.ws.local["packages"] = {builder.name: {"output": str(output)}}
+        self.ws.write_local()
+        with unittest.mock.patch.object(steps, "PACKAGE_BUILDERS", [replaced]):
+            steps.PREPARE_STEPS["prepare_packages"].apply(self.ws.context())
+        return built
+
+    def faucet_files(self, lock_sha256, tool_sha256):
+        return {"manifest.json": {"release_lock_sha256": lock_sha256, "files": {"prepare_faucet.py": tool_sha256}}}
+
+    def test_faucet_package_of_another_lock_is_removed_and_rebuilt(self):
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "faucet")
+        tool = self.ws.lock["tool_sha256"]["prepare_faucet.py"]
+        output = self.package("faucet", self.faucet_files("b" * 64, tool))
+        self.apply_with(builder, output)
+        self.assertFalse((output / "manifest.json").exists())
+
+    def test_faucet_package_of_this_lock_is_kept(self):
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "faucet")
+        tool = self.ws.lock["tool_sha256"]["prepare_faucet.py"]
+        output = self.package("faucet", self.faucet_files("a" * 64, tool))
+        self.apply_with(builder, output)
+        self.assertTrue((output / "manifest.json").exists())
+
+    def test_faucet_package_with_an_older_installer_is_removed(self):
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "faucet")
+        output = self.package("faucet", self.faucet_files("a" * 64, "c" * 64))
+        self.apply_with(builder, output)
+        self.assertFalse((output / "manifest.json").exists())
+
+    def test_proxy_package_is_stale_when_either_role_is_bound_to_another_lock(self):
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "proxy")
+        tool = self.ws.lock["tool_sha256"]["prepare_proxies.py"]
+        output = self.package("proxy", {"system/package.json": {"release_lock_sha256": "a" * 64, "installer_sha256": tool},
+                                        "user/package.json": {"release_lock_sha256": "d" * 64, "installer_sha256": tool}})
+        self.apply_with(builder, output)
+        self.assertFalse(output.exists())
+
+    def test_worker_package_is_stale_when_its_installer_copy_differs_from_the_lock(self):
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "worker")
+        output = self.package("worker", {"prepare_workers.py": "# older installer\n", "build.json": "{}"})
+        self.apply_with(builder, output)
+        self.assertFalse(output.exists())
+        fresh = self.package("worker2", {"prepare_workers.py": "# fixture prepare_workers.py\n"})
+        self.apply_with(builder, fresh)
+        self.assertTrue((fresh / "prepare_workers.py").exists())
+
+    def test_core_package_and_unrecognised_directories_are_never_removed(self):
+        core = next(b for b in steps.PACKAGE_BUILDERS if b.name == "core")
+        self.assertIsNone(core.is_stale)
+        builder = next(b for b in steps.PACKAGE_BUILDERS if b.name == "faucet")
+        stray = self.package("faucet", {"notes.txt": "mine"})
+        self.apply_with(builder, stray)
+        self.assertTrue((stray / "notes.txt").exists())
+
+
 class CorePackageTests(PrepareTestCase):
     HOST = "gcp-test-cp"
 

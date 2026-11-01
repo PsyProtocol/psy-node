@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -314,6 +315,7 @@ class PackageBuilder:
     build: Callable[[DeployContext, dict], Path]
     verify: Callable[[DeployContext, dict, Path], dict]
     check: Callable[[DeployContext, dict], None] = None
+    is_stale: Callable[[DeployContext, Path], bool] = None
 
 
 def core_build(ctx, inputs):
@@ -548,13 +550,43 @@ def faucet_verify(ctx, inputs, output):
     return {"package_sha256": package_sha256, "operators": recorded["operator_count"]}
 
 
+def recorded_document(path):
+    try:
+        document = release_lock.read_document(path)
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def faucet_stale(ctx, output):
+    manifest = recorded_document(output / "manifest.json")
+    if manifest is None:
+        return False
+    return (manifest.get("release_lock_sha256") != ctx.lock_sha256
+            or manifest.get("files", {}).get("prepare_faucet.py") != ctx.lock["tool_sha256"]["prepare_faucet.py"])
+
+
+def proxy_stale(ctx, output):
+    for role in PROXY_ROLES:
+        approval = recorded_document(output / role / "package.json")
+        if approval is not None and (approval.get("release_lock_sha256") != ctx.lock_sha256
+                                     or approval.get("installer_sha256") != ctx.lock["tool_sha256"]["prepare_proxies.py"]):
+            return True
+    return False
+
+
+def worker_stale(ctx, output):
+    installer = output / "prepare_workers.py"
+    return installer.is_file() and file_sha256(installer) != ctx.lock["tool_sha256"]["prepare_workers.py"]
+
+
 # Adding a package family is one line here plus its packages.<name> input.
 PACKAGE_BUILDERS = [PackageBuilder("core", ("registration_keys", "faucet_operators", "p2p_keys", "output"), core_build,
                                   core_verify),
                     PackageBuilder("proxy", ("rpc_endpoints", "setup_dir", "verifier_dir", "output"), proxy_build,
-                                  proxy_verify, proxy_check),
-                    PackageBuilder("worker", ("output",), worker_build, worker_verify),
-                    PackageBuilder("faucet", ("faucet_operators", "output"), faucet_build, faucet_verify)]
+                                  proxy_verify, proxy_check, proxy_stale),
+                    PackageBuilder("worker", ("output",), worker_build, worker_verify, None, worker_stale),
+                    PackageBuilder("faucet", ("faucet_operators", "output"), faucet_build, faucet_verify, None, faucet_stale)]
 
 
 def packages_check(ctx):
@@ -572,7 +604,19 @@ def packages_check(ctx):
             builder.check(ctx, values)
 
 
+def retire_stale_package(ctx, builder, values):
+    """A finished package bound to an older lock or installer is derived data; remove it so the builder rebuilds it."""
+    output = Path(values.get("output", ""))
+    if builder.is_stale is None or not output.is_absolute() or output.is_symlink() or not output.is_dir():
+        return
+    if builder.is_stale(ctx, output):
+        print(f"[deploy] {builder.name} package was built for another release lock or installer; rebuilding it")
+        shutil.rmtree(output)
+
+
 def packages_apply(ctx):
+    for builder in PACKAGE_BUILDERS:
+        retire_stale_package(ctx, builder, local_value(ctx, "packages", builder.name))
     outputs = {builder.name: str(builder.build(ctx, local_value(ctx, "packages", builder.name)))
                for builder in PACKAGE_BUILDERS}
     write_state(ctx, "prepare_packages", outputs)
