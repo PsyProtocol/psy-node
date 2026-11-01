@@ -776,7 +776,7 @@ class WorkerPackageBuilderTests(unittest.TestCase):
         self.builder = [b for b in prepare_steps.PACKAGE_BUILDERS if b.name == "worker"][0]
 
     def test_the_worker_builder_is_registered_with_its_input_declaration(self):
-        self.assertEqual([builder.name for builder in prepare_steps.PACKAGE_BUILDERS], ["core", "proxy", "worker"])
+        self.assertEqual([builder.name for builder in prepare_steps.PACKAGE_BUILDERS], ["core", "proxy", "worker", "faucet"])
         self.assertEqual(self.builder.inputs, ("output",))
         with patch.object(prepare_steps, "PACKAGE_BUILDERS", [self.builder]):
             prepare_steps.PREPARE_STEPS["prepare_packages"].check(self.ws.context())

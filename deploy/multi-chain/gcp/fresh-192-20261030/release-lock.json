@@ -130,7 +130,7 @@
   "faucet": {
     "account": "psy-faucet-r2",
     "listen_port": 29998,
-    "operators_sha256": ""
+    "operators_sha256": "f5973cb308f869fa74a0d357eee9afc30b7e3d15577b9830f6551291b8b40404"
   },
   "images": {
     "scylla": "scylladb/scylla@sha256:7e93267357fe3fbd3da3c92aa0e980f08ddadc1fe8a38c2aae3a3f7f9a1014a7",
@@ -206,7 +206,7 @@
     "install_relayer.py": "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9",
     "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
-    "prepare_faucet.py": "1ce5b823ba27389d2210468fbe41ea8b18dc6d1336f0fa52739af08052e6ed2f",
+    "prepare_faucet.py": "ef39b4e15ee739bd3ce2a9ea15662a7d92df02131bbb884bf83c9476b73d33d2",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
     "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",

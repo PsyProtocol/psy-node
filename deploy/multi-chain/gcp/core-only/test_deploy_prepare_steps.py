@@ -446,8 +446,8 @@ class PackageBuilderTests(PrepareTestCase):
             result = run_all(steps.PREPARE_STEPS["prepare_packages"], self.ws.context())
         self.assertEqual(list(result["packages"]), ["alpha", "beta", "gamma"])
 
-    def test_the_shipped_list_holds_the_core_proxy_and_worker_builders(self):
-        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core", "proxy", "worker"])
+    def test_the_shipped_list_holds_the_core_proxy_worker_and_faucet_builders(self):
+        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core", "proxy", "worker", "faucet"])
 
     def test_duplicate_builder_names_are_refused(self):
         order = []

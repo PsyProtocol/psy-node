@@ -404,6 +404,15 @@ def write_tool_hashes(lock_path, tools_dir=HERE):
     replace_lock(lock_path, lock)
 
 
+def write_faucet_operators(lock_path, operators_path):
+    """Pin the Genesis operator file in the lock by hash; the file is parsed in memory and never printed."""
+    lock = read_release_lock(lock_path)
+    operators = json.loads(Path(operators_path).read_bytes()).get("operators")
+    require(isinstance(operators, list) and len(operators) == 100, "operator file must hold 100 operators")
+    lock["faucet"]["operators_sha256"] = sha256_file(operators_path)
+    replace_lock(lock_path, lock)
+
+
 def replace_lock(lock_path, lock):
     text = json.dumps(lock, indent=2) + "\n"
     directory = Path(lock_path).resolve().parent
@@ -427,6 +436,9 @@ def main(argv=None):
     check.add_argument("--private-dir", type=Path)
     update = commands.add_parser("update-tools", help="rewrite tool_sha256 from the files in this directory")
     update.add_argument("--lock", type=Path, required=True)
+    pin = commands.add_parser("update-faucet-operators", help="pin the hash of the Genesis faucet operator file")
+    pin.add_argument("--lock", type=Path, required=True)
+    pin.add_argument("--operators", type=Path, required=True)
     inputs = commands.add_parser("update-inputs", help="rewrite inputs from the current files")
     inputs.add_argument("--lock", type=Path, required=True)
     inputs.add_argument("--private-dir", type=Path)
@@ -440,6 +452,9 @@ def main(argv=None):
         elif args.command == "update-inputs":
             write_inputs(args.lock, args.lock.resolve().parent, args.private_dir)
             print("inputs updated")
+        elif args.command == "update-faucet-operators":
+            write_faucet_operators(args.lock, args.operators)
+            print("faucet operator hash updated")
         else:
             write_tool_hashes(args.lock)
             print("tool hashes updated")

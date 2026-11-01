@@ -79,43 +79,26 @@ This change prepares the account pool; it does not generate Genesis, regenerate
 Guardian/Validator identities, start Faucet, or increase proof concurrency to 100.
 Keep concurrency bounded separately according to proving capacity.
 
-## Batched Faucet release (r3-batch10)
+## Batched Faucet release
 
-`prepare_faucet.py` pins the batched Faucet: psy-node `ffebbba7`
-(`feat/faucet-batch-departure`), unit `psy-faucet-r3-batch10.service`,
-`MemoryMax=20G`, `MemorySwapMax=0`, `Restart=on-failure`. Claims depart every
-5 s, up to 10 recipients per operator End Cap and at most 3 End Caps proving at
-once; each End Cap holds one local SD-key signature proof of about 2 GiB, so
-the memory bound no longer depends on the number of concurrent claims. It
-reuses the r3 host-bound operator credential (`OLD_CUSTODY`).
+`prepare_faucet.py` packages, installs and activates the batched Faucet from the release lock: the runtime
+`psy_user_cli`, canonical config, operator-set hash, account, listen port, unit name and install paths all come
+from the lock. The unit keeps the live batch10 settings: `MemoryMax=20G`, `MemorySwapMax=0`, `RAYON_NUM_THREADS=4`,
+`PSY_FAUCET_WINDOW_CHECKPOINTS=120`, Turnstile off, `Restart=on-failure`. Claims depart every 5 s, up to 10
+recipients per operator End Cap, at most 3 End Caps proving at once; each SD-key proof adds about 3.76 GiB on top
+of about 4.7 GiB after the circuit build (about 60 s), so 3 in flight is the ceiling under 20 GiB.
 
-The pinned binary is built on the Faucet host with `build_faucet_host.sh`
-(`-C target-cpu=native`, AVX-512), so it runs only on that host. Prepare
-`<build-root>/src` from `git archive` of the pinned commit plus the r3
-`psy-genesis/` inputs that `build_runtime.py` mounts, and copy the offline Cargo
-home and Go caches to `<build-root>/cargo`, `go` and `go-build`. Then, on the
-host:
-
-```bash
-BUILD_ROOT=<build-root> BUILDER_IMAGE=<local builder image id> ./build_faucet_host.sh
-python3 -I -B prepare_faucet.py prepare --binary <build-root>/out/psy_user_cli \
-  --canonical <r3-release>/canonical.json --rpc <r3-release>/rpc.json \
-  --host-spec <r3-release>/host.json --spec-sha256 <host.json sha256> --output <package>
-```
-
-Bootstrap refuses to run while any listed Faucet unit is active or while the
-listener port is still bound. A just-stopped Faucet leaves TIME-WAIT sockets on
-the port for up to 60 s, so wait until the port binds before bootstrapping:
-
-```bash
-sudo systemctl stop <previous faucet unit>
-sudo python3 -I -B <package>/prepare_faucet.py bootstrap --package <package> \
-  --manifest-sha256 <manifest sha256> --start-private --public-ingress-closed
-```
-
-Roll back by stopping `psy-faucet-r3-batch10.service` and starting
-`psy-faucet-r3.service`; both releases and their state directories stay
-installed side by side.
+The operators are Genesis's 100 operators; nothing is read from an earlier release's custody. Pin the operator file
+once: `release_lock.py update-faucet-operators --lock <lock> --operators <faucetOperators.json>` (prints no keys).
+`prepare_packages` builds the package (`packages.faucet`: `faucet_operators`, `output`). Its RPC config is derived from
+`files.config`: the coordinator, both realms and the prove proxy move to the `-stg` public hosts of
+`lock.ingress.fenced_hosts`, one URL each. Step 76 (`deploy_faucet_steps.py`) stages the package on the operator
+host and prints one `sudo` command. The command seals the operators to the host with `systemd-creds`, enables and
+starts the unit, and writes a report. Rerun `--from 76` to validate the report, issue one grant (default recipient
+262144, a Genesis validator; `local-inputs.json faucet_grant.recipient_user_id` overrides, operators are refused),
+wait until the chain includes it (`psy_user_cli tx get-status` on the host), and only then remove the Faucet
+maintenance route. A restart of the unit does not block a rerun. `PSY_FAUCET_BATCH_MAX_IN_FLIGHT` (default 3) passes
+through the unit wrapper, so the in-flight limit can be lowered with a drop-in and no tool change.
 
 ## Network selection
 

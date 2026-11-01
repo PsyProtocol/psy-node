@@ -471,12 +471,86 @@ def worker_verify(ctx, inputs, output):
     return {"files": len(files), "worker_sha256": release.worker_sha256}
 
 
-# Adding a package family (Faucet) is one line here plus its packages.<name> input.
+def faucet_host(ctx):
+    return release_lock.read_document(ctx.release_dir / "release.json")["core_placement"]["faucet"]
+
+
+def faucet_tool_argv(ctx, action, *arguments):
+    check_tool_hash(ctx, "prepare_faucet.py")
+    return [sys.executable, "-B", str(HERE / "prepare_faucet.py"), action,
+            "--release-lock", str(ctx.release_dir / "release-lock.json"), "--release-lock-sha256", ctx.lock_sha256,
+            *arguments]
+
+
+def public_host(ctx, name):
+    """The staging public host of one route (<name>-stg.*), taken from the fenced hosts of the lock."""
+    matches = [host for host in ctx.lock["ingress"]["fenced_hosts"] if host.startswith(name + "-stg.")]
+    require(len(matches) == 1, f"lock.ingress.fenced_hosts must hold exactly one {name}-stg host")
+    return matches[0]
+
+
+def faucet_rpc_bytes(ctx):
+    """The faucet RPC config: files.config with the coordinator, both realms and the prove proxy on public hosts."""
+    document = release_lock.read_document(local_path(ctx, "files", "config"))
+    network = document["networks"]["testnet"]
+    require(document.get("defaultNetwork") == "testnet", "files.config is not the testnet config")
+    url = lambda name: [f"https://{public_host(ctx, name)}/"]
+    require([row["id"] for row in network["coordinator_configs"]] == [0], "files.config coordinator ids differ")
+    network["coordinator_configs"][0]["rpc_url"] = url("coordinator")
+    realms = {row["id"]: row for row in network["realm_configs"]}
+    require(sorted(realms) == [0, 1], "files.config realm ids differ")
+    for realm_id, row in realms.items():
+        row["rpc_url"] = url(f"realm{realm_id}")
+    network["prove_proxy_url"] = url("prove")
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+
+
+def faucet_build(ctx, inputs):
+    output = Path(inputs["output"])
+    if output.exists():
+        return output  # verification judges what is there
+    binary = rebuilt_binary(ctx, "psy_user_cli")
+    require(file_sha256(binary) == ctx.lock["binaries"]["psy_user_cli"], "user binary differs from the lock")
+    partial = output.with_name(output.name + ".partial")
+    require(not partial.exists(), "a partial faucet package output exists; inspect it first")
+    rpc_raw = faucet_rpc_bytes(ctx)
+    rpc_file = ctx.state_dir / "faucet-rpc.json"
+    rpc_file.write_bytes(rpc_raw)
+    argv = faucet_tool_argv(ctx, "package", "--binary", str(binary),
+                            "--canonical", str(local_path(ctx, "files", "canonical_config")),
+                            "--rpc", str(rpc_file), "--rpc-sha256", hashlib.sha256(rpc_raw).hexdigest(),
+                            "--operators", inputs["faucet_operators"], "--host", faucet_host(ctx),
+                            "--output", str(partial))
+    outcome = run_local(argv, PACKAGE_TIMEOUT_SECONDS)
+    if outcome.returncode != 0:
+        raise RuntimeError(command_failure("prepare_faucet package", outcome))
+    partial.rename(output)
+    return output
+
+
+def faucet_verify(ctx, inputs, output):
+    package_sha256 = file_sha256(output / "manifest.json")
+    outcome = run_local(faucet_tool_argv(ctx, "verify", "--package", str(output), "--package-sha256", package_sha256),
+                        PACKAGE_TIMEOUT_SECONDS)
+    if outcome.returncode != 0:
+        raise RuntimeError(command_failure("prepare_faucet verify", outcome))
+    recorded = release_lock.read_document(output / "manifest.json")
+    require(recorded["files"]["prepare_faucet.py"] == ctx.lock["tool_sha256"]["prepare_faucet.py"],
+            "faucet package installer differs from the reviewed tool")
+    require(recorded["operators_sha256"] == ctx.lock["faucet"]["operators_sha256"],
+            "faucet package operator set differs from the lock")
+    require(recorded["rpc_sha256"] == hashlib.sha256(faucet_rpc_bytes(ctx)).hexdigest(),
+            "faucet package RPC config differs from the one derived from files.config")
+    return {"package_sha256": package_sha256, "operators": recorded["operator_count"]}
+
+
+# Adding a package family is one line here plus its packages.<name> input.
 PACKAGE_BUILDERS = [PackageBuilder("core", ("registration_keys", "faucet_operators", "p2p_keys", "output"), core_build,
                                   core_verify),
                     PackageBuilder("proxy", ("rpc_endpoints", "setup_dir", "verifier_dir", "output"), proxy_build,
                                   proxy_verify, proxy_check),
-                    PackageBuilder("worker", ("output",), worker_build, worker_verify)]
+                    PackageBuilder("worker", ("output",), worker_build, worker_verify),
+                    PackageBuilder("faucet", ("faucet_operators", "output"), faucet_build, faucet_verify)]
 
 
 def packages_check(ctx):
