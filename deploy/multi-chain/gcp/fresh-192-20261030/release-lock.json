@@ -209,8 +209,8 @@
     "prepare_faucet.py": "1ce5b823ba27389d2210468fbe41ea8b18dc6d1336f0fa52739af08052e6ed2f",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
-    "prepare_workers.py": "4592a624249e798d61ef9c786774a4c60ad12f3d1e253733ccd343d708f8d4c4",
-    "probe_databases.py": "74efabf7874d7a2e156e496cd0d6aa0e70c7b08dba5b1d996ca8cb0c18198c68",
+    "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",
+    "probe_databases.py": "409189181240e5cbc767a3ddaf41dee18b5e5be1b4e92dee6280b31ca33bda69",
     "relayer_exec.py": "98befed16fc38214bf7c6c444158b4a4c61d77035eec2352261e66f9386e6fb6"
   }
 }

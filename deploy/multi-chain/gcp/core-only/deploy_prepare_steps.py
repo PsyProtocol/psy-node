@@ -14,6 +14,7 @@ import sys
 
 import deploy_monitoring_steps
 import fresh_l1
+import prepare_workers
 import release_lock
 from deploy_remote import DeployContext, RemoteError, Step, redact_tail
 
@@ -446,11 +447,36 @@ def proxy_verify(ctx, inputs, output):
     return reports
 
 
-# Adding a package family (Worker, Faucet) is one line here plus its packages.<name> input.
+def worker_build(ctx, inputs):
+    output = Path(inputs["output"])
+    if output.exists():
+        return output  # the tool creates the directory atomically; verification judges the content
+    check_tool_hash(ctx, "prepare_workers.py")
+    build_dir = Path(read_state(ctx, "rebuild_binaries")["build_dir"])
+    argv = [sys.executable, "-B", str(HERE / "prepare_workers.py"), "package",
+            "--release-lock", str(ctx.release_dir / "release-lock.json"), "--release-lock-sha256", ctx.lock_sha256,
+            "--build-dir", str(build_dir), "--network-config", str(local_path(ctx, "files", "config")),
+            "--output", str(output)]
+    result = run_local(argv, PACKAGE_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise RuntimeError(command_failure("prepare_workers", result))
+    return output
+
+
+def worker_verify(ctx, inputs, output):
+    release = prepare_workers.load_worker_release(ctx.lock)
+    files = prepare_workers.read_package(output, release)
+    require(hashlib.sha256(files["prepare_workers.py"]).hexdigest() == ctx.lock["tool_sha256"]["prepare_workers.py"],
+            "the package helper differs from the lock")
+    return {"files": len(files), "worker_sha256": release.worker_sha256}
+
+
+# Adding a package family (Faucet) is one line here plus its packages.<name> input.
 PACKAGE_BUILDERS = [PackageBuilder("core", ("registration_keys", "faucet_operators", "p2p_keys", "output"), core_build,
                                   core_verify),
                     PackageBuilder("proxy", ("rpc_endpoints", "setup_dir", "verifier_dir", "output"), proxy_build,
-                                  proxy_verify, proxy_check)]
+                                  proxy_verify, proxy_check),
+                    PackageBuilder("worker", ("output",), worker_build, worker_verify)]
 
 
 def packages_check(ctx):

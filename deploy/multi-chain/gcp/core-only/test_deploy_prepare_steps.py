@@ -446,8 +446,8 @@ class PackageBuilderTests(PrepareTestCase):
             result = run_all(steps.PREPARE_STEPS["prepare_packages"], self.ws.context())
         self.assertEqual(list(result["packages"]), ["alpha", "beta", "gamma"])
 
-    def test_the_shipped_list_holds_the_core_and_proxy_builders(self):
-        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core", "proxy"])
+    def test_the_shipped_list_holds_the_core_proxy_and_worker_builders(self):
+        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core", "proxy", "worker"])
 
     def test_duplicate_builder_names_are_refused(self):
         order = []
@@ -508,6 +508,9 @@ class CorePackageTests(PrepareTestCase):
                                          "faucet_operators": str(ws.root / "operators.json"),
                                          "p2p_keys": str(ws.root / "p2p"), "output": str(self.output)}}
         ws.write_local()
+        patcher = unittest.mock.patch.object(steps, "PACKAGE_BUILDERS", [steps.PACKAGE_BUILDERS[0]])
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def make_packages(self, *, tamper=None, extra_file=False, manifest_hash=True):
         root = self.output / self.HOST
@@ -621,7 +624,7 @@ class RegistrationTests(unittest.TestCase):
     def test_standard_library_and_release_modules_only(self):
         source = Path(steps.__file__).read_text()
         imported = set(re.findall(r"(?m)^(?:import|from) ([a-z_0-9]+)", source))
-        local = {"deploy_remote", "release_lock", "build_runtime", "fresh_l1", "deploy_monitoring_steps"}
+        local = {"deploy_remote", "release_lock", "build_runtime", "fresh_l1", "deploy_monitoring_steps", "prepare_workers"}
         import sys
         self.assertEqual({name for name in imported if name not in sys.stdlib_module_names}, local & imported)
 

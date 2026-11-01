@@ -120,6 +120,65 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.ProbeFailed, "closed"):
             probe.NatsClient(Wire(b'INFO {}\r\nPONG\r\n')).request("$JS.API.X", b"{}")
 
+    def scripted_nats(self, replies):
+        import io
+
+        class Wire:
+            def __init__(self, data):
+                self.incoming, self.written = io.BytesIO(data), []
+
+            def readline(self):
+                return self.incoming.readline()
+
+            def write(self, data):
+                self.written.append(data)
+
+        body = b'INFO {"server_id":"x"}\r\nPONG\r\n'
+        for reply in replies:
+            text = json.dumps(reply)
+            body += f"MSG _INBOX.abc 9 {len(text)}\r\n{text}\r\n".encode()
+        wire = Wire(body)
+        return probe.NatsClient(wire), wire
+
+    @staticmethod
+    def consumer(policy, wait, deliver):
+        return {"name": "c", "config": {"ack_policy": policy, "ack_wait": wait, "max_deliver": deliver}}
+
+    def test_consumer_listing_pages_filters_ack_all_and_releases_each_subscription(self):
+        client, wire = self.scripted_nats([
+            {"streams": ["A", "B"], "total": 2},
+            {"consumers": [self.consumer("explicit", 30_000_000_000, -1), self.consumer("all", 5_000_000_000, 1)], "total": 3},
+            {"consumers": [self.consumer("explicit", 1, 5)], "total": 3},
+            {"consumers": [], "total": 0}])
+        rows = client.list_consumers()
+        self.assertEqual(rows, [{"stream": "A", "ack_policy": "explicit", "ack_wait": 30_000_000_000, "max_deliver": -1},
+                                {"stream": "A", "ack_policy": "explicit", "ack_wait": 1, "max_deliver": 5}])
+        requests = [data for data in wire.written if data.startswith(b"PUB ")]
+        self.assertIn(b'{"offset": 2}', requests[2])
+        self.assertEqual(sum(data == b"UNSUB 9\r\n" for data in wire.written), 4)
+
+    def test_consumer_listing_rejects_an_api_error_and_a_closed_connection(self):
+        client, _ = self.scripted_nats([{"streams": ["A"], "total": 1}, {"error": {"code": 503}}])
+        with self.assertRaisesRegex(probe.ProbeFailed, "refused"):
+            client.list_consumers()
+        client, _ = self.scripted_nats([{"error": {"code": 503}}])
+        with self.assertRaisesRegex(probe.ProbeFailed, "refused"):
+            client.list_consumers()
+        client, _ = self.scripted_nats([{"streams": ["A"], "total": 1}])
+        with self.assertRaisesRegex(probe.ProbeFailed, "closed"):
+            client.list_consumers()
+
+    def test_the_consumer_command_prints_the_listing(self):
+        class Client:
+            def list_consumers(self):
+                return [{"stream": "A", "ack_policy": "explicit", "ack_wait": 7, "max_deliver": -1}]
+        import contextlib, io
+        output = io.StringIO()
+        with unittest.mock.patch.object(probe, "connect_nats", return_value=Client()), contextlib.redirect_stdout(output):
+            self.assertEqual(probe.main(["nats-consumers"]), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual((report["ok"], report["consumers"][0]["ack_wait"]), (True, 7))
+
     def test_the_websocket_handshake_does_not_spin_on_end_of_file(self):
         class Closed:
             def sendall(self, data):

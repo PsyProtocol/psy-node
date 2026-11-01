@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Prepare/install workers; explicitly activate only the reviewed r3 worker units.
+"""Prepare/install workers; explicitly activate only the three worker units named by the release lock.
 
-package --release-dir DIR --network-config FILE --build-attestation FILE --output NEW_DIR
+Every action takes --release-lock FILE --release-lock-sha256 HASH (both required).
+package --build-dir DIR --network-config FILE --output NEW_DIR
 check-host --package DIR             (sudo; read-only)
 install --package DIR                (sudo; separately authorized; never starts)
-activate --package DIR               (sudo; enables/starts only the three r3 units)
+activate --package DIR               (sudo; enables/starts only the three lock units)
 
 The existing parth system account is reused. Existing worker JSON credentials
 are read only on-host. No Genesis private keys are inputs. Fresh installations
@@ -12,6 +13,8 @@ only: partial installs require inspection, never automatic deletion or repair.
 """
 
 import argparse
+from collections.abc import Mapping
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -25,17 +28,6 @@ import time
 
 
 HERE = Path(__file__).resolve().parent
-SOURCE = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-RELEASE_ID = "core-testnet-20261027-r3"
-WORKER_SHA256 = "08d76103fb40639ecbe8182113e7fc5df61ae9a408abefb2f96de9b0ad56238d"
-CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-TOPOLOGY_SHA256 = "78403e274c24dd8bbb44405775868477b3cfe0ad9c9a3815cb59a1f267e5675f"
-BUILD_SHA256 = "4432ea02ead2f2fd48a723b911049f5dcdb8d1ef80072518361759ab77628072"
-ATTESTATION_SHA256 = "f6fdece9553ac78e85a3d7636b1883b0efed5f9332c1628d38fc9729b2fa8acb"
-ACTIVATION_INSTALLER_SHA256 = "302522b5e98d3469afc54bfcc8fd0ea60352237df5d68198f07a09dc56558ed8"
-RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
-CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
-STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID
 UNITS = Path("/etc/systemd/system")
 UNIT_SEARCH = (UNITS, Path("/run/systemd/system"), Path("/usr/lib/systemd/system"))
 SOURCES = {
@@ -51,6 +43,7 @@ PUBLIC_KEYS = {
 THREADS = {"coordinator": 4, "realm-0": 6, "realm-1": 6}
 ROOT_UID = 0
 ROOT_GID = 0
+HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 class WorkerError(ValueError):
@@ -60,6 +53,52 @@ class WorkerError(ValueError):
 def require(condition, message):
     if not condition:
         raise WorkerError(message)
+
+
+@dataclass(frozen=True)
+class WorkerRelease:
+    release_id: str
+    source_commit: str
+    network_magic: str
+    worker_sha256: str
+    config_sha256: str
+    topology_sha256: str
+    helper_sha256: str
+    unit_prefix: str
+    release_dir: Path
+    config_dir: Path
+    state_dir: Path
+    binaries: Mapping[str, str]
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise WorkerError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_worker_release(lock):
+    worker = lock["paths"]["worker"]
+    return WorkerRelease(lock["release_id"], lock["sources"]["runtime"], lock["network_magic"],
+                         lock["binaries"]["psy_worker_cli"], lock["inputs"]["runtime_config"],
+                         lock["inputs"]["topology"], lock["tool_sha256"]["prepare_workers.py"],
+                         lock["units"]["worker_prefix"], Path(worker["release"]), Path(worker["config"]),
+                         Path(worker["state"]), dict(lock["binaries"]))
+
+
+def unit_name(release, role):
+    return release.unit_prefix + role + ".service"
+
+
+def slice_name(release):
+    return release.unit_prefix.rstrip("-") + ".slice"
+
+
+def unit_fallbacks(name):
+    """Dash-prefix fallback unit names systemd consults for a unit, plus the bare suffix."""
+    parts = name.removesuffix(".service").split("-")
+    return ["-".join(parts[:count]) + "-.service" for count in range(len(parts) - 1, 0, -1)] + ["service"]
 
 
 def decode(raw):
@@ -110,7 +149,7 @@ def read_file(path):
         os.close(parent)
 
 
-def worker_configs(topology):
+def worker_configs(topology, release):
     coordinator = topology["coordinator"]
     host = topology["hosts"][coordinator["host"]]
     configs = {}
@@ -127,73 +166,62 @@ def worker_configs(topology):
             "network": "psy-public-testnet",
             "coordinator_api_urls": urls, "realm_api_urls": realm_urls,
             "url_rotation_strategy": "round-robin",
-            "completed_jobs_log_file": str(STATE / role / "completed.backup"),
+            "completed_jobs_log_file": str(release.state_dir / role / "completed.backup"),
         }
     return configs
 
 
-def unit_name(role):
-    return "psy-core-worker-r3-" + role + ".service"
-
-
-def worker_unit(role):
+def worker_unit(release, role):
     return ("\n".join([
         "[Unit]", "Description=Psy testnet worker " + role,
         "Wants=network-online.target", "After=network-online.target",
         "StartLimitIntervalSec=600", "StartLimitBurst=3", "",
         "[Service]", "Type=simple", "User=parth", "Group=parth", "UMask=0077",
-        "Slice=psy-core-worker-r3.slice", "WorkingDirectory=" + str(RELEASE),
-        "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(CONFIG / "network.json"),
+        "Slice=" + slice_name(release), "WorkingDirectory=" + str(release.release_dir),
+        "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(release.config_dir / "network.json"),
         "Environment=RUST_LOG=info", "Environment=RUST_MIN_STACK=134217728",
         "Environment=RAYON_NUM_THREADS=" + str(THREADS[role]), "Environment=TOKIO_WORKER_THREADS=2",
-        "ExecStart=" + str(RELEASE / "psy_worker_cli") + " worker --config " + str(CONFIG / (role + ".json"))
+        "ExecStart=" + str(release.release_dir / "psy_worker_cli") + " worker --config "
+        + str(release.config_dir / (role + ".json"))
         + " --network psy-public-testnet --proving-backend plonky2-poseidon-goldilocks"
         + " --url-rotation-strategy round-robin --batch-size 1 --proving-pools per-job"
         + " --threads-per-job " + str(THREADS[role]),
         "Restart=on-failure", "RestartSec=15", "TimeoutStopSec=300", "LimitNOFILE=65536",
         "LimitCORE=0", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectHome=true",
-        "ProtectSystem=strict", "ReadWritePaths=" + str(STATE / role),
+        "ProtectSystem=strict", "ReadWritePaths=" + str(release.state_dir / role),
         "StandardOutput=journal", "StandardError=journal", "",
         "[Install]", "WantedBy=multi-user.target", "",
     ])).encode()
 
 
-def payloads(inputs):
-    require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
-                for value in (WORKER_SHA256, CONFIG_SHA256, TOPOLOGY_SHA256, BUILD_SHA256, ATTESTATION_SHA256)),
-            "r3 artifact pins not frozen")
-    require(digest(inputs["psy_worker_cli"]) == WORKER_SHA256, "worker binary hash mismatch")
-    require(digest(inputs["network.json"]) == CONFIG_SHA256, "compiled network config hash mismatch")
-    require(digest(inputs["topology.json"]) == TOPOLOGY_SHA256, "reviewed topology hash mismatch")
-    require(digest(inputs["build.json"]) == BUILD_SHA256, "original build manifest hash mismatch")
-    require(digest(inputs["attestation.json"]) == ATTESTATION_SHA256, "build attestation hash mismatch")
+def payloads(inputs, release):
+    require(all(isinstance(value, str) and HEX64.fullmatch(value) for value in
+                (release.worker_sha256, release.config_sha256, release.topology_sha256)),
+            "worker artifact pins not frozen")
+    require(digest(inputs["psy_worker_cli"]) == release.worker_sha256, "worker binary hash mismatch")
+    require(digest(inputs["network.json"]) == release.config_sha256, "compiled network config hash mismatch")
+    require(digest(inputs["topology.json"]) == release.topology_sha256, "reviewed topology hash mismatch")
     build = decode(inputs["build.json"])
-    attestation = decode(inputs["attestation.json"])
-    require(type(attestation["schema_version"]) is int and attestation["schema_version"] == 1
-            and attestation["kind"] == "packaging-build-attestation"
-            and attestation["build_manifest_sha256"] == BUILD_SHA256,
-            "attestation does not bind original build manifest")
-    require(all(attestation[field] == build[field] for field in
-                ("source_commit", "config_sha256", "network", "network_magic", "binaries")),
-            "attestation differs from original build manifest")
-    require(build["source_commit"] == SOURCE and build["network"] == "testnet"
-            and build["network_magic"] == "0x1337CF514544CF69"
-            and attestation["cli_network"] == "psy-public-testnet"
-            and attestation["backend"] == "plonky2-poseidon-goldilocks"
-            and build["config_sha256"] == CONFIG_SHA256
-            and build["binaries"]["psy_worker_cli"] == WORKER_SHA256, "build provenance mismatch")
+    require(build["source_commit"] == release.source_commit and build["network"] == "testnet"
+            and build["network_magic"] == release.network_magic
+            and build["config_sha256"] == release.config_sha256
+            and build["binaries"]["psy_worker_cli"] == release.worker_sha256, "build provenance mismatch")
+    require(all(release.binaries.get(name) == digest for name, digest in build["binaries"].items()),
+            "build binaries differ from the lock")
     topology = decode(inputs["topology.json"])
-    require(topology["runtime_commit"] == SOURCE and topology["release_id"] == RELEASE_ID,
+    require(topology["runtime_commit"] == release.source_commit and topology["release_id"] == release.release_id,
             "topology release mismatch")
+    require(topology["network"] == "psy-public-testnet"
+            and topology["proving_backend"] == "plonky2-poseidon-goldilocks", "topology network or backend mismatch")
     config = decode(inputs["network.json"])
     whitelist = config["networks"]["testnet"]["whitelist"]
     require(config["defaultNetwork"] == "testnet" and whitelist["enabled"] is True
             and set(whitelist["secp256k1"]) == set(PUBLIC_KEYS.values()), "approved whitelist mismatch")
     files = dict(inputs)
-    for role, template in worker_configs(topology).items():
+    for role, template in worker_configs(topology, release).items():
         files[role + ".json"] = encode(template)
-        files[unit_name(role)] = worker_unit(role)
-    files["psy-core-worker-r3.slice"] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
+        files[unit_name(release, role)] = worker_unit(release, role)
+    files[slice_name(release)] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
     return files
 
 
@@ -219,13 +247,12 @@ def write_new(path, raw, mode, uid, gid):
         os.close(parent)
 
 
-def prepare_package(release_dir, network_config, topology, output, build_attestation):
+def prepare_package(release, build_dir, network_config, topology, output):
     inputs = {name: read_file(path)[0] for name, path in {
-        "psy_worker_cli": release_dir / "psy_worker_cli", "build.json": release_dir / "manifest.json",
+        "psy_worker_cli": build_dir / "psy_worker_cli", "build.json": build_dir / "manifest.json",
         "network.json": network_config, "topology.json": topology,
-        "attestation.json": build_attestation,
     }.items()}
-    files = payloads(inputs)
+    files = payloads(inputs, release)
     files["prepare_workers.py"] = read_file(Path(__file__).absolute())[0]
     parent = directory(output.parent)
     try:
@@ -237,7 +264,7 @@ def prepare_package(release_dir, network_config, topology, output, build_attesta
     return {"mode": "prepared", "services": len(THREADS), "contains_credentials": False, "started": False}
 
 
-def read_package(package, *, activation=False):
+def read_package(package, release, *, activation=False):
     fd = directory(package)
     try:
         owner = os.fstat(fd)
@@ -246,12 +273,12 @@ def read_package(package, *, activation=False):
     finally:
         os.close(fd)
     inputs = {}
-    for name in ("psy_worker_cli", "build.json", "network.json", "topology.json", "attestation.json"):
+    for name in ("psy_worker_cli", "build.json", "network.json", "topology.json"):
         inputs[name] = read_file(package / name)[0]
-    expected = payloads(inputs)
+    expected = payloads(inputs, release)
     if activation:
         installer = read_file(package / "prepare_workers.py")[0]
-        require(digest(installer) in (ACTIVATION_INSTALLER_SHA256, digest(read_file(Path(__file__).absolute())[0])),
+        require(digest(installer) in (release.helper_sha256, digest(read_file(Path(__file__).absolute())[0])),
                 "installed package helper hash mismatch")
         expected["prepare_workers.py"] = installer
     else:
@@ -312,24 +339,24 @@ def read_credentials(gid):
     return keys
 
 
-def install_paths(files, keys, user):
+def install_paths(files, keys, user, release):
     uid, gid = user
     targets = {
-        RELEASE / "psy_worker_cli": (files["psy_worker_cli"], 0o755, ROOT_UID, ROOT_GID),
-        CONFIG / "network.json": (files["network.json"], 0o640, ROOT_UID, gid),
-        CONFIG / "build.json": (files["build.json"], 0o640, ROOT_UID, gid),
-        CONFIG / "attestation.json": (files["attestation.json"], 0o640, ROOT_UID, gid),
-        CONFIG / "topology.json": (files["topology.json"], 0o640, ROOT_UID, gid),
+        release.release_dir / "psy_worker_cli": (files["psy_worker_cli"], 0o755, ROOT_UID, ROOT_GID),
+        release.config_dir / "network.json": (files["network.json"], 0o640, ROOT_UID, gid),
+        release.config_dir / "build.json": (files["build.json"], 0o640, ROOT_UID, gid),
+        release.config_dir / "topology.json": (files["topology.json"], 0o640, ROOT_UID, gid),
     }
-    directories = {RELEASE: (0o755, ROOT_UID, ROOT_GID), CONFIG: (0o750, ROOT_UID, gid),
-                   STATE: (0o750, ROOT_UID, gid), UNITS: (0o755, ROOT_UID, ROOT_GID)}
+    directories = {release.release_dir: (0o755, ROOT_UID, ROOT_GID), release.config_dir: (0o750, ROOT_UID, gid),
+                   release.state_dir: (0o750, ROOT_UID, gid), UNITS: (0o755, ROOT_UID, ROOT_GID)}
     for role in THREADS:
         config = decode(files[role + ".json"])
         config["private_key"] = keys[role]
-        targets[CONFIG / (role + ".json")] = (encode(config), 0o640, ROOT_UID, gid)
-        directories[STATE / role] = (0o700, uid, gid)
-        targets[UNITS / unit_name(role)] = (files[unit_name(role)], 0o644, ROOT_UID, ROOT_GID)
-    targets[UNITS / "psy-core-worker-r3.slice"] = (files["psy-core-worker-r3.slice"], 0o644, ROOT_UID, ROOT_GID)
+        targets[release.config_dir / (role + ".json")] = (encode(config), 0o640, ROOT_UID, gid)
+        directories[release.state_dir / role] = (0o700, uid, gid)
+        name = unit_name(release, role)
+        targets[UNITS / name] = (files[name], 0o644, ROOT_UID, ROOT_GID)
+    targets[UNITS / slice_name(release)] = (files[slice_name(release)], 0o644, ROOT_UID, ROOT_GID)
     for path in list(directories):
         for parent in path.parents:
             if parent != Path("/"):
@@ -337,12 +364,11 @@ def install_paths(files, keys, user):
     return targets, directories
 
 
-def check_destinations(targets, directories):
-    for root in (RELEASE, CONFIG, STATE):
+def check_destinations(targets, directories, release):
+    for root in (release.release_dir, release.config_dir, release.state_dir):
         require(not os.path.lexists(root), "worker release/config/state already exists; inspection required")
-    for name in [*(unit_name(role) for role in THREADS), "psy-core-worker-r3.slice",
-                 "psy-core-worker-r3-realm-.service", "psy-core-worker-r3-.service",
-                 "psy-core-worker-.service", "psy-core-.service", "psy-.service", "service"]:
+    names = [unit_name(release, role) for role in THREADS]
+    for name in [*names, slice_name(release), *(fallback for unit in names for fallback in unit_fallbacks(unit))]:
         for root in UNIT_SEARCH:
             require(not os.path.lexists(root / name) and not os.path.lexists(root / (name + ".d")),
                     "existing worker unit or override")
@@ -385,15 +411,15 @@ def create_directory(path, mode, uid, gid):
         os.close(parent)
 
 
-def install_workers(package, check_only=True):
-    files = read_package(package)
+def install_workers(package, release, check_only=True):
+    files = read_package(package, release)
     user = check_host()
     keys = read_credentials(user[1])
-    targets, directories = install_paths(files, keys, user)
-    check_destinations(targets, directories)
+    targets, directories = install_paths(files, keys, user, release)
+    check_destinations(targets, directories, release)
     if not check_only:
         check_host()
-        check_destinations(targets, directories)
+        check_destinations(targets, directories, release)
         for path, attributes in sorted(directories.items(), key=lambda item: len(item[0].parts)):
             create_directory(path, *attributes)
         for path, attributes in targets.items():
@@ -410,7 +436,7 @@ def unit_state(name):
     return dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
 
 
-def verify_worker_process(name):
+def verify_worker_process(name, release):
     pid = None
     for attempt in range(20):
         state = unit_state(name)
@@ -421,9 +447,9 @@ def verify_worker_process(name):
         pid = current
         with open(f"/proc/{pid}/exe", "rb") as stream:
             actual = os.fstat(stream.fileno())
-            expected = os.stat(RELEASE / "psy_worker_cli")
+            expected = os.stat(release.release_dir / "psy_worker_cli")
             if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
-                require(hashlib.file_digest(stream, "sha256").hexdigest() == WORKER_SHA256,
+                require(hashlib.file_digest(stream, "sha256").hexdigest() == release.worker_sha256,
                         "running worker hash mismatch")
                 require(unit_state(name)["MainPID"] == str(pid), "worker PID changed during verification")
                 return pid
@@ -441,58 +467,71 @@ def verify_worker_process(name):
     raise WorkerError("worker exec did not complete within startup grace")
 
 
-def activate_workers(package):
+def check_foreign_workers(names):
+    """Worker units of any other release must be loaded-inactive and disabled or gone."""
+    for pattern in ("parth-c4d-worker@*.service", "psy-core-worker*.service"):
+        listed = command(["systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager", pattern])
+        for line in listed.splitlines():
+            foreign = line.split()[0]
+            if foreign in names or foreign.endswith(".slice"):
+                continue
+            old = unit_state(foreign)
+            require(old["ActiveState"] == "inactive" and old["SubState"] == "dead"
+                    and old["MainPID"] == "0" and old["UnitFileState"] == "disabled",
+                    "old worker must be inactive/PID0/disabled")
+
+
+def activate_workers(package, release):
     require(os.geteuid() == 0, "sudo required for worker activation")
     require(command(["hostname", "-s"]).strip() == "test-c4d", "wrong worker host")
     require(command(["uname", "-m"]).strip() == "x86_64", "worker architecture mismatch")
-    files = read_package(package, activation=True)
+    files = read_package(package, release, activation=True)
     account = pwd.getpwnam("parth")
     require(account.pw_uid != 0 and account.pw_gid != 0, "non-root parth account required")
     keys = read_credentials(account.pw_gid)
-    targets, _ = install_paths(files, keys, (account.pw_uid, account.pw_gid))
+    targets, _ = install_paths(files, keys, (account.pw_uid, account.pw_gid), release)
     for path, (expected, mode, uid, gid) in targets.items():
         actual, info = read_file(path)
         require(actual == expected and stat.S_IMODE(info.st_mode) == mode
                 and (info.st_uid, info.st_gid) == (uid, gid), "installed worker files differ")
-    names = [unit_name(role) for role in THREADS]
-    for role in THREADS:
-        old = unit_state("psy-core-worker-r2-" + role + ".service")
-        require(old["ActiveState"] == "inactive" and old["SubState"] == "dead"
-                and old["MainPID"] == "0" and old["UnitFileState"] == "disabled",
-                "old r2 worker must be inactive/PID0/disabled")
-    for name in [*names, "psy-core-worker-r3.slice"]:
+    names = [unit_name(release, role) for role in THREADS]
+    check_foreign_workers(names)
+    for name in [*names, slice_name(release)]:
         state = unit_state(name)
         require(state["LoadState"] == "loaded" and state["FragmentPath"] == str(UNITS / name)
                 and not state["DropInPaths"] and state["NeedDaemonReload"] == "no",
                 "effective worker unit differs or needs reload")
     check_worker_activity(allowed=names)
     command(["systemctl", "enable", "--now", *names])
-    pids = {name: verify_worker_process(name) for name in names}
+    pids = {name: verify_worker_process(name, release) for name in names}
     return {"mode": "activated", "services": 3, "enabled": True, "started": True,
-            "worker_sha256": WORKER_SHA256, "pids": pids}
+            "worker_sha256": release.worker_sha256, "pids": pids}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="action", required=True)
     prepare = commands.add_parser("package")
-    prepare.add_argument("--release-dir", type=Path, required=True)
+    prepare.add_argument("--build-dir", type=Path, required=True)
     prepare.add_argument("--network-config", type=Path, required=True)
-    prepare.add_argument("--build-attestation", type=Path, required=True)
-    prepare.add_argument("--topology", type=Path, default=HERE / "topology.json")
     prepare.add_argument("--output", type=Path, required=True)
-    for name in ("check-host", "install", "activate"):
-        host = commands.add_parser(name)
-        host.add_argument("--package", type=Path, required=True)
+    for name in ("package", "check-host", "install", "activate"):
+        host = prepare if name == "package" else commands.add_parser(name)
+        host.add_argument("--release-lock", type=Path, required=True)
+        host.add_argument("--release-lock-sha256", required=True)
+        if name != "package":
+            host.add_argument("--package", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        lock = read_release_lock(args.release_lock, args.release_lock_sha256)
+        release = load_worker_release(lock)
         if args.action == "package":
-            report = prepare_package(args.release_dir, args.network_config, args.topology, args.output,
-                                     args.build_attestation)
+            topology = args.release_lock.resolve().parent / "topology.json"
+            report = prepare_package(release, args.build_dir, args.network_config, topology, args.output)
         elif args.action == "activate":
-            report = activate_workers(args.package)
+            report = activate_workers(args.package, release)
         else:
-            report = install_workers(args.package, args.action == "check-host")
+            report = install_workers(args.package, release, args.action == "check-host")
     except WorkerError as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
         return 1

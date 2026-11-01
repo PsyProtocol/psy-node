@@ -95,7 +95,33 @@ class NatsClient:
         inbox = f"_INBOX.psy{time.time_ns()}"
         self.stream.write(f"SUB {inbox} 9\r\n".encode())
         self.stream.write(f"PUB {subject} {inbox} {len(payload)}\r\n".encode() + payload + b"\r\n")
-        return json.loads(self.message(9))
+        reply = json.loads(self.message(9))
+        self.stream.write(b"UNSUB 9\r\n")
+        return reply
+
+    def page(self, subject, key):
+        """Every row under one key of a paged JetStream listing; an API error is a failure, not an empty list."""
+        rows, offset = [], 0
+        while True:
+            reply = self.request(subject, json.dumps({"offset": offset}).encode())
+            if "error" in reply:
+                raise ProbeFailed(f"JetStream refused {subject.split('.')[2].lower()} listing")
+            found = reply.get(key) or []
+            rows += found
+            offset += len(found)
+            if not found or offset >= reply.get("total", 0):
+                return rows
+
+    def list_consumers(self):
+        """Every consumer that is not an ack-all consumer, with the configuration the server reports (ack_wait in ns)."""
+        rows = []
+        for stream in self.page("$JS.API.STREAM.NAMES", "streams"):
+            for consumer in self.page(f"$JS.API.CONSUMER.LIST.{stream}", "consumers"):
+                config = consumer.get("config", {})
+                if config.get("ack_policy") != "all":
+                    rows.append({"stream": stream, "ack_policy": config.get("ack_policy"),
+                                 "ack_wait": config.get("ack_wait"), "max_deliver": config.get("max_deliver")})
+        return rows
 
     def roundtrip(self, subject, payload):
         self.stream.write(f"SUB {subject} 8\r\n".encode())
@@ -103,9 +129,21 @@ class NatsClient:
         return self.message(8) == payload
 
 
+class SocketStream:
+    """Buffered reads, unbuffered writes: a large listing must not cost one system call per byte."""
+
+    def __init__(self, sock):
+        self.sock, self.reader = sock, sock.makefile("rb")
+
+    def readline(self):
+        return self.reader.readline()
+
+    def write(self, data):
+        self.sock.sendall(data)
+
+
 def connect_nats(port=NATS_PORT):
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
-    return NatsClient(sock.makefile("rwb", buffering=0))
+    return NatsClient(SocketStream(socket.create_connection(("127.0.0.1", port), timeout=10)))
 
 
 def nats_roundtrip():
@@ -139,6 +177,10 @@ def probe_nats(roundtrip=nats_roundtrip, fetch=lambda url: urllib.request.urlope
     if stored["streams_left"]:
         raise ProbeFailed("old streams are still present: " + ", ".join(stored["streams_left"]))
     return {"component": "nats", "read_write": True, "jetstream": True, "jetstream_write": True}
+
+
+def nats_consumers():
+    return {"component": "nats", "consumers": connect_nats().list_consumers()}
 
 
 def probe_postgres(run=command):
@@ -312,17 +354,18 @@ def probe_nostr(run=command, connect=Socket, container="nostr-relay", event_id=N
 
 PROBES = {"valkey": probe_valkey, "nats": probe_nats, "postgres": probe_postgres, "scylla": probe_scylla,
           "nostr": probe_nostr}
-USAGE = "usage: probe_databases.py " + "|".join(sorted(PROBES)) + " | nostr-read <event id>"
+COMMANDS = {**PROBES, "nats-consumers": nats_consumers}
+USAGE = "usage: probe_databases.py " + "|".join(sorted(PROBES)) + " | nostr-read <event id> | nats-consumers"
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     read_back = len(argv) == 2 and argv[0] == "nostr-read" and len(argv[1]) == 64 and set(argv[1]) <= set("0123456789abcdef")
-    if not read_back and (len(argv) != 1 or argv[0] not in PROBES):
+    if not read_back and (len(argv) != 1 or argv[0] not in COMMANDS):
         print(json.dumps({"ok": False, "error": USAGE}))
         return 2
     try:
-        report = {"ok": True, **(probe_nostr(event_id=argv[1]) if read_back else PROBES[argv[0]]())}
+        report = {"ok": True, **(probe_nostr(event_id=argv[1]) if read_back else COMMANDS[argv[0]]())}
     except ProbeFailed as error:
         report = {"ok": False, "component": argv[0], "error": str(error)}
     print(json.dumps(report, sort_keys=True))

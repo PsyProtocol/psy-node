@@ -315,7 +315,7 @@ class ProxyPackageBuilderTests(base.PrepareTestCase):
 
     def test_proxy_builder_is_registered_after_core(self):
         names = [builder.name for builder in prepare.PACKAGE_BUILDERS]
-        self.assertEqual(names, ["core", "proxy"])
+        self.assertEqual(names[:2], ["core", "proxy"])
 
     def test_build_packages_both_roles_from_the_lock(self):
         calls = []

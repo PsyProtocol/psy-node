@@ -267,6 +267,7 @@ Operator hosts (x1, x2, x3) are stopped and cleared by one printed command (step
 result live in a mode 0700 directory under the operator's home; step `clear_node_state` only verifies their results.
 The release check (`check_hosts`, step 55) and `stop_services` both run the whole clearing request of every host without
 `--apply` (unprivileged on operator hosts) and fail on any refusal.
+| `packages.worker` | `output` | Output directory of the Worker package (must not exist before the first run). Absolute. |
 
 Build attempts live in `<output_root>/<release id>-<first 12 of the runtime commit>-build-<n>`.
 A completed attempt of the same commit is verified and reused; a failed attempt

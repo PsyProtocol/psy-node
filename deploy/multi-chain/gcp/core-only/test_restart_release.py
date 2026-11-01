@@ -17,17 +17,20 @@ PROXY_RELEASE = proxies.ProxyRelease(LOCK["release_id"], LOCK["sources"]["runtim
                                      Path(PROXY_PATHS["config"]), Path(PROXY_PATHS["state"]),
                                      LOCK["groth16"]["setup_manifest_sha256"], "8" * 64)
 
+WORKER_RELEASE = workers.load_worker_release(LOCK)
+
 
 class RestartReleaseTests(unittest.TestCase):
-    def test_core_runtime_comes_from_the_lock_and_workers_stay_r3_but_proxy_follows_the_lock(self):
+    def test_core_and_worker_runtime_come_from_the_lock_and_proxy_follows_the_lock(self):
         source = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
         topology = fixture(LOCK)[0]
         for value in (RELEASE.source_commit, topology["runtime_commit"], LOCK["sources"]["runtime"]):
             self.assertEqual(value, "1" * 40)
-        self.assertEqual(workers.SOURCE, source)
+        self.assertEqual(WORKER_RELEASE.source_commit, LOCK["sources"]["runtime"])
+        self.assertNotEqual(WORKER_RELEASE.source_commit, source)
         self.assertEqual(RELEASE.release_id, LOCK["release_id"])
-        self.assertNotEqual(RELEASE.release_id, workers.RELEASE_ID)
-        self.assertEqual(workers.RELEASE_ID, "core-testnet-20261027-r3")
+        self.assertEqual(WORKER_RELEASE.release_id, LOCK["release_id"])
+        self.assertNotEqual(WORKER_RELEASE.release_id, "core-testnet-20261027-r3")
         self.assertEqual(PROXY_RELEASE.source_commit, LOCK["sources"]["runtime"])
         self.assertEqual(PROXY_RELEASE.release_id, LOCK["release_id"])
         with self.assertRaises(proxies.ProxyError):
@@ -52,20 +55,19 @@ class RestartReleaseTests(unittest.TestCase):
 
     def test_core_and_consumers_have_separate_unit_names(self):
         self.assertTrue(RELEASE.unit_prefix.startswith("psy-core-" + RELEASE.namespace_prefix))
-        self.assertEqual(workers.unit_name("realm-1"), "psy-core-worker-r3-realm-1.service")
+        self.assertEqual(workers.unit_name(WORKER_RELEASE, "realm-1"), LOCK["units"]["worker_prefix"] + "realm-1.service")
         self.assertEqual(proxies.unit_name(PROXY_RELEASE, "user"), LOCK["units"]["proxy_prefix"] + "user.service")
         self.assertFalse(hasattr(proxies, "OLD_UNITS"))
         self.assertNotEqual(RELEASE.unit_prefix, LOCK["units"]["worker_prefix"])
         self.assertNotEqual(RELEASE.unit_prefix, LOCK["units"]["proxy_prefix"])
 
-    def test_core_pins_come_from_the_lock_and_worker_pins_stay_frozen(self):
+    def test_core_and_worker_pins_come_from_the_lock(self):
         self.assertEqual(RELEASE.pins["bin/psy_node_cli"], LOCK["binaries"]["psy_node_cli"])
         self.assertEqual(RELEASE.pins["config.json"], LOCK["inputs"]["runtime_config"])
         self.assertEqual(RELEASE.pins["genesis.json"], LOCK["inputs"]["genesis"])
-        self.assertEqual(workers.WORKER_SHA256,
-                         "08d76103fb40639ecbe8182113e7fc5df61ae9a408abefb2f96de9b0ad56238d")
-        self.assertEqual(workers.TOPOLOGY_SHA256,
-                         "78403e274c24dd8bbb44405775868477b3cfe0ad9c9a3815cb59a1f267e5675f")
+        self.assertEqual(WORKER_RELEASE.worker_sha256, LOCK["binaries"]["psy_worker_cli"])
+        self.assertEqual(WORKER_RELEASE.topology_sha256, LOCK["inputs"]["topology"])
+        self.assertEqual(WORKER_RELEASE.config_sha256, LOCK["inputs"]["runtime_config"])
 
 
 if __name__ == "__main__":
