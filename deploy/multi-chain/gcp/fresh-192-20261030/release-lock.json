@@ -193,6 +193,7 @@
     "activate_bridge.py": "cd8762d5f1e2800ee5bb86b9ada15ec83f3305c2e7adb60660b3d497bdd4332e",
     "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
     "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
+    "caddy_ingress.py": "c961a48b123a325ad189167423b16e1517b67365bb17d5a316df88f99f080b14",
     "clear_host_state.py": "5cf1e6a3322a444bf01b41789e2577ceca17e8d43463646501f4e7258b0115a0",
     "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
     "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
