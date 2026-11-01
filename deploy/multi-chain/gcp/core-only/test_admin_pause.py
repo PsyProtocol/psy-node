@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 import admin_pause as m
 
@@ -112,6 +113,78 @@ class RunTests(unittest.TestCase):
                                "--request-sha256", digest], capture_output=True, text=True)
         self.assertEqual(json.loads(done.stdout)["ok"], False)  # not root here: refused cleanly, no traceback
         self.assertNotIn("Traceback", done.stderr)
+
+
+FAKE_ETHERS = r"""
+class N { constructor(v) { this.v = BigInt(v); }
+  mul(x) { return new N(this.v * BigInt(x.v ?? x)); } add(x) { return new N(this.v + BigInt(x.v ?? x)); }
+  div(x) { return new N(this.v / BigInt(x.v ?? x)); } gt(x) { return this.v > BigInt(x.v ?? x); }
+  lt(x) { return this.v < BigInt(x.v ?? x); } toString() { return this.v.toString(); } }
+const state = JSON.parse(process.env.FAKE_CHAIN);
+exports.utils = {
+  Interface: class { encodeFunctionData(name, args) { return name + ':' + JSON.stringify(args); }
+    decodeFunctionResult(name, data) { return JSON.parse(data); } },
+  parseUnits: (v, unit) => new N(BigInt(v) * 10n ** 9n), keccak256: (raw) => '0xhash',
+};
+exports.providers = { JsonRpcProvider: class {
+  async send() { return '0x' + state.chainId.toString(16); }
+  async call(tx) { if (tx.data.startsWith('getPauseFlags')) return JSON.stringify(state.flags[0]); if (tx.data.startsWith('isBridgeAdmin')) return JSON.stringify([true]); return '[]'; }
+  async estimateGas() { return new N(state.gas); } async getGasPrice() { return new N(state.price); }
+  async getTransactionCount() { return 1; } async getBalance() { return new N(state.balance); }
+  async sendTransaction(raw) { const target = JSON.parse(raw).target; state.flags = state.flags.map(() => [target, 0, target]); }
+  async waitForTransaction() { return { status: 1, blockNumber: 7, gasUsed: new N(50000), effectiveGasPrice: new N(state.price) }; } } };
+exports.Wallet = { fromEncryptedJson: async () => ({ address: state.signer,
+  signTransaction: async (tx) => JSON.stringify({ target: Number(process.env.FAKE_TARGET) }) }) };
+"""
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "node is needed to run the embedded script")
+class EmbeddedScriptTests(unittest.TestCase):
+    """The embedded node script against a fake ethers module: fee cap and balance margin apply to opening only."""
+
+    def run_tool(self, target, price, balance):
+        import os
+        import shutil
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "ethers.js").write_text(FAKE_ETHERS)
+        (root / "env").write_text("export WALLET_PASSWORD=pw\n")
+        (root / "keystore").write_text("{}")
+        flags = [[1, 0, 1]] * 3 if target == 0 else [[0, 0, 0]] * 3
+        chain = {"chainId": 11155111, "flags": flags, "gas": 55000, "price": price, "balance": balance, "signer": ADDRESS}
+        os.environ["FAKE_CHAIN"], os.environ["FAKE_TARGET"] = json.dumps(chain), str(target)
+        self.addCleanup(os.environ.pop, "FAKE_CHAIN")
+        self.addCleanup(os.environ.pop, "FAKE_TARGET")
+        original_environ = m.subprocess.Popen
+
+        def popen(argv, **kwargs):
+            kwargs["env"] = {**kwargs["env"], "FAKE_CHAIN": os.environ["FAKE_CHAIN"], "FAKE_TARGET": os.environ["FAKE_TARGET"]}
+            return original_environ(argv, **kwargs)
+        req = request(execute=True, target=target, node=shutil.which("node"), ethers=str(root / "ethers.js"),
+                      env_file=str(root / "env"), keystore=str(root / "keystore"))
+        encoded, digest = encode(req)
+        out = io.StringIO()
+        with unittest.mock.patch.object(m.subprocess, "Popen", popen), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = m.main(["--request-base64", encoded, "--request-sha256", digest], geteuid=lambda: 0)
+        return code, json.loads(out.getvalue().strip().splitlines()[-1])
+
+    HIGH_PRICE, LOW_BALANCE = 100 * 10 ** 9, 55000 * 2 * 100 * 10 ** 9 * 2
+
+    def test_opening_is_refused_above_the_fee_cap(self):
+        code, report = self.run_tool(0, self.HIGH_PRICE, 10 ** 30)
+        self.assertEqual((code, report["ok"]), (1, False))
+        self.assertIn("fee above the cap", report["msg"])
+
+    def test_a_repause_goes_out_above_the_fee_cap_and_with_a_thin_balance(self):
+        code, report = self.run_tool(1, self.HIGH_PRICE, self.LOW_BALANCE)
+        self.assertEqual((code, report["ok"], report["broadcast"]), (0, True, True))
+        self.assertEqual(report["flags"], [[1, 0, 1]] * 3)
+
+    def test_opening_needs_the_three_times_balance_margin_but_a_repause_does_not(self):
+        code, report = self.run_tool(0, 10 ** 9, 55000 * 2 * 10 ** 9 * 2)
+        self.assertEqual(code, 1)
+        self.assertIn("balance is low", report["msg"])
 
 
 if __name__ == "__main__":

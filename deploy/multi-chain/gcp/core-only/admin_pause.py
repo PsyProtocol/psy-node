@@ -40,11 +40,13 @@ let stage='input';
  const data=ABI.encodeFunctionData('setGlobalPauseFlags',[r.target]); const tx={from:ADMIN,to:C.bridge,data,value:0};
  stage='simulate'; await p.call(tx); const gas=await p.estimateGas(tx);
  if(gas.gt(C.maxGas)) throw Error('gas estimate '+gas+' is above the ceiling '+C.maxGas);
- const price=(await p.getGasPrice()).mul(2); if(price.gt(ethers.utils.parseUnits(String(C.maxFeeGwei),'gwei'))) throw Error('fee above the cap');
+ // A re-pause (target 1) is never refused by the fee cap or the balance margin: it must go out whenever gas can be paid.
+ const restoring=r.target===1;
+ const price=(await p.getGasPrice()).mul(2); if(!restoring&&price.gt(ethers.utils.parseUnits(String(C.maxFeeGwei),'gwei'))) throw Error('fee above the cap');
  const gasLimit=gas.mul(125).div(100).add(5000);
  stage='nonce'; let nonce; for(let i=0;i<30;i++){nonce=await p.getTransactionCount(ADMIN,'latest'); if(nonce===await p.getTransactionCount(ADMIN,'pending'))break; await new Promise(x=>setTimeout(x,2000));}
  if(nonce!==await p.getTransactionCount(ADMIN,'pending')) throw Error('signer has a pending transaction');
- const bal=await p.getBalance(ADMIN); if(bal.lt(gasLimit.mul(price).mul(3))) throw Error('signer balance is low');
+ const bal=await p.getBalance(ADMIN); if(bal.lt(gasLimit.mul(price).mul(restoring?1:3))) throw Error('signer balance is low');
  const rep={estimate:gas.toString(),gasLimit:gasLimit.toString(),gasPrice:price.toString(),nonce,signerBalance:bal.toString()};
  if(!r.execute){console.log(JSON.stringify({ok:true,dry:true,flagsBefore:before,flags:before,broadcast:false,...rep}));return;}
  stage='unlock'; const w=await ethers.Wallet.fromEncryptedJson(r.encrypted,r.password); if(w.address.toLowerCase()!==ADMIN.toLowerCase()) throw Error('keystore is not the signer');
@@ -96,8 +98,8 @@ def read_password(env_file):
 
 
 def run_node(request):
-    config = {key: request[key] for key in ("signer", "port", "bridge", "acl", "tokens", "max_gas", "max_fee_gwei")}
-    config["chainId"] = request["chain_id"]
+    config = {key: request[key] for key in ("signer", "port", "bridge", "acl", "tokens")}
+    config.update(chainId=request["chain_id"], maxGas=request["max_gas"], maxFeeGwei=request["max_fee_gwei"])
     payload = {"cfg": config, "target": request["target"], "execute": request["execute"]}
     if request["execute"]:
         with open(request["keystore"]) as stream:
