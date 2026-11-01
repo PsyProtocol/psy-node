@@ -21,7 +21,8 @@ if "--plan" in sys.argv:
 with open(os.path.join(os.environ["STUB_LOG_DIR"], "calls.jsonl"), "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "regen": "REGENERATE_GENESIS" in os.environ,
         "leaked": [k for k in ("REGENERATE_GENESIS", "PARTH_ALLOW_GENESIS_OVERWRITE") if k in os.environ],
-        "confirm": "CONFIRM_FULL_FRESH_DEPLOY" in os.environ}) + "\\n")
+        "confirm": "CONFIRM_FULL_FRESH_DEPLOY" in os.environ,
+        "open_confirm": os.environ.get("CONFIRM_OPEN_DEPOSITS")}) + "\\n")
 step = sys.argv[1]
 print("stub " + step)
 sys.exit(int(os.environ.get("STUB_EXIT_" + step, "0")))
@@ -294,6 +295,19 @@ class DeployAllPythonStepTests(unittest.TestCase):
         r = w.run("--only", "50")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(w.calls()[0]["leaked"], [])
+
+    def test_the_open_deposits_confirmation_comes_only_from_the_operator_environment(self):
+        w = self.world()
+        (w.gcp / "config.env").write_text("CONFIRM_OPEN_DEPOSITS=1\n")
+        r = w.run("--only", "50")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(w.calls()[0]["open_confirm"])
+        r = w.run("--only", "50", extra={"CONFIRM_OPEN_DEPOSITS": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(w.calls()[1]["open_confirm"], "1")
+        (w.gcp / "config.env").write_text("")
+        r = w.run("--only", "50", extra={"CONFIRM_OPEN_DEPOSITS": "yes"})
+        self.assertIsNone(w.calls()[2]["open_confirm"])
 
     def test_py_run_prints_no_shell_table_notices(self):
         w = self.world()

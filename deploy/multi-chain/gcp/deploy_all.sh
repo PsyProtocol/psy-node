@@ -21,7 +21,7 @@ Usage: bash deploy/multi-chain/gcp/deploy_all.sh [options]
 
 DRY_RUN=1 is equivalent to --plan. SKIP_STEPS accepts comma/space-separated IDs.
 Real execution requires CONFIRM_MULTICHAIN_REPLACES_CURRENT_STAGING=1 and
-CONFIRM_FULL_FRESH_DEPLOY=1. Step selection is manual, not automatic recovery.
+CONFIRM_FULL_FRESH_DEPLOY=1. CONFIRM_OPEN_DEPOSITS=1 (step 86) is read from the process environment only. Step selection is manual, not automatic recovery.
 Step tables may use py:<name> and py-cutover:<name> rows, run by
 core-only/deploy.py with DEPLOY_RELEASE_DIR (default: the step table directory),
 DEPLOY_ACCESS_FILE and DEPLOY_PRIVATE_DIR. py-cutover rows need the two
@@ -59,6 +59,7 @@ done
 # Cutover confirmations must come from the invoking environment, not config.env.
 env_confirm_replace="${CONFIRM_MULTICHAIN_REPLACES_CURRENT_STAGING:-0}"
 env_confirm_fresh="${CONFIRM_FULL_FRESH_DEPLOY:-0}"
+env_confirm_open="${CONFIRM_OPEN_DEPOSITS:-0}"
 
 config_to_read="$GCP_DEPLOY_CONFIG"
 if [ ! -f "$config_to_read" ]; then
@@ -207,6 +208,8 @@ EOF
   unset REGENERATE_GENESIS PARTH_ALLOW_GENESIS_OVERWRITE
   if [ "$env_confirm_replace" = "1" ]; then export CONFIRM_MULTICHAIN_REPLACES_CURRENT_STAGING=1; else unset CONFIRM_MULTICHAIN_REPLACES_CURRENT_STAGING; fi
   if [ "$env_confirm_fresh" = "1" ]; then export CONFIRM_FULL_FRESH_DEPLOY=1; else unset CONFIRM_FULL_FRESH_DEPLOY; fi
+  # Opening deposits is outward-facing: only the operator's own environment may confirm it, never config.env.
+  if [ "$env_confirm_open" = "1" ]; then export CONFIRM_OPEN_DEPOSITS=1; else unset CONFIRM_OPEN_DEPOSITS; fi
 else
   # Fail before *any* stop/reset while the split-fleet reset and artifact gates
   # remain unresolved. The legacy host enumeration is not safe for this fleet.
