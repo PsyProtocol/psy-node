@@ -357,7 +357,15 @@ class RunnerTests(unittest.TestCase):
         verify.assert_called_once_with(str(self.root), "approved", COMMIT)
         self.assertEqual(status.call_args_list[0].args, ("sepolia", "own", "backup", "protected-env-backup"))
         self.assertEqual([r["execute"] for r in requests], [False, True])
-        self.assertTrue(all(r["rpc"] == "backup" and r["public_rpc"] == "own" for r in requests))
+        self.assertTrue(all(r["rpc"] == "backup" for r in requests))
+        self.assertEqual({r["public_rpc"] for r in requests}, {m.loopback_rpc("sepolia")})
+
+    def test_documents_carry_the_loopback_route_that_guardian_and_relayer_accept(self):
+        import install_guardian
+        for network, (_, _, port, _) in m.NETWORKS.items():
+            url = m.loopback_rpc(network)
+            self.assertEqual(url, f"http://127.0.0.1:{port}")
+            install_guardian.guardian_origins([url])
 
     def test_nonce_mismatch_blocks_deploy(self):
         for label, reports in (("pending-before-preflight", [self.report(5, 6)]),

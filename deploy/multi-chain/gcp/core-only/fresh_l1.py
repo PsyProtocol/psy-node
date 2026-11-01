@@ -295,6 +295,12 @@ def own_rpc(config, network):
     return f"http://{ip}:{NETWORKS[network][2]}"
 
 
+def loopback_rpc(network):
+    """The route recorded in the public documents: Guardian and Relayer hosts reach the gateway on loopback forwards."""
+    require(network in NETWORKS, "network forbidden")
+    return f"http://127.0.0.1:{NETWORKS[network][2]}"
+
+
 def rpc(url, method, params):
     require(method in {"eth_chainId", "eth_getBalance", "eth_gasPrice", "eth_getBlockByNumber", "eth_syncing",
                        "eth_getTransactionCount", "eth_estimateGas"}, "read-only RPC method required")
@@ -436,7 +442,7 @@ def deploy(args):
     require(estimate_creation(args.network, endpoint, bundle, budget)["within_budget"],
             "creation gas estimate exceeds the approved per-transaction budget")
     request = {"execute": False, "password": secrets["WALLET_PASSWORD"], "keystore": str(key),
-               "rpc": endpoint, "public_rpc": primary, "policy": policy["networks"][args.network],
+               "rpc": endpoint, "public_rpc": loopback_rpc(args.network), "policy": policy["networks"][args.network],
                "pause_deposits": True, "budget": budget}
     child(args.node, bundle, output, args.network, request)
     recheck_nonce(args, report, primary, secrets)
