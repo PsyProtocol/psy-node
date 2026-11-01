@@ -226,9 +226,10 @@ class Remote:
                      f'  IdentityFile "{identity}"', "  IdentitiesOnly yes", "  BatchMode yes",
                      "  StrictHostKeyChecking yes", f'  UserKnownHostsFile "{self._known_hosts}"',
                      "  GlobalKnownHostsFile /dev/null", f"  ConnectTimeout {CONNECT_TIMEOUT_SECONDS}"]
+            # Tools open many short connections; reuse one per host so the jump host is not throttled.
+            lines += ["  ControlMaster auto", "  ControlPath /tmp/psyssh-%C", "  ControlPersist 120"]
             if host_access["jump"] is not None:
-                jump = self._hosts[host_access["jump"]]
-                lines.append("  ProxyCommand " + shlex.join(["ssh", *self._options(jump), "-W", "%h:%p", jump["ssh"]]))
+                lines.append("  ProxyJump " + host_access["jump"])
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks) + "\n"
 

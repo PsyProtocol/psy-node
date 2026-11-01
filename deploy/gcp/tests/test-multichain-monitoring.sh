@@ -15,8 +15,12 @@ mkdir -p "$tmp/collectors"
 for host in "${hosts[@]}"; do
   printf 'id = "%s"\n' "$host" > "$tmp/collectors/$host.toml"
   zone=gcp
-  [[ "$host" == arc99x* ]] && zone=offsite
-  printf '%s %s\n' "$host" "$zone" >> "$tmp/hosts"
+  [[ "$host" == arc99x1 ]] && zone=offsite
+  [[ "$host" == arc99x3 ]] && zone=offsite
+  address=10.148.0.9
+  [[ "$host" == arc99x1 ]] && address=10.250.0.13
+  [[ "$host" == arc99x3 ]] && address=10.250.0.12
+  printf '%s %s %s\n' "$host" "$zone" "$address" >> "$tmp/hosts"
 done
 export MONITORING_HOSTS_FILE="$tmp/hosts" MONITORING_COLLECTOR_DIR="$tmp/collectors" MONITORING_CHAIN_INDEXES='[0,1,2]'
 touch "$tmp/ssh-config" "$repo/config/staging/controller.wallet-slack-test.toml"
@@ -31,6 +35,9 @@ if [[ "$name" == deploy-staging-all.sh && " $* " == *' --apply '* ]]; then exit 
 if [[ "$name" == deploy-staging-controller.sh && "${TEST_CONTROLLER_FAIL:-0}" == 1 ]]; then exit 17; fi
 SH
 done
+mkdir -p "$repo/deploy/staging/gateway"
+printf '#!/usr/bin/env bash\noffsite_peers=("10.250.0.11" "10.250.0.12")\n' > "$repo/deploy/staging/gateway/parth-sentinel-wireguard-forward"
+printf '[Unit]\nDescription=old\n[Service]\nExecStart=/usr/local/libexec/parth-sentinel-wireguard-forward start\n' > "$repo/deploy/staging/gateway/parth-sentinel-wireguard-forward.service"
 git -C "$repo" init -q
 git -C "$repo" add .gitignore config deploy
 git -C "$repo" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
@@ -68,6 +75,12 @@ if [[ "$*" == *'sha256sum /usr/local/bin/psy-notifier-collector'* ]]; then
 fi
 echo status-query >> "$TEST_CALLS"
 cat "$TEST_HEALTH"
+SH
+cat > "$tmp/bin/scp" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *release-forward* ]]; then
+  for arg in "$@"; do [[ -f "$arg" ]] && grep -h '^offsite_peers=' "$arg" >> "$TEST_CALLS" || true; done
+fi
 SH
 cat > "$tmp/bin/sleep" <<'SH'
 #!/usr/bin/env bash
@@ -111,6 +124,7 @@ grep -q 'arc99x1.toml' "$TEST_CALLS"
 grep -q 'arc99x3.toml' "$TEST_CALLS"
 if grep -q 'arc99x4' "$TEST_CALLS"; then exit 1; fi
 grep -q '^deploy-wireguard-forward.sh --apply$' "$TEST_CALLS"
+grep -q '^offsite_peers=("10.250.0.13" "10.250.0.12")$' "$TEST_CALLS"
 grep -q 'PENDING: cloud installed' "$tmp/apply.log"
 if grep -q 'PASS: Controller ready' "$tmp/apply.log"; then exit 1; fi
 if TEST_BAD_SHA=bad bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi

@@ -27,6 +27,31 @@ case "$origin" in
 esac
 [[ "$(git -C "$repo" rev-parse HEAD)" == "$EXPECTED_PSY_NOTIFIER_COMMIT" ]] || fail 'Psy Notifier HEAD does not match the pinned commit'
 [[ -z "$(git -C "$repo" status --porcelain --untracked-files=all)" ]] || fail 'Psy Notifier checkout must be clean; preserve edits in another worktree'
+# The Notifier's WireGuard forwarder only admits the retired offsite peers. Install the same helper
+# with this release's offsite addresses as a second unit; the pinned Notifier files stay untouched.
+forward_release_peers() {
+  local gateway=gcp-gateway helper unit work peers address tag
+  [[ "${#offsite_addresses[@]}" -gt 0 ]] || return 0
+  helper="$repo/deploy/staging/gateway/parth-sentinel-wireguard-forward"
+  unit="$repo/deploy/staging/gateway/parth-sentinel-wireguard-forward.service"
+  work="$(mktemp -d)"
+  peers="$(printf '"%s" ' "${offsite_addresses[@]}")"
+  sed -E "s|^offsite_peers=\(.*\)$|offsite_peers=(${peers% })|" "$helper" > "$work/helper"
+  grep -q "^offsite_peers=(${peers% })$" "$work/helper" || fail 'cannot rewrite the forwarder peer list'
+  sed -e 's|parth-sentinel-wireguard-forward|psy-monitoring-release-forward|g' \
+    -e 's|^Description=.*|Description=Forward release offsite Notifier Collectors through the WireGuard gateway|' \
+    "$unit" > "$work/unit"
+  tag="psy-monitoring-release-forward.$$"
+  scp -F "$SSH_CONFIG" "$work/helper" "$gateway:/tmp/$tag"
+  scp -F "$SSH_CONFIG" "$work/unit" "$gateway:/tmp/$tag.service"
+  ssh -F "$SSH_CONFIG" "$gateway" "sudo install -m 0755 /tmp/$tag /usr/local/libexec/psy-monitoring-release-forward \
+    && sudo install -m 0644 /tmp/$tag.service /etc/systemd/system/psy-monitoring-release-forward.service \
+    && sudo systemctl daemon-reload && sudo systemctl enable psy-monitoring-release-forward.service \
+    && sudo systemctl restart psy-monitoring-release-forward.service \
+    && sudo systemctl is-active psy-monitoring-release-forward.service; rm -f /tmp/$tag /tmp/$tag.service"
+  rm -rf -- "$work"
+}
+
 # The fleet comes from the release: deploy_monitoring_steps.py writes one "<host> <gcp|offsite>"
 # line per release host and a matching collector config directory and Controller config.
 hosts_file="${MONITORING_HOSTS_FILE:-}"
@@ -36,10 +61,15 @@ chain_indexes="${MONITORING_CHAIN_INDEXES:-}"
   || fail 'MONITORING_HOSTS_FILE, MONITORING_COLLECTOR_DIR and MONITORING_CHAIN_INDEXES are required (run step 85)'
 hosts=()
 offsite_hosts=()
-while read -r host zone; do
+offsite_addresses=()
+while read -r host zone address; do
   [[ -n "$host" ]] || continue
   hosts+=("$host")
-  [[ "$zone" == offsite ]] && offsite_hosts+=("$host")
+  if [[ "$zone" == offsite ]]; then
+    offsite_hosts+=("$host")
+    [[ "$address" =~ ^10\.250\.[0-9]+\.[0-9]+$ ]] || fail "offsite host $host needs a WireGuard address in the hosts file"
+    offsite_addresses+=("$address")
+  fi
 done < "$hosts_file"
 for host in "${hosts[@]}"; do
   [[ -f "$collector_dir/$host.toml" ]] || fail "missing collector config: $host"
@@ -83,6 +113,7 @@ if [[ "$mode" == --apply ]]; then
   done
   "$binaries/psy-notifier-controller" config validate --config "$SENTINEL_CONTROLLER_CONFIG"
   bash "$repo/deploy/staging/deploy-wireguard-forward.sh" --apply
+  forward_release_peers
   # The fleet wrapper checks every collector even in controller-only mode.
   # Install/verify the Controller independently before staging the collectors.
   bash "$repo/deploy/staging/deploy-staging-controller.sh" --skip-build --apply

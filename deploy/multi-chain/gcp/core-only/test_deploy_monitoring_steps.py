@@ -196,7 +196,8 @@ class HostTests(Fixture):
                                 "sudo": "passwordless"}}}
         text = Remote(access, {"hosts": {"guardian-next-1": "10.148.0.39"}}).ssh_config()
         self.assertIn("Host guardian-next-1", text)
-        self.assertRegex(text, r"ProxyCommand ssh .* -W %h:%p ubuntu@203\.0\.113\.1")
+        self.assertIn("ProxyJump jump", text)
+        self.assertIn("ControlPersist 120", text)
         self.assertIn("StrictHostKeyChecking yes", text)
 
     def key(self, name):

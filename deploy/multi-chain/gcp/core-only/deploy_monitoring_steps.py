@@ -89,6 +89,10 @@ def monitoring_hosts(release_dir, lock):
                   for alias, address in addresses.items())
 
 
+def host_addresses(release_dir, lock):
+    return {**lock["hosts"], **release_lock.read_document(release_dir / "topology.json")["hosts"]}
+
+
 def unit_patterns(lock):
     """Units discovered on hosts; core units come from the topology instead."""
     units = lock["units"]
@@ -311,7 +315,8 @@ def render_files(ctx):
         text = render_collector(ctx.lock, alias, zone, base.read_text() if base.is_file() else None,
                                 core_targets(ctx.lock, topology, alias), discover_units(ctx, alias))
         (work / "collectors" / f"{alias}.toml").write_text(text)
-    (work / "hosts").write_text("".join(f"{alias} {zone}\n" for alias, zone in hosts))
+    addresses = host_addresses(ctx.release_dir, ctx.lock)
+    (work / "hosts").write_text("".join(f"{alias} {zone} {addresses[alias]}\n" for alias, zone in hosts))
     write_private_text(work / "ssh_config", ctx.remote.ssh_config())
     base_text = (repo / CONTROLLER_CONFIG).read_text()
     controller = tomllib.loads(base_text)
@@ -395,7 +400,7 @@ def monitoring_apply(ctx):
     run = run_adapter(ctx, "--apply", work)
     if run.returncode == EXIT_PENDING:
         commands = install_commands(run.stdout)
-        offsite = [line.split()[0] for line in (work / "hosts").read_text().splitlines() if line.endswith("offsite")]
+        offsite = [line.split()[0] for line in (work / "hosts").read_text().splitlines() if line.split()[1] == "offsite"]
         raise OperatorPending(offsite[0] if offsite else CONTROLLER_HOST, "; ".join(commands),
                               str(ctx.run_dir / "deploy_monitoring.json"))
     if run.returncode != 0:
