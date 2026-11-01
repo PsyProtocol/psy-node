@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "environment": "multi-chain-testnet",
+  "l1_primary": {"network": "sepolia", "chain_name": "Sepolia", "chain_short_name": "Sepolia"},
+  "chains": {
+    "sepolia": {"rpc_url": "https://rpc-eth-stg.psy-protocol.xyz", "explorer_url": "https://sepolia.etherscan.io", "gas_faucet_url": "https://cloud.google.com/application/web3/faucet/ethereum/sepolia"},
+    "bscTestnet": {"rpc_url": "https://rpc-bsc-stg.psy-protocol.xyz", "explorer_url": "https://testnet.bscscan.com", "gas_faucet_url": "https://faucet.zalalena.com/bsc"},
+    "baseSepolia": {"rpc_url": "https://rpc-base-stg.psy-protocol.xyz", "explorer_url": "https://sepolia.basescan.org", "gas_faucet_url": "https://portal.cdp.coinbase.com/products/faucet"}
+  },
+  "services": {
+    "coordinator_rpc": "https://coordinator-stg.psy-protocol.xyz",
+    "realm_rpcs": ["https://realm0-stg.psy-protocol.xyz", "https://realm1-stg.psy-protocol.xyz"],
+    "prove_proxy": "https://prove-stg.psy-protocol.xyz",
+    "faucet_rpc": "https://faucet-stg.psy-protocol.xyz",
+    "psy_services": "https://services-stg.psy-protocol.xyz",
+    "indexer_graphql": "https://indexer-stg.psy-protocol.xyz/v1/graphql"
+  },
+  "frontends": {
+    "app": "https://app-stg.psy-protocol.xyz/",
+    "psy_bridge": "https://app-stg.psy-protocol.xyz/",
+    "psy_explorer": "https://explorer-stg.psy-protocol.xyz/",
+    "psy_ide": "https://ide-stg.psy-protocol.xyz/",
+    "config": "https://config-stg.psy-protocol.xyz/",
+    "wallet": "https://wallet-stg.psy-protocol.xyz/"
+  },
+  "config_site": {"project": "psy-config-stg", "branch": "staging", "wrangler": "wrangler@4.114.0"},
+  "trust_setup": {
+    "host": "gcp-nostr",
+    "root": "/opt/nostr-relay/public/trust-setup",
+    "base_url": "https://nostr-stg.psy-protocol.xyz/trust-setup",
+    "archive": "psy-groth16-trust-setup.tar.gz",
+    "installer": "install-groth16-trust-setup.sh"
+  },
+  "sites": {
+    "app": "https://app-stg.psy-protocol.xyz/",
+    "explorer": "https://explorer-stg.psy-protocol.xyz/",
+    "ide": "https://ide-stg.psy-protocol.xyz/",
+    "account": "https://account-stg.psy-protocol.xyz/",
+    "wallet": "https://wallet-stg.psy-protocol.xyz/"
+  },
+  "bundle_sites": {"app": true, "account": false},
+  "workflows": ["Deploy Testnet Frontends", "Deploy Testnet Wallet Site", "Deploy Testnet IDE", "Deploy Testnet Account"],
+  "dapp": {"branch": "deploy/testnet", "l1_file": "deploy/common/public-l1-r3.json", "client_file": "deploy/common/public-client-r3.json",
+           "page_source": "apps/config"},
+  "wallet": {"r2_bucket": "psy-wallet-assets-stg", "public_base_url": "https://wallet-assets-stg.psy-protocol.xyz",
+             "package_mode": "staging", "script": "scripts/publish-wallet-r2-stg.sh"}
+}
