@@ -366,8 +366,9 @@ class CommittedLockTests(unittest.TestCase):
     def test_committed_lock_validates_while_pending_values_are_empty(self):
         lock_module.validate_release_lock(self.lock, RELEASE_DIR, False)
 
-    def test_committed_lock_still_has_pending_values_and_a_known_key_source(self):
-        self.assertEqual(self.lock["sources"]["contracts"], "")
+    def test_committed_lock_pins_published_sources_and_a_known_key_source(self):
+        for name in ("contracts", "services", "indexer", "notifier"):
+            self.assertRegex(self.lock["sources"][name], "^[0-9a-f]{40}$")
         self.assertEqual(self.lock["sources"]["guardian_key"], "de539f565ec1a92f91bb4e9686e1442e89ba8639")
 
     def test_committed_lock_matches_current_tools(self):

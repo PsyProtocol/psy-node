@@ -4,9 +4,9 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "8c9a4de713f343240e081e7d1aa253ea02c340edae2df3411ffbf05e59bc3282",
-    "topology": "f2baf55c95218e186ab3fa37ba3c068208372ffa746373bc2f6c1eff8dfc9526",
-    "artifacts": "94bfa7af49ffca2e3eb3c5e76bd4a9ed8c4904499979b9fea36ee63636845297",
+    "release_profile": "2e46314ae0d4d9424f760027e1207e177527aebb0237d547305e8cf981bc2442",
+    "topology": "d9881c5d4a132ff8822f4103b0cee01d64884bc40c07f935a54ff0af7144ed2b",
+    "artifacts": "070ad056539692424d7f48f1d270b5235ee4e3c3a9bcd1161ecf3f08d789a0bf",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
@@ -16,23 +16,23 @@
     "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
-    "runtime": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
+    "runtime": "397b096e50a830bcc87da5a1af685b59eb252891",
     "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
-    "contracts": "",
-    "services": "",
-    "indexer": "",
-    "notifier": ""
+    "contracts": "b18aa6cfe1d8aa57ba15969a805637408a880188",
+    "services": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
+    "indexer": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
+    "notifier": "d80a89f390623f59d7bad0750a485793aee31358"
   },
   "binaries": {
-    "psy_dev_cli": "ec29b42b125f9b4cf574e5211841882094b0bdeaeab171871ca0956af4be1e23",
-    "psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
-    "psy_relayer_cli": "a5bb1076fe274d8ac839552d7d298259f91d6dbb94e2bc0a0455cfd5ad52b4f5",
-    "psy_user_cli": "8e6d1eb75033cd896e15acc9e541ca82142fc8cb4a691df16b00d0e9a125482f",
-    "psy_worker_cli": "20d67f8578097f8526468c7f172ea6759aba201037a44840f0587855f9aa025c",
-    "psy-services": "",
-    "psy-indexer": ""
+    "psy_dev_cli": "82d201552d236cf9b4afe8a21188888411216a4946095e6a8b44188e4194536f",
+    "psy_node_cli": "5cbd17ac0c2abaac801652433c38737270f56fb355610031b65bed8a6dca4c43",
+    "psy_relayer_cli": "4a0d2104e937c81c354d9321257a3435971d37e93df420f629e3b399c508728d",
+    "psy_user_cli": "1525aac9c73d0900736e6ea90c0c61b5bf1308c3e1993f1bd4de4fe7f0762027",
+    "psy_worker_cli": "c8f6c522ca459e744a69cf57dcaf3d002b4315c88dc789f10453f24d5122240e",
+    "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
+    "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a"
   },
   "paths": {
     "core": {
@@ -152,19 +152,19 @@
     "network": "nostr-relay_nostr-net"
   },
   "groth16": {
-    "setup_manifest_sha256": "",
+    "setup_manifest_sha256": "d573f87f8319dbcb06e60c2d33b4964e047efbfcd2dcc129967fa162607ea6d2",
     "verifiers": {
-      "gnark_groth16_verifier": "",
-      "deposit_batch_verifier": "",
-      "withdrawal_claim_verifier": ""
+      "gnark_groth16_verifier": "4261a39a61a3ff192d2703260997cbc01335319bd6cb1932c7bf299ec88c69ca",
+      "deposit_batch_verifier": "003f99fb4da72a027bb082929b842e9aa7f503f2b293d9cbdaeaacba56a987a3",
+      "withdrawal_claim_verifier": "1a327db454bd7bcbc1fb1bbd7df156b8c6e7b62fa3536b8e8f01cb71420ab2b7"
     }
   },
   "l1": {
     "signer": "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad",
     "signer_host": "gcp-faucet",
     "output_root": "/var/lib/psy-fresh20261030sd192",
-    "bundle_sha256": "",
-    "policy_sha256": "",
+    "bundle_sha256": "db06d58152cc250f3c1fa12c2bcdcd2732390da04c22950e788a297bb69d6a3e",
+    "policy_sha256": "0effbedf9cc0cf81478e379bf74bee6755fb499f0384716418250fe9d5f45531",
     "gas_budget_sha256": {
       "sepolia": "49d45dcfad7842a0c2edb832516cb3dd9aa4207c91853c680b16dbef6f986f71",
       "bscTestnet": "2e12b66b9a79f0eb1fe025d91b655259dd5f21bf6d2321c87e1e4896121cd6e9",

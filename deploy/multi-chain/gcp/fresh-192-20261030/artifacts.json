@@ -3,7 +3,7 @@
   "release_id": "core-testnet-20261030-sd192",
   "prepared_on": "2026-10-31",
   "status": "READY_STATIC",
-  "source_commit": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
+  "source_commit": "397b096e50a830bcc87da5a1af685b59eb252891",
   "preparation_commits": {
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -21,14 +21,14 @@
   "compiler_stamp_sha256": "4b22bb7aed61caf4156f1709a52ccc43999737f6bf29342f58d8c63cea4d8c61",
   "genesis_sha256": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
   "binaries": {
-    "psy_dev_cli": "ec29b42b125f9b4cf574e5211841882094b0bdeaeab171871ca0956af4be1e23",
-    "psy_node_cli": "d42eb8dd997b4026da3556eb3bec3329f0e942d96a7a0f29215a9d2ce5ad097d",
-    "psy_relayer_cli": "a5bb1076fe274d8ac839552d7d298259f91d6dbb94e2bc0a0455cfd5ad52b4f5",
-    "psy_user_cli": "8e6d1eb75033cd896e15acc9e541ca82142fc8cb4a691df16b00d0e9a125482f",
-    "psy_worker_cli": "20d67f8578097f8526468c7f172ea6759aba201037a44840f0587855f9aa025c"
+    "psy_dev_cli": "82d201552d236cf9b4afe8a21188888411216a4946095e6a8b44188e4194536f",
+    "psy_node_cli": "5cbd17ac0c2abaac801652433c38737270f56fb355610031b65bed8a6dca4c43",
+    "psy_relayer_cli": "4a0d2104e937c81c354d9321257a3435971d37e93df420f629e3b399c508728d",
+    "psy_user_cli": "1525aac9c73d0900736e6ea90c0c61b5bf1308c3e1993f1bd4de4fe7f0762027",
+    "psy_worker_cli": "c8f6c522ca459e744a69cf57dcaf3d002b4315c88dc789f10453f24d5122240e"
   },
   "receipts": {
-    "runtime_manifest_sha256": "b0bc11e35553a3fb71c068e05b9aeadb478366290fb38adfa370a8dd2284064c",
+    "runtime_manifest_sha256": "645a46c3a6641aae723f31bf2690cd70aa679c2c90a056467db81a13c7c0b804",
     "tools_manifest_sha256": "c61c14f9c37c97befe6fe21407eea95be99cda4f3afe8ad8e12e6b7ebc0af092",
     "privacy_measurements_sha256": "d2fdb8bc4d715adc17722a62d5511f18652b59768d676579ca73fd20eb7a258a",
     "genesis_spec_sha256": "2ea5bdcd4e6f523cef5949ab81d8795b8e146b5133963c299d048cfc430fd951",
@@ -68,13 +68,16 @@
     "installed": false,
     "started": false,
     "manifest_sha256": {
-      "gcp-cp-ce": "89fd0917bd37cdafa762dba08c146277abc046547ca6a29c26c752ffd6376dc8",
-      "gcp-edge-1": "1b6b9a20a8dc09277390bb9c9157627ab6e4bbe18707556a8cc676f2a490f039",
-      "gcp-edge-2": "38cb8b9ccaf95db28d2e38ede99e3aba59e6ce02d2b981a10f63cdc37ec9107d",
-      "gcp-realm-processor": "a7482b0624ed7e28594cd5735377b4190ef86ac5b5a0e9fed06a59d3cec58c2f",
-      "realm-processors-b": "5496c5a8817998393942d06c9bb8a36c4673945c9592f187dbd9332d121dd8be",
-      "realm-processors-c": "ceb0e736e6fc0e72211f433d11e6fcfdd2742ead4c87929a16e1edcfcacc7c0d"
+      "gcp-cp-ce": "1940cc2efb6846c8281e4cccec65f8e179a42d7f65a2ee0678ec04ed18b39347",
+      "gcp-edge-1": "14b05ed5b8a2d4f3037b71fefc7213247a38a1c320a21c1c758a902f99b9dd0a",
+      "gcp-edge-2": "780544be6d1a3e1c730ba71ac5535ebb5e0c633ab9007ca440f78bd0ea90e987",
+      "gcp-realm-processor": "57f8e7af3e3ddeeb01fb515572ba557777871ed64108d2abb7c6a7f4e3b6cb87",
+      "realm-processors-b": "7ac92732d72bbdc717643526a3a36ea3c4edd69ca5d8fd16f88ef22fb0f944d6",
+      "realm-processors-c": "20b5bda8ff818b2e8dd30b9b6f56d6f9fb4b104190761615e5098393dbbfa89e"
     }
+  },
+  "proxy_packages": {
+    "rpc_endpoints_sha256": "95810643153f6cabca92f530a9bb5b60bf8a2410cd23a8e617630803daae185f"
   },
   "runtime_approved": false,
   "deployment_ready": false,

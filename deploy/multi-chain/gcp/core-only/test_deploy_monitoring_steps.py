@@ -385,10 +385,12 @@ class CheckoutTests(Fixture):
         with self.assertRaisesRegex(ValueError, "differs"):
             steps.check_notifier_checkout(self.context(FakeRemote()))
 
-    def test_lock_carries_a_notifier_source_that_stays_pending_until_set(self):
+    def test_lock_notifier_source_equals_the_source_versions_pin(self):
         self.assertIn("notifier", release_lock.SOURCES)
         lock = json.loads((ADAPTER.parent / "fresh-192-20261030/release-lock.json").read_text())
-        self.assertEqual(lock["sources"]["notifier"], "")
+        versions = (ADAPTER.parent / "source-versions.env").read_text()
+        self.assertRegex(lock["sources"]["notifier"], "^[0-9a-f]{40}$")
+        self.assertIn(f'EXPECTED_PSY_NOTIFIER_COMMIT="{lock["sources"]["notifier"]}"', versions)
 
 
 class StatusTests(Fixture):
