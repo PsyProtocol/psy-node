@@ -62,10 +62,21 @@ class RebindTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "beyond tool_sha256: paths, tool_sha256"):
             self.run_rebind()
 
-    def test_a_lock_with_other_tools_or_no_change_is_refused(self):
-        self.write_locks(self.old, {**self.old, "tool_sha256": {**NEW_TOOLS, "c.py": "4" * 64}})
-        with self.assertRaisesRegex(ValueError, "other tools"):
+    def test_a_tool_added_next_to_changed_hashes_is_the_real_case_and_passes(self):
+        self.write_locks(self.old, {**self.old, "tool_sha256": {**NEW_TOOLS, "admin_pause.py": "4" * 64}})
+        path = self.state("retained_baseline.json", {"lock_sha256": self.old_sha})
+        self.assertEqual(self.run_rebind()["rebound"], ["retained_baseline.json"])
+        self.assertEqual(json.loads(path.read_text())["lock_sha256"], self.new_sha)
+
+    def test_an_added_tool_together_with_any_other_difference_is_still_refused(self):
+        self.write_locks(self.old, {**self.old, "paths": ["y"], "tool_sha256": {**NEW_TOOLS, "admin_pause.py": "4" * 64}})
+        with self.assertRaisesRegex(ValueError, "beyond tool_sha256: paths, tool_sha256"):
             self.run_rebind()
+        self.write_locks({**self.old, "tool_sha256": {**OLD_TOOLS, "z.py": "5" * 64}}, {**self.old, "tool_sha256": NEW_TOOLS})
+        with self.assertRaisesRegex(ValueError, "dropped tools"):
+            self.run_rebind()
+
+    def test_a_lock_with_no_change_is_refused(self):
         self.write_locks(self.old, self.old)
         with self.assertRaisesRegex(ValueError, "nothing to move"):
             self.run_rebind()

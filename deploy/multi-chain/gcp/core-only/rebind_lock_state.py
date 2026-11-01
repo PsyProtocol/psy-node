@@ -4,7 +4,7 @@
 State files in the private state directory carry the hash of the lock they were written under, and every step
 refuses a file bound to another lock. When a tool fix changes only tool_sha256 in the lock, the recorded
 facts are still true. This command proves that the previous lock differs from the current one only in
-tool_sha256 and then rewrites the binding, so nobody edits state by hand. It is a dry run unless --apply is given.
+tool_sha256 (hashes changed, tools added) and then rewrites the binding, so nobody edits state by hand. It is a dry run unless --apply is given.
 """
 import argparse
 import hashlib
@@ -25,7 +25,9 @@ def tool_only_difference(previous, current):
     changed = [name for name in names if previous.get(name) != current.get(name)]
     require("tool_sha256" in changed and changed == ["tool_sha256"],
             "the previous lock differs from the current lock beyond tool_sha256: " + ", ".join(changed or ["nothing"]))
-    require(set(previous["tool_sha256"]) == set(current["tool_sha256"]), "the previous lock lists other tools")
+    # A tool may be added (a new reviewed tool changes the lock like a changed hash does); a tool may not vanish.
+    removed = sorted(set(previous["tool_sha256"]) - set(current["tool_sha256"]))
+    require(not removed, "the current lock dropped tools the previous lock had: " + ", ".join(removed))
 
 
 def write_state(path, document):
