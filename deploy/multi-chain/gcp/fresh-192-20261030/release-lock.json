@@ -12,8 +12,8 @@
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
     "worker_whitelist": "d55077d02c67cb2a9f1cf9ba8b3620d98134c9416deb6b7fd4b8274cd3b1540c",
     "risk_acceptance": "b05874b9d98ee4397c6a5ccdb0a7d0dfeb8e50a9d3209645e5f6662f5cc9b333",
-    "retired_state": "db61952882b46c4e22a4ac33225ee9ca39d96e9f5335b32e7f71ef423a0e59dd",
-    "retained_paths": "54575b40bbf62f0c1be447f57301640099999a1f1728976e22dba95617801182"
+    "retired_state": "a53ccac87c53b2a5b2e20822165ac51b87eb9a000f53c31593aa0d17b309ca10",
+    "retained_paths": "2a73330561d572b6d8895b0756fd2bd33d3e552ac3a76f636819a3ab572bd417"
   },
   "sources": {
     "runtime": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
@@ -148,6 +148,7 @@
   },
   "l1": {
     "signer": "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad",
+    "signer_host": "gcp-faucet",
     "output_root": "/var/lib/psy-fresh20261030sd192",
     "bundle_sha256": "",
     "policy_sha256": "",
@@ -188,7 +189,7 @@
     "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
     "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
     "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
-    "fresh_l1.py": "fb68c45ce29e7ee5fb6404491e10146abe9e127741c676b5a9d16fbc31d04b49",
+    "fresh_l1.py": "91c9f3f673c91605ad7e02e27f18783898d7316a8936b2423895864ee559526d",
     "guardian_exec.py": "edaef4870cf666b9478911fafdc5d69c3a4c6b2e0a4d8280892db5caf1a0b9d1",
     "indexer_backup_mirror.py": "fea7793cfca5b69ab88a26f1f4774196a3966dacc942f29e3ed574886810c1d7",
     "install_envio.py": "d251bde36b6173a51873a42053fb884494d62de994ca75a58b4c5dd858fbb309",

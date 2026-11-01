@@ -144,6 +144,12 @@ class RemoteTests(unittest.TestCase):
         remote = remote_with(FakeRunner())
         self.assertEqual(remote.missing_aliases(["inner", "x", "y"]), ["x", "y"])
 
+    def test_sudo_mode_reports_the_access_file_value(self):
+        remote = remote_with(FakeRunner())
+        self.assertEqual((remote.sudo_mode("inner"), remote.sudo_mode("oper")), ("passwordless", "operator"))
+        with self.assertRaises(RemoteError):
+            remote.sudo_mode("unknown")
+
     def test_operator_host_refuses_run_root(self):
         runner = FakeRunner(stdout="{}")
         with self.assertRaisesRegex(RemoteError, "operator host oper"):
@@ -180,6 +186,35 @@ class RemoteTests(unittest.TestCase):
                 remote_with(runner).run_root_json("inner", ["x"], 30, show_stderr=show)
             self.assertIn(expected, str(caught.exception))
         self.assertNotIn("visible diagnostic", str(RemoteError("h: exit 2: details withheld")))
+
+    def test_run_root_text_sends_stdin_as_a_here_document_under_the_remote_timeout(self):
+        runner = FakeRunner(stdout="[]")
+        text = remote_with(runner).run_root_text("inner", ["/usr/bin/python3", "-I", "/dev/stdin"], 60,
+                                                 stdin_text="print(1)")
+        script = script_of(runner)
+        self.assertEqual(text, "[]")
+        self.assertIn("sudo -n -- /usr/bin/timeout --signal=TERM --kill-after=30 60 /usr/bin/python3 -I /dev/stdin "
+                      "<<'PSY_ROOT_STDIN_END'\nprint(1)\nPSY_ROOT_STDIN_END\n", script)
+
+    def test_run_root_text_maps_remote_timeout_exits_and_refuses_operator_hosts(self):
+        with self.assertRaisesRegex(RemoteError, "timed out on the remote"):
+            remote_with(FakeRunner(returncode=124)).run_root_text("inner", ["x"], 30, stdin_text="a")
+        with self.assertRaisesRegex(RemoteError, "operator host oper"):
+            remote_with(FakeRunner()).run_root_text("oper", ["x"], 30)
+        with self.assertRaisesRegex(ValueError, "collides"):
+            remote_with(FakeRunner()).run_root_text("inner", ["x"], 30, stdin_text="PSY_ROOT_STDIN_END")
+
+    @unittest.skipUnless(Path("/usr/bin/timeout").exists() and Path("/usr/bin/python3").exists(), "needs coreutils")
+    def test_here_document_script_runs_in_real_bash_with_stdin_as_the_program(self):
+        runner = FakeRunner(stdout="[]")
+        remote_with(runner).run_root_text("inner", ["/usr/bin/python3", "-I", "-B", "/dev/stdin", "status"], 20,
+                                          stdin_text="import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        fake_bin = Path(tempfile.mkdtemp(dir=KEY_DIR))
+        (fake_bin / "sudo").write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+        (fake_bin / "sudo").chmod(0o755)
+        done = subprocess.run(["/usr/bin/bash", "-s"], input=script_of(runner).encode(), capture_output=True,
+                              env={"PATH": f"{fake_bin}:/usr/bin"}, timeout=30)
+        self.assertEqual((done.returncode, done.stdout.decode().strip()), (0, '["status"]'))
 
     def test_run_root_json_rejects_duplicate_keys(self):
         with self.assertRaisesRegex(RemoteError, "JSON object"):

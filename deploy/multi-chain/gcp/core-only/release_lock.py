@@ -261,8 +261,9 @@ def check_chain_values(lock, walk):
     for name in GROTH16_VERIFIERS:
         walk.digest(fields(groth16["verifiers"], GROTH16_VERIFIERS, "groth16.verifiers")[name],
                     "groth16.verifiers." + name)
-    l1 = fields(lock["l1"], ("signer", "output_root", "bundle_sha256", "policy_sha256", "gas_budget_sha256"), "l1")
+    l1 = fields(lock["l1"], ("signer", "signer_host", "output_root", "bundle_sha256", "policy_sha256", "gas_budget_sha256"), "l1")
     require(isinstance(l1["signer"], str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", l1["signer"]), "l1.signer address")
+    require(l1["signer_host"] in ALL_HOSTS, "l1.signer_host must be a known host alias")
     walk.absolute(l1["output_root"], "l1.output_root")
     walk.digest(l1["bundle_sha256"], "l1.bundle_sha256")
     walk.digest(l1["policy_sha256"], "l1.policy_sha256")

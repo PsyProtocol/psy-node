@@ -98,7 +98,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
                    "nostr": "scsibug/nostr-rs-relay@sha256:" + "f" * 64},
         "groth16": {"setup_manifest_sha256": digest("setup"),
                     "verifiers": {name: digest(name) for name in lock_module.GROTH16_VERIFIERS}},
-        "l1": {"signer": "0x" + "9" * 40, "output_root": "/var/lib/psy-fresh-test",
+        "l1": {"signer": "0x" + "9" * 40, "signer_host": "gcp-faucet", "output_root": "/var/lib/psy-fresh-test",
                "bundle_sha256": digest("bundle"), "policy_sha256": digest("policy"),
                "gas_budget_sha256": {chain: digest("gas" + chain) for chain in CHAINS}},
         "ingress": {"fenced_hosts": ["fenced.example.test"], "faucet_hosts": ["faucet.example.test"],
@@ -124,6 +124,17 @@ class ReleaseLockTests(unittest.TestCase):
 
     def test_fixture_is_valid_and_complete(self):
         self.validate()
+
+    def test_signer_host_must_be_a_known_alias(self):
+        for value in ("not-a-host", "", 5):
+            lock = copy.deepcopy(self.lock)
+            lock["l1"]["signer_host"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "signer_host"):
+                self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        del lock["l1"]["signer_host"]
+        with self.assertRaisesRegex(ValueError, "l1 fields"):
+            self.validate(lock)
 
     def test_load_rejects_hash_mismatch(self):
         path = Path(self.temp.name) / "lock.json"

@@ -194,12 +194,44 @@ class RunnerTests(unittest.TestCase):
             calls.append((url, method))
             if url == "own": raise ValueError("never expose https://token@backup")
             return {"eth_chainId": hex(11155111), "eth_getBlockByNumber": {"timestamp": hex(1000), "number": "0x2"},
-                    "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4"}[method]
+                    "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4",
+                    "eth_getTransactionCount": "0x5"}[method]
         with patch.object(m, "rpc", side_effect=fake), patch.object(m.time, "time", return_value=1001):
             report, selected = m.status("sepolia", "own", "https://token@backup")
         self.assertEqual(calls[0][0], "own")
         self.assertEqual(selected, "https://token@backup")
         self.assertNotIn("token", json.dumps(report))
+
+
+    def test_status_reports_signer_and_latest_and_pending_nonce(self):
+        seen = []
+        def fake(url, method, params):
+            seen.append((method, params))
+            return {"eth_chainId": hex(11155111), "eth_getBlockByNumber": {"timestamp": hex(1000), "number": "0x2"},
+                    "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4",
+                    "eth_getTransactionCount": "0x7" if (params or [None])[-1] == "latest" else "0x9"}[method]
+        with patch.object(m, "rpc", side_effect=fake), patch.object(m.time, "time", return_value=1001):
+            report, _ = m.status("sepolia", "own")
+        self.assertEqual(report["signer"], m.SIGNER)
+        self.assertEqual((report["nonce_latest"], report["nonce_pending"]), (7, 9))
+        self.assertIn(("eth_getTransactionCount", [m.SIGNER, "pending"]), seen)
+
+    def test_nonce_read_is_an_allowed_read_only_method(self):
+        with patch.object(m.urllib.request, "build_opener", side_effect=RuntimeError("reached transport")):
+            with self.assertRaises(RuntimeError):
+                m.rpc("http://unused", "eth_getTransactionCount", [m.SIGNER, "latest"])
+
+    def test_validate_budget_is_the_one_check_for_all_networks(self):
+        good = {"maxGasPriceWei": "1", "maxGasPerTransaction": "2", "maxTotalGas": "3", "maxNativeSpendWei": "4",
+                "l1FeeReserveWeiPerTransaction": "0"}
+        m.validate_budget(good, "sepolia")
+        for bad in ({**good, "maxTotalGas": "0"}, {**good, "maxTotalGas": 3}, {**good, "extra": "1"},
+                    {key: value for key, value in good.items() if key != "maxTotalGas"}):
+            with self.assertRaises(m.GateError):
+                m.validate_budget(bad, "sepolia")
+        with self.assertRaisesRegex(m.GateError, "Base L1 data-fee reserve required"):
+            m.validate_budget(good, "baseSepolia")
+        m.validate_budget({**good, "l1FeeReserveWeiPerTransaction": "1"}, "baseSepolia")
 
     def test_stale_or_wrong_chain_fails_closed(self):
         with patch.object(m, "rpc", return_value="0x1"):
@@ -208,7 +240,8 @@ class RunnerTests(unittest.TestCase):
     def test_explicit_backup_only_and_sanitized_report(self):
         values = {"eth_chainId": hex(11155111),
                   "eth_getBlockByNumber": {"timestamp": hex(1000), "number": "0x2"},
-                  "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4"}
+                  "eth_syncing": False, "eth_getBalance": "0x3", "eth_gasPrice": "0x4",
+                  "eth_getTransactionCount": "0x5"}
         with patch.object(m, "rpc", side_effect=lambda url, method, params: values[method]) as rpc, \
                 patch.object(m.time, "time", return_value=1001):
             report, endpoint = m.status("sepolia", "own", "https://backup.invalid/token",

@@ -22,6 +22,7 @@ ROOT_LOCAL_MARGIN_SECONDS = 15
 ROOT_LIMIT_EXIT_CODES = (124, 137)
 CONNECTION_EXIT_CODE = 255
 SUDO_MODES = ("passwordless", "operator")
+HERE_DOCUMENT_MARKER = "PSY_ROOT_STDIN_END"
 # Broad pattern for free-form text where a false positive only hides a line.
 SECRET_TEXT = re.compile(r"private|secret|passw|passphrase|token|mnemonic|credential|cookie", re.IGNORECASE)
 USERINFO_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s@]*@")
@@ -49,6 +50,11 @@ class RemoteConnectionError(RemoteError):
 
 class ResultRefused(ValueError):
     """A step result was refused; the message names a location, never a value."""
+
+
+def require_text(condition, message):
+    if not condition:
+        raise ValueError(message)
 
 
 def looks_secret(text):
@@ -217,6 +223,9 @@ class Remote:
     def missing_aliases(self, aliases):
         return sorted(alias for alias in set(aliases) if alias not in self._hosts)
 
+    def sudo_mode(self, host):
+        return self._access_of(host)["sudo"]
+
     def _access_of(self, host):
         if host not in self._hosts:
             raise RemoteError(f"host not in the access file: {host}", host=host)
@@ -261,19 +270,27 @@ class Remote:
     def run_script(self, host, script, timeout_seconds):
         return self._run_script_bytes(host, script, timeout_seconds).decode("utf-8", errors="replace")
 
-    def run_root_json(self, host, argv, timeout_seconds, *, show_stderr=False):
+    def run_root_text(self, host, argv, timeout_seconds, *, stdin_text=None, show_stderr=False):
         host_access = self._access_of(host)
         if type(timeout_seconds) is not int or timeout_seconds <= 0:
             raise ValueError("timeout must be a positive number of seconds")
         if host_access["sudo"] != "passwordless":
-            raise RemoteError(f"operator host {host} has no passwordless sudo; raise OperatorPending instead",
+            raise RemoteError(f"operator host {host} cannot run sudo without a prompt; raise OperatorPending instead",
                               host=host)
         # timeout runs as root under sudo, so it can signal the root tool; a local timeout fires later still.
         limit = f"/usr/bin/timeout --signal=TERM --kill-after={ROOT_KILL_AFTER_SECONDS} {timeout_seconds} "
-        script = "set -euo pipefail\nsudo -n -- " + limit + shlex.join(argv) + "\n"
-        output = self._run_script_bytes(host, script, timeout_seconds + ROOT_KILL_AFTER_SECONDS
-                                        + ROOT_LOCAL_MARGIN_SECONDS, should_show_stderr=show_stderr,
-                                        remote_limit_codes=ROOT_LIMIT_EXIT_CODES).decode("utf-8", errors="replace")
+        command = "sudo -n -- " + limit + shlex.join(argv)
+        if stdin_text is not None:
+            require_text(HERE_DOCUMENT_MARKER not in stdin_text, "stdin text collides with the here-document marker")
+            command += f" <<'{HERE_DOCUMENT_MARKER}'\n{stdin_text}{'' if stdin_text.endswith(chr(10)) else chr(10)}"
+            command += HERE_DOCUMENT_MARKER
+        output = self._run_script_bytes(host, "set -euo pipefail\n" + command + "\n",
+                                        timeout_seconds + ROOT_KILL_AFTER_SECONDS + ROOT_LOCAL_MARGIN_SECONDS,
+                                        should_show_stderr=show_stderr, remote_limit_codes=ROOT_LIMIT_EXIT_CODES)
+        return output.decode("utf-8", errors="replace")
+
+    def run_root_json(self, host, argv, timeout_seconds, *, show_stderr=False):
+        output = self.run_root_text(host, argv, timeout_seconds, show_stderr=show_stderr)
         try:
             root_report = json.loads(output, object_pairs_hook=release_lock.unique_object)
         except ValueError:

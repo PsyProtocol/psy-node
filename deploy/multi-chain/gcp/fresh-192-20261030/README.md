@@ -221,3 +221,33 @@ continuity: verify actual private-key possession, host addresses, native config
 acceptance and Guardian quorum before rollout. Keep generated configs outside
 Git and public client artifacts. Build final caches/artifacts with this exact
 accepted config; the earlier template-based checks are not that final build.
+
+## Local Inputs For The Preparation Steps
+
+The release lock pins hashes, not machine paths. The preparation steps read the
+local paths from `local-inputs.json` in the operator-only directory (mode 0600,
+never committed). Every file named there is hash-checked against the lock or
+`artifacts.json` when used; the file itself is not pinned.
+
+| Section | Names | Meaning |
+| --- | --- | --- |
+| `build` | `source`, `builder_image`, `caches` (`cargo`, `target`, `go`, `go_build`), `output_root`, `jobs` | Inputs of the pinned Node build. All paths absolute. |
+| `files` | `config`, `canonical_config`, `genesis`, `genesis_contracts`, `compiler_stamp`, `groth16_setup_manifest`, `gnark_groth16_verifier`, `deposit_batch_verifier`, `withdrawal_claim_verifier`, `psy_services`, `psy_indexer`, `l1_bundle_manifest`, `l1_policy` | Frozen release inputs. `l1_bundle_manifest` is the `manifest.json` at the root of the L1 bundle directory. |
+| `packages.core` | `registration_keys`, `faucet_operators`, `p2p_keys`, `output` | Inputs of the core host packages; `output` must not exist before the first run. All absolute. |
+
+Build attempts live in `<output_root>/<release id>-<first 12 of the runtime commit>-build-<n>`.
+A completed attempt of the same commit is verified and reused; a failed attempt
+is kept and the next number is used. A build of another commit never blocks a
+new one.
+
+Cache paths may need to match the pinned build. Cargo records `CARGO_HOME`
+(the `cargo` cache) in compiled-in paths, so a binary built with a different
+cache path can differ from the hash in `artifacts.json`. Use the cache paths of
+the build that produced those hashes, or expect to re-pin.
+
+Step `check_hosts` takes the signer host from `l1.signer_host` in the lock and
+requires the retained paths to agree: that host must keep both `/etc/parth` and
+`/var/lib/parth/.psy/keystore`, plus the keystore file
+`/var/lib/parth/.psy/keystore/bridge-relayer-dev`. It reads the L1 balance and
+nonces with the pinned `fresh_l1.py status`, sent on stdin to that host and run
+with `--rpc-preference protected-env-backup`, the route the deployment uses.

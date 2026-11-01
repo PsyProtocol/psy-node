@@ -68,6 +68,8 @@ SOURCE_DIRS = {"src", "deploy", "helpers", "protocol-config", "tasks", "scripts"
 SOURCE_FILES = {"package.json", "pnpm-lock.yaml", "tsconfig.json", "hardhat.config.ts",
                 "helper-hardhat-config.ts"}
 AMOUNTS = ("minDepositAmount", "depositCap", "smallWithdrawalMax", "mediumWithdrawalMax", "totalWithdrawalCap")
+BUDGET_FIELDS = {"maxGasPriceWei", "maxGasPerTransaction", "maxTotalGas", "maxNativeSpendWei",
+                 "l1FeeReserveWeiPerTransaction"}
 DELAYS = ("smallWithdrawalDelay", "mediumWithdrawalDelay", "largeWithdrawalDelay")
 
 
@@ -287,8 +289,8 @@ def own_rpc(config, network):
 
 
 def rpc(url, method, params):
-    require(method in {"eth_chainId", "eth_getBalance", "eth_gasPrice", "eth_getBlockByNumber", "eth_syncing"},
-            "read-only RPC method required")
+    require(method in {"eth_chainId", "eth_getBalance", "eth_gasPrice", "eth_getBlockByNumber", "eth_syncing",
+                       "eth_getTransactionCount"}, "read-only RPC method required")
     parsed = urllib.parse.urlsplit(url)
     require(parsed.scheme in ("http", "https") and parsed.hostname, "invalid RPC endpoint")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -321,7 +323,9 @@ def status(network, primary, fallback=None, rpc_preference="own-node"):
             report = {"network": network, "provider": label, "chain_id": NETWORKS[network][0],
                       "block": int(block["number"], 16), "block_age_seconds": age,
                       "balance_wei": str(int(rpc(url, "eth_getBalance", [SIGNER, "latest"]), 16)),
-                      "gas_price_wei": str(int(rpc(url, "eth_gasPrice", []), 16))}
+                      "gas_price_wei": str(int(rpc(url, "eth_gasPrice", []), 16)), "signer": SIGNER,
+                      "nonce_latest": int(rpc(url, "eth_getTransactionCount", [SIGNER, "latest"]), 16),
+                      "nonce_pending": int(rpc(url, "eth_getTransactionCount", [SIGNER, "pending"]), 16)}
             return report, url
         except Exception:
             pass
@@ -343,18 +347,21 @@ def child(node, bundle, output, network, request):
     return response
 
 
+def validate_budget(budget, network):
+    require(set(budget) == BUDGET_FIELDS, "explicit gas budget required")
+    for name, value in budget.items():
+        require(isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value)
+                and (int(value) > 0 or name == "l1FeeReserveWeiPerTransaction"), "invalid gas budget")
+    require(network != "baseSepolia" or int(budget["l1FeeReserveWeiPerTransaction"]) > 0,
+            "Base L1 data-fee reserve required")
+
+
 def deploy(args):
     require(args.execute, "broadcast requires --execute after independent review")
     policy = read_json(args.policy, args.policy_sha256)
     validate_policy(policy)
     budget = read_json(args.gas_budget, args.gas_budget_sha256)
-    require(set(budget) == {"maxGasPriceWei", "maxGasPerTransaction", "maxTotalGas", "maxNativeSpendWei",
-                            "l1FeeReserveWeiPerTransaction"}, "explicit gas budget required")
-    for name, value in budget.items():
-        require(isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value)
-                and (int(value) > 0 or name == "l1FeeReserveWeiPerTransaction"), "invalid gas budget")
-    require(args.network != "baseSepolia" or int(budget["l1FeeReserveWeiPerTransaction"]) > 0,
-            "Base L1 data-fee reserve required")
+    validate_budget(budget, args.network)
     bundle = verify_bundle(args.bundle, args.manifest_sha256)
     output = safe_root(args.output)
     require(read_json(output / "prepared.json") == {"manifest_sha256": args.manifest_sha256},
