@@ -445,8 +445,8 @@ class PackageBuilderTests(PrepareTestCase):
             result = run_all(steps.PREPARE_STEPS["prepare_packages"], self.ws.context())
         self.assertEqual(list(result["packages"]), ["alpha", "beta", "gamma"])
 
-    def test_the_shipped_list_holds_the_core_builder(self):
-        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core"])
+    def test_the_shipped_list_holds_the_core_and_proxy_builders(self):
+        self.assertEqual([builder.name for builder in steps.PACKAGE_BUILDERS], ["core", "proxy"])
 
     def test_duplicate_builder_names_are_refused(self):
         order = []
@@ -498,6 +498,10 @@ class CorePackageTests(PrepareTestCase):
         (ws.state_dir / "rebuild_binaries.json").write_text(json.dumps({"build_dir": str(self.build_dir)}))
         ws.put_file("config", b"config", pin=lambda h: ws.lock["inputs"].update(runtime_config=h))
         ws.put_file("genesis", b"genesis", pin=lambda h: ws.lock["inputs"].update(genesis=h))
+        only_core = [builder for builder in steps.PACKAGE_BUILDERS if builder.name == "core"]
+        patcher = unittest.mock.patch.object(steps, "PACKAGE_BUILDERS", only_core)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.output = ws.root / "packages"
         ws.local["packages"] = {"core": {"registration_keys": str(ws.root / "keys.json"),
                                          "faucet_operators": str(ws.root / "operators.json"),

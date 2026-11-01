@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Package/check/install fresh proxies without enabling or starting anything.
+"""Package, check, install and activate prove proxies for the release named by the release lock.
+
+Every action takes --release-lock FILE --release-lock-sha256 HASH. Runtime commit, network magic, unit names,
+install paths and the Groth16 setup manifest hash come from the lock; nothing release-specific is built in.
+activate --package DIR --package-sha256 HASH --request-sha256 HASH --report-path FILE installs when nothing is
+installed, enables and starts the role unit, waits until it stays active, and writes the report JSON with
+lock_sha256, request_sha256, role, unit, pid and the hash of the running binary.
 
 package --role system|user --source-commit FULL_SHA --binary FILE --binary-manifest FILE
         --binary-manifest-sha256 HASH --network-config FILE --output NEW_DIR
@@ -20,7 +26,7 @@ Older packages and endpoint maps without placement are rejected.
 Only the runtime URL fields change;
 build config, P2P and guardian commitments are retained. No network probes run.
 Reachability and real RPC behavior require separate pre-activation verification.
-MemoryHigh/Max default to 36/44 GiB system and 40/48 GiB user. Overrides may
+MemoryHigh/Max default to 56/60 GiB system and 40/48 GiB user, the live effective limits. Overrides may
 lower these caps; cold four-cohort preload/proving memory fit remains unverified.
 CPU provenance is retained from the build manifest, not an AVX-512 claim.
 System additionally requires an approved setup manifest with exactly:
@@ -41,11 +47,12 @@ No setup hashes are supplied by this script; user packages reject setup inputs.
 
 Host checks require root to inspect private state paths. Install additionally
 requires separate authorization. It only creates fresh paths
-and reloads systemd. A partial install must be inspected; never auto-overwritten.
+and reloads systemd; activate then starts the unit. A partial install must be inspected; never auto-overwritten.
 Verify the transferred installer against the reviewed source before executing it.
 """
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import io
 import ipaddress
@@ -57,41 +64,40 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from urllib.parse import urlsplit
 
 
-RELEASE_ID = "core-testnet-20261026-r2"
-SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
-PREVIOUS_RELEASE_ID = "core-testnet-20261026"
-PREVIOUS_HASHES = {
-    "psy_user_cli": "0861d6488e39010619bfb5526cc283efd6c872abea334472646a01c00e4d7e3c",
-    "build.json": "c480d96f72a26be0269f777453153d46bb5d20e9f29edaf15580716152fa6d5b",
-    "network.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-    "rpc.json": "74229dcabd3472b0c6c886285bbb41fd9478a701581fd6a3ad4e56f1a9d4f04f",
-    "setup.json": "97228ec6444cfa63940a4cee50bb5102ed9d9ff4dbb1d9acf06a7cef801af80e",
-    "system": "8d05153f036e8dec36c5f5611890d42036754d4593298fa1e3d81ec16e72356b",
-    "user": "99f3862522014dc67749b0419761add06d77f55fa16c5f398b0bddd62b57fd5e",
-}
-MAGIC = "0x1337CF514544CF69"
 ROLES = ("system", "user")
-MEMORY_GIB = {"system": (36, 44), "user": (40, 48)}
+# Match the effective limits of the live proxies: x1 system 56/60 (control drop-ins), x3 user 40/48.
+MEMORY_GIB = {"system": (56, 60), "user": (40, 48)}
 VERIFIERS = {"bridge_agg": "GnarkGroth16Verifier.sol", "deposit_append": "DepositBatchVerifier.sol",
              "withdrawal_claim": "WithdrawalClaimVerifier.sol", "reward_claim": "RewardClaimVerifier.sol"}
 COHORTS = tuple(VERIFIERS)
 SETUP_NAMES = tuple(("" if cohort == "bridge_agg" else cohort + "/") + name
                     for cohort in COHORTS
                     for name in ("circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"))
-RELEASE_ROOT = Path("/opt/psy-core-prove-proxy/releases")
-CONFIG_ROOT = Path("/etc/psy-core-prove-proxy")
-STATE_ROOT = Path("/var/lib/psy-core-prove-proxy")
 UNITS = Path("/etc/systemd/system")
-OLD_UNITS = ("parth-prove-proxy@system.service", "parth-prove-proxy@user.service",
-             "parth-offsite-prove-proxy.service", "psy-core-prove-proxy-system.service",
-             "psy-core-prove-proxy-user.service")
+VAR_LIB = Path("/var/lib")
+STABLE_SECONDS = 20
+POLL_SECONDS = 2
 
 
 class ProxyError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ProxyRelease:
+    release_id: str
+    source_commit: str
+    magic: str
+    unit_prefix: str
+    release_path: Path
+    config_path: Path
+    state_path: Path
+    setup_manifest_sha256: str
+    lock_sha256: str
 
 
 def require(condition, message):
@@ -109,8 +115,8 @@ def validate_hash(value):
     return value
 
 
-def validate_source(value):
-    require(value == SOURCE, "source must match pinned r2 runtime")
+def validate_source(release, value):
+    require(value == release.source_commit, "source must match the release lock runtime")
     return value
 
 
@@ -202,9 +208,9 @@ def validate_public(value):
                     "credential/query-bearing URL rejected")
 
 
-def validate_build(build, network_raw, source_commit):
+def validate_build(release, build, network_raw, source_commit):
     validate_public(build)
-    require(build["source_commit"] == validate_source(source_commit) and build["network"] == "testnet",
+    require(build["source_commit"] == validate_source(release, source_commit) and build["network"] == "testnet",
             "binary source or network mismatch")
     require(validate_hash(build["config_sha256"]) == digest(network_raw),
             "compiled network config mismatch")
@@ -245,12 +251,12 @@ def validate_placement(endpoints):
     return placement
 
 
-def rpc_config(network_raw, endpoints):
+def rpc_config(release, network_raw, endpoints):
     config = decode(network_raw)
     validate_public(config)
     require(config["defaultNetwork"] == "testnet", "testnet selection required")
     network = config["networks"]["testnet"]
-    require(network["magic"] == MAGIC, "testnet magic mismatch")
+    require(network["magic"] == release.magic, "testnet magic mismatch")
     require([coordinator["id"] for coordinator in network["coordinator_configs"]] == [0],
             "fresh coordinator configuration required")
     require([realm["id"] for realm in network["realm_configs"]] == [0, 1],
@@ -271,12 +277,12 @@ def rpc_config(network_raw, endpoints):
     return encode(config)
 
 
-def validate_setup(setup, build):
+def validate_setup(release, setup, build):
     require(set(setup) == {"version", "network", "magic", "consumer", "generator", "verifier_solidity_sha256", "files"},
             "setup manifest schema mismatch")
     require(type(setup["version"]) is int and setup["version"] == 1
             and setup["network"] == "testnet"
-            and setup["magic"] == MAGIC, "setup provenance mismatch")
+            and setup["magic"] == release.magic, "setup provenance mismatch")
     provenance_fields = {"source_commit", "config_sha256", "local_circuits_sha256", "binary_sha256"}
     for role, binary in (("consumer", "psy_user_cli"), ("generator", "psy_relayer_cli")):
         provenance = setup[role]
@@ -297,12 +303,17 @@ def validate_setup(setup, build):
         validate_hash(record["sha256"])
 
 
-def paths(role):
-    name = RELEASE_ID + "-" + role
-    return RELEASE_ROOT / name, CONFIG_ROOT / name, STATE_ROOT / name
+def paths(release, role):
+    return tuple(Path(str(root) + "-" + role)
+                 for root in (release.release_path, release.config_path, release.state_path))
 
 
-def validate_retained_setup(setup, build, setup_build):
+def private_state(state):
+    require(VAR_LIB in state.parents, "state path must live under /var/lib")
+    return VAR_LIB / "private" / state.relative_to(VAR_LIB)
+
+
+def validate_retained_setup(release, setup, build, setup_build):
     validate_public(setup_build)
     require(setup_build["network"] == build["network"] == "testnet"
             and re.fullmatch(r"[0-9a-f]{40}", setup_build["source_commit"])
@@ -311,11 +322,11 @@ def validate_retained_setup(setup, build, setup_build):
                   "cached_common_data_sha256", "genesis_contracts_sha256"):
         require(validate_hash(setup_build[field]) == validate_hash(build[field]),
                 "retained setup circuit/config artifacts changed")
-    validate_setup(setup, setup_build)
+    validate_setup(release, setup, setup_build)
 
 
-def unit_name(role):
-    return "psy-core-prove-proxy-r2-" + role + ".service"
+def unit_name(release, role):
+    return release.unit_prefix + role + ".service"
 
 
 def memory_limits(role, high=None, maximum=None):
@@ -327,8 +338,8 @@ def memory_limits(role, high=None, maximum=None):
     return high, maximum
 
 
-def proxy_unit(role, endpoints, high=None, maximum=None):
-    release, config, state = paths(role)
+def proxy_unit(proxy_release, role, endpoints, high=None, maximum=None):
+    release, config, state = paths(proxy_release, role)
     target = validate_placement(endpoints)[role]
     host, listen = target["host"], target["listen_addr"]
     high, maximum = memory_limits(role, high, maximum)
@@ -337,7 +348,7 @@ def proxy_unit(role, endpoints, high=None, maximum=None):
         "ConditionHost=" + host, "Wants=network-online.target", "After=network-online.target",
         "StartLimitIntervalSec=600", "StartLimitBurst=3", "",
         "[Service]", "Type=simple", "DynamicUser=yes", "User=psy-core-proxy-" + role,
-        "UMask=0077", "StateDirectory=psy-core-prove-proxy/" + state.name,
+        "UMask=0077", "StateDirectory=" + str(state.relative_to(VAR_LIB)),
         "StateDirectoryMode=0700", "WorkingDirectory=" + str(state),
         "Environment=HOME=" + str(release / "home"), "Environment=PSY_NETWORK=testnet",
         "Environment=PSY_CONFIG_PATH=" + str(config / "network.json"),
@@ -403,7 +414,7 @@ def create_directory(path, mode=0o755, fresh=False):
         os.close(parent)
 
 
-def prepare_package(args):
+def prepare_package(release, args):
     require(args.role == "system" or not any((args.setup_dir, args.verifier_dir, args.setup_manifest,
                                              args.setup_manifest_sha256, args.setup_build_manifest,
                                              args.setup_build_manifest_sha256)), "user role forbids setup")
@@ -415,13 +426,13 @@ def prepare_package(args):
     require(digest(build_raw) == validate_hash(args.binary_manifest_sha256), "binary manifest pin mismatch")
     build = decode(build_raw)
     network_raw = read_json_bytes(args.network_config)
-    validate_build(build, network_raw, args.source_commit)
+    validate_build(release, build, network_raw, args.source_commit)
     endpoints_raw = read_json_bytes(args.rpc_endpoints)
     require(digest(endpoints_raw) == validate_hash(args.rpc_endpoints_sha256), "RPC endpoint approval pin mismatch")
     high, maximum = memory_limits(args.role, args.memory_high_gib, args.memory_max_gib)
     generated = {"build.json": build_raw, "network.json": network_raw, "rpc-endpoints.json": endpoints_raw,
-                 "rpc.json": rpc_config(network_raw, decode(endpoints_raw)),
-                 unit_name(args.role): proxy_unit(args.role, decode(endpoints_raw), high, maximum)}
+                 "rpc.json": rpc_config(release, network_raw, decode(endpoints_raw)),
+                 unit_name(release, args.role): proxy_unit(release, args.role, decode(endpoints_raw), high, maximum)}
     with open_file(Path(__file__).absolute()) as stream:
         generated["prepare_proxies.py"] = stream.read()
     sources = {"psy_user_cli": (args.binary, build["binaries"]["psy_user_cli"])}
@@ -433,16 +444,17 @@ def prepare_package(args):
     if args.role == "system":
         raw = read_json_bytes(args.setup_manifest)
         setup_hash = validate_hash(args.setup_manifest_sha256)
+        require(setup_hash == release.setup_manifest_sha256, "setup manifest differs from the release lock")
         require(digest(raw) == setup_hash, "setup manifest pin mismatch")
         setup = decode(raw)
         if args.setup_build_manifest:
             setup_build_raw = read_json_bytes(args.setup_build_manifest)
             setup_build_hash = validate_hash(args.setup_build_manifest_sha256)
             require(digest(setup_build_raw) == setup_build_hash, "original setup build pin mismatch")
-            validate_retained_setup(setup, build, decode(setup_build_raw))
+            validate_retained_setup(release, setup, build, decode(setup_build_raw))
             generated["setup-build.json"] = setup_build_raw
         else:
-            validate_setup(setup, build)
+            validate_setup(release, setup, build)
         generated["setup.json"] = raw
         for name in SETUP_NAMES:
             require(file_hash(args.setup_dir / name) == setup["files"][name], "setup artifact mismatch")
@@ -452,7 +464,8 @@ def prepare_package(args):
             require(file_hash(args.verifier_dir / name)["sha256"] == sha256, "exported verifier mismatch")
             sources["verifiers/" + name] = (args.verifier_dir / name, sha256)
     require(file_hash(args.binary)["sha256"] == sources["psy_user_cli"][1], "binary hash mismatch")
-    generated["package.json"] = encode({"version": 3, "role": args.role,
+    generated["package.json"] = encode({"version": 4, "role": args.role,
+        "release_lock_sha256": release.lock_sha256,
         "source_commit": args.source_commit,
         "rpc_endpoints_sha256": args.rpc_endpoints_sha256,
         "memory_high_gib": high, "memory_max_gib": maximum,
@@ -472,15 +485,16 @@ def prepare_package(args):
             "rpc_reachability_verified": False, "memory_fit_verified": False}
 
 
-def read_package(package, package_hash):
+def read_package(release, package, package_hash):
     raw = read_json_bytes(package / "package.json")
     require(digest(raw) == validate_hash(package_hash), "package approval pin mismatch")
     approval = decode(raw)
-    require(set(approval) == {"version", "role", "source_commit", "binary_manifest_sha256", "setup_manifest_sha256",
+    require(set(approval) == {"version", "role", "source_commit", "release_lock_sha256", "binary_manifest_sha256", "setup_manifest_sha256",
                               "setup_build_manifest_sha256",
                               "rpc_endpoints_sha256", "installer_sha256", "memory_high_gib", "memory_max_gib"}
             and type(approval["version"]) is int
-            and approval["version"] == 3 and approval["role"] in ROLES, "package schema mismatch")
+            and approval["version"] == 4 and approval["role"] in ROLES, "package schema mismatch")
+    require(approval["release_lock_sha256"] == release.lock_sha256, "package was approved for another release lock")
     role = approval["role"]
     require(file_hash(Path(__file__).absolute())["sha256"] == validate_hash(approval["installer_sha256"]),
             "running installer differs from approved package")
@@ -488,28 +502,29 @@ def read_package(package, package_hash):
     require(digest(build_raw) == approval["binary_manifest_sha256"], "binary manifest pin mismatch")
     build = decode(build_raw)
     network_raw = read_json_bytes(package / "network.json")
-    validate_build(build, network_raw, approval["source_commit"])
+    validate_build(release, build, network_raw, approval["source_commit"])
     endpoints_raw = read_json_bytes(package / "rpc-endpoints.json")
     require(digest(endpoints_raw) == validate_hash(approval["rpc_endpoints_sha256"]), "RPC endpoint approval pin mismatch")
     expected = {"package.json": digest(raw), "build.json": digest(build_raw),
                 "network.json": digest(network_raw), "rpc-endpoints.json": digest(endpoints_raw),
-                "rpc.json": digest(rpc_config(network_raw, decode(endpoints_raw))),
-                unit_name(role): digest(proxy_unit(role, decode(endpoints_raw),
+                "rpc.json": digest(rpc_config(release, network_raw, decode(endpoints_raw))),
+                unit_name(release, role): digest(proxy_unit(release, role, decode(endpoints_raw),
                                                    approval["memory_high_gib"], approval["memory_max_gib"])),
                 "psy_user_cli": build["binaries"]["psy_user_cli"],
                 "prepare_proxies.py": validate_hash(approval["installer_sha256"])}
     if role == "system":
         raw = read_json_bytes(package / "setup.json")
-        require(digest(raw) == validate_hash(approval["setup_manifest_sha256"]), "setup manifest pin mismatch")
+        require(digest(raw) == validate_hash(approval["setup_manifest_sha256"]) == release.setup_manifest_sha256,
+                "setup manifest pin mismatch")
         setup = decode(raw)
         if approval["setup_build_manifest_sha256"] is not None:
             setup_build_raw = read_json_bytes(package / "setup-build.json")
             require(digest(setup_build_raw) == validate_hash(approval["setup_build_manifest_sha256"]),
                     "original setup build pin mismatch")
-            validate_retained_setup(setup, build, decode(setup_build_raw))
+            validate_retained_setup(release, setup, build, decode(setup_build_raw))
             expected["setup-build.json"] = digest(setup_build_raw)
         else:
-            validate_setup(setup, build)
+            validate_setup(release, setup, build)
         expected["setup.json"] = digest(raw)
         for name in SETUP_NAMES:
             require(file_hash(package / "keystore" / name) == setup["files"][name], "setup artifact mismatch")
@@ -542,18 +557,14 @@ def command(argv):
         raise ProxyError("host command failed; no command output logged") from None
 
 
-def check_host(role, endpoints):
+def check_host(release, role, endpoints):
     placement = validate_placement(endpoints)
     require(socket.gethostname() == placement[role]["host"], "wrong proxy host")
     require(os.uname().machine == "x86_64", "wrong proxy architecture")
-    for unit in (*OLD_UNITS, *(unit_name(role) for role in ROLES)):
+    for unit in (unit_name(release, name) for name in ROLES):
         output = command(["systemctl", "show", unit,
                           "--property=LoadState,ActiveState,UnitFileState,MainPID,FragmentPath,DropInPaths"])
         properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-        if unit == "psy-core-prove-proxy-" + role + ".service":
-            require(properties.get("LoadState") == "loaded", "expected previous proxy unit missing")
-            require(properties.get("FragmentPath") == str(UNITS / unit)
-                    and properties.get("DropInPaths") == "", "previous proxy unit override rejected")
         if properties.get("LoadState") == "not-found":
             continue
         require(properties.get("ActiveState") == "inactive" and properties.get("MainPID") == "0"
@@ -565,45 +576,20 @@ def check_host(role, endpoints):
     ports = {str(urlsplit("//" + target["listen_addr"]).port) for target in placement.values()}
     require(not any(len(fields) > 3 and fields[3].rsplit(":", 1)[-1] in ports
                     for fields in map(str.split, sockets.splitlines())), "proxy port occupied")
-    verify_previous_installation(role)
 
 
-def verify_previous_installation(role):
-    name = PREVIOUS_RELEASE_ID + "-" + role
-    release, config = RELEASE_ROOT / name, CONFIG_ROOT / name
-    targets = {release / file: (PREVIOUS_HASHES[file], 0o755 if file == "psy_user_cli" else 0o644)
-               for file in ("psy_user_cli", "build.json")}
-    targets.update({config / file: (PREVIOUS_HASHES[file], 0o644) for file in ("network.json", "rpc.json")})
-    targets[UNITS / ("psy-core-prove-proxy-" + role + ".service")] = (PREVIOUS_HASHES[role], 0o644)
-    if role == "system":
-        targets[release / "setup.json"] = (PREVIOUS_HASHES["setup.json"], 0o644)
-    for path, (expected, mode) in targets.items():
-        with open_file(path) as stream:
-            info = os.fstat(stream.fileno())
-            require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == mode,
-                    "previous installation owner/mode mismatch")
-            require(hashlib.file_digest(stream, "sha256").hexdigest() == expected,
-                    "previous installation hash mismatch")
-    if role == "system":
-        setup = decode(read_json_bytes(release / "setup.json"))
-        validate_setup(setup, decode(read_json_bytes(release / "build.json")))
-        for file, record in setup["files"].items():
-            require(file_hash(release / "home/.psy/keystore" / file) == record,
-                    "previous setup artifact changed")
-        for cohort, file in VERIFIERS.items():
-            require(file_hash(release / "verifiers" / file)["sha256"] == setup["verifier_solidity_sha256"][cohort],
-                    "previous exported verifier changed")
-
-
-def check_destinations(role):
-    release, config, state = paths(role)
-    roots = (release, config, state, Path("/var/lib/private/psy-core-prove-proxy") / state.name)
+def check_destinations(proxy_release, role):
+    release, config, state = paths(proxy_release, role)
+    roots = (release, config, state, private_state(state))
     for path in roots:
         require(not os.path.lexists(path), "release/config/state already exists; inspect before retry")
     search = command(["systemd-analyze", "unit-paths"]).splitlines()
     require(str(UNITS) in search and all(path.startswith("/") for path in search), "invalid unit search paths")
-    names = (unit_name(role), "psy-core-prove-proxy-r2-.service", "psy-core-prove-proxy-.service", "psy-core-prove-.service",
-             "psy-core-.service", "psy-.service", "service")
+    unit = unit_name(proxy_release, role)
+    prefixes = [unit.rsplit("-", 1)[0] + "-.service"]
+    while prefixes[-1].count("-") > 1:
+        prefixes.append(prefixes[-1].rsplit("-", 2)[0] + "-.service")
+    names = (unit, *prefixes, "service")
     for root in map(Path, search):
         for name in names:
             require(not os.path.lexists(root / name) and not os.path.lexists(root / (name + ".d")),
@@ -629,22 +615,28 @@ def check_destinations(role):
             os.close(fd)
 
 
-def install_proxy(package, package_hash, check_only=True):
-    role, expected = read_package(package, package_hash)
+def install_targets(proxy_release, role, expected):
+    release, config, _ = paths(proxy_release, role)
+    targets = {name: release / name for name in expected}
+    for name in ("network.json", "rpc.json"):
+        targets[name] = config / name
+    targets[unit_name(proxy_release, role)] = UNITS / unit_name(proxy_release, role)
+    for name in expected:
+        if name.startswith("keystore/"):
+            targets[name] = release / "home" / ".psy" / name
+    return targets
+
+
+def install_proxy(proxy_release, package, package_hash, check_only=True):
+    role, expected = read_package(proxy_release, package, package_hash)
     require(os.geteuid() == 0, "host checks require root; install requires separate authorization")
     endpoints_raw = read_json_bytes(package / "rpc-endpoints.json")
     require(digest(endpoints_raw) == expected["rpc-endpoints.json"], "RPC endpoint approval pin mismatch")
-    check_host(role, decode(endpoints_raw))
-    check_destinations(role)
+    check_host(proxy_release, role, decode(endpoints_raw))
+    check_destinations(proxy_release, role)
     if not check_only:
-        release, config, state = paths(role)
-        targets = {name: release / name for name in expected}
-        for name in ("network.json", "rpc.json"):
-            targets[name] = config / name
-        targets[unit_name(role)] = UNITS / unit_name(role)
-        for name in expected:
-            if name.startswith("keystore/"):
-                targets[name] = release / "home" / ".psy" / name
+        release, config, state = paths(proxy_release, role)
+        targets = install_targets(proxy_release, role, expected)
         directories = {release, config, release / "home"}
         for path in tuple(directories):
             directories.update(path.parents)
@@ -655,7 +647,8 @@ def install_proxy(package, package_hash, check_only=True):
                 continue
             create_directory(path, fresh=path in (release, config, state))
         # Unit last: a failed copy never exposes an incomplete service definition.
-        for name in sorted(targets, key=lambda name: name == unit_name(role)):
+        unit = unit_name(proxy_release, role)
+        for name in sorted(targets, key=lambda name: name == unit):
             with open_file(package / name) as stream:
                 write_new(targets[name], stream, expected[name], 0o755 if name == "psy_user_cli" else 0o644)
         command(["systemctl", "daemon-reload"])
@@ -663,10 +656,90 @@ def install_proxy(package, package_hash, check_only=True):
             "enabled": False, "claim_ready": False, "rpc_reachability_verified": False, "memory_fit_verified": False}
 
 
+def unit_properties(unit):
+    output = command(["systemctl", "show", unit, "--property=ActiveState,MainPID,NRestarts"])
+    return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+
+def wait_stable(unit):
+    """Return the main PID once the unit has stayed active with one PID and no restart for STABLE_SECONDS."""
+    deadline = time.monotonic() + STABLE_SECONDS
+    first = None
+    while True:
+        properties = unit_properties(unit)
+        pid = int(properties.get("MainPID", "0"))
+        require(properties.get("ActiveState") == "active" and pid > 0 and properties.get("NRestarts") == "0",
+                "proxy unit did not stay active")
+        require(first in (None, pid), "proxy main process changed")
+        first = pid
+        if time.monotonic() >= deadline:
+            return pid
+        time.sleep(POLL_SECONDS)
+
+
+def running_binary_sha256(pid):
+    with open("/proc/%d/exe" % pid, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def write_report(path, document):
+    parent = path.parent
+    create_directory(parent)
+    temporary = parent / (".report-" + os.urandom(8).hex())
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o644)
+        stream.write(encode(document))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def activate_proxy(proxy_release, package, package_hash, request_sha256, report_path):
+    """Install when nothing is installed, enable and start the unit, then record unit, pid and binary hash."""
+    require(os.geteuid() == 0, "activation requires root")
+    validate_hash(request_sha256)
+    require(report_path.is_absolute(), "report path must be absolute")
+    role, expected = read_package(proxy_release, package, package_hash)
+    targets = install_targets(proxy_release, role, expected)
+    present = [os.path.lexists(path) for path in targets.values()]
+    if not any(present):
+        install_proxy(proxy_release, package, package_hash, check_only=False)
+    else:
+        require(all(present) and all(file_hash(path)["sha256"] == expected[name] for name, path in targets.items()),
+                "partial or changed installation; inspect before retry")
+    unit = unit_name(proxy_release, role)
+    try:
+        command(["systemctl", "enable", "--now", unit])
+        pid = wait_stable(unit)
+    except ProxyError:
+        print(f"proxy unit {unit} did not start or stay active; inspect: journalctl -u {unit} -n 100 --no-pager",
+              file=sys.stderr)
+        raise
+    running = running_binary_sha256(pid)
+    require(running == expected["psy_user_cli"], "running binary differs from the package")
+    write_report(report_path, {"lock_sha256": proxy_release.lock_sha256, "request_sha256": request_sha256,
+                               "role": role, "unit": unit, "pid": pid, "binary_sha256": running})
+    return {"role": role, "mode": "activated", "unit": unit, "pid": pid}
+
+
+def read_release_lock(path, expected_sha256):
+    with open_file(Path(path).absolute()) as stream:
+        raw = stream.read(8 * 1024 * 1024)
+    require(digest(raw) == validate_hash(expected_sha256), "release lock hash mismatch")
+    lock = decode(raw)
+    proxy = lock["paths"]["proxy"]
+    setup = lock["groth16"]["setup_manifest_sha256"]
+    return ProxyRelease(lock["release_id"], lock["sources"]["runtime"], lock["network_magic"],
+                        lock["units"]["proxy_prefix"], Path(proxy["release"]), Path(proxy["config"]),
+                        Path(proxy["state"]), setup, digest(raw))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="action", required=True)
     package = commands.add_parser("package")
+    lock_arguments = [package]
     package.add_argument("--role", choices=ROLES, required=True)
     package.add_argument("--source-commit", required=True)
     for name in ("binary", "binary-manifest", "network-config", "rpc-endpoints", "output"):
@@ -680,20 +753,30 @@ def main(argv=None):
     package.add_argument("--setup-manifest-sha256")
     package.add_argument("--setup-build-manifest", type=Path)
     package.add_argument("--setup-build-manifest-sha256")
-    for name in ("verify", "check-host", "install"):
+    for name in ("verify", "check-host", "install", "activate"):
         action = commands.add_parser(name)
         action.add_argument("--package", type=Path, required=True)
         action.add_argument("--package-sha256", required=True)
+        if name == "activate":
+            action.add_argument("--request-sha256", required=True)
+            action.add_argument("--report-path", type=Path, required=True)
+        lock_arguments.append(action)
+    for action in lock_arguments:
+        action.add_argument("--release-lock", type=Path, required=True)
+        action.add_argument("--release-lock-sha256", required=True)
     args = parser.parse_args(argv)
     try:
+        release = read_release_lock(args.release_lock, args.release_lock_sha256)
         if args.action == "package":
-            report = prepare_package(args)
+            report = prepare_package(release, args)
         elif args.action == "verify":
-            role, _ = read_package(args.package, args.package_sha256)
+            role, _ = read_package(release, args.package, args.package_sha256)
             report = {"role": role, "verified": True, "claim_ready": False,
                       "rpc_reachability_verified": False, "memory_fit_verified": False}
+        elif args.action == "activate":
+            report = activate_proxy(release, args.package, args.package_sha256, args.request_sha256, args.report_path)
         else:
-            report = install_proxy(args.package, args.package_sha256, args.action == "check-host")
+            report = install_proxy(release, args.package, args.package_sha256, args.action == "check-host")
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
         print('{"error":"proxy preparation failed; input or host safety gate rejected; no input values logged"}',
               file=sys.stderr)

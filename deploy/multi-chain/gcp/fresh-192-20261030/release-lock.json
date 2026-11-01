@@ -204,7 +204,7 @@
     "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
     "prepare_bridge_forwarders.py": "8ea58b8e6f8e178a0fff1574948e5a784e95d5e60d1236456d75942a6c83b833",
     "prepare_faucet.py": "1ce5b823ba27389d2210468fbe41ea8b18dc6d1336f0fa52739af08052e6ed2f",
-    "prepare_proxies.py": "0d91693df906575f55c6031f711f9172023bc7adecf32eedde8aacaa97d0743c",
+    "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
     "prepare_workers.py": "4592a624249e798d61ef9c786774a4c60ad12f3d1e253733ccd343d708f8d4c4",
     "probe_databases.py": "74efabf7874d7a2e156e496cd0d6aa0e70c7b08dba5b1d996ca8cb0c18198c68",

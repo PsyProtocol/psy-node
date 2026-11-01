@@ -235,6 +235,23 @@ never committed). Every file named there is hash-checked against the lock or
 | `files` | `config`, `canonical_config`, `genesis`, `genesis_contracts`, `compiler_stamp`, `groth16_setup_manifest`, `gnark_groth16_verifier`, `deposit_batch_verifier`, `withdrawal_claim_verifier`, `psy_services`, `psy_indexer`, `l1_bundle_manifest`, `l1_policy` | Frozen release inputs. `l1_bundle_manifest` is the `manifest.json` at the root of the L1 bundle directory. |
 | `databases` | `postgres_password_file` | Absolute path of a file whose single line is the PostgreSQL superuser password for the rebuilt database host (step `rebuild_databases`). The controller sends it on stdin; the installer exports it and `docker` takes it from the environment, so it is in no command line. |
 | `packages.core` | `registration_keys`, `faucet_operators`, `p2p_keys`, `output` | Inputs of the core host packages; `output` must not exist before the first run. All absolute. |
+| `packages.proxy` | `rpc_endpoints`, `setup_dir`, `verifier_dir`, `output` | Inputs of the SYSTEM and USER Proxy packages; `output` must not exist before the first run and receives `system/` and `user/`. `setup_dir` is the `keystore` directory of the Groth16 setup and `verifier_dir` holds the four exported verifiers (system role only). All absolute. |
+
+`packages.proxy.rpc_endpoints` is a JSON file the operator writes and approves; it is not generated. It holds
+`coordinator` (id `"0"`) and `realms` (ids `"0"`, `"1"`) with three RPC URLs each, taken from the Edge and
+Realm endpoints of `topology.json`; `prove_proxy_url` and `system_prove_proxy_url` as URL arrays; and
+`placement` with, for `system` and `user`, the `host` (the machine's own hostname, used as a unit
+`ConditionHost`) and `listen_addr` (IP:port). The listen IP of each role must equal the lock address of its
+host, `arc99x1` for system and `arc99x3` for user; step 68 checks that. The hosts are operator hosts without
+passwordless sudo, so step 68 stages the package and prints a command for the operator.
+
+`artifacts.json` needs one more pin before step 53 can run, filled at B14 with the runtime values:
+`proxy_packages.rpc_endpoints_sha256`, the sha256 of the approved `rpc_endpoints` file. The lock also
+needs `groth16.setup_manifest_sha256` (the hash of the setup manifest) and `binaries.psy_user_cli` of the
+final runtime build, because the package binary is checked against both. The setup manifest must name
+`psy_user_cli` as consumer and `psy_relayer_cli` as generator. The proxy tool is given a narrow build
+document (five fields) written to `<private>/state/proxy-build-input.json`, not the full build record.
+Default memory caps are 56/60 GiB for system and 40/48 GiB for user, the live effective limits.
 
 Steps 61-64 read the private `retired-state.json` (`stop`, `containers`, `retain`, `clear`, and the optional `clear_allow`).
 `stop` may name services, timers and sockets (timers and sockets are stopped first, and every listed unit is disabled and

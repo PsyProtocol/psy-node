@@ -1,4 +1,5 @@
 """Historical per-component release isolation; not fresh-release acceptance."""
+from pathlib import Path
 import unittest
 
 import install_host as install
@@ -10,10 +11,15 @@ from test_release_lock import build_test_lock
 
 LOCK = build_test_lock()
 RELEASE = install.load_core_release(LOCK)
+PROXY_PATHS = LOCK["paths"]["proxy"]
+PROXY_RELEASE = proxies.ProxyRelease(LOCK["release_id"], LOCK["sources"]["runtime"], LOCK["network_magic"],
+                                     LOCK["units"]["proxy_prefix"], Path(PROXY_PATHS["release"]),
+                                     Path(PROXY_PATHS["config"]), Path(PROXY_PATHS["state"]),
+                                     LOCK["groth16"]["setup_manifest_sha256"], "8" * 64)
 
 
 class RestartReleaseTests(unittest.TestCase):
-    def test_core_runtime_comes_from_the_lock_and_workers_stay_r3_but_proxy_remains_r2(self):
+    def test_core_runtime_comes_from_the_lock_and_workers_stay_r3_but_proxy_follows_the_lock(self):
         source = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
         topology = fixture(LOCK)[0]
         for value in (RELEASE.source_commit, topology["runtime_commit"], LOCK["sources"]["runtime"]):
@@ -22,12 +28,12 @@ class RestartReleaseTests(unittest.TestCase):
         self.assertEqual(RELEASE.release_id, LOCK["release_id"])
         self.assertNotEqual(RELEASE.release_id, workers.RELEASE_ID)
         self.assertEqual(workers.RELEASE_ID, "core-testnet-20261027-r3")
-        self.assertEqual(proxies.SOURCE, "5d38eefc07b0925ed9875b74805d9c3fea73d998")
-        self.assertEqual(proxies.RELEASE_ID, "core-testnet-20261026-r2")
+        self.assertEqual(PROXY_RELEASE.source_commit, LOCK["sources"]["runtime"])
+        self.assertEqual(PROXY_RELEASE.release_id, LOCK["release_id"])
         with self.assertRaises(proxies.ProxyError):
-            proxies.validate_source("d" * 40)
+            proxies.validate_source(PROXY_RELEASE, "d" * 40)
         with self.assertRaises(proxies.ProxyError):
-            proxies.validate_source(source)
+            proxies.validate_source(PROXY_RELEASE, source)
 
     def test_core_units_paths_and_namespaces_are_isolated(self):
         topology, config, genesis, whitelist = fixture(LOCK)
@@ -47,8 +53,8 @@ class RestartReleaseTests(unittest.TestCase):
     def test_core_and_consumers_have_separate_unit_names(self):
         self.assertTrue(RELEASE.unit_prefix.startswith("psy-core-" + RELEASE.namespace_prefix))
         self.assertEqual(workers.unit_name("realm-1"), "psy-core-worker-r3-realm-1.service")
-        self.assertEqual(proxies.unit_name("user"), "psy-core-prove-proxy-r2-user.service")
-        self.assertIn("psy-core-prove-proxy-user.service", proxies.OLD_UNITS)
+        self.assertEqual(proxies.unit_name(PROXY_RELEASE, "user"), LOCK["units"]["proxy_prefix"] + "user.service")
+        self.assertFalse(hasattr(proxies, "OLD_UNITS"))
         self.assertNotEqual(RELEASE.unit_prefix, LOCK["units"]["worker_prefix"])
         self.assertNotEqual(RELEASE.unit_prefix, LOCK["units"]["proxy_prefix"])
 

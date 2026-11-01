@@ -307,6 +307,7 @@ class PackageBuilder:
     inputs: tuple
     build: Callable[[DeployContext, dict], Path]
     verify: Callable[[DeployContext, dict, Path], dict]
+    check: Callable[[DeployContext, dict], None] = None
 
 
 def core_build(ctx, inputs):
@@ -354,9 +355,101 @@ def core_verify(ctx, inputs, output):
     return {"hosts": len(hosts), "manifest_sha256": dict(expected)}
 
 
-# Adding a package family (Worker, Proxy, Faucet) is one line here plus its packages.<name> input.
+PROXY_ROLES = ("system", "user")
+
+
+def proxy_pin(ctx, name):
+    pinned = read_artifacts(ctx).get("proxy_packages", {}).get(name)
+    require(pinned, f"artifacts proxy_packages.{name} is not pinned")
+    return pinned
+
+
+def proxy_tool_argv(ctx, action, *arguments):
+    check_tool_hash(ctx, "prepare_proxies.py")
+    return [sys.executable, "-B", str(HERE / "prepare_proxies.py"), action,
+            "--release-lock", str(ctx.release_dir / "release-lock.json"), "--release-lock-sha256", ctx.lock_sha256,
+            *arguments]
+
+
+BUILD_FIELDS = ("source_commit", "network", "config_sha256", "local_circuits_sha256")
+BUILD_BINARIES = ("psy_user_cli", "psy_relayer_cli")
+
+
+def narrow_build_document(build):
+    """The fields the proxy tool reads; the full build record holds hundreds of local library paths."""
+    for name in BUILD_FIELDS:
+        require(isinstance(build.get(name), str) and build[name], f"build record lacks {name}")
+    binaries = build.get("binaries")
+    require(isinstance(binaries, dict) and all(isinstance(binaries.get(name), str) for name in BUILD_BINARIES),
+            "build record lacks the user and relayer binary hashes")
+    return {**{name: build[name] for name in BUILD_FIELDS}, "binaries": {name: binaries[name] for name in BUILD_BINARIES}}
+
+
+def proxy_check(ctx, inputs):
+    check_tool_hash(ctx, "prepare_proxies.py")
+    proxy_pin(ctx, "rpc_endpoints_sha256")
+
+
+def proxy_role_arguments(ctx, inputs, role, binary, build_file, output):
+    arguments = ["--role", role, "--source-commit", ctx.lock["sources"]["runtime"], "--binary", str(binary),
+                 "--binary-manifest", str(build_file), "--binary-manifest-sha256", file_sha256(build_file),
+                 "--network-config", str(local_path(ctx, "files", "config")),
+                 "--rpc-endpoints", inputs["rpc_endpoints"], "--rpc-endpoints-sha256", proxy_pin(ctx, "rpc_endpoints_sha256"),
+                 "--output", str(output / role)]
+    if role == "system":
+        setup_hash = ctx.lock["groth16"]["setup_manifest_sha256"]
+        require(setup_hash, "groth16.setup_manifest_sha256 is not pinned in the lock")
+        arguments += ["--setup-dir", inputs["setup_dir"], "--verifier-dir", inputs["verifier_dir"],
+                      "--setup-manifest", str(local_path(ctx, "files", "groth16_setup_manifest")),
+                      "--setup-manifest-sha256", setup_hash]
+    return arguments
+
+
+def proxy_build(ctx, inputs):
+    output = Path(inputs["output"])
+    if output.exists():
+        return output  # verification judges what is there
+    binary = rebuilt_binary(ctx, "psy_user_cli")
+    require(file_sha256(binary) == ctx.lock["binaries"]["psy_user_cli"], "user binary differs from the lock")
+    narrow = narrow_build_document(release_lock.read_document(binary.parent / "manifest.json"))
+    build_file = ctx.state_dir / "proxy-build-input.json"
+    write_private_json(build_file, narrow)
+    partial = output.with_name(output.name + ".partial")
+    require(not partial.exists(), "a partial proxy package output exists; inspect it first")
+    argvs = [proxy_tool_argv(ctx, "package", *proxy_role_arguments(ctx, inputs, role, binary, build_file, partial))
+             for role in PROXY_ROLES]
+    partial.mkdir(mode=0o700)
+    for role, argv in zip(PROXY_ROLES, argvs):
+        outcome = run_local(argv, PACKAGE_TIMEOUT_SECONDS)
+        if outcome.returncode != 0:
+            raise RuntimeError(command_failure(f"prepare_proxies package {role}", outcome))
+    partial.rename(output)
+    return output
+
+
+def proxy_verify(ctx, inputs, output):
+    require(output.is_dir() and sorted(path.name for path in output.iterdir()) == sorted(PROXY_ROLES),
+            "proxy package roles differ from system and user")
+    reports = {}
+    for role in PROXY_ROLES:
+        package = output / role
+        package_sha256 = file_sha256(package / "package.json")
+        argv = proxy_tool_argv(ctx, "verify", "--package", str(package), "--package-sha256", package_sha256)
+        outcome = run_local(argv, PACKAGE_TIMEOUT_SECONDS)
+        if outcome.returncode != 0:
+            raise RuntimeError(command_failure(f"prepare_proxies verify {role}", outcome))
+        approval = release_lock.read_document(package / "package.json")
+        require(approval["installer_sha256"] == ctx.lock["tool_sha256"]["prepare_proxies.py"],
+                f"{role} package installer differs from the reviewed tool")
+        reports[role] = {"package_sha256": package_sha256}
+    return reports
+
+
+# Adding a package family (Worker, Faucet) is one line here plus its packages.<name> input.
 PACKAGE_BUILDERS = [PackageBuilder("core", ("registration_keys", "faucet_operators", "p2p_keys", "output"), core_build,
-                                  core_verify)]
+                                  core_verify),
+                    PackageBuilder("proxy", ("rpc_endpoints", "setup_dir", "verifier_dir", "output"), proxy_build,
+                                  proxy_verify, proxy_check)]
 
 
 def packages_check(ctx):
@@ -370,6 +463,8 @@ def packages_check(ctx):
             require(name in values, f"local-inputs.json lacks packages.{builder.name}.{name}")
             require(isinstance(values[name], str) and values[name].startswith("/") and ".." not in values[name].split("/"),
                     f"local-inputs.json packages.{builder.name}.{name} must be an absolute path")
+        if builder.check is not None:
+            builder.check(ctx, values)
 
 
 def packages_apply(ctx):
