@@ -269,8 +269,11 @@ class Remote:
             raise RemoteError(f"{host}: timed out on the remote (exit {done.returncode})", host=host,
                               exit_code=done.returncode)
         if done.returncode != 0:
-            tail = (redact_tail(done.stderr.decode("utf-8", errors="replace")) if should_show_stderr
-                    else "details withheld")
+            tail = "details withheld"
+            if should_show_stderr:
+                # A tool that fails after printing its own JSON reason on stdout leaves stderr empty.
+                shown = done.stderr or done.stdout
+                tail = redact_tail(shown.decode("utf-8", errors="replace"))
             kind = RemoteConnectionError if done.returncode == CONNECTION_EXIT_CODE else RemoteError
             raise kind(f"{host}: exit {done.returncode}: {tail}", host=host, exit_code=done.returncode)
         return done.stdout
@@ -283,7 +286,7 @@ class Remote:
     def run_script(self, host, script, timeout_seconds):
         return self._run_script_bytes(host, script, timeout_seconds).decode("utf-8", errors="replace")
 
-    def run_root_text(self, host, argv, timeout_seconds, *, stdin_text=None, show_stderr=False):
+    def run_root_text(self, host, argv, timeout_seconds, *, stdin_text=None, show_stderr=True):
         host_access = self._access_of(host)
         if type(timeout_seconds) is not int or timeout_seconds <= 0:
             raise ValueError("timeout must be a positive number of seconds")
@@ -302,7 +305,7 @@ class Remote:
                                         should_show_stderr=show_stderr, remote_limit_codes=ROOT_LIMIT_EXIT_CODES)
         return output.decode("utf-8", errors="replace")
 
-    def run_root_json(self, host, argv, timeout_seconds, *, show_stderr=False):
+    def run_root_json(self, host, argv, timeout_seconds, *, show_stderr=True):
         output = self.run_root_text(host, argv, timeout_seconds, show_stderr=show_stderr)
         try:
             root_report = json.loads(output, object_pairs_hook=release_lock.unique_object)

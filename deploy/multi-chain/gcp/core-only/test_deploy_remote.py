@@ -187,6 +187,19 @@ class RemoteTests(unittest.TestCase):
             self.assertIn(expected, str(caught.exception))
         self.assertNotIn("visible diagnostic", str(RemoteError("h: exit 2: details withheld")))
 
+    def test_failure_reason_is_shown_by_default_and_falls_back_to_stdout(self):
+        runner = FakeRunner(returncode=1, stdout='{"component": "valkey", "error": "write refused", "ok": false}\n')
+        with self.assertRaisesRegex(RemoteError, "write refused"):
+            remote_with(runner).run_root_text("inner", ["x"], 30)
+        runner = FakeRunner(returncode=1, stdout="from stdout", stderr="from stderr")
+        with self.assertRaisesRegex(RemoteError, "from stderr") as caught:
+            remote_with(runner).run_root_json("inner", ["x"], 30)
+        self.assertNotIn("from stdout", str(caught.exception))
+        leaky = FakeRunner(returncode=1, stdout='{"error": "bad", "password": "hunter2"}\n')
+        with self.assertRaises(RemoteError) as caught:
+            remote_with(leaky).run_root_text("inner", ["x"], 30)
+        self.assertNotIn("hunter2", str(caught.exception))
+
     def test_run_root_text_sends_stdin_as_a_here_document_under_the_remote_timeout(self):
         runner = FakeRunner(stdout="[]")
         text = remote_with(runner).run_root_text("inner", ["/usr/bin/python3", "-I", "/dev/stdin"], 60,
