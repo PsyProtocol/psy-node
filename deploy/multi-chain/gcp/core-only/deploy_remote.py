@@ -52,11 +52,6 @@ class ResultRefused(ValueError):
     """A step result was refused; the message names a location, never a value."""
 
 
-def require_text(condition, message):
-    if not condition:
-        raise ValueError(message)
-
-
 def looks_secret(text):
     return bool(SECRET_TEXT.search(text) or USERINFO_URL.search(text))
 
@@ -281,7 +276,7 @@ class Remote:
         limit = f"/usr/bin/timeout --signal=TERM --kill-after={ROOT_KILL_AFTER_SECONDS} {timeout_seconds} "
         command = "sudo -n -- " + limit + shlex.join(argv)
         if stdin_text is not None:
-            require_text(HERE_DOCUMENT_MARKER not in stdin_text, "stdin text collides with the here-document marker")
+            release_lock.require(HERE_DOCUMENT_MARKER not in stdin_text, "stdin text collides with the here-document marker")
             command += f" <<'{HERE_DOCUMENT_MARKER}'\n{stdin_text}{'' if stdin_text.endswith(chr(10)) else chr(10)}"
             command += HERE_DOCUMENT_MARKER
         output = self._run_script_bytes(host, "set -euo pipefail\n" + command + "\n",

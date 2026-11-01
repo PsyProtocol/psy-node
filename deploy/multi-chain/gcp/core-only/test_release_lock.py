@@ -251,7 +251,7 @@ class ReleaseLockTests(unittest.TestCase):
             self.validate(lock, complete=True)
 
     def test_complete_check_requires_the_private_directory(self):
-        with self.assertRaisesRegex(ValueError, "complete check requires the private directory"):
+        with self.assertRaisesRegex(ValueError, "complete check requires the operator-only directory"):
             self.validate(complete=True, private=False)
         self.validate(complete=False, private=False)
 
@@ -397,7 +397,7 @@ class RetirementListTests(unittest.TestCase):
 
     def test_infrastructure_kind_on_a_secret_path_is_rejected(self):
         self.retained["paths"][0]["kind"] = "infrastructure"
-        with self.assertRaisesRegex(ValueError, "infrastructure kind on secret path"):
+        with self.assertRaisesRegex(ValueError, "infrastructure kind on a sensitive path"):
             self.check()
 
     def test_host_entry_has_exactly_stop_containers_retain_clear(self):
@@ -446,7 +446,7 @@ class RetirementListTests(unittest.TestCase):
 
     def test_local_private_material_must_be_retained(self):
         self.retained["paths"] = [i for i in self.retained["paths"] if i["host"] != "local"]
-        with self.assertRaisesRegex(ValueError, "local .private material"):
+        with self.assertRaisesRegex(ValueError, "local operator-only material"):
             self.check()
 
     def test_host_set_is_closed(self):

@@ -205,7 +205,7 @@ def check_names(lock, release, topology):
                     f"path must carry the release id or namespace: {role}.{name}")
     for alias, address in lock["hosts"].items():
         require(alias not in topology["hosts"], f"host duplicates the topology: {alias}")
-        require(ipaddress.ip_address(address).is_private, f"host address must be private: {alias}")
+        require(ipaddress.ip_address(address).is_private, f"host address must be internal: {alias}")
 
 
 def check_shape(lock, walk):
@@ -287,7 +287,7 @@ def check_chain_values(lock, walk):
 
 def validate_release_lock(lock, release_dir, is_complete, private_dir=None):
     release_dir = Path(release_dir)
-    require(private_dir is not None or not is_complete, "complete check requires the private directory")
+    require(private_dir is not None or not is_complete, "complete check requires the operator-only directory")
     walk = Walk()
     check_shape(lock, walk)
     check_services(lock, walk)
@@ -341,9 +341,9 @@ def validate_retirement(retired, retained):
         require(item["kind"] in ("secret", "infrastructure"), "retained path kind")
         require(item["host"] == "local" or item["host"] in hosts, f"retained path for unknown host: {item['host']}")
         require(item["kind"] == "secret" or not any(m in item["path"] for m in SECRET_MARKERS),
-                f"infrastructure kind on secret path: {item['path']}")
+                f"infrastructure kind on a sensitive path of {item['host']}")
         listed.setdefault(item["host"], set()).add(item["path"])
-    require(".private" in " ".join(listed.get("local", ())), "local .private material must be retained")
+    require(".private" in " ".join(listed.get("local", ())), "local operator-only material must be retained")
     for alias, entry in hosts.items():
         require(listed.get(alias, set()) == set(entry["retain"]), f"retained paths differ from retain list: {alias}")
 

@@ -29,6 +29,7 @@ class FakeRemote:
 
     def run_root_text(self, host, argv, timeout_seconds, *, stdin_text=None, show_stderr=False):
         self.root_calls.append((host, argv, stdin_text))
+        self.show_stderr = show_stderr
         return json.dumps(self.l1)
 
     def run_script(self, host, script, timeout_seconds):
@@ -165,6 +166,7 @@ class CheckHostsTests(PrepareTestCase):
         self.assertEqual(stdin_text, "# fixture fresh_l1.py\n")
         self.assertEqual(argv, steps.STATUS_ARGV)
         self.assertEqual(argv[-2:], ["--rpc-preference", "protected-env-backup"])
+        self.assertTrue(remote.show_stderr)
 
     def test_tool_changed_between_check_and_send_is_refused_by_hashing_the_sent_bytes(self):
         step = steps.PREPARE_STEPS["check_hosts"]
@@ -220,7 +222,7 @@ class CheckHostsTests(PrepareTestCase):
     def test_only_secret_kind_paths_are_statted_and_stat_is_used_never_a_read(self):
         remote = self.remote()
         self.run_step(remote)
-        scripts = "\n".join(script for host, script in remote.scripts )
+        scripts = "\n".join(script for host, script in remote.scripts)
         self.assertIn("/var/lib/test/sealed", scripts)
         self.assertNotIn("/etc/test-infra", scripts)
         self.assertRegex(scripts, r"stat -c %F --")
@@ -258,7 +260,7 @@ class CheckHostsTests(PrepareTestCase):
     def test_every_host_of_the_release_is_probed_once(self):
         remote = self.remote()
         self.run_step(remote)
-        probed = sorted(host for host, script in remote.scripts )
+        probed = sorted(host for host, script in remote.scripts)
         self.assertEqual(probed, sorted([self.CP, self.SERVICES, self.OPERATOR]))
 
     def test_pending_nonce_failure_names_the_likely_cause(self):
@@ -292,8 +294,9 @@ class CheckHostsTests(PrepareTestCase):
             steps.PREPARE_STEPS["check_hosts"].check(self.ws.context(self.remote()))
 
     def test_every_failure_is_collected_before_the_step_fails(self):
-        remote = self.remote(avail={self.CP: 1}, denied=[self.SERVICES], states={(self.OPERATOR, "/var/lib/parth/.psy"): "missing"},
-                             l1=self.reports(sepolia={"balance_wei": "1"}, bscTestnet={"nonce_pending": 9}))
+        remote = self.remote(
+            avail={self.CP: 1}, denied=[self.SERVICES], states={(self.OPERATOR, "/var/lib/parth/.psy"): "missing"},
+            l1=self.reports(sepolia={"balance_wei": "1"}, bscTestnet={"nonce_pending": 9}))
         with self.assertRaises(ValueError) as caught:
             self.run_step(remote)
         lines = str(caught.exception).splitlines()
@@ -316,8 +319,8 @@ class CheckHostsTests(PrepareTestCase):
 
     def test_every_failure_message_survives_the_operator_output_filter(self):
         from deploy_remote import redact_tail
-        remote = self.remote(avail={self.CP: 1}, denied=[self.SERVICES], states={(self.OPERATOR, "/var/lib/parth/.psy"): "missing",
-                                                                                  (self.CP, "/var/lib/test/sealed"): "denied"},
+        states = {(self.OPERATOR, "/var/lib/parth/.psy"): "missing", (self.CP, "/var/lib/test/sealed"): "denied"}
+        remote = self.remote(avail={self.CP: 1}, denied=[self.SERVICES], states=states,
                              l1=self.reports(sepolia={"nonce_pending": 9}))
         with self.assertRaises(ValueError) as caught:
             self.run_step(remote)

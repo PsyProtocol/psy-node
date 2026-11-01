@@ -399,13 +399,13 @@ def retained_secret_paths(ctx):
     require(path.is_file() and file_sha256(path) == ctx.lock["inputs"]["retained_paths"],
             "retained-paths.json differs from the lock")
     remote, local = {}, []
-    for item in release_lock.read_document(path)["paths"]:
-        if item["kind"] != "secret":
+    for retained_path in release_lock.read_document(path)["paths"]:
+        if retained_path["kind"] != "secret":
             continue
-        if item["host"] == "local":
-            local.append(item["path"])
+        if retained_path["host"] == "local":
+            local.append(retained_path["path"])
         else:
-            remote.setdefault(item["host"], []).append(item["path"])
+            remote.setdefault(retained_path["host"], []).append(retained_path["path"])
     outside = sorted(set(remote) - set(release_hosts(ctx)))
     require(not outside, f"retained path for a host outside the release: {outside[0] if outside else ''}")
     return remote, local
@@ -470,14 +470,15 @@ def read_status_source(ctx):
 
 def read_l1_reports(ctx, host):
     require(ctx.remote.sudo_mode(host) == "passwordless", "signer host needs no-prompt sudo for the L1 status read")
-    output = ctx.remote.run_root_text(host, STATUS_ARGV, L1_LIMIT_SECONDS, stdin_text=read_status_source(ctx))
+    output = ctx.remote.run_root_text(host, STATUS_ARGV, L1_LIMIT_SECONDS, stdin_text=read_status_source(ctx),
+                                       show_stderr=True)
     try:
         reports = json.loads(output)
     except ValueError:
         reports = None
-    require(isinstance(reports, list) and all(isinstance(item, dict) for item in reports),
+    require(isinstance(reports, list) and all(isinstance(report, dict) for report in reports),
             "L1 status output is not a JSON list of reports")
-    by_chain = {item.get("network"): item for item in reports}
+    by_chain = {report.get("network"): report for report in reports}
     require(len(reports) == len(by_chain) and set(by_chain) == set(release_lock.CHAINS),
             "L1 status chains differ from the release chains")
     return by_chain
