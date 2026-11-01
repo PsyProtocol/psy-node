@@ -29,8 +29,8 @@ IMAGES = ("scylla", "valkey", "nats", "postgres", "nostr")
 CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
 GROTH16_VERIFIERS = ("gnark_groth16_verifier", "deposit_batch_verifier", "withdrawal_claim_verifier")
 # Every file that is loaded or executed on a remote host, keyed by file name in this directory.
-TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "clear_host_state.py",
-              "enable_services_nostr.py",
+TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "caddy_ingress.py",
+              "clear_host_state.py", "enable_services_nostr.py",
               "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_envio.py",
               "install_guardian.py", "install_host.py", "install_relayer.py", "install_services.py",
               "prepare_bridge_forwarders.py", "prepare_faucet.py", "prepare_proxies.py",
@@ -277,11 +277,12 @@ def check_chain_values(lock, walk):
     for chain in CHAINS:
         walk.digest(fields(l1["gas_budget_sha256"], CHAINS, "l1.gas_budget_sha256")[chain],
                     "l1.gas_budget_sha256." + chain)
-    ingress = fields(lock["ingress"], ("fenced_hosts", "faucet_hosts", "maintenance_tag"), "ingress")
+    ingress = fields(lock["ingress"], ("fenced_hosts", "faucet_hosts", "maintenance_tag", "forwarder_topology_sha256"), "ingress")
     for name in ("fenced_hosts", "faucet_hosts"):
         require(isinstance(ingress[name], list) and ingress[name] and all(
             isinstance(host, str) and host for host in ingress[name]), f"ingress.{name} must list hosts")
     walk.text(ingress["maintenance_tag"], "ingress.maintenance_tag")
+    walk.digest(ingress["forwarder_topology_sha256"], "ingress.forwarder_topology_sha256")
     gates = fields(lock["gates"], ("l2_stability_checkpoint_count", "worker_queue_ack_wait_ms"), "gates")
     walk.number(gates["worker_queue_ack_wait_ms"], "gates.worker_queue_ack_wait_ms", 1, 2**63 - 1)
     require(type(gates["l2_stability_checkpoint_count"]) is int and gates["l2_stability_checkpoint_count"] == 100,

@@ -18,6 +18,7 @@ STEP_MODULES = (
     "deploy_clear_steps",
     "deploy_proxy_steps",
     "deploy_monitoring_steps",
+    "deploy_ingress_steps",
 )
 EXIT_FAILURE = 1
 EXIT_UNKNOWN_STEP = 2

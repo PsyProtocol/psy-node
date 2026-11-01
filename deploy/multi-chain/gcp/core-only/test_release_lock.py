@@ -104,7 +104,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
                "bundle_sha256": digest("bundle"), "policy_sha256": digest("policy"),
                "gas_budget_sha256": {chain: digest("gas" + chain) for chain in CHAINS}},
         "ingress": {"fenced_hosts": ["fenced.example.test"], "faucet_hosts": ["faucet.example.test"],
-                    "maintenance_tag": "maintenance-test"},
+                    "maintenance_tag": "maintenance-test", "forwarder_topology_sha256": digest("forwarders")},
         "gates": {"l2_stability_checkpoint_count": 100, "worker_queue_ack_wait_ms": 30000},
         "tool_sha256": {name: digest(name) for name in lock_module.TOOL_NAMES},
     }
@@ -126,6 +126,17 @@ class ReleaseLockTests(unittest.TestCase):
 
     def test_fixture_is_valid_and_complete(self):
         self.validate()
+
+    def test_forwarder_topology_pin_is_required_and_must_be_a_digest(self):
+        for value in ("", "abc", "G" * 64, 5):
+            lock = copy.deepcopy(self.lock)
+            lock["ingress"]["forwarder_topology_sha256"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        del lock["ingress"]["forwarder_topology_sha256"]
+        with self.assertRaisesRegex(ValueError, "ingress fields"):
+            self.validate(lock)
 
     def test_signer_host_must_be_a_known_alias(self):
         for value in ("not-a-host", "", 5):

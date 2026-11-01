@@ -182,7 +182,8 @@
       "faucet.psy-protocol.xyz",
       "faucet-stg.psy-protocol.xyz"
     ],
-    "maintenance_tag": "psy-sd192-maintenance"
+    "maintenance_tag": "psy-sd192-maintenance",
+    "forwarder_topology_sha256": "acfef0dfc3ac9eeb0b7752cc84c8081496545a203f2eff1a6ccbb38b0de4b04d"
   },
   "gates": {
     "l2_stability_checkpoint_count": 100,
@@ -203,7 +204,7 @@
     "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
     "install_relayer.py": "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9",
     "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
-    "prepare_bridge_forwarders.py": "8ea58b8e6f8e178a0fff1574948e5a784e95d5e60d1236456d75942a6c83b833",
+    "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
     "prepare_faucet.py": "1ce5b823ba27389d2210468fbe41ea8b18dc6d1336f0fa52739af08052e6ed2f",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",

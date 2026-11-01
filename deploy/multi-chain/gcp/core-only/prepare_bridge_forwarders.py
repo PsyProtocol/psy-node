@@ -3,6 +3,7 @@
 
 preview prints the exact units. check-host (default) is read-only, requires root,
 and checks host identity, listener conflicts, BPF attachment and backend RPC/TCP.
+check-backends is read-only for installed forwarders: sockets active, services not failed, backends answer.
 install requires --apply, creates only absent files, reloads systemd, and never
 enables/starts anything. Repeat install accepts only byte-identical owned files.
 --scope edges checks/installs only the nine Edge routes; --scope proxies selects
@@ -393,6 +394,24 @@ def check_host(files, topology, scope="all"):
     require(all(check["ready"] for check in checks), "backend readiness failed; nothing changed")
 
 
+def check_active_backends(topology, scope="all"):
+    units = []
+    for forwarder in build_forwarders(topology, scope):
+        socket_state = get_unit_properties(forwarder.unit_name(".socket"))["ActiveState"]
+        service_state = get_unit_properties(forwarder.unit_name(".service"))["ActiveState"]
+        units.append({"name": forwarder.name, "socket_active": socket_state == "active",
+                      "service_failed": service_state == "failed"})
+    checks = check_backends(topology, scope)
+    print(json.dumps({"mode": "read-only", "scope": scope, "units": units, "backends": checks,
+                      "edges": topology["edges"], "proxies": topology["proxies"]}, sort_keys=True))
+    inactive = [unit["name"] for unit in units if not unit["socket_active"]]
+    failed = [unit["name"] for unit in units if unit["service_failed"]]
+    not_ready = [check["name"] for check in checks if not check["ready"]]
+    require(not inactive, "forwarder sockets not active: " + ", ".join(inactive))
+    require(not failed, "forwarder services failed: " + ", ".join(failed))
+    require(not not_ready, "backends not ready: " + ", ".join(not_ready))
+
+
 def write_new(path, raw, mode):
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = ".forwarder-" + os.urandom(12).hex()
@@ -475,7 +494,7 @@ def rollback_files(files, present):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", default="check-host",
-                        choices=("preview", "check-host", "install", "rollback", "check-filter"))
+                        choices=("preview", "check-host", "check-backends", "install", "rollback", "check-filter"))
     parser.add_argument("unit", nargs="?")
     parser.add_argument("--topology", type=Path, required=True)
     parser.add_argument("--topology-sha256", required=True)
@@ -491,6 +510,10 @@ def main(argv=None):
             return 0
         if args.command == "check-filter":
             check_filter(args.unit, topology, args.topology_sha256)
+            return 0
+        if args.command == "check-backends":
+            verify_host(topology)
+            check_active_backends(topology, args.scope)
             return 0
         files = build_files(topology, raw, args.scope)
         if args.command in ("check-host", "install"):

@@ -233,6 +233,42 @@ class BackendTests(unittest.TestCase):
         self.assertEqual([check["ready"] for check in checks], [True] * 9 + [False] * 2)
 
 
+    def test_check_backends_needs_active_sockets_unfailed_services_and_ready_backends(self):
+        def properties(socket_state, service_state):
+            return lambda unit: {"LoadState": "loaded",
+                                 "ActiveState": socket_state if unit.endswith(".socket") else service_state}
+        ready = [{"name": f.name, "ready": True} for f in forwarders.build_forwarders(TOPOLOGY)]
+        with patch.object(forwarders, "check_backends", return_value=ready), patch("sys.stdout", new_callable=io.StringIO) as out:
+            with patch.object(forwarders, "get_unit_properties", side_effect=properties("active", "inactive")) as unit:
+                forwarders.check_active_backends(TOPOLOGY)
+            self.assertEqual(unit.call_count, 22)
+            report = json.loads(out.getvalue())
+            self.assertEqual(len(report["units"]), 11)
+            self.assertEqual(report["edges"], TOPOLOGY["edges"])
+            self.assertEqual(report["proxies"], TOPOLOGY["proxies"])
+            with patch.object(forwarders, "get_unit_properties", side_effect=properties("inactive", "inactive")):
+                with self.assertRaisesRegex(forwarders.ForwarderError, "sockets not active: edge-15370"):
+                    forwarders.check_active_backends(TOPOLOGY)
+            with patch.object(forwarders, "get_unit_properties", side_effect=properties("active", "failed")):
+                with self.assertRaisesRegex(forwarders.ForwarderError, "services failed"):
+                    forwarders.check_active_backends(TOPOLOGY)
+        not_ready = ready[:10] + [dict(ready[10], ready=False)]
+        with patch.object(forwarders, "get_unit_properties", side_effect=properties("active", "active")), \
+                patch.object(forwarders, "check_backends", return_value=not_ready), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaisesRegex(forwarders.ForwarderError, "backends not ready: user"):
+                forwarders.check_active_backends(TOPOLOGY)
+
+    def test_check_backends_command_changes_nothing_and_skips_install_checks(self):
+        with patch.object(forwarders, "verify_host"), patch.object(forwarders, "check_active_backends") as check, \
+                patch.object(forwarders, "check_host") as host, patch.object(forwarders, "install_files") as install, \
+                patch.object(forwarders, "read_topology", return_value=(TOPOLOGY, RAW)):
+            self.assertEqual(forwarders.main(["check-backends", "--topology", "x", "--topology-sha256", PIN]), 0)
+        check.assert_called_once()
+        host.assert_not_called()
+        install.assert_not_called()
+
+
 class HostTests(unittest.TestCase):
     def test_hostname_interfaces_and_addresses_must_match(self):
         interfaces = [{"ifname": network["interface"], "addr_info": [{"family": "inet", "local": network["address"]}]}
