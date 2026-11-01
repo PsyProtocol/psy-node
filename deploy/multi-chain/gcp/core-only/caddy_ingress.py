@@ -50,7 +50,9 @@ def read_release_lock(encoded_lock, expected_sha256):
 
 
 def read_ingress(lock):
-    ingress = lock['ingress']
+    ingress = dict(lock['ingress'])
+    if 'envio' in lock and 'gcp-postgres' in lock.get('hosts', {}):
+        ingress['indexer_upstream'] = f"{lock['hosts']['gcp-postgres']}:{lock['envio']['hasura_port']}"
     hosts = ingress['fenced_hosts'] + ingress['faucet_hosts']
     require(all(isinstance(host, str) and re.fullmatch(r'[a-z0-9.-]+', host) for host in hosts) and len(set(hosts)) == len(hosts),
             'ingress hosts must be distinct DNS names')
@@ -188,12 +190,39 @@ def fenced_hosts_in(text, ingress):
     return fenced
 
 
+def refuse_foreign_blocks(text, ingress):
+    """A maintenance block with another tag inside a listed site would outlive both our fence and our open."""
+    for host in ingress['fenced_hosts'] + ingress['faucet_hosts']:
+        start, end = block_span(text, host)
+        for found in re.finditer(r'(?m)^\s*# BEGIN (\S+)\s*$', text[start:end]):
+            require(found.group(1) == marker_of(ingress, host),
+                    f'foreign maintenance block {found.group(1)} in {host}; remove it by hand or give it this release tag')
+
+
+def align_indexer_upstream(text, ingress):
+    """The indexer sites must proxy to the Hasura port of this release; other upstream hosts stay as they are."""
+    upstream = ingress.get('indexer_upstream')
+    if not upstream:
+        return text
+    address = upstream.rsplit(':', 1)[0]
+    for host in ingress['fenced_hosts']:
+        if host.split('.')[0].startswith('indexer'):
+            start, end = block_span(text, host)
+            block = re.sub(r'(?m)^(\s*reverse_proxy\s+)' + re.escape(address) + r':\d+(?=\s|$)',
+                           lambda found: found.group(1) + upstream, text[start:end])
+            text = text[:start] + block + text[end:]
+    return text
+
+
 def render(raw, current, phase, ingress):
     targets = target_hosts(phase, ingress)
     text = raw.decode()
     baseline = normalized(adapt(raw))
     require(baseline == normalized(current), 'runtime config differs from the Caddyfile source')
+    refuse_foreign_blocks(text, ingress)
     fenced_hosts_in(text, ingress)
+    if phase == 'fence':
+        text = align_indexer_upstream(text, ingress)
     for host in targets:
         text = set_fence(text, host, marker_of(ingress, host), ingress['maintenance_tag'], phase == 'fence')
     fenced_hosts_in(text, ingress)

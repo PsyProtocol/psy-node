@@ -209,11 +209,42 @@ class RenderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'differ from the phase'):
                 self.render(fenced, 'open')
 
+    def test_fence_moves_the_indexer_upstream_to_the_locked_hasura_port(self):
+        ingress = dict(INGRESS, fenced_hosts=[*INGRESS['fenced_hosts'], 'indexer.example.test'], indexer_upstream='10.0.0.24:38081')
+        raw = fixture_text() + site_text('indexer.example.test', '10.0.0.24:28081').encode()
+        raw += site_text('other-indexer.example.test', '10.0.0.24:28081').encode()
+        candidate, config = c.render(raw, adapt_text(raw), 'fence', ingress)
+        self.assertIn('reverse_proxy 10.0.0.24:38081 {', self.block(candidate, 'indexer.example.test'))
+        self.assertIn('reverse_proxy 10.0.0.24:28081 {', self.block(candidate, 'other-indexer.example.test'))
+        again, _ = c.render(candidate, config, 'fence', ingress)
+        self.assertEqual(again, candidate)
+        opened, _ = c.render(candidate, config, 'open', ingress)
+        self.assertIn('reverse_proxy 10.0.0.24:38081 {', self.block(opened, 'indexer.example.test'))
+
+    def test_already_fenced_indexer_with_a_stale_upstream_is_realigned(self):
+        ingress = dict(INGRESS, fenced_hosts=[*INGRESS['fenced_hosts'], 'indexer.example.test'], indexer_upstream='10.0.0.24:38081')
+        raw = fixture_text() + site_text('indexer.example.test', '10.0.0.24:28081').encode()
+        fenced, config = c.render(raw, adapt_text(raw), 'fence', INGRESS | {'fenced_hosts': ingress['fenced_hosts']})
+        stale, stale_config = fenced, adapt_text(fenced)
+        candidate, _ = c.render(stale, stale_config, 'fence', ingress)
+        self.assertNotEqual(candidate, stale)
+        self.assertIn('10.0.0.24:38081', self.block(candidate, 'indexer.example.test'))
+
+    def test_a_foreign_maintenance_block_is_refused_by_name(self):
+        foreign = self.raw.replace(b'coordinator.example.test {\n', b'coordinator.example.test {\n    # BEGIN other-team-maintenance\n'
+                                   b'    respond "down" 503\n    # END other-team-maintenance\n', 1)
+        for phase in ('fence', 'open'):
+            with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, 'foreign maintenance block other-team-maintenance'):
+                c.render(foreign, adapt_text(foreign), phase, INGRESS)
+
     def test_ingress_comes_from_a_hash_checked_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             raw = json.dumps({'ingress': LOCK_INGRESS}).encode()
             encoded_lock = base64.b64encode(raw).decode()
             self.assertEqual(c.read_ingress(c.read_release_lock(encoded_lock, c.sha(raw))), LOCK_INGRESS)
+            with_envio = json.dumps({'ingress': LOCK_INGRESS, 'hosts': {'gcp-postgres': '10.0.0.24'}, 'envio': {'hasura_port': 38081}}).encode()
+            self.assertEqual(c.read_ingress(c.read_release_lock(base64.b64encode(with_envio).decode(), c.sha(with_envio)))
+                             ['indexer_upstream'], '10.0.0.24:38081')
             with self.assertRaisesRegex(ValueError, 'hash mismatch'):
                 c.read_release_lock(encoded_lock, c.sha(raw + b' '))
         for bad in (dict(LOCK_INGRESS, maintenance_tag='Bad Tag'), dict(LOCK_INGRESS, faucet_hosts=['coordinator.example.test']),
