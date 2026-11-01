@@ -316,3 +316,39 @@ requires the retained paths to agree: that host must keep both `/etc/parth` and
 `/var/lib/parth/.psy/keystore/bridge-relayer-dev`. It reads the L1 balance and
 nonces with the pinned `fresh_l1.py status`, sent on stdin to that host and run
 with `--rpc-preference protected-env-backup`, the route the deployment uses.
+
+## Public Release And Acceptance Steps (77-87)
+
+The table finishes the release end to end. Step 77 uploads the nine public Groth16 files (circuit, pk and vk of
+bridge, deposit_append and withdrawal_claim, checked against the setup manifest; nothing else of the keystore) to the
+Nostr host and verifies the public digest. Step 78 generates `config.json` and the trust-setup installer from the
+recorded L1 documents and `public.json` (the public sites, routes and Pages project of this release), refuses any
+address that differs from the documents, deploys the page, and verifies the live hashes. Step 79 applies the live
+config to the dapp deploy files, pushes `deploy/testnet` fast-forward only and checks that CI is green for the pushed
+commit and that the served bundles hold the new PSY addresses and none of the previous release (the account site
+carries dead data from a vendored wallet preset and is only checked for the new address). It also compares the
+committed config with the live one, because CI builds from the live config without checking the committed file.
+Steps 80-84 and 87 refuse to run while the frontends are not current (step 79) or any chain is left unpaused. Step 86
+opens deposits and is last on purpose (87 sits before it in the table).
+
+Private inputs, in `local-inputs.json` next to the others:
+
+| Section | Names | Meaning |
+| --- | --- | --- |
+| `public` | `cloudflare_env` (a file of `export CLOUDFLARE_ACCOUNT_ID=` and `export CLOUDFLARE_API_TOKEN=` lines, mode 0600), `dapp_checkout` (psy-dapp worktree with the release commit; origin must be the GitHub repository), `allow_frontend_push` (`true` lets step 79 push and publish; absent, step 79 raises PENDING with the exact commands), optional `wallet_checkout`, `wallet_sdk_label`, `wallet_skip_build`, `wallet_ref` | Steps 77-79. Absolute paths. |
+| `acceptance` | `user_rpc_config` (the public client config, for example the dapp `public-client-r3.json`), `work_dir` (keys of the acceptance users are created here, mode 0600), `wallet_key_file` (EVM test wallet, mode 0600), `wallet_address` | Steps 82-84, 87. |
+
+Step 86 needs `CONFIRM_OPEN_DEPOSITS=1` in the process environment; without it the step is PENDING and opens nothing.
+The pause tool `core-only/admin_pause.py` is hash-pinned in the lock like every remote tool. Windows open one chain at a
+time, check the illegal deposit while paused first, and restore and read back the pause on any exit; a window that did
+not finish is never repeated blindly (read the pending deposit count first). Reads and sends go through the private
+gateway ports (an ssh tunnel to the signer host), because the public route can lag one block behind an administrator
+transaction. Gas is measured live. The drivers are in `../e2e/three-chain/` and take everything from the environment.
+MetaMask flows are skipped by name and the reward claim is recorded as unverified.
+
+After a tool-only change of the lock, recorded state can move to the new lock without hand edits:
+`python3 core-only/rebind_lock_state.py --release-dir <dir> --private-dir <private> --previous-lock <old release-lock.json>`
+(dry run; add `--apply`). It refuses when the two locks differ in anything but `tool_sha256`. Lock-bound packages of step
+53 are removed and rebuilt by the step itself when the lock or an installer changed. A Caddyfile that holds a
+maintenance block of another tag inside a listed site is refused by name; the indexer upstream follows
+`envio.hasura_port` in `fence`.
