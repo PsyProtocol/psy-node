@@ -14,6 +14,7 @@ from unittest.mock import patch
 import yaml
 
 import prepare_envio as envio
+from test_release_lock import build_test_lock
 
 
 class PrepareEnvioTests(unittest.TestCase):
@@ -27,21 +28,18 @@ class PrepareEnvioTests(unittest.TestCase):
                          "contracts": [{"name": "Bridge", "handler": "./handlers.ts",
                                         "events": [{"event": "WithdrawalClaimed(bytes32 indexed nullifier)"}]}],
                          "networks": []}
+        self.lock = build_test_lock()
         self.sources = {name: (name + " pinned\n").encode() for name in envio.SOURCE_FILES}
         self.sources["package.json"] = envio.encode(self.package)
         self.sources["config.template.yaml"] = yaml.safe_dump(self.template).encode()
         self.spec = {"version": 1, "patches": {}, "dependency_lock": None, "placement": None,
                      "rpc_routes": {}, "l1_documents": {}}
-        self.pins = {}
-        for name in envio.PATCHES:
+        for name in self.lock["envio"]["patch_sha256"]:
             self.spec["patches"][name] = self.artifact(name, ("fixture:" + name).encode())
-            self.pins[name] = self.spec["patches"][name]["sha256"]
+            self.lock["envio"]["patch_sha256"][name] = self.spec["patches"][name]["sha256"]
         self.source_mock = patch.object(envio, "source_files", return_value=self.sources)
         self.source_mock.start()
         self.addCleanup(self.source_mock.stop)
-        pins = patch.object(envio, "PATCHES", self.pins)
-        pins.start()
-        self.addCleanup(pins.stop)
 
     def artifact(self, name, raw):
         path = self.root / name
@@ -54,9 +52,10 @@ class PrepareEnvioTests(unittest.TestCase):
         address = str(ipaddress.IPv4Address(0xAC100102))
         self.spec["placement"] = {"postgres_host": address, "postgres_port": 5432,
                                   "postgres_user": "envio_fresh", "hasura_bind": address,
-                                  "hasura_port": 38081, "indexer_port": 29899}
+                                  "hasura_port": self.lock["envio"]["hasura_port"],
+                                  "indexer_port": self.lock["envio"]["graphql_port"]}
         for name, (index, chain_id, depth) in envio.CHAINS.items():
-            self.spec["rpc_routes"][name] = {"urls": [envio.RPC_URLS[name]],
+            self.spec["rpc_routes"][name] = {"urls": [self.lock["envio"]["rpc_routes"][name]],
                                              "confirmed_block_threshold": depth}
             bridge, manager = "0x" + "1" * 40, "0x" + "2" * 40
             summary = {"network": name, "chainId": chain_id, "deploymentBlock": 120,
@@ -64,7 +63,7 @@ class PrepareEnvioTests(unittest.TestCase):
                        "core": {"Bridge": bridge, "StateManager": manager},
                        "contracts": {"Bridge": bridge, "StateManager": manager},
                        "proxies": {"Bridge_Proxy": bridge, "StateManager_Proxy": manager}}
-            directory = envio.L1_DOCUMENT_ROOT + "/deployments/" + name + "/"
+            directory = "documents/" + name + "/"
             docs = {"summary": self.artifact(directory + "summary", envio.encode(summary))}
             for key, value, block in (("bridge_receipt", bridge, 120), ("state_manager_receipt", manager, 100)):
                 receipt = {"address": value, "transactionHash": "0x" + "a" * 64,
@@ -78,7 +77,7 @@ class PrepareEnvioTests(unittest.TestCase):
         self.spec["dependency_lock"] = self.artifact("lock.yaml", yaml.safe_dump(lock).encode())
 
     def build(self):
-        return envio.build_files(self.spec, self.root)
+        return envio.build_files(self.spec, self.root, self.lock)
 
     def test_pending_has_no_runnable_config_or_claims(self):
         files, report = self.build()
@@ -105,20 +104,21 @@ class PrepareEnvioTests(unittest.TestCase):
         self.complete()
         files, _ = self.build()
         compose = json.loads(files["compose.hasura.json"])
-        self.assertEqual(compose["name"], envio.PROJECT)
+        self.assertEqual(compose["name"], self.lock["envio"]["project"])
+        self.assertEqual(compose["services"]["graphql-engine"]["image"], self.lock["envio"]["image"])
         self.assertEqual(set(compose["services"]), {"graphql-engine"})
         self.assertNotIn("volumes", compose)
         service = compose["services"]["graphql-engine"]
         self.assertEqual(service["restart"], "no")
         self.assertEqual(service["ports"][0]["host_ip"], self.spec["placement"]["hasura_bind"])
         for key in ("HASURA_GRAPHQL_DATABASE_URL", "HASURA_GRAPHQL_METADATA_DATABASE_URL"):
-            self.assertTrue(service["environment"][key].endswith("/" + envio.DATABASE))
+            self.assertTrue(service["environment"][key].endswith("/" + self.lock["envio"]["database"]))
             self.assertNotIn("${ENVIO_DATABASE_URL", service["environment"][key])
         runtime = json.loads(files["runtime-env.json"])
-        self.assertEqual(runtime["ENVIO_PG_DATABASE"], envio.DATABASE)
+        self.assertEqual(runtime["ENVIO_PG_DATABASE"], self.lock["envio"]["database"])
         self.assertEqual(runtime["ENVIO_RPC_POLLING_INTERVAL_MILLIS"], "12000")
         self.assertEqual(runtime["HASURA_GRAPHQL_ENDPOINT"],
-                         f'http://{self.spec["placement"]["hasura_bind"]}:38081/v1/metadata')
+                         f'http://{self.spec["placement"]["hasura_bind"]}:{self.lock["envio"]["hasura_port"]}/v1/metadata')
 
     def test_own_node_or_additional_fallback_is_rejected(self):
         self.complete()
@@ -211,14 +211,16 @@ class PrepareEnvioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.build()
 
-    def test_old_or_mixed_document_roots_are_rejected(self):
+    def test_mixed_or_misplaced_document_roots_are_rejected(self):
         self.complete()
         docs = self.spec["l1_documents"]["sepolia"]
         raw = Path(docs["summary"]["path"]).read_bytes()
-        for directory in ("psy-fresh20261027r3", "other/" + envio.L1_DOCUMENT_ROOT):
-            docs["summary"] = self.artifact(directory + "/deployments/sepolia/summary", raw)
-            with self.assertRaisesRegex(ValueError, "cohort rejected|mixed deployment"):
-                self.build()
+        docs["summary"] = self.artifact("other/sepolia/summary", raw)
+        with self.assertRaisesRegex(ValueError, "mixed deployment"):
+            self.build()
+        docs["summary"] = self.artifact("documents/elsewhere/summary", raw)
+        with self.assertRaisesRegex(ValueError, "one directory per chain"):
+            self.build()
 
     def test_package_does_not_copy_extra_document_fields_or_source_paths(self):
         self.complete()
@@ -246,14 +248,14 @@ class PrepareEnvioTests(unittest.TestCase):
         args = SimpleNamespace(spec=Path(spec["path"]), spec_sha256=spec["sha256"],
                                source_repo=self.root, output=self.root / "package")
         with patch.object(envio.subprocess, "run", side_effect=AssertionError("unexpected command")):
-            envio.prepare(args)
+            envio.prepare(args, self.lock)
         for path in args.output.rglob("*"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
         manifest = json.loads((args.output / "manifest.json").read_bytes())
         for name, expected in manifest["files"].items():
             self.assertEqual(hashlib.sha256((args.output / name).read_bytes()).hexdigest(), expected)
         with self.assertRaises(ValueError):
-            envio.prepare(args)
+            envio.prepare(args, self.lock)
         self.assertEqual(list(self.root.glob(".envio-prepare-*")), [])
 
     def test_failure_cleans_only_owned_temporary_output(self):
@@ -261,7 +263,7 @@ class PrepareEnvioTests(unittest.TestCase):
         args = SimpleNamespace(spec=Path(spec["path"]), spec_sha256=spec["sha256"],
                                source_repo=self.root, output=self.root / "package")
         with patch.object(envio, "write_new", side_effect=OSError("disk full")), self.assertRaises(OSError):
-            envio.prepare(args)
+            envio.prepare(args, self.lock)
         self.assertFalse(args.output.exists())
         self.assertEqual(list(self.root.glob(".envio-prepare-*")), [])
         self.assertTrue(args.spec.exists())
@@ -278,7 +280,7 @@ class PrepareEnvioTests(unittest.TestCase):
         args = SimpleNamespace(spec=Path(spec["path"]), spec_sha256=spec["sha256"],
                                source_repo=self.root, output=self.root / "package")
         with self.assertRaises(ValueError):
-            envio.prepare(args)
+            envio.prepare(args, self.lock)
 
     def test_git_reader_uses_commit_objects_not_dirty_worktree(self):
         self.source_mock.stop()
@@ -294,15 +296,13 @@ class PrepareEnvioTests(unittest.TestCase):
                         "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
         commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
         (repo / envio.SOURCE_DIR / "handlers.ts").write_text("unowned dirty bytes")
-        with patch.object(envio, "SOURCE", commit):
-            self.assertEqual(envio.source_files(repo)["handlers.ts"], self.sources["handlers.ts"])
+        self.assertEqual(envio.source_files(repo, commit)["handlers.ts"], self.sources["handlers.ts"])
         old = subprocess.check_output(["git", "-C", str(repo), "rev-parse", f"{commit}:{envio.SOURCE_DIR}/handlers.ts"], text=True).strip()
         new = subprocess.check_output(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=b"replaced object").decode().strip()
         subprocess.run(["git", "-C", str(repo), "replace", old, new], check=True)
-        with patch.object(envio, "SOURCE", commit):
-            self.assertEqual(envio.source_files(repo)["handlers.ts"], self.sources["handlers.ts"])
-            with patch.dict(os.environ, {"GIT_DIR": str(self.root / "missing.git")}):
-                self.assertEqual(envio.source_files(repo)["handlers.ts"], self.sources["handlers.ts"])
+        self.assertEqual(envio.source_files(repo, commit)["handlers.ts"], self.sources["handlers.ts"])
+        with patch.dict(os.environ, {"GIT_DIR": str(self.root / "missing.git")}):
+            self.assertEqual(envio.source_files(repo, commit)["handlers.ts"], self.sources["handlers.ts"])
 
 
 if __name__ == "__main__":

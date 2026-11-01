@@ -1,165 +1,156 @@
 #!/usr/bin/env python3
-"""Package frozen Services inputs offline; missing fresh L1 documents block installation."""
-import argparse
+"""Package the Services and indexer inputs per host from the release lock, offline.
+
+Pending mode (no L1 documents) builds every package except the three-chain configuration; the packages are not
+installable until real documents are bound. The first-package behaviour fixed after the previous release lives here:
+Nostr ingestion on, per-request indexer JWTs (checked in the binary), the Realm indexer first start, Redis pool size.
+"""
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import install_services as installer
-import prepare_envio
 import prepare_services_inputs as inputs
 
 HERE = Path(__file__).resolve().parent
+NOSTR_RELAY_URL = "wss://nostr-stg.psy-protocol.xyz/"
+NOSTR_LOOKBACK_SECONDS = 172800
+REDIS_POOL_SIZE = 10
+# A binary built before the per-request JWT fix carries no such symbol; its indexer would be refused after a day.
+JWT_RENEWAL_MARKER = b"authorization_header"
+CHAIN_IDENTITY = {"sepolia": (0, 11155111), "bscTestnet": (1, 97), "baseSepolia": (2, 84532)}
 
 
 def encode(value):
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
 
 
-def deployment_topology():
-    value = inputs.topology()
-    value["groups"] = {name: {"host": host, "roles": roles,
-                              "user": "parth" if name == "services" else "psy-core"}
-                       for name, (host, roles) in installer.HOSTS.items()}
-    value["services_host"], value["services_port"] = "10.148.0.38", 3001
-    value["nostr_state"] = "/var/lib/psy-services-fresh-20261027-r3"
-    value["indexers"] = {
-        "coordinator": {"args": "coordinator", "backup_subdir": "coordinator_0_0",
-                        "core_unit": "psy-core-r3-coordinator-processor.service", "edge_url": "http://10.148.0.25:15370"},
-        "realm0": {"args": "realm --realm-id 0 --realm-sub-id 1", "backup_subdir": "realm_0_1",
-                   "core_unit": "psy-core-r3-realm-0-v1-processor.service", "edge_url": "http://10.148.0.36:15380"},
-        "realm1": {"args": "realm --realm-id 1 --realm-sub-id 1", "backup_subdir": "realm_1_1",
-                   "core_unit": "psy-core-r3-realm-1-v1-processor.service", "edge_url": "http://10.148.0.35:15383"},
-    }
-    return value
+def check_jwt_renewal(indexer_binary):
+    inputs.require(JWT_RENEWAL_MARKER in indexer_binary, "the indexer binary lacks per-request JWT signing")
 
 
-def service_config(topology, documents):
+def service_config(topology, lock, documents):
+    """documents maps chain name to the raw L1 summary bytes; empty means pending."""
     chains = []
-    for name, (index, chain_id, _) in prepare_envio.CHAINS.items():
+    for name, (index, chain_id) in CHAIN_IDENTITY.items():
         if documents:
-            document = json.loads(documents[f"l1/{name}/summary.json"])
             chains.append({"name": name, "chain_id": chain_id, "chain_index": index,
-                           "eth_rpc_url": prepare_envio.RPC_URLS[name],
-                           "state_manager": document["core"]["StateManager"],
+                           "eth_rpc_url": lock["envio"]["rpc_routes"][name],
+                           "state_manager": json.loads(documents[name])["core"]["StateManager"],
                            "graphql_url": topology["hasura_url"]})
+    realm_ids = sorted(int(role[len("realm"):]) for role in topology["indexers"] if role.startswith("realm"))
+    endpoints = [{"role": {"type": "Coordinator", "id": 0}, "url": topology["indexers"]["coordinator"]["edge_url"]}]
+    endpoints += [{"role": {"type": "Realm", "id": realm_id}, "url": topology["indexers"][f"realm{realm_id}"]["edge_url"]}
+                  for realm_id in realm_ids]
     return {
-        "service_name": "psy-services-fresh-20261027-r3", "network_type": "psy-public-testnet",
+        "service_name": lock["units"]["services"].removesuffix(".service"), "network_type": "psy-public-testnet",
         "database": {"url": "postgresql://unconfigured@127.0.0.1/NOT_CONFIGURED", "run_migrations": True},
-        "redis": {"url": topology["redis_url"], "key_prefix": topology["redis_prefix"]},
-        "rpc": {"endpoints": [{"role": {"type": "Coordinator" if name == "coordinator" else "Realm",
-                                        "id": 1 if name == "realm1" else 0}, "url": row["edge_url"]}
-                              for name, row in topology["indexers"].items()]},
+        "redis": {"url": topology["redis_url"], "key_prefix": topology["redis_prefix"], "pool_size": REDIS_POOL_SIZE},
+        "rpc": {"endpoints": endpoints},
         "api": {"host": topology["services_host"], "port": topology["services_port"], "disable_auth": False},
-        "nostr": {"enabled": False, "relay_url": "wss://nostr-stg.psy-protocol.xyz/", "lookback_seconds": 0},
+        "nostr": {"enabled": True, "relay_url": NOSTR_RELAY_URL, "lookback_seconds": NOSTR_LOOKBACK_SECONDS},
         "l1_chains": chains,
     }
 
 
-def unit(topology, group, role, bootstrap_realms=False):
+def start_env_file(unit_name):
+    return f"/run/{unit_name.removesuffix('.service')}.start.env"
+
+
+def unit(topology, lock, lock_sha256, user, role):
     release = topology["release"]
+    name = installer.unit_name(lock, role)
+    guard = (f"ExecStartPre=/usr/bin/python3 -I -B {release}/install_services.py guard --package {release} --role {role} "
+             f"--release-lock {release}/release-lock.json --release-lock-sha256 {lock_sha256}\n")
+    extra = ""
     if role == "services":
         command = (f"{release}/psy-services --config {release}/services.json --network-type psy-public-testnet "
                    f"--genesis-path {release}/genesis.json.zst --run-migrations=true --migrations-path {release}/migrations")
-        writable = "StateDirectory=psy-services-fresh-20261027-r3\nStateDirectoryMode=0700\n"
+        state = Path(topology["nostr_state"]).name
+        writable = f"StateDirectory={state}\nStateDirectoryMode=0700\n"
         writable += f"Environment=PSY_NOSTR_SCAN_STATE_DIR={topology['nostr_state']}/nostr\nReadWritePaths={topology['nostr_state']}\n"
     else:
         item = topology["indexers"][role]
         sources = f"--committed-realm-sources {release}/{role}.json " if role.startswith("realm") else ""
-        # This override precedes retained cursors; remove it after first cursor creation.
-        start = "--start-checkpoint 0 " if bootstrap_realms and role.startswith("realm") else ""
         command = (f"{release}/psy-indexer {sources}--edge-url {item['edge_url']} "
                    f"--psy-services-url {topology['services_url']} --backup-dir {topology['backup_dir']} "
-                   f"--network-type psy-public-testnet {start}{item['args']}")
+                   f"--network-type psy-public-testnet {item['args']}")
         writable = f"ReadWritePaths={topology['backup_dir']}/indexer_state\n"
+        if role.startswith("realm"):
+            # A Realm indexer in committed mode refuses to start without a cursor or a start checkpoint. The checkpoint
+            # applies only while no cursor exists, so a restart never replays from the beginning.
+            cursor = f"{topology['backup_dir']}/indexer_state/realm_{role[len('realm'):]}_1.json"
+            env_file = start_env_file(name)
+            extra = (f"EnvironmentFile=-{env_file}\nExecStartPre=+/usr/bin/bash -c 'if [ -e {cursor} ]; then : > {env_file}; "
+                     f"else echo PSY_INDEXER_START_CHECKPOINT=0 > {env_file}; fi'\n")
     credentials = topology["credentials"] + ("/services.env" if role == "services" else "/indexer.env")
-    restart = "no" if bootstrap_realms and role.startswith("realm") else "on-failure"
-    cursor_guard = ""
-    if bootstrap_realms and role.startswith("realm"):
-        cursor = f"{topology['backup_dir']}/indexer_state/realm_{role[-1]}_1.json"
-        cursor_guard = f"ExecStartPre=+/usr/bin/test ! -e {cursor}\nExecStartPre=+/usr/bin/test ! -L {cursor}\n"
-    return (f"[Unit]\nDescription=Fresh R3 {role}\nWants=network-online.target\nAfter=network-online.target\n\n"
-            f"[Service]\nType=simple\nUser={group['user']}\nGroup={group['user']}\nWorkingDirectory={release}\n"
+    return (f"[Unit]\nDescription=Fresh testnet {role}\nWants=network-online.target\nAfter=network-online.target\n\n"
+            f"[Service]\nType=simple\nUser={user}\nGroup={user}\nWorkingDirectory={release}\n"
             f"EnvironmentFile={credentials}\nEnvironment=PSY_NETWORK_TYPE=psy-public-testnet\nEnvironment=RUST_LOG=info\n"
-            f"{cursor_guard}"
-            f"ExecStartPre=/usr/bin/python3 -I -B {release}/install_services.py guard --package {release} --role {role}\n"
-            f"ExecStart={command}\nRestart={restart}\nRestartSec=10\nNoNewPrivileges=true\nPrivateTmp=true\n"
+            f"{extra}{guard}ExecStart={command}\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\nPrivateTmp=true\n"
             f"ProtectSystem=strict\nProtectHome=true\nUMask=0027\nLimitNOFILE=65536\n{writable}\n"
             "[Install]\nWantedBy=multi-user.target\n").encode()
 
 
-def prepare(args):
-    inputs.require(inputs.digest(args.inputs / "input-manifest.json") == args.input_manifest_sha256, "input manifest mismatch")
-    original = json.loads((args.inputs / "input-manifest.json").read_bytes())
-    inputs.require(original["genesis_sha256"] == inputs.GENESIS_SHA256
-                   and original["services_commit"] == inputs.SERVICES_COMMIT
-                   and original["indexer_commit"] == inputs.INDEXER_COMMIT, "input cohort mismatch")
-    actual = {str(p.relative_to(args.inputs)): inputs.digest(p) for p in args.inputs.rglob("*")
+def read_inputs(inputs_dir, input_manifest_sha256, lock):
+    """Verify the offline inputs against the lock and return {relative name: hash}."""
+    require = inputs.require
+    require(inputs.digest(inputs_dir / "input-manifest.json") == input_manifest_sha256, "input manifest mismatch")
+    original = json.loads((inputs_dir / "input-manifest.json").read_bytes())
+    require(original["genesis_sha256"] == lock["inputs"]["genesis"] and original["services_commit"] == lock["sources"]["services"]
+            and original["indexer_commit"] == lock["sources"]["indexer"], "input cohort mismatch")
+    actual = {str(p.relative_to(inputs_dir)): inputs.digest(p) for p in inputs_dir.rglob("*")
               if p.is_file() and p.name != "input-manifest.json"}
-    inputs.require(actual == original["files"], "input inventory mismatch")
-    for name, pin in inputs.BINARY_SHA256.items():
-        inputs.require(actual[name] == pin, "binary pin mismatch")
-    inputs.require(json.loads((args.inputs / "topology.json").read_bytes()) == inputs.topology(), "input topology mismatch")
-    inputs.read_abis(args.inputs / "genesis_abi")
-    documents, networks = {}, []
-    if args.envio_spec:
-        inputs.require(inputs.digest(args.envio_spec) == args.envio_spec_sha256, "Envio spec mismatch")
-        spec = json.loads(args.envio_spec.read_bytes())
-        prepare_envio.validate_placement(spec["placement"])
-        prepare_envio.validate_routes(spec["rpc_routes"])
-        inputs.require(spec["placement"]["postgres_user"] == prepare_envio.DATABASE
-                       and spec["placement"]["hasura_bind"] == "10.148.0.24", "fresh Envio identity mismatch")
-        if spec["l1_documents"]:
-            documents, networks = prepare_envio.l1_files(spec["l1_documents"])
-    else:
-        inputs.require(not args.envio_spec_sha256, "Envio spec path missing")
-    inputs.require(not os.path.lexists(args.output), "output exists; preserve prior package")
-    os.umask(0o077)
-    args.output.mkdir(mode=0o700)
-    topology = deployment_topology()
+    require(actual == original["files"], "input inventory mismatch")
+    for name in ("psy-services", "psy-indexer"):
+        require(actual[name] == lock["binaries"][name], "binary pin mismatch")
+    inputs.read_abis(inputs_dir / "genesis_abi")
+    return actual
+
+
+def build_service_packages(lock, lock_sha256, release_dir, inputs_dir, input_manifest_sha256, output, documents):
+    """Write one package per Services or indexer host under output and return {host alias: manifest sha256}.
+
+    documents is None (pending) or {chain: raw L1 summary bytes}.
+    """
+    require = inputs.require
+    release_topology_raw = (release_dir / "topology.json").read_bytes()
+    require(hashlib.sha256(release_topology_raw).hexdigest() == lock["inputs"]["topology"], "release topology differs from the lock")
+    lock_raw = (release_dir / "release-lock.json").read_bytes()
+    require(hashlib.sha256(lock_raw).hexdigest() == lock_sha256, "release lock bytes differ from the lock in use")
+    for tool in ("install_services.py", "activate_services.py"):
+        require(hashlib.sha256((HERE / tool).read_bytes()).hexdigest() == lock["tool_sha256"][tool], f"tool hash differs: {tool}")
+    actual = read_inputs(inputs_dir, input_manifest_sha256, lock)
+    check_jwt_renewal((inputs_dir / "psy-indexer").read_bytes())
+    require(not output.exists(), "output exists; preserve the prior package")
+    topology = installer.placement(lock, json.loads(release_topology_raw))
+    output.mkdir(mode=0o700, parents=True)
     delivery = {}
-    for group, placement in topology["groups"].items():
-        root = args.output / group
+    for alias, group in topology["groups"].items():
         files = {"topology.json": encode(topology), "install_services.py": (HERE / "install_services.py").read_bytes(),
-                 "activate_services.py": (HERE / "activate_services.py").read_bytes()}
-        binary = "psy-services" if group == "services" else "psy-indexer"
-        files[binary] = (args.inputs / binary).read_bytes()
-        if group == "services":
-            files["services.json"] = encode(service_config(topology, documents))
+                 "activate_services.py": (HERE / "activate_services.py").read_bytes(),
+                 "release-lock.json": lock_raw, "release-topology.json": release_topology_raw}
+        is_services = "services" in group["roles"]
+        binary = "psy-services" if is_services else "psy-indexer"
+        files[binary] = (inputs_dir / binary).read_bytes()
+        if is_services:
+            files["services.json"] = encode(service_config(topology, lock, documents))
             for name in actual:
                 if name == "genesis.json.zst" or name.startswith(("genesis_abi/", "migrations/")):
-                    files[name] = (args.inputs / name).read_bytes()
-        for role in placement["roles"]:
-            files["units/" + installer.unit_name(role)] = unit(topology, placement, role, args.bootstrap_realms)
-            if role.startswith("realm"):
-                files[role + ".json"] = encode(inputs.realm_sources(int(role[-1])))
-        files.update(documents)
+                    files[name] = (inputs_dir / name).read_bytes()
+        for role in group["roles"]:
+            files["units/" + installer.unit_name(lock, role)] = unit(topology, lock, lock_sha256, group["user"], role)
+            if role in topology["realm_sources"]:
+                files[role + ".json"] = encode(topology["realm_sources"][role])
         for name, raw in files.items():
-            inputs.write_new(root / name, raw)
-        manifest = {"group": group, "runtime_node_commit": inputs.RUNTIME_COMMIT,
-                    "genesis_sha256": inputs.GENESIS_SHA256, "services_commit": inputs.SERVICES_COMMIT,
-                    "indexer_commit": inputs.INDEXER_COMMIT, "node_build_commit": inputs.NODE_BUILD_COMMIT,
-                    "input_manifest_sha256": args.input_manifest_sha256,
-                    "l1_ready": bool(documents), "envio_spec_sha256": args.envio_spec_sha256,
-                    "l1_document_cohort": prepare_envio.L1_DOCUMENT_ROOT,
+            inputs.write_new(output / alias / name, raw)
+        manifest = {"group": alias, "runtime_node_commit": lock["sources"]["runtime"], "genesis_sha256": lock["inputs"]["genesis"],
+                    "services_commit": lock["sources"]["services"], "indexer_commit": lock["sources"]["indexer"],
+                    "input_manifest_sha256": input_manifest_sha256, "l1_ready": documents is not None,
                     "rpc_policy": "protected-alchemy-only-no-fallback",
-                    "envio_networks": networks, "files": {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}}
-        inputs.write_json(root / "manifest.json", manifest)
-        pin = inputs.digest(root / "manifest.json")
-        installer.load_package(root, pin)
-        delivery[group] = {"manifest_sha256": pin, "installable": bool(documents), "started": False}
-    inputs.write_json(args.output / "delivery.json", delivery)
+                    "files": {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}}
+        inputs.write_json(output / alias / "manifest.json", manifest)
+        pin = inputs.digest(output / alias / "manifest.json")
+        installer.load_package(output / alias, pin, lock, lock_sha256)
+        delivery[alias] = pin
     return delivery
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--inputs", type=Path, required=True)
-    parser.add_argument("--input-manifest-sha256", required=True)
-    parser.add_argument("--envio-spec", type=Path)
-    parser.add_argument("--envio-spec-sha256")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--bootstrap-realms", action="store_true",
-                        help="Temporary realm start at checkpoint 1; remove after cursor creation before normal operation")
-    print(json.dumps(prepare(parser.parse_args()), sort_keys=True))

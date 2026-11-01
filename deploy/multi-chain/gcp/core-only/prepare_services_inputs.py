@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare public R3 Services/indexer inputs offline; never install or activate.
+"""Prepare public Services/indexer inputs offline; never install or activate.
 
-Uses the retained Services/Indexer builds and fresh core artifacts. No credentials,
-old L1 documents, cursors, Nostr history or database contents are inputs. The
-output deliberately contains no executable install/start entrypoint or final
-Services configuration until fresh L1 documents and deployment guards are bound.
+Uses the lock-pinned Services/Indexer builds and the lock-pinned Genesis. No credentials, L1 documents, cursors,
+Nostr history or database contents are inputs.
 """
 import argparse
 import hashlib
@@ -14,20 +12,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
-SERVICES_COMMIT = "dfd4e4837a068d67c43cc013f204053e06d1a153"
-INDEXER_COMMIT = "9de6b34671fb52addf6c5f4790eae932a363bc92"
-NODE_BUILD_COMMIT = "da6391549e44d49c07e856eaeb5d0b8d7902ef17"
-RUNTIME_COMMIT = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-GENESIS_COMMIT = "9420e2c9799ce29487e9d0cca1d1121fbfb4cf40"
-GENESIS_SHA256 = "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173"
-CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-BINARY_SHA256 = {
-    "psy-services": "27071ac53edf861e33a3c59d2ffce819bd6b84a9bf3cc85627b960cda6c6699e",
-    "psy-indexer": "d2a1cd3c2ddaac55b7dc5d87471ea5aafe89d44448c732a1ab7ade5986d18a53",
-}
-BACKUPS = "/var/lib/psy-core/core-testnet-20261027-r3/checkpoints"
-MIRROR = "/var/lib/psy-indexer-r3-mirror"
-RELEASE = "/opt/psy-services/releases/core-testnet-20261027-dfd4e483-r3"
+import release_lock
+
 ABI_NAMES = ("PsyTokenContract", "MultisigPolicyContract", "PsyDepositTreeContract",
              "PsyWithdrawalTreeContract", "USDTTokenContract", "PsyFaucetContract")
 HEIGHTS = (32, 4, 21, 15, 32, 31)
@@ -90,58 +76,22 @@ def read_abis(root):
     return result
 
 
-def realm_sources(realm):
-    return {
-        "coordinator_rpc_url": "http://10.148.0.25:15370",
-        "coordinator_backup_base_dir": MIRROR + "/cp/checkpoints",
-        "validators": [{
-            "realm_sub_id": sub,
-            "edge_rpc_url": f"http://10.148.0.{36 if realm == 0 else 35}:{15380 + realm * 3 + sub - 1}",
-            "backup_base_dir": BACKUPS if sub == 1 else f"{MIRROR}/v{sub}/checkpoints",
-        } for sub in (1, 2, 3)],
-    }
-
-
-def topology():
-    return {
-        "release": RELEASE, "credentials": "/etc/psy-services-fresh-20261027-r3",
-        "database": "psy_services_fresh_20261027_r3", "database_owner": "psy_services_fresh_20261026",
-        "postgres_host": "10.148.0.24", "redis_url": "redis://10.148.0.12:6379/14",
-        "redis_prefix": "psy_svc_fresh_20261027_r3:", "backup_dir": BACKUPS,
-        "cursor_dir": BACKUPS + "/indexer_state", "mirror_dir": MIRROR,
-        "nostr_state": "/var/lib/psy-services-fresh-20261027-r3/nostr",
-        "nostr_enabled": False, "bridge_reader_enabled": False,
-        "services_url": "http://10.148.0.38:3001",
-        "hasura_url": "http://10.148.0.24:38081/v1/graphql",
-        "envio_database": "envio_bridge_fresh_20261027_r3",
-        "envio_project": "psy-envio-fresh-20261027-r3",
-        "envio_indexer_port": 29899,
-        "roles": {
-            "services": {"host": "10.148.0.38", "user": "parth"},
-            "coordinator": {"host": "10.148.0.25", "user": "psy-core", "backup_subdir": "coordinator_0_0"},
-            "realm0": {"host": "10.148.0.37", "user": "psy-core", "backup_subdir": "realm_0_1"},
-            "realm1": {"host": "10.148.0.37", "user": "psy-core", "backup_subdir": "realm_1_1"},
-        },
-        "mirror_sources": {
-            "cp": {"host": "10.148.0.25", "root": BACKUPS, "roles": ["coordinator_0_0"]},
-            "v2": {"host": "10.148.0.42", "root": BACKUPS, "roles": ["realm_0_2", "realm_1_2"]},
-            "v3": {"host": "10.148.0.43", "root": BACKUPS, "roles": ["realm_0_3", "realm_1_3"]},
-        },
-    }
-
-
-def prepare(args):
+def prepare(args, lock):
     require(not os.path.lexists(args.output), "output already exists; preserve partial inputs")
     require(args.output.parent.is_dir(), "output parent missing")
     for path in (args.output.parent, *args.output.parent.parents):
         require(not path.is_symlink(), "output ancestor symlink")
-    check_source(args.services_source, SERVICES_COMMIT)
-    check_source(args.indexer_source, INDEXER_COMMIT)
-    check_source(args.genesis_source, GENESIS_COMMIT)
-    require(digest(args.genesis) == GENESIS_SHA256, "fresh Genesis mismatch")
+    sources = lock["sources"]
+    for label in ("services", "indexer", "genesis"):
+        require(sources[label], f"sources.{label} is not pinned in the lock")
+    check_source(args.services_source, sources["services"])
+    check_source(args.indexer_source, sources["indexer"])
+    check_source(args.genesis_source, sources["genesis"])
+    genesis_sha256 = lock["inputs"]["genesis"]
+    require(digest(args.genesis) == genesis_sha256, "Genesis differs from the lock")
     binaries = {"psy-services": args.services_binary, "psy-indexer": args.indexer_binary}
     for name, path in binaries.items():
-        require(digest(path) == BINARY_SHA256[name], "binary hash mismatch: " + name)
+        require(digest(path) == lock["binaries"][name], "binary hash mismatch: " + name)
     abis = read_abis(args.genesis_source / "genesis_abi")
     require(shutil.disk_usage(args.output.parent).free > args.genesis.stat().st_size + 128 * 1024**2,
             "insufficient staging capacity")
@@ -159,23 +109,12 @@ def prepare(args):
     subprocess.run(["zstd", "-q", "-T2", "-3", str(args.genesis), "-o", str(args.output / "genesis.json.zst")], check=True)
     with subprocess.Popen(["zstd", "-q", "-d", "-c", str(args.output / "genesis.json.zst")], stdout=subprocess.PIPE) as decoder:
         restored = hashlib.file_digest(decoder.stdout, "sha256").hexdigest()
-        require(decoder.wait() == 0 and restored == GENESIS_SHA256, "compressed Genesis roundtrip mismatch")
-    write_json(args.output / "topology.json", topology())
-    for realm in (0, 1):
-        write_json(args.output / f"realm{realm}.json", realm_sources(realm))
-    write_new(args.output / "create-database.sql", b"CREATE DATABASE psy_services_fresh_20261027_r3 OWNER psy_services_fresh_20261026;\n")
+        require(decoder.wait() == 0 and restored == genesis_sha256, "compressed Genesis roundtrip mismatch")
     receipt = {
-        "schema_version": 1, "scope": "offline-fresh-inputs-only", "installable": False, "started": False,
-        "services_commit": SERVICES_COMMIT, "indexer_commit": INDEXER_COMMIT,
-        "binary_node_dependency_commit": NODE_BUILD_COMMIT, "runtime_node_commit": RUNTIME_COMMIT,
-        "genesis_artifacts_commit": GENESIS_COMMIT, "genesis_sha256": GENESIS_SHA256,
-        "runtime_config_sha256": CONFIG_SHA256,
-        "genesis_generation_provenance": "Retained f839 artifact; not regenerated or relabeled by this preparation.",
-        "pending": ["Fresh three-chain deployment documents and hash-pinned Services L1 config",
-                    "Fresh Envio database and isolated Hasura at port38081; never use old28080/28081",
-                    "R3 install/activation and backup-mirror helpers with old-instance fencing",
-                    "On-host create-only database and protected environment preparation",
-                    "Retained Services binary preview of this Genesis/ABI; no database writes"],
+        "schema_version": 2, "scope": "offline-inputs-only", "installable": False, "started": False,
+        "services_commit": sources["services"], "indexer_commit": sources["indexer"],
+        "runtime_node_commit": sources["runtime"], "genesis_artifacts_commit": sources["genesis"],
+        "genesis_sha256": genesis_sha256,
         "files": {str(p.relative_to(args.output)): digest(p) for p in sorted(args.output.rglob("*")) if p.is_file()},
     }
     write_json(args.output / "input-manifest.json", receipt)
@@ -184,6 +123,10 @@ def prepare(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     for name in ("services-source", "indexer-source", "genesis-source", "services-binary", "indexer-binary", "genesis", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
-    print(json.dumps(prepare(parser.parse_args()), sort_keys=True))
+    parsed = parser.parse_args()
+    lock = release_lock.load_checked_release_lock(parsed.release_lock, parsed.release_lock_sha256)
+    print(json.dumps(prepare(parsed, lock), sort_keys=True))

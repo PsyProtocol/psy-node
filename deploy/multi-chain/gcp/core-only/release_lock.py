@@ -27,10 +27,11 @@ UNITS = ("core_prefix", "core_namespace_prefix", "guardian_prefix", "relayer", "
          "indexer_prefix", "envio")
 IMAGES = ("scylla", "valkey", "nats", "postgres", "nostr")
 CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
+ENVIO_PATCHES = ("history.py", "polling.py", "ordered.py", "reorg.py", "deposit-indexes.py")
 GROTH16_VERIFIERS = ("gnark_groth16_verifier", "deposit_batch_verifier", "withdrawal_claim_verifier")
 # Every file that is loaded or executed on a remote host, keyed by file name in this directory.
 TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "caddy_ingress.py",
-              "clear_host_state.py", "enable_services_nostr.py",
+              "clear_host_state.py",
               "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_envio.py",
               "install_guardian.py", "install_host.py", "install_relayer.py", "install_services.py",
               "prepare_bridge_forwarders.py", "prepare_faucet.py", "prepare_proxies.py",
@@ -241,7 +242,11 @@ def check_services(lock, walk):
     walk.number(services["redis_db"], "services.redis_db", 0, 15)
     walk.absolute(services["backups"], "services.backups")
     walk.absolute(services["mirror"], "services.mirror")
-    envio = fields(lock["envio"], ("database", "project", "image", "graphql_port", "hasura_port", "rpc_routes"), "envio")
+    envio = fields(lock["envio"], ("database", "project", "image", "graphql_port", "hasura_port", "rpc_routes",
+                                   "node_sha256", "patch_sha256"), "envio")
+    walk.digest(envio["node_sha256"], "envio.node_sha256")
+    for name in ENVIO_PATCHES:
+        walk.digest(fields(envio["patch_sha256"], ENVIO_PATCHES, "envio.patch_sha256")[name], "envio.patch_sha256." + name)
     for name in ("database", "project"):
         walk.text(envio[name], "envio." + name)
     walk.image(envio["image"], "envio")

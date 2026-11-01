@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Local plan/check-host/install for one fresh Envio release; never start or restart services."""
+"""Plan, check-host, install and activate one fresh Envio release from the release lock.
+
+install never starts services. activate without --apply only reports; with --apply it starts this release's
+Hasura project and Envio unit, waits for polling on all three chains and builds the Deposit query indexes.
+"""
 import argparse
+from dataclasses import dataclass
 import grp
 import hashlib
 import ipaddress
@@ -12,18 +17,48 @@ import re
 import socket
 import stat
 import subprocess
+import time
+import urllib.request
 from urllib.parse import quote
 
 
-SOURCE = "da6391549e44d49c07e856eaeb5d0b8d7902ef17"
-NODE_HASH = "94efd062ed066c1a0b332e18249859c905e920eeada5df55d24c99b919629a90"
-DATABASE = "envio_bridge_fresh_20261027_r3"
-PROJECT = "psy-envio-fresh-20261027-r3"
-RELEASE = Path("/opt/psy-envio/releases/core-testnet-20261027-r3")
-STATE = Path("/var/lib/psy-envio/core-testnet-20261027-r3")
-CONFIG = Path("/etc/psy-envio/core-testnet-20261027-r3")
-UNIT = Path("/etc/systemd/system") / (PROJECT + ".service")
 USER = "psy-envio-fresh"
+CHAIN_IDS = (11155111, 97, 84532)
+UNIT_DIRECTORY = Path("/etc/systemd/system")
+ACTIVATE_LIMIT_SECONDS = 600
+POLL_SECONDS = 10
+PATCH_TIMEOUT_SECONDS = 1800
+
+
+@dataclass(frozen=True)
+class EnvioRelease:
+    source: str
+    node_sha256: str
+    database: str
+    project: str
+    image: str
+    release: Path
+    state: Path
+    config: Path
+    unit: Path
+    hasura_port: int
+    indexer_port: int
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_release(lock):
+    envio, paths = lock["envio"], lock["paths"]["envio"]
+    return EnvioRelease(
+        source=lock["sources"]["runtime"], node_sha256=envio["node_sha256"], database=envio["database"],
+        project=envio["project"], image=envio["image"], release=Path(paths["release"]), state=Path(paths["state"]),
+        config=Path(paths["config"]), unit=UNIT_DIRECTORY / lock["units"]["envio"],
+        hasura_port=envio["hasura_port"], indexer_port=envio["graphql_port"])
 
 
 def require(value, message):
@@ -72,7 +107,7 @@ def inventory(root):
     return result
 
 
-def load_plan(spec_path, spec_hash):
+def load_plan(spec_path, spec_hash, release):
     raw = read(spec_path, private=True)
     require(sha(raw) == spec_hash, "spec pin mismatch")
     spec = json.loads(raw)
@@ -86,23 +121,23 @@ def load_plan(spec_path, spec_hash):
     build_raw = read(root / "build.json")
     require(sha(build_raw) == spec["build_sha256"], "build pin mismatch")
     build = json.loads(build_raw)
-    require(build["source_commit"] == SOURCE and build["node_sha256"] == NODE_HASH
+    require(build["source_commit"] == release.source and build["node_sha256"] == release.node_sha256
             and all(build[key] is True for key in ("frozen_install_verified", "patches_verified", "native_help_verified", "generated_config_verified")),
             "verified build required")
     require(inventory(root) == build["files"], "package inventory mismatch")
-    require(sha(read(root / "node/bin/node")) == NODE_HASH, "bundled Node mismatch")
+    require(sha(read(root / "node/bin/node")) == release.node_sha256, "bundled Node mismatch")
     runtime = json.loads(read(root / "runtime-env.json"))
     require(set(runtime) == {"ENVIO_PG_HOST", "ENVIO_PG_PORT", "ENVIO_PG_USER", "ENVIO_PG_DATABASE",
                             "ENVIO_PG_PUBLIC_SCHEMA", "ENVIO_PG_SSL_MODE", "ENVIO_HASURA", "ENVIO_INDEXER_PORT",
                             "TUI_OFF", "HASURA_GRAPHQL_ENDPOINT", "ENVIO_RPC_POLLING_INTERVAL_MILLIS",
                             "PSY_ENVIO_FRESH_REORG_PARENT", "PSY_ENVIO_ORDERED_FAILOVER"}, "runtime environment fields mismatch")
-    require(runtime["ENVIO_PG_DATABASE"] == DATABASE and runtime["ENVIO_PG_PUBLIC_SCHEMA"] == "envio"
-            and runtime["ENVIO_PG_HOST"] == spec["address"] and runtime["ENVIO_PG_USER"] == DATABASE,
+    require(runtime["ENVIO_PG_DATABASE"] == release.database and runtime["ENVIO_PG_PUBLIC_SCHEMA"] == "envio"
+            and runtime["ENVIO_PG_HOST"] == spec["address"] and runtime["ENVIO_PG_USER"] == release.database,
             "isolated database identity mismatch")
     require(runtime["ENVIO_RPC_POLLING_INTERVAL_MILLIS"] == "12000" and runtime["PSY_ENVIO_FRESH_REORG_PARENT"] == "1"
             and runtime["ENVIO_HASURA"] == "true" and runtime["PSY_ENVIO_ORDERED_FAILOVER"] in ("0", "1"), "runtime policy mismatch")
     compose = json.loads(read(root / "compose.hasura.json"))
-    require(compose["name"] == PROJECT and set(compose["services"]) == {"graphql-engine"}
+    require(compose["name"] == release.project and set(compose["services"]) == {"graphql-engine"}
             and set(compose) == {"name", "services"}, "Hasura-only compose required")
     service = compose["services"]["graphql-engine"]
     require(set(service) == {"image", "user", "restart", "ports", "ulimits", "logging", "environment"}, "unexpected Compose capability")
@@ -110,13 +145,13 @@ def load_plan(spec_path, spec_hash):
     hasura_port = int(listener["published"])
     indexer_port = int(runtime["ENVIO_INDEXER_PORT"])
     require(listener["host_ip"] == spec["address"] and listener["target"] == 8080
-            and service["restart"] == "no" and service["image"] == "hasura/graphql-engine:v2.43.0", "Hasura isolation mismatch")
+            and service["restart"] == "no" and service["image"] == release.image, "Hasura isolation mismatch")
     require(runtime["HASURA_GRAPHQL_ENDPOINT"] == f'http://{spec["address"]}:{hasura_port}/v1/metadata'
             and len({hasura_port, indexer_port, int(runtime["ENVIO_PG_PORT"])}) == 3
-            and (hasura_port, indexer_port) == (38081, 29899), "port identity mismatch")
-    database_url = (f'postgresql://{DATABASE}:'
+            and (hasura_port, indexer_port) == (release.hasura_port, release.indexer_port), "port identity mismatch")
+    database_url = (f'postgresql://{release.database}:'
                     '${ENVIO_POSTGRES_PASSWORD_ENCODED:?URL-encoded private password required}'
-                    f'@{spec["address"]}:{runtime["ENVIO_PG_PORT"]}/{DATABASE}')
+                    f'@{spec["address"]}:{runtime["ENVIO_PG_PORT"]}/{release.database}')
     require(all(service["environment"][key] == database_url for key in
                 ("HASURA_GRAPHQL_DATABASE_URL", "HASURA_GRAPHQL_METADATA_DATABASE_URL")), "Hasura must use only the new database")
     descriptor = spec["secrets"]
@@ -129,15 +164,15 @@ def load_plan(spec_path, spec_hash):
     return spec, root, build_raw, build, runtime, secrets, (hasura_port, indexer_port)
 
 
-def run(args, input=None):
-    result = subprocess.run([str(arg) for arg in args], input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+def run(args, input=None, timeout=120):
+    result = subprocess.run([str(arg) for arg in args], input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     require(result.returncode == 0, "host command failed; diagnostics suppressed")
     return result.stdout.strip()
 
 
-def pg(spec, sql):
+def pg(spec, sql, database="postgres"):
     return run(["docker", "exec", "-i", "--user", "postgres", spec["postgres_container_id"],
-                "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres"], sql)
+                "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database], sql)
 
 
 def trusted(path):
@@ -146,7 +181,7 @@ def trusted(path):
             and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX), "untrusted directory")
 
 
-def host_checks(plan):
+def host_checks(plan, release):
     spec, root, _, _, runtime, _, ports = plan
     require(os.geteuid() == 0 and socket.gethostname() == spec["hostname"] and os.uname().machine == "x86_64", "wrong host or user")
     addresses = json.loads(run(["ip", "-j", "-4", "address", "show"]))
@@ -160,24 +195,25 @@ def host_checks(plan):
         for name in dirs + files:
             info = (Path(directory) / name).lstat()
             require(info.st_uid == 0 and (stat.S_ISLNK(info.st_mode) or not info.st_mode & 0o022), "untrusted package ownership/mode")
-    for target in (RELEASE, STATE, CONFIG, UNIT, UNIT.with_name(UNIT.name + ".d")):
+    unit_path = release.unit
+    for target in (release.release, release.state, release.config, unit_path, unit_path.with_name(unit_path.name + ".d")):
         require(not os.path.lexists(target), "destination already exists")
         for parent in target.parents:
             if os.path.lexists(parent):
                 trusted(parent)
-    require(not run(["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + PROJECT]), "Compose project already exists")
+    require(not run(["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + release.project]), "Compose project already exists")
     info = json.loads(run(["docker", "inspect", "--format", "{{json .Id}}", spec["postgres_container_id"]]))
     require(info == spec["postgres_container_id"] and run(["docker", "inspect", "--format", "{{.State.Running}}", info]) == "true", "PG identity/state mismatch")
     role = runtime["ENVIO_PG_USER"]
     sql = ("SET default_transaction_read_only=on;\n"
-           f"SELECT count(*) FROM pg_database WHERE datname='{DATABASE}';\n"
+           f"SELECT count(*) FROM pg_database WHERE datname='{release.database}';\n"
            f"SELECT count(*) FROM pg_roles WHERE rolname='{role}' AND rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls;\n"
            f"SELECT count(*) FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname='{role}');\n")
     require(pg(spec, sql).splitlines() == ["0", "1", "0"], "new DB must be absent; isolated login role must already exist")
     listeners = run(["ss", "-H", "-lnt"])
     require(not any(int(line.split()[3].rsplit(":", 1)[1]) in ports for line in listeners.splitlines()), "new port already in use")
-    require(run(["systemctl", "show", UNIT.name, "--property=LoadState", "--value"]) == "not-found", "unit already loaded")
-    run(["docker", "image", "inspect", "--format", "{{.Id}}", "hasura/graphql-engine:v2.43.0"])
+    require(run(["systemctl", "show", unit_path.name, "--property=LoadState", "--value"]) == "not-found", "unit already loaded")
+    run(["docker", "image", "inspect", "--format", "{{.Id}}", release.image])
     run(["docker", "compose", "version"])
     return account
 
@@ -200,28 +236,28 @@ def write(path, raw, mode=0o640, gid=0):
         os.fsync(stream.fileno())
 
 
-def unit():
-    node = str(RELEASE / "node/bin/node")
+def unit(release):
+    node = str(release.release / "node/bin/node")
     return "\n".join([
         "[Unit]", "Description=Fresh testnet Envio indexer", "After=network-online.target docker.service",
         "[Service]", "Type=simple", "User=" + USER, "Group=" + USER, "UMask=0077",
-        "WorkingDirectory=" + str(RELEASE / "generated"), "EnvironmentFile=" + str(CONFIG / "runtime.env"),
+        "WorkingDirectory=" + str(release.release / "generated"), "EnvironmentFile=" + str(release.config / "runtime.env"),
         f"ExecStartPre={node} -e 'require(\"./src/db/Migrations.res.js\").runUpMigrations(true,false)'",
         f"ExecStart={node} node_modules/ts-node/dist/bin.js src/Index.res.js", "Restart=on-failure", "RestartSec=10",
         "TimeoutStopSec=90", "KillSignal=SIGINT", "MemoryMax=1G", "LimitNOFILE=65536", "LimitCORE=0",
         "NoNewPrivileges=true", "PrivateTmp=true", "ProtectHome=true", "ProtectSystem=strict",
-        "ReadWritePaths=" + str(STATE), "RestrictAddressFamilies=AF_UNIX AF_INET", "IPAddressDeny=any",
+        "ReadWritePaths=" + str(release.state), "RestrictAddressFamilies=AF_UNIX AF_INET", "IPAddressDeny=any",
         "IPAddressAllow=localhost", "IPAddressAllow=10.0.0.0/8", "IPAddressAllow=172.16.0.0/12", "IPAddressAllow=192.168.0.0/16",
         "[Install]", "WantedBy=multi-user.target", "",
     ]).encode()
 
 
-def install(plan):
-    account = host_checks(plan)
+def install(plan, release):
+    account = host_checks(plan, release)
     spec, root, build_raw, build, runtime, secrets, _ = plan
-    mkdir(RELEASE, gid=account.pw_gid)
+    mkdir(release.release, gid=account.pw_gid)
     for name, info in sorted(build["files"].items(), key=lambda pair: (pair[0].count("/"), pair[0])):
-        target = RELEASE / name
+        target = release.release / name
         if "directory" in info:
             mkdir(target, gid=account.pw_gid)
         elif "sha256" in info:
@@ -230,43 +266,132 @@ def install(plan):
             write(target, raw, 0o750 if info["executable"] else 0o640, account.pw_gid)
     for name, info in build["files"].items():
         if "link" in info:
-            os.symlink(info["link"], RELEASE / name)
-    write(RELEASE / "build.json", build_raw, gid=account.pw_gid)
-    require(inventory(RELEASE) == build["files"], "installed inventory mismatch")
-    mkdir(STATE, 0o700, account.pw_uid, account.pw_gid)
-    mkdir(CONFIG, 0o700)
+            os.symlink(info["link"], release.release / name)
+    write(release.release / "build.json", build_raw, gid=account.pw_gid)
+    require(inventory(release.release) == build["files"], "installed inventory mismatch")
+    mkdir(release.state, 0o700, account.pw_uid, account.pw_gid)
+    mkdir(release.config, 0o700)
     environment = dict(runtime, ENVIO_PG_PASSWORD=secrets["postgres_password"],
                        HASURA_GRAPHQL_ADMIN_SECRET=secrets["hasura_admin_secret"],
-                       LOG_FILE=str(STATE / "envio.log"), FILE_LOG_LEVEL="info",
-                       PATH=str(RELEASE / "node/bin") + ":/usr/bin:/bin",
+                       LOG_FILE=str(release.state / "envio.log"), FILE_LOG_LEVEL="info",
+                       PATH=str(release.release / "node/bin") + ":/usr/bin:/bin",
                        TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS","moduleResolution":"node","noImplicitAny":false}')
     line = lambda key, value: key + "=" + json.dumps(str(value)) + "\n"
-    write(CONFIG / "runtime.env", "".join(line(k, v) for k, v in environment.items()).encode(), 0o600)
+    write(release.config / "runtime.env", "".join(line(k, v) for k, v in environment.items()).encode(), 0o600)
     compose_env = {"ENVIO_POSTGRES_PASSWORD_ENCODED": quote(secrets["postgres_password"], safe=""),
                    "HASURA_GRAPHQL_ADMIN_SECRET": secrets["hasura_admin_secret"]}
-    write(CONFIG / "hasura.env", "".join(line(k, v) for k, v in compose_env.items()).encode(), 0o600)
-    pg(spec, f'CREATE DATABASE "{DATABASE}" OWNER "{runtime["ENVIO_PG_USER"]}" TEMPLATE template0;\n'
-             f'REVOKE CONNECT ON DATABASE "{DATABASE}" FROM PUBLIC;\n')
-    write(UNIT, unit(), 0o644)
+    write(release.config / "hasura.env", "".join(line(k, v) for k, v in compose_env.items()).encode(), 0o600)
+    pg(spec, f'CREATE DATABASE "{release.database}" OWNER "{runtime["ENVIO_PG_USER"]}" TEMPLATE template0;\n'
+             f'REVOKE CONNECT ON DATABASE "{release.database}" FROM PUBLIC;\n')
+    write(release.unit, unit(release), 0o644)
     run(["systemctl", "daemon-reload"])
+
+
+def unit_properties(release):
+    text = run(["systemctl", "show", release.unit.name, "--property=LoadState,ActiveState,MainPID,NRestarts,UnitFileState"])
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def hasura_container_ids(release, running_only):
+    command = ["docker", "ps", "-q", "--filter", "label=com.docker.compose.project=" + release.project]
+    return run(command if not running_only else command + ["--filter", "status=running"]).split()
+
+
+def hasura_is_healthy(plan):
+    spec, _, _, _, runtime, _, (hasura_port, _) = plan
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://{spec['address']}:{hasura_port}/healthz", timeout=5) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+def chain_rows(plan, release):
+    spec = plan[0]
+    sql = "SET default_transaction_read_only=on;\nSELECT id, source_block, max_reorg_depth FROM envio.envio_chains ORDER BY id;\n"
+    rows = [line.split("|") for line in pg(spec, sql, release.database).splitlines() if "|" in line]
+    return {int(row[0]): {"source_block": int(row[1] or 0), "max_reorg_depth": int(row[2] or 0)} for row in rows}
+
+
+def polling_is_live(rows):
+    return set(rows) == set(CHAIN_IDS) and all(row["source_block"] > 0 for row in rows.values())
+
+
+def report(plan, release):
+    properties = unit_properties(release)
+    healthy = hasura_is_healthy(plan)
+    rows = chain_rows(plan, release) if properties.get("ActiveState") == "active" else {}
+    return {"unit_active": properties.get("ActiveState") == "active" and int(properties.get("MainPID", "0")) > 0,
+            "unit_restarts": int(properties.get("NRestarts", "0") or 0), "hasura_healthy": healthy,
+            "chains": {str(chain): row for chain, row in sorted(rows.items())}, "polling_live": polling_is_live(rows)}
+
+
+def wait_until_ready(condition, release, label):
+    deadline = time.monotonic() + ACTIVATE_LIMIT_SECONDS
+    while not condition():
+        require(unit_properties(release).get("ActiveState") != "failed", f"{label}: unit failed while waiting")
+        require(time.monotonic() < deadline, f"{label}: not ready within {ACTIVATE_LIMIT_SECONDS}s")
+        time.sleep(POLL_SECONDS)
+
+
+def check_installed(plan, release):
+    spec, root, build_raw, build, runtime, secrets, _ = plan
+    require(os.geteuid() == 0, "root required")
+    require(inventory(release.release) == build["files"] and read(release.release / "build.json") == build_raw, "installed release differs from the build")
+    require(read(release.unit) == unit(release), "installed unit differs from the release")
+    require(unit_properties(release).get("LoadState") == "loaded", "unit is not loaded")
+    for name in ("runtime.env", "hasura.env"):
+        require(read(release.config / name, private=True), "protected environment file missing")
+
+
+def apply_indexes(plan, release):
+    spec = plan[0]
+    psql = f"docker exec -i --user postgres {spec['postgres_container_id']} psql -U postgres -d {release.database}"
+    result = subprocess.run(["/usr/bin/python3", "-I", "-B", str(release.release / "patches/deposit-indexes.py"),
+                             "--psql", psql, "--schema", "envio", "--mode", "apply"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PATCH_TIMEOUT_SECONDS)
+    require(result.returncode == 0, "Deposit query indexes did not build; rerun is safe")
+
+
+def activate(plan, release, is_apply):
+    check_installed(plan, release)
+    if not is_apply:
+        return report(plan, release)
+    if not hasura_container_ids(release, running_only=True):
+        run(["docker", "compose", "--project-name", release.project, "--file", str(release.release / "compose.hasura.json"),
+             "--env-file", str(release.config / "hasura.env"), "up", "--detach", "--pull", "never"], timeout=ACTIVATE_LIMIT_SECONDS)
+    wait_until_ready(lambda: hasura_is_healthy(plan), release, "Hasura")
+    run(["systemctl", "enable", "--now", release.unit.name], timeout=ACTIVATE_LIMIT_SECONDS)
+    wait_until_ready(lambda: unit_properties(release).get("ActiveState") == "active"
+                     and int(unit_properties(release).get("MainPID", "0")) > 0, release, "Envio unit")
+    wait_until_ready(lambda: polling_is_live(chain_rows(plan, release)), release, "Envio polling on three chains")
+    apply_indexes(plan, release)
+    return report(plan, release)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("plan", "check-host", "install"))
+    parser.add_argument("mode", choices=("plan", "check-host", "install", "activate"))
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--spec-sha256", required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        plan = load_plan(args.spec, args.spec_sha256)
-        require(not args.apply or args.mode == "install", "apply only belongs to install")
+        release = load_release(read_release_lock(args.release_lock, args.release_lock_sha256))
+        plan = load_plan(args.spec, args.spec_sha256, release)
+        require(not args.apply or args.mode in ("install", "activate"), "apply only belongs to install and activate")
         if args.mode == "install":
             require(args.apply, "install requires --apply")
-            install(plan)
+            install(plan, release)
         elif args.mode == "check-host":
-            host_checks(plan)
+            host_checks(plan, release)
+        elif args.mode == "activate":
+            print(json.dumps(dict(activate(plan, release, args.apply), mode="activate", applied=args.apply), sort_keys=True))
+            return
         print(json.dumps({"mode": args.mode, "installed": args.mode == "install", "database_created": args.mode == "install",
                           "started": False, "enabled": False, "postgres_restarted": False,
                           "deployment_ready": False, "release_approved": False}, sort_keys=True))

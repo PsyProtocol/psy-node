@@ -15,27 +15,14 @@ from urllib.parse import urlsplit
 
 import yaml
 
+import release_lock
 from prepare_host_packages import publish_packages, write_new
 
 
-SOURCE = "da6391549e44d49c07e856eaeb5d0b8d7902ef17"
 SOURCE_DIR = "psy_cli/psy_relayer_cli/indexer/envio"
 SOURCE_FILES = ("package.json", "handlers.ts", "schema.graphql", "schema.ts",
                 "envio-env.d.ts", "pnpm-workspace.yaml", "config.template.yaml")
-PATCHES = {
-    "history.py": "39ba5c386edad2e4dfa5a191160ac8abd995afdd0215337309ac605d332b9a64",
-    "polling.py": "0b929faf38cf8fd1d40fccdf8ec743174ec12f252cec4a2660884c048bdf2ac9",
-    "ordered.py": "846f282659a65bb33f44a11b0c5e0fd992b58a082dba1ae35ac5a113a76154a6",
-    "reorg.py": "8739c575630a57d831cd4063f48033ffc7c8c27dde62ace310ec22e5f0e1bebf",
-    "deposit-indexes.py": "c2fcf5d23d3568706f2fc5b263b92dc52821dba96e30effbb232cf723d634711",
-}
 CHAINS = {"sepolia": (0, 11155111, 8), "bscTestnet": (1, 97, 200), "baseSepolia": (2, 84532, 64)}
-DATABASE = "envio_bridge_fresh_20261027_r3"
-PROJECT = "psy-envio-fresh-20261027-r3"
-RELEASE = "/opt/psy-envio/releases/core-testnet-20261027-r3"
-L1_DOCUMENT_ROOT = "psy-fresh20261027r3b"
-RPC_URLS = {name: f"http://10.148.0.32:{port}" for name, port in
-            zip(CHAINS, (18545, 18645, 18945))}
 
 
 def require(value, message):
@@ -74,11 +61,11 @@ def artifact(value):
     return raw
 
 
-def source_files(repo):
+def source_files(repo, source):
     result = {}
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     for name in SOURCE_FILES:
-        process = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "show", f"{SOURCE}:{SOURCE_DIR}/{name}"],
+        process = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "show", f"{source}:{SOURCE_DIR}/{name}"],
                                  check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
         result[name] = process.stdout
     require(json.loads(result["package.json"])["devDependencies"]["envio"] == "2.32.10",
@@ -98,7 +85,7 @@ def port(value):
     return value
 
 
-def validate_placement(value):
+def validate_placement(value, lock):
     require(set(value) == {"postgres_host", "postgres_port", "postgres_user", "hasura_bind",
                            "hasura_port", "indexer_port"}, "placement fields mismatch")
     private_ip(value["postgres_host"])
@@ -106,19 +93,19 @@ def validate_placement(value):
     for key in ("postgres_port", "hasura_port", "indexer_port"):
         port(value[key])
     require(len({value[key] for key in ("postgres_port", "hasura_port", "indexer_port")}) == 3
-            and value["hasura_port"] == 38081
-            and value["indexer_port"] == 29899, "fresh r3 ports required")
+            and value["hasura_port"] == lock["envio"]["hasura_port"]
+            and value["indexer_port"] == lock["envio"]["graphql_port"], "release ports required")
     require(isinstance(value["postgres_user"], str)
             and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value["postgres_user"])
             and value["postgres_user"] != "postgres", "dedicated database role required")
 
 
-def validate_routes(routes):
+def validate_routes(routes, lock):
     require(set(routes) == set(CHAINS), "all three RPC routes required")
     for name, route in routes.items():
         require(set(route) == {"urls", "confirmed_block_threshold"}, "RPC route fields mismatch")
         urls = route["urls"]
-        require(urls == [RPC_URLS[name]], "only the protected Alchemy forward is allowed; no node fallback")
+        require(urls == [lock["envio"]["rpc_routes"][name]], "only the protected Alchemy forward is allowed; no node fallback")
         for url in urls:
             require(isinstance(url, str) and not any(c.isspace() for c in url), "invalid RPC URL")
             parsed = urlsplit(url)
@@ -140,10 +127,8 @@ def l1_files(documents):
         require(set(row) == {"summary", "bridge_receipt", "state_manager_receipt"}, "L1 document fields mismatch")
         for descriptor in row.values():
             path = Path(descriptor["path"])
-            require(path.parent.name == name and path.parent.parent.name == "deployments"
-                    and path.parent.parent.parent.name == L1_DOCUMENT_ROOT,
-                    "final r3b deployment documents required; partial/old cohort rejected")
-            roots.add(path.parent.parent.parent)
+            require(path.parent.name == name, "deployment documents must sit in one directory per chain")
+            roots.add(path.parent.parent)
         require(len(roots) == 1, "mixed deployment document roots rejected")
         raw = {key: artifact(value) for key, value in row.items()}
         summary = json.loads(raw["summary"])
@@ -189,9 +174,9 @@ def l1_files(documents):
     return files, networks
 
 
-def config_bytes(template, networks, routes):
+def config_bytes(template, networks, routes, project):
     config = yaml.safe_load(template)
-    config["name"] = PROJECT
+    config["name"] = project
     config["networks"] = networks
     for name, network in zip(CHAINS, networks):
         route = routes[name]
@@ -204,12 +189,13 @@ def config_bytes(template, networks, routes):
     return yaml.safe_dump(config, sort_keys=False).encode()
 
 
-def compose(value):
+def compose(value, lock):
+    database = lock["envio"]["database"]
     database_url = (f'postgresql://{value["postgres_user"]}:'
                     '${ENVIO_POSTGRES_PASSWORD_ENCODED:?URL-encoded private password required}'
-                    f'@{value["postgres_host"]}:{value["postgres_port"]}/{DATABASE}')
-    return {"name": PROJECT, "services": {"graphql-engine": {
-        "image": "hasura/graphql-engine:v2.43.0", "user": "1001:1001", "restart": "no",
+                    f'@{value["postgres_host"]}:{value["postgres_port"]}/{database}')
+    return {"name": lock["envio"]["project"], "services": {"graphql-engine": {
+        "image": lock["envio"]["image"], "user": "1001:1001", "restart": "no",
         "ports": [{"target": 8080, "published": str(value["hasura_port"]), "host_ip": value["hasura_bind"], "protocol": "tcp"}],
         "ulimits": {"nofile": {"soft": 65536, "hard": 524288}},
         "logging": {"driver": "json-file", "options": {"max-size": "100m", "max-file": "100", "compress": "true"}},
@@ -220,35 +206,36 @@ def compose(value):
                         "HASURA_GRAPHQL_UNAUTHORIZED_ROLE": "public", "HASURA_GRAPHQL_NO_OF_RETRIES": "10"}}}}
 
 
-def build_files(spec, repo):
+def build_files(spec, repo, lock):
     require(set(spec) == {"version", "patches", "dependency_lock", "placement", "rpc_routes", "l1_documents"}
             and type(spec["version"]) is int and spec["version"] == 1, "operator spec fields mismatch")
-    files = source_files(repo)
+    files = source_files(repo, lock["sources"]["runtime"])
     source_hashes = {name: digest(raw) for name, raw in files.items()}
-    require(set(spec["patches"]) == set(PATCHES), "all five pinned patch inputs required")
-    for name, expected in PATCHES.items():
+    patch_pins = lock["envio"]["patch_sha256"]
+    require(set(spec["patches"]) == set(patch_pins), "all five pinned patch inputs required")
+    for name, expected in patch_pins.items():
         raw = artifact(spec["patches"][name])
         require(digest(raw) == expected, "reviewed patch mismatch")
         files[f"patches/{name}"] = raw
     if spec["dependency_lock"] is not None:
         raw = artifact(spec["dependency_lock"])
-        lock = yaml.safe_load(raw)
+        pnpm_lock = yaml.safe_load(raw)
         package = json.loads(files["package.json"])
-        require(str(lock["lockfileVersion"]) == "9.0" and set(lock["importers"]) == {"."}, "source-only pnpm lock required")
-        require(not lock.get("overrides") and not lock.get("patchedDependencies"), "unexpected dependency overrides")
+        require(str(pnpm_lock["lockfileVersion"]) == "9.0" and set(pnpm_lock["importers"]) == {"."}, "source-only pnpm lock required")
+        require(not pnpm_lock.get("overrides") and not pnpm_lock.get("patchedDependencies"), "unexpected dependency overrides")
         for kind in ("dependencies", "devDependencies"):
-            require({key: value["specifier"] for key, value in lock["importers"]["."][kind].items()}
+            require({key: value["specifier"] for key, value in pnpm_lock["importers"]["."][kind].items()}
                     == package[kind], "lock does not match pinned package")
         files["pnpm-lock.yaml"] = raw
     if spec["rpc_routes"]:
-        validate_routes(spec["rpc_routes"])
+        validate_routes(spec["rpc_routes"], lock)
     if spec["placement"] is not None:
         value = spec["placement"]
-        validate_placement(value)
-        files["compose.hasura.json"] = encode(compose(value))
+        validate_placement(value, lock)
+        files["compose.hasura.json"] = encode(compose(value, lock))
         environment = {
             "ENVIO_PG_HOST": value["postgres_host"], "ENVIO_PG_PORT": str(value["postgres_port"]),
-            "ENVIO_PG_USER": value["postgres_user"], "ENVIO_PG_DATABASE": DATABASE,
+            "ENVIO_PG_USER": value["postgres_user"], "ENVIO_PG_DATABASE": lock["envio"]["database"],
             "ENVIO_PG_PUBLIC_SCHEMA": "envio", "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "true",
             "ENVIO_INDEXER_PORT": str(value["indexer_port"]), "TUI_OFF": "true",
             "HASURA_GRAPHQL_ENDPOINT": f'http://{value["hasura_bind"]}:{value["hasura_port"]}/v1/metadata',
@@ -260,10 +247,12 @@ def build_files(spec, repo):
         require(bool(spec["rpc_routes"]), "L1 configuration requires all private RPC routes")
         documents, networks = l1_files(spec["l1_documents"])
         files.update(documents)
-        files["config.yaml"] = config_bytes(files["config.template.yaml"], networks, spec["rpc_routes"])
-    report = {"source_commit": SOURCE, "source_files": source_hashes, "database": DATABASE,
-              "l1_document_cohort": L1_DOCUMENT_ROOT, "rpc_policy": "protected-alchemy-only-no-fallback",
-              "compose_project": PROJECT, "release_path": RELEASE, "unit_name": PROJECT + ".service",
+        files["config.yaml"] = config_bytes(files["config.template.yaml"], networks, spec["rpc_routes"],
+                                            lock["envio"]["project"])
+    report = {"source_commit": lock["sources"]["runtime"], "source_files": source_hashes,
+              "database": lock["envio"]["database"], "rpc_policy": "protected-alchemy-only-no-fallback",
+              "compose_project": lock["envio"]["project"], "release_path": lock["paths"]["envio"]["release"],
+              "unit_name": lock["units"]["envio"],
               "l1_documents_pending": not bool(spec["l1_documents"]),
               "placement_pending": spec["placement"] is None, "rpc_routes_pending": not bool(spec["rpc_routes"]),
               "dependency_lock_pending": spec["dependency_lock"] is None,
@@ -274,10 +263,10 @@ def build_files(spec, repo):
     return files, report
 
 
-def prepare(args):
+def prepare(args, lock):
     raw = read(args.spec, private=True)
     require(digest(raw) == args.spec_sha256, "operator spec pin mismatch")
-    files, report = build_files(json.loads(raw), args.source_repo)
+    files, report = build_files(json.loads(raw), args.source_repo, lock)
     output = args.output.absolute()
     require(".." not in output.parts and not os.path.lexists(output), "new output directory required")
     for parent in (output.parent, *output.parent.parents):
@@ -297,6 +286,8 @@ def prepare(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--source-repo", type=Path, required=True)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--spec-sha256", required=True)
@@ -304,7 +295,8 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        print(json.dumps(prepare(args), sort_keys=True))
+        lock = release_lock.load_checked_release_lock(args.release_lock, args.release_lock_sha256)
+        print(json.dumps(prepare(args, lock), sort_keys=True))
     except Exception:
         raise SystemExit("Envio prepare refused; no existing output replaced") from None
 

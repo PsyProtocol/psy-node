@@ -15,13 +15,8 @@ import subprocess
 import tempfile
 from urllib.parse import urlsplit
 
-RELEASE = "/opt/psy-services/releases/core-testnet-20261027-dfd4e483-r3"
-BACKUPS = "/var/lib/psy-core/core-testnet-20261027-r3/checkpoints"
-HOSTS = {"services": ("10.148.0.38", ["services"]), "cp": ("10.148.0.25", ["coordinator"]),
-         "realm0": ("10.148.0.37", ["realm0", "realm1"])}
-BINARIES = {"psy-services": "27071ac53edf861e33a3c59d2ffce819bd6b84a9bf3cc85627b960cda6c6699e",
-            "psy-indexer": "d2a1cd3c2ddaac55b7dc5d87471ea5aafe89d44448c732a1ab7ade5986d18a53"}
-SERVICE_PATTERNS = ("psy-services-fresh-*", "psy-indexer-fresh-*", "parth-psy-services.service", "parth-psy-indexer@*")
+POSTGRES_ALIAS = "gcp-postgres"
+SERVICE_PATTERNS = ("psy-services-fresh*", "psy-indexer-fresh*", "parth-psy-services.service", "parth-psy-indexer@*")
 
 
 class ValidationError(ValueError):
@@ -31,6 +26,65 @@ class ValidationError(ValueError):
 def require(ok, message):
     if not ok:
         raise ValidationError(message)
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == expected_sha256, "release lock hash mismatch")
+    return json.loads(raw)
+
+
+def unit_name(lock, role):
+    return lock["units"]["services"] if role == "services" else f"{lock['units']['indexer_prefix']}{role}.service"
+
+
+def placement(lock, release_topology):
+    """The Services and indexer placement, derived only from the release lock and the release topology."""
+    services, envio = lock["services"], lock["envio"]
+    addresses = {**release_topology["hosts"], **lock["hosts"]}
+    postgres_host = addresses[POSTGRES_ALIAS]
+    listen_host, _, listen_port = services["listen"].rpartition(":")
+    owners = [alias for alias, address in addresses.items() if address == listen_host]
+    require(len(owners) == 1, "the Services listen address must belong to exactly one host")
+    core_prefix, backups, mirror = lock["units"]["core_prefix"], services["backups"], services["mirror"]
+    groups = {owners[0]: {"host": listen_host, "roles": ["services"], "user": "parth"}}
+
+    def add_role(alias, role):
+        groups.setdefault(alias, {"host": addresses[alias], "roles": [], "user": "psy-core"})["roles"].append(role)
+
+    coordinator = release_topology["coordinator"]
+    add_role(coordinator["host"], "coordinator")
+    indexers = {"coordinator": {"args": "coordinator", "backup_subdir": "coordinator_0_0",
+                                "core_unit": f"{core_prefix}coordinator-processor.service",
+                                "edge_url": f"http://{addresses[coordinator['host']]}:{coordinator['edge_ports'][0]}"}}
+    sources = {}
+    for realm in release_topology["realms"]:
+        realm_id, first = realm["id"], realm["validators"][0]
+        role = f"realm{realm_id}"
+        add_role(first["processor_host"], role)
+        indexers[role] = {"args": f"realm --realm-id {realm_id} --realm-sub-id 1", "backup_subdir": f"realm_{realm_id}_1",
+                          "core_unit": f"{core_prefix}realm-{realm_id}-v1-processor.service",
+                          "edge_url": f"http://{addresses[first['edge_host']]}:{first['http_port']}"}
+        sources[role] = {"coordinator_rpc_url": indexers["coordinator"]["edge_url"],
+                         "coordinator_backup_base_dir": mirror + "/cp/checkpoints",
+                         "validators": [{"realm_sub_id": position,
+                                         "edge_rpc_url": f"http://{addresses[v['edge_host']]}:{v['http_port']}",
+                                         "backup_base_dir": backups if position == 1 else f"{mirror}/v{position}/checkpoints"}
+                                        for position, v in enumerate(realm["validators"], 1)]}
+    mirror_sources = {"cp": {"host": addresses[coordinator["host"]], "roles": ["coordinator_0_0"]}}
+    for position in range(2, len(release_topology["realms"][0]["validators"]) + 1):
+        hosts = {realm["validators"][position - 1]["processor_host"] for realm in release_topology["realms"]}
+        require(len(hosts) == 1, f"validator {position} must run on one processor host")
+        mirror_sources[f"v{position}"] = {"host": addresses[hosts.pop()],
+                                          "roles": [f"realm_{realm['id']}_{position}" for realm in release_topology["realms"]]}
+    return {"release": lock["paths"]["services"]["release"], "credentials": lock["paths"]["services"]["config"],
+            "database": services["database"], "database_owner": services["owner"], "postgres_host": postgres_host,
+            "redis_url": f"{release_topology['infrastructure']['redis_url']}/{services['redis_db']}",
+            "redis_prefix": services["key_prefix"], "backup_dir": backups, "cursor_dir": backups + "/indexer_state",
+            "mirror_dir": mirror, "nostr_state": lock["paths"]["services"]["state"],
+            "services_url": "http://" + services["listen"], "services_host": listen_host, "services_port": int(listen_port),
+            "hasura_url": f"http://{postgres_host}:{envio['hasura_port']}/v1/graphql", "envio_database": envio["database"],
+            "groups": groups, "indexers": indexers, "realm_sources": sources, "mirror_sources": mirror_sources}
 
 
 def digest(path):
@@ -81,7 +135,7 @@ def trusted_parents(path):
                     "destination/credential ancestors must be root-owned and not writable by others")
 
 
-def load_package(root, expected):
+def load_package(root, expected, lock, lock_sha256):
     no_links(root)
     require(digest(root / "manifest.json") == expected, "manifest hash mismatch")
     manifest = json.loads((root / "manifest.json").read_bytes())
@@ -97,27 +151,25 @@ def load_package(root, expected):
         require(not Path(name).is_absolute() and ".." not in Path(name).parts,
                 "invalid package path")
         require(digest(path) == expected_hash, "package file hash mismatch: " + name)
+    require(inventory.get("release-lock.json") == lock_sha256, "package release lock differs from the lock in use")
+    release_topology_raw = (root / "release-topology.json").read_bytes()
+    require(hashlib.sha256(release_topology_raw).hexdigest() == lock["inputs"]["topology"], "release topology differs from the lock")
     topology = json.loads((root / "topology.json").read_bytes())
-    require(manifest["group"] in HOSTS and type(manifest.get("l1_ready")) is bool, "unknown package group/readiness")
-    require(topology["release"] == RELEASE and topology["backup_dir"] == BACKUPS
-            and topology["database"] == "psy_services_fresh_20261027_r3"
-            and topology["database_owner"] == "psy_services_fresh_20261026"
-            and topology["credentials"] == "/etc/psy-services-fresh-20261027-r3"
-            and topology["redis_prefix"] == "psy_svc_fresh_20261027_r3:"
-            and topology["hasura_url"] == "http://10.148.0.24:38081/v1/graphql"
-            and topology["envio_database"] == "envio_bridge_fresh_20261027_r3", "fresh r3 paths required")
-    require(manifest["l1_document_cohort"] == "psy-fresh20261027r3b"
-            and manifest["rpc_policy"] == "protected-alchemy-only-no-fallback", "L1 cohort/policy mismatch")
-    require(manifest["runtime_node_commit"] == "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-            and manifest["genesis_sha256"] == "f839b453ab130c29998620c4c5d4bf9a30ce341a2e7c480aa9dbd8ed10902173",
-            "runtime/Genesis mismatch")
-    for group, (ip, roles) in HOSTS.items():
-        require(topology["groups"][group]["host"] == ip and topology["groups"][group]["roles"] == roles,
-                "host placement mismatch")
-    binary = "psy-services" if manifest["group"] == "services" else "psy-indexer"
-    require(inventory.get(binary) == BINARIES[binary], "binary pin mismatch")
-    expected_units = {"units/" + unit_name(role) for role in HOSTS[manifest["group"]][1]}
+    require(topology == placement(lock, json.loads(release_topology_raw)), "package topology differs from the release placement")
+    require(manifest["group"] in topology["groups"] and type(manifest.get("l1_ready")) is bool, "unknown package group/readiness")
+    require(manifest["rpc_policy"] == "protected-alchemy-only-no-fallback", "RPC policy mismatch")
+    require(manifest["runtime_node_commit"] == lock["sources"]["runtime"]
+            and manifest["genesis_sha256"] == lock["inputs"]["genesis"], "runtime/Genesis mismatch")
+    binary = "psy-services" if "services" in topology["groups"][manifest["group"]]["roles"] else "psy-indexer"
+    require(inventory.get(binary) == lock["binaries"][binary], "binary pin mismatch")
+    for tool in ("install_services.py", "activate_services.py"):
+        require(inventory.get(tool) == lock["tool_sha256"][tool], f"package copy of {tool} differs from the lock")
+    expected_units = {"units/" + unit_name(lock, role) for role in topology["groups"][manifest["group"]]["roles"]}
     require({name for name in inventory if name.startswith("units/")} == expected_units, "unit scope mismatch")
+    for role in topology["groups"][manifest["group"]]["roles"]:
+        if role in topology["realm_sources"]:
+            require(json.loads((root / (role + ".json")).read_bytes()) == topology["realm_sources"][role],
+                    f"committed realm sources differ from the placement: {role}")
     return manifest, topology
 
 
@@ -184,7 +236,7 @@ def read_credentials(path, role, topology):
     return values
 
 
-def check_host(root, manifest, topology):
+def check_host(root, manifest, topology, lock):
     require(os.geteuid() == 0, "root required for host preflight")
     require(manifest["l1_ready"], "fresh three-chain documents not bound; install blocked")
     fence_services()
@@ -199,10 +251,10 @@ def check_host(root, manifest, topology):
     release = Path(topology["release"])
     trusted_parents(release)
     require(not release.exists(), "release already exists; do not overwrite or reinstall")
-    credential_role = "services" if manifest["group"] == "services" else "indexer"
+    credential_role = "services" if "services" in group["roles"] else "indexer"
     read_credentials(Path(topology["credentials"]) / (credential_role + ".env"), credential_role, topology)
     for role in group["roles"]:
-        unit = unit_name(role)
+        unit = unit_name(lock, role)
         for base in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"):
             require(not os.path.lexists(Path(base) / unit), "unit already exists")
             require(not os.path.lexists(Path(base) / (unit + ".d")), "unit drop-in exists")
@@ -214,7 +266,7 @@ def check_host(root, manifest, topology):
             no_links(backup)
             require((backup / item["backup_subdir"]).is_dir(), "fresh backup subtree missing")
             subprocess.run(["systemctl", "is-active", "--quiet", item["core_unit"]], check=True)
-    if manifest["group"] == "services":
+    if "services" in group["roles"]:
         require(not os.path.lexists(topology["nostr_state"]), "fresh Nostr state already exists")
         with socket.socket() as sock:
             sock.bind((topology["services_host"], topology["services_port"]))
@@ -224,12 +276,7 @@ def check_host(root, manifest, topology):
     return account
 
 
-def unit_name(role):
-    return ("psy-services-fresh-20261027-r3" if role == "services" else
-            "psy-indexer-fresh-20261027-r3-" + role) + ".service"
-
-
-def install(root, manifest, topology, account):
+def install(root, manifest, topology, account, lock):
     require(manifest["l1_ready"], "fresh three-chain documents not bound; install blocked")
     fence_services()
     os.umask(0o022)
@@ -251,12 +298,12 @@ def install(root, manifest, topology, account):
         if temporary.exists():
             shutil.rmtree(temporary)
     # All destinations were checked before the first write; no existing bytes are replaced.
-    if manifest["group"] != "services":
+    if "services" not in topology["groups"][manifest["group"]]["roles"]:
         cursor = Path(topology["backup_dir"]) / "indexer_state"
         cursor.mkdir(mode=0o750)
         os.chown(cursor, account.pw_uid, account.pw_gid)
     for role in topology["groups"][manifest["group"]]["roles"]:
-        name = unit_name(role)
+        name = unit_name(lock, role)
         write_new(Path("/etc/systemd/system") / name, (root / "units" / name).read_bytes(), 0o644)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     print("INSTALL PASS; no start/enable or database operation performed")
@@ -266,9 +313,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["verify", "check-host", "install", "guard"])
     parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--role", choices=["services", "coordinator", "realm0", "realm1"])
+    parser.add_argument("--role")
     args = parser.parse_args()
     require(args.package.is_absolute(), "absolute package path required")
     expected = args.manifest_sha256
@@ -280,16 +329,17 @@ def main():
             require(st.st_uid == 0 and not st.st_mode & 0o022, "installed package permissions invalid")
         expected = digest(args.package / "manifest.json")
     require(expected is not None, "manifest hash required")
-    manifest, topology = load_package(args.package, expected)
+    lock = read_release_lock(args.release_lock, args.release_lock_sha256)
+    manifest, topology = load_package(args.package, expected, lock, args.release_lock_sha256)
     if args.mode == "guard":
         require(manifest["l1_ready"], "fresh L1 documents missing")
         require(args.role in topology["groups"][manifest["group"]]["roles"], "role mismatch")
         validate_environment(os.environ, args.role, topology)
     elif args.mode in ("check-host", "install"):
-        account = check_host(args.package, manifest, topology)
+        account = check_host(args.package, manifest, topology, lock)
         if args.mode == "install":
-            require(args.apply, "install needs explicit --apply")
-            install(args.package, manifest, topology, account)
+            require(args.apply, "install needs --apply")
+            install(args.package, manifest, topology, account, lock)
     print(args.mode.upper() + " PASS")
 
 

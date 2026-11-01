@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Activate only a reviewed installed R3 Services/indexer group; never stop or repair."""
+"""Activate only a reviewed installed Services/indexer group; never stop or repair."""
 import argparse
 import hashlib
 import json
@@ -12,10 +12,17 @@ import types
 import urllib.request
 
 
-def load_installer(expected):
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_installer(lock):
     path = Path(__file__).with_name("install_services.py")
     raw = path.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != expected:
+    if hashlib.sha256(raw).hexdigest() != lock["tool_sha256"]["install_services.py"]:
         raise ValueError("installer hash mismatch")
     helper = types.ModuleType("reviewed_services_installer")
     helper.__file__ = str(path)
@@ -33,9 +40,9 @@ def http_health(url):
             raise ValueError("private dependency health check failed")
 
 
-def preflight(helper, root, manifest, topology):
+def preflight(helper, root, manifest, topology, lock):
     helper.require(os.geteuid() == 0 and manifest["l1_ready"], "root and fresh L1 documents required")
-    helper.require(str(root) == helper.RELEASE, "installed r3 release required")
+    helper.require(str(root) == topology["release"], "installed release required")
     group = topology["groups"][manifest["group"]]
     addresses = subprocess.check_output(["hostname", "-I"], text=True).split()
     helper.require(group["host"] in addresses, "wrong host")
@@ -44,9 +51,9 @@ def preflight(helper, root, manifest, topology):
         helper.no_links(path)
         info = path.stat()
         helper.require(info.st_uid == 0 and not info.st_mode & 0o022, "installed file permissions")
-    names = [helper.unit_name(role) for role in group["roles"]]
+    names = [helper.unit_name(lock, role) for role in group["roles"]]
     helper.fence_services(names)
-    role = "services" if manifest["group"] == "services" else "indexer"
+    role = "services" if "services" in group["roles"] else "indexer"
     helper.read_credentials(Path(topology["credentials"]) / (role + ".env"), role, topology)
     for name in names:
         value = helper.unit_status(name)
@@ -60,8 +67,7 @@ def preflight(helper, root, manifest, topology):
         if value["ActiveState"] == "inactive":
             helper.require(value.get("MainPID") == "0", "inactive unit still has PID")
     if role == "services":
-        helper.require(topology["hasura_url"] == "http://10.148.0.24:38081/v1/graphql", "fresh Hasura required")
-        http_health("http://10.148.0.24:38081/healthz")
+        http_health(topology["hasura_url"].replace("/v1/graphql", "/healthz"))
     else:
         http_health(topology["services_url"] + "/health")
         for name in group["roles"]:
@@ -79,21 +85,21 @@ def preflight(helper, root, manifest, topology):
     return names
 
 
-def process(helper, name, binary):
+def process(helper, name, binary, release, lock):
     value = helper.unit_status(name)
     helper.require(value.get("ActiveState") == "active" and value.get("MainPID", "0").isdigit()
                    and int(value["MainPID"]) > 0, "unit not active; inspect without restart")
     path = Path("/proc") / value["MainPID"] / "exe"
-    helper.require(os.readlink(path) == helper.RELEASE + "/" + binary, "unexpected running executable")
+    helper.require(os.readlink(path) == release + "/" + binary, "unexpected running executable")
     with path.open("rb") as stream:
         sha = hashlib.file_digest(stream, "sha256").hexdigest()
-    helper.require(sha == helper.BINARIES[binary], "running binary mismatch")
+    helper.require(sha == lock["binaries"][binary], "running binary mismatch")
     again = helper.unit_status(name)
     helper.require(again.get("MainPID") == value["MainPID"] and again.get("ActiveState") == "active", "process changed")
     return {"unit": name, "pid": int(value["MainPID"]), "exe_sha256": sha}
 
 
-def wait_process(helper, name, binary):
+def wait_process(helper, name, binary, release, lock):
     deadline = time.monotonic() + 15
     observed_pid = None
     while True:
@@ -108,8 +114,8 @@ def wait_process(helper, name, binary):
                 executable = os.readlink(Path("/proc") / pid / "exe")
             except (FileNotFoundError, ProcessLookupError):
                 executable = None
-            if executable == helper.RELEASE + "/" + binary:
-                return process(helper, name, binary)
+            if executable == release + "/" + binary:
+                return process(helper, name, binary, release, lock)
             # Type=simple may become active before the systemd executor's execve.
             helper.require(executable in (None, "/usr/lib/systemd/systemd", "/lib/systemd/systemd",
                                           "/usr/lib/systemd/systemd-executor", "/lib/systemd/systemd-executor"),
@@ -119,20 +125,23 @@ def wait_process(helper, name, binary):
 
 
 def activate(args):
-    helper = load_installer(args.installer_sha256)
-    manifest, topology = helper.load_package(args.package, args.manifest_sha256)
+    lock = read_release_lock(args.release_lock, args.release_lock_sha256)
+    helper = load_installer(lock)
+    manifest, topology = helper.load_package(args.package, args.manifest_sha256, lock, args.release_lock_sha256)
     helper.require(helper.digest(Path(helper.__file__)) == manifest["files"]["install_services.py"], "helper/package mismatch")
-    names = preflight(helper, args.package, manifest, topology)
-    binary = "psy-services" if manifest["group"] == "services" else "psy-indexer"
+    names = preflight(helper, args.package, manifest, topology, lock)
+    binary = "psy-services" if "services" in topology["groups"][manifest["group"]]["roles"] else "psy-indexer"
+    release = topology["release"]
     results = []
     if args.apply:
         for name in names:
-            preflight(helper, args.package, manifest, topology)
+            preflight(helper, args.package, manifest, topology, lock)
             already_active = helper.unit_status(name).get("ActiveState") == "active"
             if already_active:
-                process(helper, name, binary)
+                process(helper, name, binary, release, lock)
             subprocess.run(["systemctl", "enable", *([] if already_active else ["--now"]), name], check=True)
-            results.append(process(helper, name, binary) if already_active else wait_process(helper, name, binary))
+            results.append(process(helper, name, binary, release, lock) if already_active
+                           else wait_process(helper, name, binary, release, lock))
     return {"group": manifest["group"], "started": args.apply, "processes": results,
             "database_acceptance_verified": False, "indexer_progress_verified": False}
 
@@ -141,7 +150,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
-    parser.add_argument("--installer-sha256", required=True)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--apply", action="store_true")
     try:
         print(json.dumps(activate(parser.parse_args()), sort_keys=True))

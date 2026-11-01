@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import prepare_services_inputs as prep
+from test_release_lock import build_test_lock
 
 
 class ServicesInputTests(unittest.TestCase):
@@ -59,32 +60,19 @@ class ServicesInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "slot mismatch"):
             prep.read_abis(self.root)
 
+    def test_sources_binaries_and_genesis_must_be_pinned_in_the_lock(self):
+        lock = build_test_lock()
+        lock["sources"]["services"] = ""
+        args = SimpleNamespace(output=self.root / "new", services_source=self.root, indexer_source=self.root,
+                               genesis_source=self.root)
+        with self.assertRaisesRegex(ValueError, "sources.services is not pinned"):
+            prep.prepare(args, lock)
+
     def test_existing_output_never_reused(self):
         with patch.object(prep, "check_source") as source:
             with self.assertRaisesRegex(ValueError, "output already exists"):
-                prep.prepare(SimpleNamespace(output=self.root))
+                prep.prepare(SimpleNamespace(output=self.root), {})
             source.assert_not_called()
-
-    def test_all_validator_sources_use_fresh_backups(self):
-        for realm in (0, 1):
-            sources = prep.realm_sources(realm)
-            self.assertEqual(sources["coordinator_backup_base_dir"], prep.MIRROR + "/cp/checkpoints")
-            self.assertEqual([v["realm_sub_id"] for v in sources["validators"]], [1, 2, 3])
-            self.assertEqual(sources["validators"][0]["backup_base_dir"], prep.BACKUPS)
-            for sub in (2, 3):
-                self.assertEqual(sources["validators"][sub - 1]["backup_base_dir"], f"{prep.MIRROR}/v{sub}/checkpoints")
-            self.assertNotIn("20261026", json.dumps(sources))
-
-    def test_fresh_state_preserves_owner_and_excludes_bridge_reader(self):
-        topology = prep.topology()
-        self.assertEqual(topology["database"], "psy_services_fresh_20261027_r3")
-        self.assertEqual(topology["database_owner"], "psy_services_fresh_20261026")
-        self.assertFalse(topology["bridge_reader_enabled"])
-        self.assertFalse(topology["nostr_enabled"])
-        self.assertEqual(topology["hasura_url"], "http://10.148.0.24:38081/v1/graphql")
-        self.assertEqual(topology["envio_database"], "envio_bridge_fresh_20261027_r3")
-        self.assertEqual(topology["roles"]["realm1"]["host"], "10.148.0.37")
-        self.assertEqual(topology["mirror_sources"]["v3"]["host"], "10.148.0.43")
 
 
 if __name__ == "__main__":

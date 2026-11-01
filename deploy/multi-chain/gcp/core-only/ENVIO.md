@@ -1,7 +1,9 @@
 # Independent Envio Preparation
 
-`prepare_envio.py` prepares inputs locally from Node
-`da6391549e44d49c07e856eaeb5d0b8d7902ef17`. It reads Git objects, not the
+`prepare_envio.py` prepares inputs locally from the Node runtime commit in the
+release lock (`sources.runtime`). Every name, port, image, hash and path comes from
+the lock (`envio`, `paths.envio`, `units.envio`); nothing is a module constant.
+It reads Git objects, not the
 working tree, replacement refs, old deployment artifacts or live release.
 Inherited `GIT_*` overrides are removed. It never runs APT,
 pnpm, patch scripts, SSH, Docker, SQL, systemctl or the old Envio installer.
@@ -20,7 +22,7 @@ The spec has these exact top-level fields:
 - `version`: `1`.
 - `patches`: descriptors for `history.py`, `polling.py`, `ordered.py`,
   `reorg.py`, `deposit-indexes.py`. The five hashes are enforced independently
-  of the spec in `prepare_envio.py:PATCHES`. These are the existing history,
+  of the spec against `envio.patch_sha256` in the release lock. These are the existing history,
   rebuild-safe polling, ordered failover, fresh-parent reorg and Deposit query
   index tools. Their bytes are copied unchanged; none is executed.
 - `dependency_lock`: descriptor for a reviewed pnpm v9 source-only lock, or
@@ -59,6 +61,7 @@ They must not fall back to upstream development passwords or enter argv/logs.
 
 ```sh
 python3 -B deploy/multi-chain/gcp/core-only/prepare_envio.py \
+  --release-lock '<release-lock.json>' --release-lock-sha256 '<lock-sha256>' \
   --source-repo '<pinned-node-repository>' \
   --spec '<private-spec.json>' --spec-sha256 '<spec-sha256>' \
   --output '<new-private-directory-outside-git>'
@@ -76,13 +79,13 @@ and event declarations stay together: in particular do not rename the
 template's `WithdrawalClaimed` field from `nullifier` independently of its
 handler. Do not copy old timestamp handlers or timestamp migrations.
 
-The only database name is `envio_bridge_fresh_20261026`, schema `envio`.
-Compose project is `psy-envio-fresh-20261026`; it contains Hasura only, no PG
-service, no PG volume and no auto-restart. Both Hasura data and metadata URLs
+The only database name is `envio.database` of the lock, schema `envio`.
+The Compose project is `envio.project`; it contains Hasura only, no PG
+service, no PG volume and no auto-restart. The Hasura image is `envio.image`,
+pinned by digest. Both Hasura data and metadata URLs
 are constructed with that new database name, not an overridable database URL.
-The candidate release is `/opt/psy-envio/releases/core-testnet-20261026` and
-candidate unit is `psy-envio-fresh-20261026.service`; neither is installed.
-No old `current` symlink is changed. Hasura v2.43.0 keeps bounded logs
+The release directory is `paths.envio.release` and the unit is `units.envio`.
+No old `current` symlink is changed. Hasura keeps bounded logs
 (`100m`, `100`, compression) and nofile 65536/524288.
 
 ## Remaining Gates
@@ -169,16 +172,18 @@ The OS account `psy-envio-fresh` must exist with a same-name primary group,
 nonzero UID/GID and `/usr/sbin/nologin`. If absent, main can create it with
 `useradd --system --user-group --no-create-home --home-dir /nonexistent --shell
 /usr/sbin/nologin psy-envio-fresh`; never modify an existing account to force a
-match. PG login role `envio_bridge_fresh_20261026` must already exist, with the
+match. PG login role `envio.database` (the lock) must already exist, with the
 supplied password, no elevated attributes and no role memberships. Main can
 provision that new role through its private stdin credential workflow without
 restarting/recreating PG.
 
 ```sh
-sudo python3 -B install_envio.py check-host \
-  --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
-sudo python3 -B install_envio.py install --apply \
-  --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
+sudo python3 -I -B install_envio.py check-host --release-lock '<release-lock.json>' \
+  --release-lock-sha256 '<lock-sha256>' --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
+sudo python3 -I -B install_envio.py install --apply --release-lock '<release-lock.json>' \
+  --release-lock-sha256 '<lock-sha256>' --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
+sudo python3 -I -B install_envio.py activate --apply --release-lock '<release-lock.json>' \
+  --release-lock-sha256 '<lock-sha256>' --spec '<private-install-spec.json>' --spec-sha256 '<SHA256>'
 python3 -B -m unittest discover \
   -s deploy/multi-chain/gcp/core-only -p test_install_envio.py
 ```
@@ -203,7 +208,12 @@ user; only dedicated state is writable. MemoryMax is 1 GiB and IP policy allows
 only private ranges/loopback. Host memory fit, IP-filter support, credential
 validity and startup acceptance remain to be measured.
 
-Main owns activation. The independent Hasura command must use this project,
+`activate --apply` is the activation: it starts this release's Hasura project (its
+own compose file, `--pull never`, the root-only `hasura.env`), waits for Hasura
+health, enables and starts the Envio unit, waits until `envio.envio_chains` shows a
+source block for all three chains, and builds the Deposit query indexes with the
+pinned `deposit-indexes.py`. Without `--apply` it only reports. The text below is
+the manual form of the same sequence. The independent Hasura command must use this project,
 this compose file, `--pull never` and the new root-only `hasura.env`; do not use
 the generated default compose (it includes PG). Start only the new indexer unit
 after Hasura is healthy, then apply/check Deposit indexes against the new DB

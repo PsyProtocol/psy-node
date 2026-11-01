@@ -10,6 +10,7 @@ No v1 fallback is permitted; upgrade requires a coordinated operator handoff.
 import argparse
 import base64
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import grp
 import hashlib
@@ -26,15 +27,6 @@ import sys
 import tarfile
 import time
 
-CONFIG = Path('/etc/psy-indexer-r3-mirror')
-STATE = Path('/var/lib/psy-indexer-r3-mirror')
-BACKUPS = '/var/lib/psy-core/core-testnet-20261027-r3/checkpoints'
-PROGRAM = Path('/usr/local/libexec/psy-indexer-r3-mirror.py')
-HOSTS = {
-    'cp': ('10.148.0.25', 'AAAAC3NzaC1lZDI1NTE5AAAAIJstOeTBzGI7x1kTNmXCjmBdPlt9fYRYj02jCYadYR8S', ['coordinator_0_0']),
-    'v2': ('10.148.0.42', 'AAAAC3NzaC1lZDI1NTE5AAAAIM9PZNDNv23rwH0GDV6rqH7Ff6GZ+wv/axJqpXUbDQqQ', ['realm_0_2', 'realm_1_2']),
-    'v3': ('10.148.0.43', 'AAAAC3NzaC1lZDI1NTE5AAAAIKiFB2MptvcjniVu9ySN1jBd/a5fZJiJ+5/sDsjKQ2CV', ['realm_0_3', 'realm_1_3']),
-}
 REQUEST = 'psy-indexer-backup-read-v1 '
 MAX_JSON = 32 * 1024 * 1024
 PAGE_FILES = 128
@@ -45,9 +37,39 @@ MAX_BATCH_FILES = 128
 QUIET_NS = 30 * 1000000000
 BACKUP_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,239}\.backup', re.ASCII)
 
+@dataclass(frozen=True)
+class Mirror:
+    config: Path
+    state: Path
+    backups: str
+    program: Path
+    name: str
+    audit: Path
+    reader: str
+    sources: dict  # name -> (address, ssh host key blob, roles)
+
+
 def require(ok, message):
     if not ok:
         raise RuntimeError(message)
+
+
+def read_pinned_json(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == expected_sha256, 'pinned file hash mismatch')
+    return json.loads(raw)
+
+
+def load_mirror(lock_path, lock_sha256, config_path, config_sha256):
+    lock = read_pinned_json(lock_path, lock_sha256)
+    config = read_pinned_json(config_path, config_sha256)
+    require(set(config) == {'reader', 'sources'}, 'mirror config fields mismatch')
+    state = Path(lock['services']['mirror'])
+    require(state.is_absolute() and state.name, 'mirror state path invalid')
+    sources = {name: (row['host'], row['host_key'], row['roles']) for name, row in config['sources'].items()}
+    return Mirror(config=Path('/etc') / state.name, state=state, backups=lock['services']['backups'],
+                  program=Path('/usr/local/libexec') / (state.name + '.py'), name=state.name,
+                  audit=Path('/var/lib') / (state.name + '-access'), reader=config['reader'], sources=sources)
 
 def run(args, timeout=30):
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -81,10 +103,12 @@ def public_key(raw):
     require(len(blob) == 51 and blob[:19] == b'\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20', 'bad public key encoding')
     return 'ssh-ed25519 ' + fields[1]
 
-def authorize_line(key, name):
-    require(name in HOSTS, 'unknown source')
-    command = f'sudo -n --preserve-env=SSH_ORIGINAL_COMMAND /usr/bin/python3 -I -B {PROGRAM} serve --source {name}'
-    return f'from="10.148.0.37",restrict,command="{command}" {key} psy-indexer-r3-mirror\n'.encode()
+def authorize_line(key, name, m):
+    require(name in m.sources, 'unknown source')
+    address, _, roles = m.sources[name]
+    command = (f'sudo -n --preserve-env=SSH_ORIGINAL_COMMAND /usr/bin/python3 -I -B {m.program} serve --source {name} '
+               f'--address {address} --backups {m.backups} ' + ' '.join(f'--role {role}' for role in roles))
+    return f'from="{m.reader}",restrict,command="{command}" {key} {m.name}\n'.encode()
 
 
 @contextmanager
@@ -113,8 +137,8 @@ def write_json(stream, value):
     stream.flush()
 
 
-def open_source(role):
-    path = Path(BACKUPS) / role / 'guta_updates_backup'
+def open_source(backups, role):
+    path = Path(backups) / role / 'guta_updates_backup'
     require(path.is_absolute() and '..' not in path.parts, 'invalid source root')
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -266,14 +290,14 @@ def send_backups(fd, entries, output):
                         (info.st_size, info.st_mtime_ns, info.st_ctime_ns), 'backup changed during read')
 
 
-def serve(name):
-    host(HOSTS[name][0])
+def serve(address, backups, roles):
+    host(address)
     command = os.environ.get('SSH_ORIGINAL_COMMAND', '')
-    allowed = {REQUEST + role: role for role in HOSTS[name][2]}
+    allowed = {REQUEST + role: role for role in roles}
     require(command in allowed, 'command not allowed')
     role = allowed[command]
     with deadline():
-        fd = open_source(role)
+        fd = open_source(backups, role)
         try:
             write_json(sys.stdout.buffer, {'version': 2, 'role': role})
             window = read_json(sys.stdin.buffer)
@@ -288,29 +312,29 @@ def serve(name):
         finally:
             os.close(fd)
 
-def prepare_key():
-    host('10.148.0.37')
-    require(not CONFIG.exists(), 'key directory already exists; never regenerate')
-    CONFIG.mkdir(mode=0o700)
-    run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'psy-indexer-r3-mirror', '-f', str(CONFIG / 'id_ed25519')])
-    known = ''.join(f'{ip} ssh-ed25519 {key}\n' for ip, key, _ in HOSTS.values())
-    write_new(CONFIG / 'known_hosts', known.encode())
-    print(public_key((CONFIG / 'id_ed25519.pub').read_bytes()))
+def prepare_key(m):
+    host(m.reader)
+    require(not m.config.exists(), 'key directory already exists; never regenerate')
+    m.config.mkdir(mode=0o700)
+    run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', m.name, '-f', str(m.config / 'id_ed25519')])
+    known = ''.join(f'{address} ssh-ed25519 {key}\n' for address, key, _ in m.sources.values())
+    write_new(m.config / 'known_hosts', known.encode())
+    print(public_key((m.config / 'id_ed25519.pub').read_bytes()))
 
-def source_access(name, key_file):
-    host(HOSTS[name][0])
+def source_access(m, name, key_file):
+    host(m.sources[name][0])
     trusted(key_file)
     key = public_key(key_file.read_bytes())
     require(os.access('/usr/bin/python3', os.X_OK), 'python3 missing')
-    require(not PROGRAM.exists(), 'source helper already exists; inspect before retry')
-    for role in HOSTS[name][2]:
-        fd = open_source(role)
+    require(not m.program.exists(), 'source helper already exists; inspect before retry')
+    for role in m.sources[name][2]:
+        fd = open_source(m.backups, role)
         try:
             source_page(fd, '', None)
         finally:
             os.close(fd)
-    PROGRAM.parent.mkdir(mode=0o755, exist_ok=True)
-    trusted(PROGRAM.parent, directory=True)
+    m.program.parent.mkdir(mode=0o755, exist_ok=True)
+    trusted(m.program.parent, directory=True)
     keys = Path('/home/ubuntu/.ssh/authorized_keys')
     home = Path('/home/ubuntu').stat()
     for path in (Path('/home/ubuntu'), keys.parent):
@@ -324,26 +348,25 @@ def source_access(name, key_file):
                 and not info.st_mode & 0o022, 'unsafe authorized_keys')
         old = stream.read()
         require(key.split()[1].encode() not in old, 'key already present; inspect before retry')
-        audit = Path('/var/lib/psy-indexer-mirror-access-20261027-r3')
-        audit.mkdir(mode=0o700)
-        write_new(audit / 'authorized_keys.before', old)
-        addition = (b'' if not old or old.endswith(b'\n') else b'\n') + authorize_line(key, name)
-        write_new(audit / 'added-key-line', addition)
-        write_new(PROGRAM, Path(__file__).read_bytes(), 0o700)
+        m.audit.mkdir(mode=0o700)
+        write_new(m.audit / 'authorized_keys.before', old)
+        addition = (b'' if not old or old.endswith(b'\n') else b'\n') + authorize_line(key, name, m)
+        write_new(m.audit / 'added-key-line', addition)
+        write_new(m.program, Path(__file__).read_bytes(), 0o700)
         stream.write(addition)
         stream.flush()
         os.fsync(stream.fileno())
         stream.seek(0)
         require(stream.read() == old + addition, 'authorized_keys concurrent drift')
-    print(json.dumps({'host': HOSTS[name][0], 'read_only_key_added': True, 'allowed_source': '10.148.0.37', 'backup_root': BACKUPS}))
+    print(json.dumps({'host': m.sources[name][0], 'read_only_key_added': True, 'allowed_source': m.reader, 'backup_root': m.backups}))
 
-def sync_command(name, role):
-    require(name in HOSTS and role in HOSTS[name][2], 'role not allowed on source')
-    ip = HOSTS[name][0]
-    return ['/usr/bin/ssh', '-F', '/dev/null', '-i', str(CONFIG / 'id_ed25519'),
+def sync_command(m, name, role):
+    require(name in m.sources and role in m.sources[name][2], 'role not allowed on source')
+    address = m.sources[name][0]
+    return ['/usr/bin/ssh', '-F', '/dev/null', '-i', str(m.config / 'id_ed25519'),
             '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={CONFIG}/known_hosts',
-            f'ubuntu@{ip}', REQUEST + role]
+            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={m.config}/known_hosts',
+            f'ubuntu@{address}', REQUEST + role]
 
 
 def receive_backups(process, destination, role, gid):
@@ -421,10 +444,10 @@ def receive_backups(process, destination, role, gid):
         os.close(fd)
 
 
-def sync_one(name, role, gid):
-    destination = STATE / name / 'checkpoints' / role / 'guta_updates_backup'
+def sync_one(m, name, role, gid):
+    destination = m.state / name / 'checkpoints' / role / 'guta_updates_backup'
     trusted(destination, directory=True)
-    process = subprocess.Popen(sync_command(name, role), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    process = subprocess.Popen(sync_command(m, name, role), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     try:
         with deadline():
@@ -441,37 +464,41 @@ def sync_one(name, role, gid):
             process.stdin.close()
         process.stdout.close()
 
-def install():
-    host('10.148.0.37')
-    trusted(CONFIG, directory=True)
-    trusted(CONFIG / 'id_ed25519')
-    trusted(CONFIG / 'known_hosts')
+def install(m, args):
+    host(m.reader)
+    trusted(m.config, directory=True)
+    trusted(m.config / 'id_ed25519')
+    trusted(m.config / 'known_hosts')
     require(os.access('/usr/bin/ssh', os.X_OK), 'ssh missing')
-    require(not STATE.exists() and not PROGRAM.exists(), 'installation already exists')
+    require(not m.state.exists() and not m.program.exists(), 'installation already exists')
     gid = grp.getgrnam('psy-core').gr_gid
-    STATE.mkdir(mode=0o750)
-    os.chmod(STATE, 0o750)
-    os.chown(STATE, 0, gid)
-    for name, (_, _, roles) in HOSTS.items():
+    m.state.mkdir(mode=0o750)
+    os.chmod(m.state, 0o750)
+    os.chown(m.state, 0, gid)
+    for name, (_, _, roles) in m.sources.items():
         for role in roles:
-            dest = STATE / name / 'checkpoints' / role / 'guta_updates_backup'
+            dest = m.state / name / 'checkpoints' / role / 'guta_updates_backup'
             dest.mkdir(parents=True, mode=0o750)
             for parent in (dest, *dest.parents):
-                if parent == STATE:
+                if parent == m.state:
                     break
                 os.chmod(parent, 0o750)
                 os.chown(parent, 0, gid)
-    PROGRAM.parent.mkdir(mode=0o755, exist_ok=True)
-    trusted(PROGRAM.parent, directory=True)
-    write_new(PROGRAM, Path(__file__).read_bytes(), 0o700)
+    m.program.parent.mkdir(mode=0o755, exist_ok=True)
+    trusted(m.program.parent, directory=True)
+    write_new(m.program, Path(__file__).read_bytes(), 0o700)
+    lock_copy, config_copy = (m.program.with_name(m.name + suffix) for suffix in ('.lock.json', '.mirror.json'))
+    write_new(lock_copy, Path(args.release_lock).read_bytes(), 0o644)
+    write_new(config_copy, Path(args.mirror_config).read_bytes(), 0o644)
+    allowed = ' '.join(address + '/32' for address, _, _ in m.sources.values())
     unit = f'''[Unit]
-Description=Read-only backup mirror for r3 indexers
+Description=Read-only backup mirror for the indexers of this release
 After=network-online.target
 [Service]
 Type=oneshot
 User=root
 UMask=0027
-ExecStart=/usr/bin/python3 -I -B {PROGRAM} sync
+ExecStart=/usr/bin/python3 -I -B {m.program} sync --release-lock {lock_copy} --release-lock-sha256 {args.release_lock_sha256} --mirror-config {config_copy} --mirror-config-sha256 {args.mirror_config_sha256}
 TimeoutStartSec=300
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_CHOWN
@@ -481,57 +508,67 @@ MemoryMax=512M
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths={STATE}
+ReadWritePaths={m.state}
 IPAddressDeny=any
-IPAddressAllow=10.148.0.25/32 10.148.0.42/32 10.148.0.43/32
+IPAddressAllow={allowed}
 '''
-    timer = '''[Unit]
-Description=Refresh r3 indexer read-only backup mirrors
+    timer = f'''[Unit]
+Description=Refresh the read-only backup mirrors of this release
 [Timer]
 OnBootSec=30s
 OnUnitInactiveSec=10s
 AccuracySec=1s
-Unit=psy-indexer-r3-mirror.service
+Unit={m.name}.service
 [Install]
 WantedBy=timers.target
 '''
-    write_new(Path('/etc/systemd/system/psy-indexer-r3-mirror.service'), unit.encode(), 0o644)
-    write_new(Path('/etc/systemd/system/psy-indexer-r3-mirror.timer'), timer.encode(), 0o644)
+    write_new(Path('/etc/systemd/system') / (m.name + '.service'), unit.encode(), 0o644)
+    write_new(Path('/etc/systemd/system') / (m.name + '.timer'), timer.encode(), 0o644)
     print(json.dumps({'installed': True, 'started': False, 'enabled': False}))
 
-def sync():
-    host('10.148.0.37')
-    trusted(CONFIG, directory=True)
-    trusted(CONFIG / 'id_ed25519')
-    trusted(CONFIG / 'known_hosts')
-    trusted(STATE, directory=True)
+def sync(m):
+    host(m.reader)
+    trusted(m.config, directory=True)
+    trusted(m.config / 'id_ed25519')
+    trusted(m.config / 'known_hosts')
+    trusted(m.state, directory=True)
     gid = grp.getgrnam('psy-core').gr_gid
-    lock = os.open(STATE / '.sync-lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock = os.open(m.state / '.sync-lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for name, (_, _, roles) in HOSTS.items():
+        for name, (_, _, roles) in m.sources.items():
             for role in roles:
-                sync_one(name, role, gid)
+                sync_one(m, name, role, gid)
     finally:
         os.close(lock)
-    print(json.dumps({'synced_sources': list(HOSTS), 'source_deletion': False, 'atomic_file_publication': True}))
+    print(json.dumps({'synced_sources': list(m.sources), 'source_deletion': False, 'atomic_file_publication': True}))
 
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['prepare-key', 'source-access', 'install', 'sync', 'serve'])
-    parser.add_argument('--source', choices=list(HOSTS))
+    parser.add_argument('--release-lock', type=Path)
+    parser.add_argument('--release-lock-sha256')
+    parser.add_argument('--mirror-config', type=Path)
+    parser.add_argument('--mirror-config-sha256')
+    parser.add_argument('--source')
+    parser.add_argument('--address')
+    parser.add_argument('--backups')
+    parser.add_argument('--role', action='append')
     parser.add_argument('--public-key', type=Path)
     args = parser.parse_args()
-    if args.action in ('serve', 'source-access'):
-        require(args.source is not None, 'source required')
+    if args.action == 'serve':
+        require(args.source and args.address and args.backups and args.role, 'serve needs its source, address, backups and roles')
+        return serve(args.address, args.backups, args.role)
+    require(args.release_lock and args.release_lock_sha256 and args.mirror_config and args.mirror_config_sha256,
+            'release lock and mirror config are required')
+    m = load_mirror(args.release_lock, args.release_lock_sha256, args.mirror_config, args.mirror_config_sha256)
     if args.action == 'source-access':
-        require(args.public_key is not None, 'public key required')
-    if args.action == 'prepare-key': prepare_key()
-    elif args.action == 'source-access': source_access(args.source, args.public_key)
-    elif args.action == 'install': install()
-    elif args.action == 'serve': serve(args.source)
-    else: sync()
+        require(args.source in m.sources and args.public_key is not None, 'source and public key required')
+        source_access(m, args.source, args.public_key)
+    elif args.action == 'prepare-key': prepare_key(m)
+    elif args.action == 'install': install(m, args)
+    else: sync(m)
 
 if __name__ == '__main__':
     try:
