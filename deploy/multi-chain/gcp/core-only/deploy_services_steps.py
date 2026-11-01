@@ -157,7 +157,7 @@ def l1_documents(ctx):
 def prepare_apply(ctx):
     documents = l1_documents(ctx)
     output = bridge.output_directory(ctx, documents)
-    if not output.exists():
+    if not (output / "summary.json").exists():
         output = bridge.build_bridge_packages(ctx, documents)
     summary = verify_set(ctx, output, False)
     prepare.write_state(ctx, "prepare_bridge_packages", {
@@ -595,16 +595,24 @@ def read_cursor(ctx, placement, role):
     name = "coordinator.json" if role == "coordinator" else f"realm_{role[len('realm'):]}_1.json"
     path = f"{placement['backup_dir']}/indexer_state/{name}"
     text = root_script(ctx, group_alias, f"cat -- {quote_word(path)} 2>/dev/null || echo '{{}}'\n")
-    value = json.loads(text.strip().splitlines()[-1] if text.strip() else "{}")
+    try:
+        value = json.loads(text.strip() or "{}")
+    except ValueError:
+        return None  # the indexer's write is not atomic; a torn file is read again on the next poll
     return value.get("last_checkpoint_id") if type(value.get("last_checkpoint_id")) is int else None
 
 
 def watermark_advancing(ctx, placement, role, message):
-    first = read_cursor(ctx, placement, role)
+    baseline = []
 
     def advanced():
         current = read_cursor(ctx, placement, role)
-        return first is not None and current is not None and current > first
+        if current is None:
+            return False
+        if not baseline:
+            baseline.append(current)
+            return False
+        return current > baseline[0]
     try:
         wait_until(advanced, lambda: None, POLL_SECONDS, READY_SECONDS, f"{role} watermark")
     except TimeoutError:

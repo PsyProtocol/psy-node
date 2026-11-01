@@ -279,7 +279,11 @@ def build_bridge_packages(ctx, l1_documents):
     if l1_documents is None:
         clear_pending(output)
     else:
-        prepare.require(not output.exists(), "this package set exists; verify it instead of rebuilding")
+        prepare.require(not (output / "summary.json").exists(), "this package set exists; verify it instead of rebuilding")
+        if output.exists():
+            # A set without summary.json is the leftover of a failed build; the summary is written last.
+            prepare.require(output.name.startswith("final-"), "refusing to remove a directory this module did not name")
+            shutil.rmtree(output)
         prepare.require(set(l1_documents) == set(release_lock.CHAINS), "documents are needed for all three chains")
     output.mkdir(parents=True, mode=0o700)
     if l1_documents is None:

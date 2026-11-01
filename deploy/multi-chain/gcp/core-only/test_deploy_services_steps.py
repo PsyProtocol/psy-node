@@ -17,6 +17,9 @@ import release_lock
 from test_services_packages import ServicesWorld, sha
 
 
+REAL_READ_CURSOR = steps.read_cursor
+
+
 class BridgeWorld(ServicesWorld):
     """Adds the Guardian, Relayer and Envio operator inputs to a Services world."""
 
@@ -172,7 +175,8 @@ class PackageSetTests(unittest.TestCase):
             for name in ("summary", "bridge_receipt", "state_manager_receipt"):
                 path = directory / chain / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes((chain + name).encode())
+                path.write_bytes(json.dumps({"core": {"StateManager": "0x" + "1" * 40}}).encode() if name == "summary"
+                                 else (chain + name).encode())
                 row[name] = {"path": str(path), "sha256": sha(path.read_bytes())}
             documents[chain] = row
         return documents
@@ -198,6 +202,19 @@ class PackageSetTests(unittest.TestCase):
         (self.world.state_dir / "prepare_bridge_packages.json").write_text(json.dumps(record))
         with self.assertRaisesRegex(ValueError, "another release lock"):
             steps.bridge_state(self.ctx)
+
+    def test_failed_final_build_is_removed_on_rerun_but_a_finished_set_is_kept(self):
+        documents = self.documents()
+        output = bridge.output_directory(self.ctx, documents)
+        with patch.object(bridge, "plan_locally"), patch.object(bridge, "build_envio", side_effect=RuntimeError("envio build failed")):
+            with self.assertRaisesRegex(RuntimeError, "envio build failed"):
+                bridge.build_bridge_packages(self.ctx, documents)
+        self.assertTrue(output.exists() and not (output / "summary.json").exists())
+        with patch.object(bridge, "plan_locally"), patch.object(bridge, "build_envio", return_value={"source": "x"}):
+            self.assertEqual(bridge.build_bridge_packages(self.ctx, documents), output)
+            self.assertTrue((output / "summary.json").is_file())
+            with self.assertRaisesRegex(ValueError, "exists"):
+                bridge.build_bridge_packages(self.ctx, documents)
 
     def test_deployment_state_must_cover_three_chains_of_this_lock(self):
         state = {"lock_sha256": self.world.lock_sha256, "chains": {"sepolia": {}}}
@@ -246,7 +263,10 @@ class VerifyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.world = BridgeWorld(self.temp.name)
         self.ctx = self.world.ctx()
-        for name, value in (("READY_SECONDS", 0), ("POLL_SECONDS", 1)):
+        sleeper = patch("deploy_remote.time.sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+        for name, value in (("READY_SECONDS", 0.2), ("POLL_SECONDS", 1)):
             patcher = patch.object(steps, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -286,6 +306,15 @@ class VerifyTests(unittest.TestCase):
         self.cursors = {"coordinator": [None], "realm0": [4, 6]}
         with self.assertRaisesRegex(ValueError, "Coordinator indexer watermark"):
             steps.services_verify(self.ctx)
+        self.cursors = {"coordinator": [None, None, 10, 12], "realm0": [None, 4, 6]}
+        self.assertEqual(steps.services_verify(self.ctx)["watermarks"], {"coordinator": 12, "realm0": 6})
+
+    def test_read_cursor_parses_the_pretty_json_the_indexer_writes(self):
+        placement = steps.read_placement(self.ctx)
+        for text, expected in (('{\n  "last_checkpoint_id": 42\n}\n', 42), ('{}', None), ('', None),
+                               ('{\n  "last_check', None), ('{"last_checkpoint_id": "7"}', None)):
+            with self.subTest(text=text), patch.object(steps, "root_script", return_value=text):
+                self.assertEqual(REAL_READ_CURSOR(self.ctx, placement, "realm0"), expected)
 
     def test_verify_requires_running_units_without_restarts(self):
         with patch.object(steps, "unit_state", return_value={"LoadState": "loaded", "ActiveState": "active", "UnitFileState": "enabled",
