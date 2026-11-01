@@ -193,7 +193,7 @@ class FaucetTests(unittest.TestCase):
                         faucet.check_stopped(self.release)
 
     def test_unit_listing_covers_old_faucet_names_and_the_new_unit(self):
-        listing = SimpleNamespace(returncode=0, stdout="psy-faucet-old.service loaded inactive dead x\n")
+        listing = SimpleNamespace(returncode=0, stderr="", stdout="psy-faucet-old.service loaded inactive dead x\n")
         with patch.object(faucet.subprocess, "run", return_value=listing) as run:
             names = faucet.faucet_unit_names(self.release)
         self.assertEqual(names, sorted({"psy-faucet-old.service", self.release.unit}))
