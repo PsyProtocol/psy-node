@@ -29,7 +29,10 @@ LOCAL_PORT_OFFSET = 10000
 CHAIN_INDEX = {chain: fresh_l1.NETWORKS[chain][1] for chain in release_lock.CHAINS}
 PAUSED, OPEN = [1, 0, 1], [0, 0, 0]
 PAUSE_FEE_CAP_GWEI = 5
-ADMIN_SECONDS = 600
+ADMIN_SECONDS = 1500
+LOCK_PATH = "/run/psy-admin-pause.lock"
+LOCK_WAIT_SECONDS = 600
+PENDING_POLLS, PENDING_POLL_MS = 30, 2000
 REPAUSE_ATTEMPTS = 3
 REPAUSE_PAUSE_SECONDS = 5
 FLAG_POLL_SECONDS = 3
@@ -111,7 +114,9 @@ def admin_request(ctx, chain, target, execute, documents):
             "tokens": [ZERO_ADDRESS, core["PsyToken"], core["USDTToken"]], "keystore": prepare.SIGNER_KEYSTORE_FILE,
             "env_file": fresh_l1.WALLET_ENV, "node": bridge_steps.NODE_PATH,
             "ethers": f"{bridge_steps.bundle_dir(ctx)}/contracts/node_modules/ethers",
-            "max_gas": int(budget["maxGasPerTransaction"]), "max_fee_gwei": PAUSE_FEE_CAP_GWEI}
+            "max_gas": int(budget["maxGasPerTransaction"]), "max_fee_gwei": PAUSE_FEE_CAP_GWEI,
+            "lock_path": LOCK_PATH, "lock_wait_seconds": LOCK_WAIT_SECONDS, "pending_polls": PENDING_POLLS,
+            "pending_poll_ms": PENDING_POLL_MS}
 
 
 def run_admin(ctx, chain, target, execute, documents=None):

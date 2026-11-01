@@ -157,6 +157,23 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(ac.unpaused_chains(None, admin), ["bscTestnet"])
 
 
+class AdminRequestTests(unittest.TestCase):
+    def test_the_request_the_step_builds_is_accepted_by_the_pause_tool_for_every_chain(self):
+        import base64
+        import hashlib
+        import admin_pause
+        ctx = SimpleNamespace(lock={"l1": {"signer": "0x" + "a" * 40}})
+        docs = {chain: {"core": {"Bridge": "0x" + "b" * 40, "PsyACLManager": "0x" + "c" * 40, "PsyToken": "0x" + "d" * 40,
+                                 "USDTToken": "0x" + "e" * 40}} for chain in ac.release_lock.CHAINS}
+        with unittest.mock.patch.object(ac.prepare, "gas_budget", return_value=({"maxGasPerTransaction": "50000000"}, "h")), \
+                unittest.mock.patch.object(ac.bridge_steps, "bundle_dir", return_value="/opt/bundle"):
+            for chain in ac.release_lock.CHAINS:
+                raw = json.dumps(ac.admin_request(ctx, chain, 1, True, docs), sort_keys=True).encode()
+                parsed = admin_pause.read_request(base64.b64encode(raw).decode(), hashlib.sha256(raw).hexdigest())
+                self.assertEqual((parsed["lock_path"], parsed["lock_wait_seconds"]), (ac.LOCK_PATH, ac.LOCK_WAIT_SECONDS))
+        self.assertGreater(ac.ADMIN_SECONDS, ac.LOCK_WAIT_SECONDS + 300, "the call outlasts a lock wait plus one full run")
+
+
 class RunWindowTests(unittest.TestCase):
     DOCUMENTS = {"sepolia": {"core": {"Bridge": "0x" + "b" * 40, "Router": "0x" + "c" * 40, "USDTToken": "0x" + "d" * 40}}}
 
