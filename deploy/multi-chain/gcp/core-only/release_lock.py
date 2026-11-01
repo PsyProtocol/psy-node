@@ -19,7 +19,7 @@ TOP_LEVEL = ("schema_version", "release_id", "network", "network_magic", "inputs
              "tool_sha256")
 INPUTS = ("release_profile", "topology", "artifacts", "runtime_config", "canonical_config", "genesis",
           "worker_whitelist", "risk_acceptance", "retired_state", "retained_paths")
-SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "services", "indexer")
+SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "services", "indexer", "notifier")
 CLI_BINARIES = ("psy_dev_cli", "psy_node_cli", "psy_relayer_cli", "psy_user_cli", "psy_worker_cli")
 SERVICE_BINARIES = ("psy-services", "psy-indexer")
 PATH_ROLES = ("core", "guardian", "relayer", "worker", "proxy", "faucet", "services", "envio")

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 
+import deploy_monitoring_steps
 import fresh_l1
 import release_lock
 from deploy_remote import DeployContext, RemoteError, Step, redact_tail
@@ -622,6 +623,7 @@ def collect(failures, action):
 
 
 def hosts_check(ctx):
+    deploy_monitoring_steps.check_notifier_checkout(ctx)
     check_tool_hash(ctx, "fresh_l1.py")
     remote_paths, _ = retained_secret_paths(ctx)
     get_signer_host(ctx, remote_paths)

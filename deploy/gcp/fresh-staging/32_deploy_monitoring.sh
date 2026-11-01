@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-exec bash "$ROOT/deploy/multi-chain/gcp/deploy-monitoring.sh" --apply
+echo "32_deploy_monitoring.sh is retired: monitoring is step 85 of the release orchestrator (core-only/deploy_monitoring_steps.py)" >&2
+exit 1

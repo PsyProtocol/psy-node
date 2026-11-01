@@ -16,8 +16,8 @@ source "$config"
 source "${DEPLOY_SOURCE_VERSIONS_FILE:-$PROFILE/source-versions.env}"
 set +a
 [[ "${DEPLOY_MONITORING:-1}" == 1 ]] || fail 'monitoring is disabled in config'
-repo="${PSY_NOTIFIER_DIR:-$WORKSPACE_HOME/parth-sentinel}"
-export SSH_CONFIG="${NOTIFIER_SSH_CONFIG:-$HOME/.ssh/config}"
+repo="${MONITORING_NOTIFIER_DIR:-${PSY_NOTIFIER_DIR:-$WORKSPACE_HOME/parth-sentinel}}"
+export SSH_CONFIG="${MONITORING_SSH_CONFIG:-${NOTIFIER_SSH_CONFIG:-$HOME/.ssh/config}}"
 [[ -f "$SSH_CONFIG" ]] || fail "missing SSH config: $SSH_CONFIG"
 [[ -d "$repo" ]] || fail "missing pinned Psy Notifier checkout: $repo"
 origin="$(git -C "$repo" remote get-url origin)"
@@ -27,27 +27,32 @@ case "$origin" in
 esac
 [[ "$(git -C "$repo" rev-parse HEAD)" == "$EXPECTED_PSY_NOTIFIER_COMMIT" ]] || fail 'Psy Notifier HEAD does not match the pinned commit'
 [[ -z "$(git -C "$repo" status --porcelain --untracked-files=all)" ]] || fail 'Psy Notifier checkout must be clean; preserve edits in another worktree'
-hosts=(gcp-cp-ce gcp-coordinator-worker gcp-faucet gcp-postgres gcp-scylla
-       gcp-nats gcp-redis gcp-nostr gcp-gateway arc99x4 arc99x3)
+# The fleet comes from the release: deploy_monitoring_steps.py writes one "<host> <gcp|offsite>"
+# line per release host and a matching collector config directory and Controller config.
+hosts_file="${MONITORING_HOSTS_FILE:-}"
+collector_dir="${MONITORING_COLLECTOR_DIR:-}"
+chain_indexes="${MONITORING_CHAIN_INDEXES:-}"
+[[ -s "$hosts_file" && -d "$collector_dir" && -n "$chain_indexes" ]] \
+  || fail 'MONITORING_HOSTS_FILE, MONITORING_COLLECTOR_DIR and MONITORING_CHAIN_INDEXES are required (run step 85)'
+hosts=()
+offsite_hosts=()
+while read -r host zone; do
+  [[ -n "$host" ]] || continue
+  hosts+=("$host")
+  [[ "$zone" == offsite ]] && offsite_hosts+=("$host")
+done < "$hosts_file"
 for host in "${hosts[@]}"; do
-  [[ -f "$repo/config/staging/collectors/$host.toml" ]] || fail "missing collector inventory: $host"
+  [[ -f "$collector_dir/$host.toml" ]] || fail "missing collector config: $host"
 done
-collector_config() {
-  if [[ "$1" == arc99x3 ]]; then
-    printf '%s' "$PROFILE/monitoring-arc99x3.toml"
-  else
-    printf '%s' "$repo/config/staging/collectors/$1.toml"
-  fi
-}
-[[ -f "$(collector_config arc99x3)" ]] || fail 'missing dual-role collector inventory'
-for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh status-staging.sh; do
+collector_config() { printf '%s' "$collector_dir/$1.toml"; }
+for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh; do
   bash -n "$repo/deploy/staging/$script"
 done
 
-# This adapter deliberately targets the reviewed, fixed staging fleet. Avoid
-# ambient legacy overrides silently moving the Controller or disabling Slack.
+# The fleet is the release's (see above); the Controller location is fixed. Avoid ambient
+# overrides silently moving the Controller or disabling Slack.
 export SENTINEL_CONTROLLER_HOST=gcp-faucet
-export SENTINEL_CONTROLLER_CONFIG="$repo/config/staging/controller.wallet-slack-test.toml"
+export SENTINEL_CONTROLLER_CONFIG="${MONITORING_CONTROLLER_CONFIG:-$repo/config/staging/controller.wallet-slack-test.toml}"
 export SENTINEL_CONTROLLER_GRPC_LISTEN=10.148.0.33:9443
 export SENTINEL_CONTROLLER_GCP_ENDPOINT=http://10.148.0.33:9443
 export SENTINEL_CONTROLLER_OFFSITE_ENDPOINT=http://10.250.0.1:9443
@@ -83,7 +88,7 @@ if [[ "$mode" == --apply ]]; then
   bash "$repo/deploy/staging/deploy-staging-controller.sh" --skip-build --apply
   expected_sha="$(sha256sum "$binaries/psy-notifier-collector" | awk '{print $1}')"
   for host in "${hosts[@]}"; do
-    case "$host" in arc99x3|arc99x4) continue ;; esac
+    [[ " ${offsite_hosts[*]} " == *" $host "* ]] && continue
     bash "$repo/deploy/staging/deploy-collector.sh" --host "$host" \
       --config "$(collector_config "$host")" \
       --controller-endpoint "$SENTINEL_CONTROLLER_GCP_ENDPOINT" \
@@ -92,7 +97,7 @@ if [[ "$mode" == --apply ]]; then
       sha256sum /usr/local/bin/psy-notifier-collector | awk '{print $1}')"
     [[ "$actual_sha" == "$expected_sha" ]] || fail "collector binary mismatch on $host"
   done
-  for host in arc99x3 arc99x4; do
+  for host in "${offsite_hosts[@]}"; do
     bash "$repo/deploy/staging/prepare-offsite-collector.sh" --host "$host" \
       --config "$(collector_config "$host")" \
       --controller-endpoint "$SENTINEL_CONTROLLER_OFFSITE_ENDPOINT" \
@@ -103,15 +108,23 @@ if [[ "$mode" == --apply ]]; then
   exit 3
 fi
 
-bash "$repo/deploy/staging/status-staging.sh"
+# The Notifier's status-staging.sh lists a fixed fleet; check the release hosts instead.
+collector_failures=0
+for host in "${hosts[@]}"; do
+  state="$(ssh -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+    systemctl is-active parth-sentinel-collector.service 2>/dev/null)" || state=unreachable-or-missing
+  printf '%-28s %s\n' "$host" "$state"
+  [[ "$state" == active ]] || collector_failures=$((collector_failures + 1))
+done
+[[ "$collector_failures" -eq 0 ]] || fail "$collector_failures of ${#hosts[@]} collectors are not active"
 hosts_json="$(printf '%s\n' "${hosts[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 for attempt in {1..30}; do
   if status="$(ssh -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=8 gcp-faucet \
       curl -fsS --max-time 10 http://127.0.0.1:9099/status)" \
-    && jq -e --argjson hosts "$hosts_json" --argjson now "$(date +%s%3N)" \
+    && jq -e --argjson hosts "$hosts_json" --argjson chains "$chain_indexes" --argjson now "$(date +%s%3N)" \
       -f "$PROFILE/notifier-ready.jq" <<< "$status" >/dev/null; then
-    echo '[monitoring] PASS: Controller ready, three EVM probes healthy, all 11 collectors reporting within 120s'
-    jq '{ready, evm_all_healthy, collector_count: (.collectors | length), outbox_depth,
+    echo "[monitoring] PASS: Controller ready, three EVM and settlement probes healthy, all ${#hosts[@]} release collectors reporting within 120s"
+    jq '{ready, evm_all_healthy, settlement_all_healthy, collector_count: (.collectors | length), outbox_depth,
       firing_incidents_in_page: ([.incidents[] | select(.lifecycle == "firing")] | length)}' <<< "$status"
     echo '[monitoring] transport/readiness verified; incident review and notification delivery are separate acceptance checks'
     exit 0

@@ -1,27 +1,44 @@
-# Final-step monitoring deployment
+# Monitoring deployment (step 85)
 
-The multichain runner ends with **32_deploy_monitoring.sh**, after frontend
-publication, protocol smoke checks and offsite workers. It deploys the existing
-`PsyProtocol/psy-notifier` system, not a new monitoring implementation.
-Its exact published commit is pinned in `source-versions.env`.
+Step 85 of the release orchestrator deploys the existing `PsyProtocol/psy-notifier` system, not a
+new monitoring implementation. It runs after acceptance step 84. The legacy runner step 32
+(`32_deploy_monitoring.sh`, "11 collectors") is retired: it refuses to run and is superseded by step 85.
+The Notifier checkout is the path in `local-inputs.json` (`notifier.checkout`); its pinned commit
+is `sources.notifier` in the release lock and `EXPECTED_PSY_NOTIFIER_COMMIT` in
+`source-versions.env`. Both change together at Task C1, after the Notifier commit is published
+(the lock field is empty until then; `source-versions.env` still holds the retired commit).
 
 ## Inventory and configuration
 
-- Controller: `gcp-faucet`, private gRPC `10.148.0.33:9443` and localhost-only
-  status API `127.0.0.1:9099`.
-- Nine GCP collectors: cp-ce, coordinator-worker, faucet, postgres, scylla,
-  nats, redis, nostr and gateway (SSH aliases carry the `gcp-` prefix).
-- Two offsite collectors: `arc99x4` workers and `arc99x3` prove-proxy.
-  The deployment-owned `monitoring-arc99x3.toml` watches both
-  `parth-prove-proxy@user.service` and `parth-prove-proxy@system.service`.
-- Offsite reporting: existing WireGuard gateway `10.250.0.1:9443`, forwarded
-  only to the Controller. No public monitoring endpoint is created.
-- Existing `parth-sentinel-*` systemd names, users and persistent paths remain
-  unchanged. Binary branding is now `psy-notifier-*`.
+Step 85 (`core-only/deploy_monitoring_steps.py`) derives the fleet from the release;
+no host list lives in `deploy-monitoring.sh` or in this document.
 
-The adapter intentionally supports this fixed, reviewed staging inventory.
-If hosts change, review the Notifier inventory, forwarder and adapter together;
-changing only a node deployment host setting does not move its monitoring.
+- Hosts: every alias in `topology.json` and the lock `hosts`. Aliases in 10.250.0.0/16
+  are offsite (WireGuard gateway `10.250.0.1:9443`); all others report to the Controller.
+- Collector configs are rendered per host: host resources, the infrastructure targets of
+  the Notifier repository config where one exists, and every loaded unit that matches a
+  lock `units` prefix or name (discovered read-only over SSH). Retired `parth-*` units are dropped.
+- Controller: `gcp-faucet`, private gRPC `10.148.0.33:9443`, status API `127.0.0.1:9099`.
+  Its config is the Notifier staging file with the lock `l1.signer` as the balance address
+  and one `[[settlement]]` probe per release chain index (StateManager read from the
+  deployed documents on the Relayer host).
+- Alerts: `l1-low-balance` per chain (warning at 7 days of finalize gas, critical at 2 days, at
+  240 finalizes per day priced at 1 Gwei, the BSC floor; 400k gas on BSC and Base, 700k on Sepolia.
+  1 Gwei is an upper bound for Base, about 0.006 Gwei, and Sepolia, base fee about 15 wei) and
+  `settlement-stalled` per chain index (no `lastFinalizedCheckpointId` advance for 30 minutes).
+  The shared finalize round freezes all three cursors when one chain is starved, so all three alert.
+  A burst such as 644 finalizes in 20 hours spends 3x faster; `l1-runway-low` measures actual spend.
+  Step 85 refuses a Notifier config whose thresholds fall below these floors.
+- Controller `collectors.expected` is rendered from the release hosts (the Controller refuses any
+  other collector). Core targets (coordinator edges, Realm processors and edges) and their
+  latest-checkpoint probes come from `topology.json` and the lock `core_prefix`; infrastructure
+  targets of the Notifier repository configs and their non-`parth-*` services are kept.
+- The adapter takes `MONITORING_HOSTS_FILE`, `MONITORING_COLLECTOR_DIR`,
+  `MONITORING_CONTROLLER_CONFIG`, `MONITORING_CHAIN_INDEXES`, `MONITORING_NOTIFIER_DIR` and
+  `MONITORING_SSH_CONFIG` from the step; the SSH config is generated from the access file.
+- Known gaps: Guardian readiness probes and Guardian quorum groups, and probes for the services,
+  indexer, Envio and Relayer HTTP endpoints, are not rendered; those hosts get unit health and logs only.
+- Existing `parth-sentinel-*` systemd names, users and persistent paths remain unchanged.
 
 Private deployment config can set:
 

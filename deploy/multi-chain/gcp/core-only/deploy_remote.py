@@ -215,6 +215,23 @@ class Remote:
             if expected is None or host_access["ssh"].rsplit("@", 1)[-1] != expected:
                 raise ValueError(f"access host {alias}: target differs from the release address")
 
+    def ssh_config(self):
+        """OpenSSH config text for every access-file host, for tools that ssh by alias."""
+        blocks = []
+        for alias in sorted(self._hosts):
+            host_access = self._hosts[alias]
+            user, _, address = host_access["ssh"].rpartition("@")
+            identity = str(Path(host_access["identity"]).expanduser())
+            lines = [f"Host {alias}", f"  HostName {address}", *([f"  User {user}"] if user else []),
+                     f'  IdentityFile "{identity}"', "  IdentitiesOnly yes", "  BatchMode yes",
+                     "  StrictHostKeyChecking yes", f'  UserKnownHostsFile "{self._known_hosts}"',
+                     "  GlobalKnownHostsFile /dev/null", f"  ConnectTimeout {CONNECT_TIMEOUT_SECONDS}"]
+            if host_access["jump"] is not None:
+                jump = self._hosts[host_access["jump"]]
+                lines.append("  ProxyCommand " + shlex.join(["ssh", *self._options(jump), "-W", "%h:%p", jump["ssh"]]))
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks) + "\n"
+
     def missing_aliases(self, aliases):
         return sorted(alias for alias in set(aliases) if alias not in self._hosts)
 

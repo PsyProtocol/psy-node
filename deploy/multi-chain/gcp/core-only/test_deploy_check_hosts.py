@@ -50,6 +50,8 @@ class CheckHostsTests(PrepareTestCase):
     def setUp(self):
         super().setUp()
         ws = self.ws
+        ws.write_local()
+        ws.lock["sources"]["notifier"] = ""
         ws.lock["hosts"]["arc-test-operator"] = "10.0.0.50"
         ws.lock["l1"]["signer_host"] = self.SERVICES
         paths = [{"host": self.CP, "path": "/var/lib/test/sealed", "kind": "secret"},

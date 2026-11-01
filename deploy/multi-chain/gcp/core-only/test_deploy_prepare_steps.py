@@ -45,7 +45,8 @@ class Workspace:
             (self.tools_dir / name).write_text(f"# fixture {name}\n")
         self.lock["tool_sha256"] = {name: sha((self.tools_dir / name).read_bytes()) for name in release_lock.TOOL_NAMES}
         self.set_artifacts()
-        self.local = {"build": {}, "files": {}, "packages": {}}
+        (self.root / "notifier").mkdir()
+        self.local = {"build": {}, "files": {}, "packages": {}, "notifier": {"checkout": str(self.root / "notifier")}}
 
     def context(self, remote=None):
         return DeployContext(lock=self.lock, lock_sha256="a" * 64, release_dir=self.release_dir, run_dir=self.run_dir,
@@ -620,7 +621,7 @@ class RegistrationTests(unittest.TestCase):
     def test_standard_library_and_release_modules_only(self):
         source = Path(steps.__file__).read_text()
         imported = set(re.findall(r"(?m)^(?:import|from) ([a-z_0-9]+)", source))
-        local = {"deploy_remote", "release_lock", "build_runtime", "fresh_l1"}
+        local = {"deploy_remote", "release_lock", "build_runtime", "fresh_l1", "deploy_monitoring_steps"}
         import sys
         self.assertEqual({name for name in imported if name not in sys.stdlib_module_names}, local & imported)
 

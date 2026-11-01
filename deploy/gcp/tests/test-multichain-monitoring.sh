@@ -7,11 +7,18 @@ repo="$tmp/notifier"
 mkdir -p "$repo/deploy/staging" "$repo/config/staging/collectors" \
   "$repo/target/bookworm/release" "$tmp/bin" "$tmp/registry"
 export TEST_CALLS="$tmp/calls" TEST_HEALTH="$tmp/health.json"
-hosts=(gcp-cp-ce gcp-coordinator-worker gcp-faucet gcp-postgres gcp-scylla
-       gcp-nats gcp-redis gcp-nostr gcp-gateway arc99x4 arc99x3)
+# A release fleet that differs from the retired fixed list: 12 hosts, two offsite.
+hosts=(gcp-cp-ce gcp-faucet gcp-realm-processor realm-processors-b gcp-edge-1
+       gcp-edge-2 guardian-next-1 guardian-next-2 guardian-next-3 gcp-c4d-1 arc99x1 arc99x3)
+mkdir -p "$tmp/collectors"
+: > "$tmp/hosts"
 for host in "${hosts[@]}"; do
-  printf 'id = "%s"\n' "$host" > "$repo/config/staging/collectors/$host.toml"
+  printf 'id = "%s"\n' "$host" > "$tmp/collectors/$host.toml"
+  zone=gcp
+  [[ "$host" == arc99x* ]] && zone=offsite
+  printf '%s %s\n' "$host" "$zone" >> "$tmp/hosts"
 done
+export MONITORING_HOSTS_FILE="$tmp/hosts" MONITORING_COLLECTOR_DIR="$tmp/collectors" MONITORING_CHAIN_INDEXES='[0,1,2]'
 touch "$tmp/ssh-config" "$repo/config/staging/controller.wallet-slack-test.toml"
 printf 'target/\n' > "$repo/.gitignore"
 for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh status-staging.sh deploy-collector.sh prepare-offsite-collector.sh; do
@@ -49,6 +56,11 @@ if [[ "$*" == *'test -s'* ]]; then
   echo credentials-check >> "$TEST_CALLS"
   exit "${TEST_CREDENTIAL_EXIT:-0}"
 fi
+if [[ "$*" == *'is-active'* ]]; then
+  echo active-check >> "$TEST_CALLS"
+  echo "${TEST_COLLECTOR_STATE:-active}"
+  exit 0
+fi
 if [[ "$*" == *'sha256sum /usr/local/bin/psy-notifier-collector'* ]]; then
   echo checksum-query >> "$TEST_CALLS"
   printf '%s  binary\n' "${TEST_BAD_SHA:-$TEST_COLLECTOR_SHA}"
@@ -79,6 +91,8 @@ hosts_json="$(printf '%s\n' "${hosts[@]}" | jq -Rsc 'split("\n") | map(select(le
 now="$(date +%s%3N)"
 jq -n --argjson hosts "$hosts_json" --argjson now "$now" '{ready:true,evm_all_healthy:true,
   evm_probes: [97,84532,11155111] | map({chain_id:.,healthy:true}),
+  settlement_all_healthy:true,
+  settlement_probes: [0,1,2] | map({chain_index:.,healthy:true}),
   collectors: $hosts | map({collector_id:.,environment:"staging",last_seen_ms:$now}),
   incidents: [],outbox_depth:0}' > "$TEST_HEALTH"
 
@@ -87,13 +101,15 @@ bash "$runner" --check > "$tmp/check.log"
 apply_rc=0
 bash "$runner" --apply > "$tmp/apply.log" || apply_rc=$?
 [ "$apply_rc" = 3 ]
-[ "$(grep -c '^validate$' "$TEST_CALLS")" = 12 ]
+[ "$(grep -c '^validate$' "$TEST_CALLS")" = 13 ]
 grep -q '^deploy-staging-controller.sh --skip-build --apply$' "$TEST_CALLS"
 if grep -q '^deploy-staging-all.sh ' "$TEST_CALLS"; then exit 1; fi
-[ "$(grep -c '^deploy-collector.sh ' "$TEST_CALLS")" = 9 ]
-[ "$(grep -c '^checksum-query$' "$TEST_CALLS")" = 9 ]
+[ "$(grep -c '^deploy-collector.sh ' "$TEST_CALLS")" = 10 ]
+[ "$(grep -c '^checksum-query$' "$TEST_CALLS")" = 10 ]
 [ "$(grep -c '^prepare-offsite-collector.sh ' "$TEST_CALLS")" = 2 ]
-grep -q 'monitoring-arc99x3.toml' "$TEST_CALLS"
+grep -q 'arc99x1.toml' "$TEST_CALLS"
+grep -q 'arc99x3.toml' "$TEST_CALLS"
+if grep -q 'arc99x4' "$TEST_CALLS"; then exit 1; fi
 grep -q '^deploy-wireguard-forward.sh --apply$' "$TEST_CALLS"
 grep -q 'PENDING: cloud installed' "$tmp/apply.log"
 if grep -q 'PASS: Controller ready' "$tmp/apply.log"; then exit 1; fi
@@ -101,7 +117,10 @@ if TEST_BAD_SHA=bad bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
 
 : > "$TEST_CALLS"
 bash "$runner" --status > "$tmp/status.log"
-if grep -Eq 'docker|^deploy-|credentials-check' "$TEST_CALLS"; then exit 1; fi
+if grep -Eq 'docker|^deploy-|credentials-check|status-staging' "$TEST_CALLS"; then exit 1; fi
+[ "$(grep -c '^active-check$' "$TEST_CALLS")" = 12 ]
+if TEST_COLLECTOR_STATE=failed bash "$runner" --status > "$tmp/inactive.log" 2>&1; then exit 1; fi
+grep -q '12 of 12 collectors are not active' "$tmp/inactive.log"
 : > "$TEST_CALLS"
 if TEST_CREDENTIAL_EXIT=5 bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
 [ "$(cat "$TEST_CALLS")" = credentials-check ]
@@ -112,18 +131,20 @@ if grep -q '^deploy-' "$TEST_CALLS"; then exit 1; fi
 if TEST_CONTROLLER_FAIL=1 bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
 if grep -Eq '^(deploy-collector|prepare-offsite-collector)\.sh ' "$TEST_CALLS"; then exit 1; fi
 
-accepts() { jq -e --argjson hosts "$hosts_json" --argjson now "$now" -f "$filter" >/dev/null; }
+accepts() { jq -e --argjson hosts "$hosts_json" --argjson chains '[0,1,2]' --argjson now "$now" -f "$filter" >/dev/null; }
 accepts < "$TEST_HEALTH"
 for mutation in '.ready=false' '.evm_all_healthy=false' '.evm_probes=[]' \
   '.evm_probes[0].healthy=false' '.collectors[0].last_seen_ms=0' \
   '.collectors[0].last_seen_ms=null' '.collectors[0].environment="local"' \
-  'del(.collectors[0])'; do
+  'del(.collectors[0])' '.settlement_all_healthy=false' '.settlement_probes=[]' \
+  '.settlement_probes[1].healthy=false' '.settlement_probes[2].chain_index=7'; do
   if jq "$mutation" "$TEST_HEALTH" | accepts; then echo "unexpectedly accepted: $mutation"; exit 1; fi
 done
 jq '.collectors=[]' "$TEST_HEALTH" > "$tmp/stale.json"
 if TEST_HEALTH="$tmp/stale.json" bash "$runner" --status > "$tmp/stale.log" 2>&1; then exit 1; fi
 grep -q 'freshness check failed' "$tmp/stale.log"
 
+if env -u MONITORING_HOSTS_FILE bash "$runner" --status > /dev/null 2>&1; then exit 1; fi
 printf '# dirty\n' >> "$repo/deploy/staging/deploy-staging-all.sh"
 if bash "$runner" --check > /dev/null 2>&1; then exit 1; fi
 git -C "$repo" add deploy/staging/deploy-staging-all.sh

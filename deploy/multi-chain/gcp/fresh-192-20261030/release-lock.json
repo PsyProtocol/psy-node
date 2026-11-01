@@ -22,7 +22,8 @@
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
     "contracts": "",
     "services": "",
-    "indexer": ""
+    "indexer": "",
+    "notifier": ""
   },
   "binaries": {
     "psy_dev_cli": "ec29b42b125f9b4cf574e5211841882094b0bdeaeab171871ca0956af4be1e23",
