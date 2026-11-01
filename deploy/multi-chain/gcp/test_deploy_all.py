@@ -12,6 +12,12 @@ SD192_STEPS = HERE / "fresh-192-20261030" / "steps.tsv"
 
 STUB_DEPLOY = """#!/usr/bin/env python3
 import json, os, sys
+if "--plan" in sys.argv:
+    with open(os.path.join(os.environ["STUB_LOG_DIR"], "plan.jsonl"), "a") as f:
+        f.write(json.dumps({"argv": sys.argv[1:], "calls_before": os.path.exists(
+            os.path.join(os.environ["STUB_LOG_DIR"], "calls.jsonl"))}) + "\\n")
+    print("stub plan")
+    sys.exit(int(os.environ.get("STUB_PLAN_EXIT", "0")))
 with open(os.path.join(os.environ["STUB_LOG_DIR"], "calls.jsonl"), "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "regen": "REGENERATE_GENESIS" in os.environ,
         "leaked": [k for k in ("REGENERATE_GENESIS", "PARTH_ALLOW_GENESIS_OVERWRITE") if k in os.environ],
@@ -166,7 +172,8 @@ class DeployAllPythonStepTests(unittest.TestCase):
         self.assertEqual(w.called_steps(), ["verify_release", "check_hosts"])
         self.assertEqual(w.calls()[0]["argv"], [
             "verify_release", "--release-dir", str(w.release), "--access", str(w.access),
-            "--run-dir", str(w.last_run_dir), "--private-dir", str(w.private)])
+            "--run-dir", str(w.last_run_dir), "--private-dir", str(w.private), "--steps-file", str(w.steps)])
+        self.assertFalse((w.logs / "plan.jsonl").exists())
 
     def test_py_exit_3_records_pending_and_stops(self):
         w = self.world()
@@ -235,7 +242,7 @@ class DeployAllPythonStepTests(unittest.TestCase):
         r = w.run()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse((w.root / "pwned").exists())
-        self.assertEqual(len(w.calls()[0]["argv"]), 9)
+        self.assertEqual(len(w.calls()[0]["argv"]), 11)
 
     def test_mixed_py_and_shell_steps_reject(self):
         w = self.world(steps="01\t01_one.sh\told\n50\tpy:verify_release\tnew\n", shell=True)
@@ -301,6 +308,37 @@ class DeployAllPythonStepTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("L1 transactions may already exist", r.stderr)
         self.assertIn("rerunning step 69", r.stderr)
+
+    def plans(self, w):
+        import json
+        path = w.logs / "plan.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_cutover_run_checks_the_whole_table_before_the_first_step(self):
+        w = self.world()
+        r = w.run("--from", "60", confirm=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        plans = self.plans(w)
+        self.assertEqual(len(plans), 1)
+        self.assertFalse(plans[0]["calls_before"])
+        self.assertEqual(plans[0]["argv"][:2], ["fence_ingress", "--plan"])
+        self.assertEqual(plans[0]["argv"][plans[0]["argv"].index("--steps-file") + 1], str(w.steps))
+        self.assertEqual(w.called_steps()[0], "fence_ingress")
+
+    def test_failed_table_check_stops_before_any_step_or_wipe(self):
+        w = self.world()
+        r = w.run("--from", "60", confirm=True, extra={"STUB_PLAN_EXIT": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("step table check failed", r.stderr)
+        self.assertEqual(w.called_steps(), [])
+        rows = (w.last_run_dir / "status.tsv").read_text().splitlines()
+        self.assertEqual(len(rows), 1)
+
+    def test_prepare_only_run_does_not_run_the_table_check(self):
+        w = self.world()
+        r = w.run("--until", "51")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.plans(w), [])
 
     def test_missing_deploy_py_fails_before_running(self):
         w = self.world()

@@ -280,7 +280,8 @@ run_step_script() {
   local step="$1"
   if [ -n "${py_kinds[$step]:-}" ]; then
     python3 -u "$SCRIPT_DIR/core-only/deploy.py" "${py_names[$step]}" --release-dir "$release_dir" \
-      --access "$DEPLOY_ACCESS_FILE" --run-dir "$run_dir" --private-dir "$DEPLOY_PRIVATE_DIR"
+      --access "$DEPLOY_ACCESS_FILE" --run-dir "$run_dir" --private-dir "$DEPLOY_PRIVATE_DIR" \
+      --steps-file "$steps_file"
     return
   fi
   # Step 10 writes the manifest. Every downstream consumer must see the full
@@ -294,6 +295,13 @@ run_step_script() {
     bash "${scripts[$step]}"
   fi
 }
+
+# Before any wipe, the whole step table must be registered and the release lock valid.
+if [ "$py_run" = "1" ] && [ "${has_cutover:-0}" = "1" ]; then
+  python3 -u "$SCRIPT_DIR/core-only/deploy.py" "${py_names[${selected[0]}]}" --plan --release-dir "$release_dir" \
+    --access "$DEPLOY_ACCESS_FILE" --run-dir "$run_dir" --private-dir "$DEPLOY_PRIVATE_DIR" \
+    --steps-file "$steps_file" || fail "step table check failed; nothing was started"
+fi
 
 for id in "${selected[@]}"; do
   echo "[multichain-deploy] START $id: ${descriptions[$id]}"
