@@ -351,12 +351,15 @@ def unit(spec, release_set):
     ])).encode()
 
 
-def command(argv):
+def command(argv, exit_codes=(0,)):
     try:
-        return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=30,
-                              env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}).stdout
+        done = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=30,
+                              env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         raise ValueError("host command failed; details withheld") from None
+    if done.returncode not in exit_codes:
+        raise ValueError("host command failed; details withheld")
+    return done.stdout
 
 
 def trusted_directory(path, private=False):
@@ -414,9 +417,10 @@ def inactive_units(names, required, static_guardians=()):
 def guardian_unit_names():
     """Every Guardian unit file or loaded unit that systemd knows, whatever generation it belongs to."""
     names = set()
+    # list-unit-files exits 1 when nothing matches, which is the normal state on a cleared host.
     for argv in (["systemctl", "list-unit-files", "psy-guardian-*.service", "--no-legend", "--plain", "--no-pager"],
                  ["systemctl", "list-units", "--all", "psy-guardian-*.service", "--no-legend", "--plain", "--no-pager"]):
-        for line in command(argv).splitlines():
+        for line in command(argv, exit_codes=(0, 1)).splitlines():
             fields = line.split()
             if fields and GUARDIAN_UNIT.fullmatch(fields[0]):
                 names.add(fields[0])

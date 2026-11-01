@@ -1,3 +1,4 @@
+import subprocess
 import copy
 import dataclasses
 import errno
@@ -366,6 +367,14 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(list(self.root.glob(".guardian-*")), [])
 
+    def test_unit_listing_accepts_no_match_on_a_cleared_host(self):
+        done = subprocess.CompletedProcess([], 1, "", "")
+        with patch.object(installer.subprocess, "run", return_value=done):
+            self.assertEqual(installer.guardian_unit_names(), [])
+        with patch.object(installer.subprocess, "run", return_value=done):
+            with self.assertRaises(ValueError):
+                installer.command(["systemctl", "show"])
+
     def test_host_checks_custody_binding_and_conflicts(self):
         self.documents()
         self.root.chmod(0o755)
@@ -386,7 +395,7 @@ class InstallTests(unittest.TestCase):
                  "psy-guardian-previous-2.service", "psy-guardian-previous-3.service"]
         loaded = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
 
-        def command(argv):
+        def command(argv, exit_codes=(0,)):
             if argv[0] == "systemctl":
                 if argv[1] == "--version":
                     return "systemd 252"
@@ -523,7 +532,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(output=output), patch.object(installer, "command", return_value=output):
                 with self.assertRaises(ValueError):
                     installer.inactive_units(names, {"old.service"})
-        def command(argv):
+        def command(argv, exit_codes=(0,)):
             if argv[1] == "show":
                 return good if argv[2] == "old.service" else "LoadState=not-found\n"
             return ""
@@ -554,7 +563,7 @@ class InstallTests(unittest.TestCase):
         wanted = unit_root / "multi-user.target.wants"
         wanted.mkdir()
         details = f"FragmentPath={unit_root / name}\nDropInPaths=\nNames={name}\n"
-        def command(argv):
+        def command(argv, exit_codes=(0,)):
             return details if argv[0] == "systemctl" else str(unit_root)
         with patch.object(installer, "UNITS", unit_root), patch.object(installer, "command", side_effect=command):
             installer.static_guardian_unlinked(name)

@@ -390,7 +390,7 @@ class InstallTests(unittest.TestCase):
     def test_host_checks_actual_history_interface_and_port_before_custody(self):
         account = SimpleNamespace(pw_uid=4321, pw_gid=4321)
 
-        def command(argv):
+        def command(argv, exit_codes=(0,)):
             if argv[:2] == ["ip", "-j"]:
                 return json.dumps([{"addr_info": [{"local": ADDRESS}]}])
             if argv == ["systemctl", "--version"]:
@@ -449,7 +449,7 @@ class InstallTests(unittest.TestCase):
         def root_read(path, private=False, uid=None, limit=8*1024*1024):
             return read(path, private=private, uid=os.getuid() if uid == 0 else uid, limit=limit)
 
-        def command(argv):
+        def command(argv, exit_codes=(0,)):
             if argv[:2] == ["ip", "-j"]:
                 return json.dumps([{"addr_info": [{"local": ADDRESS}]}])
             if argv == ["systemctl", "--version"]:

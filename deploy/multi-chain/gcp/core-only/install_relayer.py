@@ -128,7 +128,7 @@ def relayer_unit_names():
     names = set(LEGACY_UNITS)
     for argv in (["systemctl", "list-unit-files", "psy-core-relayer*.service", "--no-legend", "--plain", "--no-pager"],
                  ["systemctl", "list-units", "--all", "psy-core-relayer*.service", "--no-legend", "--plain", "--no-pager"]):
-        for line in g.command(argv).splitlines():
+        for line in g.command(argv, exit_codes=(0, 1)).splitlines():
             fields = line.split()
             if fields and RELAYER_UNIT.fullmatch(fields[0]):
                 names.add(fields[0])

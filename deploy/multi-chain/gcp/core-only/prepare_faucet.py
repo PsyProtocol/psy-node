@@ -245,7 +245,8 @@ def faucet_unit_names(release):
     for command in (["list-units", "--all"], ["list-unit-files"]):
         listing = subprocess.run(["systemctl", *command, "--plain", "--no-legend", "--no-pager",
                                   "psy-faucet-*", "parth-faucet-*"], capture_output=True, text=True, timeout=20, env=ENV)
-        require(listing.returncode == 0, "unit listing failed")
+        # list-unit-files exits 1 when nothing matches, which is the normal state on a cleared host.
+        require(listing.returncode in (0, 1) and not listing.stderr.strip(), "unit listing failed")
         names |= {line.split()[0] for line in listing.stdout.splitlines() if line.split()}
     return sorted(names)
 
