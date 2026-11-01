@@ -22,9 +22,15 @@
 74	py-cutover:start_relayer	Start the Relayer and wait for the first settlement
 75	py-cutover:open_ingress	Remove the L2, Proxy and Services maintenance routes and check each route; Faucet stays 503
 76	py-cutover:start_faucet	Start the Faucet on x2 (operator, PENDING), issue one private grant, then remove the Faucet maintenance route
-80	py:accept_entrypoints	Check the public entrypoints (step 18)
+77	py:publish_trust_setup	Publish the public Groth16 trust setup archive and verify its public digest
+78	py:publish_public_config	Generate the public config and installer from the L1 documents, deploy the page, verify the live hashes
+79	py:publish_frontends	Apply the config to the dapp, push deploy/testnet (needs the private allow setting), verify CI and the served bundles
+80	py:accept_entrypoints	Check the public entrypoints and the freshness of the public L1 routes
 81	py:accept_p2p_rotation	Accept P2P rotation and recovery
 82	py:accept_faucet_batch	Accept concurrent Faucet batches
 83	py:accept_five_withdrawals	Accept batch_append_withdrawals_5
-84	py:accept_three_chains	Accept all three chains; always restore the pause
+84	py:accept_three_chains	Accept all three chains one at a time; the pause always comes back
 85	py:deploy_monitoring	Deploy monitoring
+# 87 runs before 86 on purpose: 86 opens deposits to users, needs CONFIRM_OPEN_DEPOSITS=1 and ends an unattended run.
+87	py:accept_psy_withdrawal	Withdraw PSY with the new address and see it settle on L1
+86	py:open_deposits	Open deposits on all three chains (outward-facing, needs CONFIRM_OPEN_DEPOSITS=1)

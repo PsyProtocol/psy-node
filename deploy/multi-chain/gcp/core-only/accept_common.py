@@ -144,8 +144,9 @@ def restore_pause(ctx, chain, admin, sleep=time.sleep):
 
 
 @contextmanager
-def unpaused_chain(ctx, chain, admin=run_admin, sleep=time.sleep):
+def unpaused_chain(ctx, chain, admin=None, sleep=time.sleep):
     """Unpause one chain, yield, and restore and read back the pause on any exit; the original error stays visible."""
+    admin = admin or run_admin
     if OPEN_CHAINS:
         raise RuntimeError(f"{OPEN_CHAINS[0]} is still unpaused; windows open one chain at a time")
     opened = admin(ctx, chain, 0, True)
@@ -167,8 +168,9 @@ def unpaused_chain(ctx, chain, admin=run_admin, sleep=time.sleep):
             raise
 
 
-def unpaused_chains(ctx, admin=run_admin):
+def unpaused_chains(ctx, admin=None):
     """Chains whose deposits are not paused right now, from a read-only run of the tool."""
+    admin = admin or run_admin
     return [chain for chain in release_lock.CHAINS if admin(ctx, chain, 1, False).get("flagsBefore") != [PAUSED] * 3]
 
 
@@ -217,7 +219,7 @@ def wait_for_flags(chain, bridge, asset, wanted):
     wait_until(agreed, lambda: None, FLAG_POLL_SECONDS, FLAG_WAIT_SECONDS, f"{chain} pause flags")
 
 
-def run_window(ctx, chain, documents, wallet, deposit, admin=run_admin):
+def run_window(ctx, chain, documents, wallet, deposit, admin=None):
     """Illegal deposit while paused, unpause, illegal deposit while open, one legal deposit, pause again; one chain."""
     core = documents[chain]["core"]
     bridge, router, asset = core["Bridge"], core["Router"], core["USDTToken"]

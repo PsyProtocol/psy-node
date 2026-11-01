@@ -353,7 +353,8 @@ def frontends_apply(ctx):
     if wallet is not None and not wallet_published(public, wallet[1]):
         run_wallet(wallet, public, cloudflare_credentials(ctx))
     write_state(ctx, FRONTEND_STATE, {"lock_sha256": ctx.lock_sha256, "dapp_commit": head, "config_sha256": config["config_sha256"],
-                                      "wallet_commit": wallet[1] if wallet else None})
+                                      "wallet_commit": wallet[1] if wallet else None,
+                                      "deposits_paused_setting": next(iter(deposit_flags(repo, public).values()))})
 
 
 def run_wallet(wallet, public, credentials):

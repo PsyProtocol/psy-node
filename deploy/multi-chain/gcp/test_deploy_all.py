@@ -51,10 +51,11 @@ EXPECTED_PAIRS = (
     ("70", "py-cutover:prepare_bridge_packages"), ("71", "py-cutover:start_guardians"),
     ("72", "py-cutover:start_envio"), ("73", "py-cutover:start_services"),
     ("74", "py-cutover:start_relayer"), ("75", "py-cutover:open_ingress"),
-    ("76", "py-cutover:start_faucet"), ("80", "py:accept_entrypoints"),
+    ("76", "py-cutover:start_faucet"), ("77", "py:publish_trust_setup"), ("78", "py:publish_public_config"),
+    ("79", "py:publish_frontends"), ("80", "py:accept_entrypoints"),
     ("81", "py:accept_p2p_rotation"), ("82", "py:accept_faucet_batch"),
     ("83", "py:accept_five_withdrawals"), ("84", "py:accept_three_chains"),
-    ("85", "py:deploy_monitoring"),
+    ("85", "py:deploy_monitoring"), ("87", "py:accept_psy_withdrawal"), ("86", "py:open_deposits"),
 )
 
 
@@ -394,7 +395,7 @@ class Sd192StepTableTests(unittest.TestCase):
         rows = [line.split("\t")[:2] for line in SD192_STEPS.read_text().splitlines()
                 if line and line[0].isdigit()]
         self.assertEqual(rows, [list(p) for p in EXPECTED_PAIRS])
-        self.assertEqual(len(rows), 29)
+        self.assertEqual(len(rows), 34)
 
     def test_plan_with_the_real_table_needs_no_private_inputs(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("DEPLOY_", "GCP_"))}
