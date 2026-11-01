@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/lib/require-pinned-image.sh"
 source "$(dirname "$0")/lib/common.sh"
+# After common.sh so that a pin in config.env counts; nothing runs before this check.
+require_pinned_image NOSTR_RELAY_IMAGE
 
 NAME="${NOSTR_VM_NAME:-parth-nostr-1}"
 NODE_HOST="${NODE_HOST:-$(instance_internal_dns "${NODE_VM_NAME:-gcp-cp-ce}")}"
@@ -20,7 +23,7 @@ run_remote_script "$NAME" "$GCP_DIR/remote/install-nostr.sh" \
   "DATA_DISK_DEVICE=${NOSTR_DATA_DISK_DEVICE:-}" \
   "DATA_DISK_MOUNTPOINT=${NOSTR_HOME:-/opt/nostr-relay}" \
   "NOSTR_HOME=${NOSTR_HOME:-/opt/nostr-relay}" \
-  "NOSTR_RELAY_IMAGE=${NOSTR_RELAY_IMAGE:-scsibug/nostr-rs-relay:latest}" \
+  "NOSTR_RELAY_IMAGE=$NOSTR_RELAY_IMAGE" \
   "NOSTR_RELAY_URL=${NOSTR_RELAY_URL}" \
   "NOSTR_DOMAIN=${NOSTR_DOMAIN}" \
   "NOSTR_ALIAS_DOMAINS=${NOSTR_ALIAS_DOMAINS:-}" \

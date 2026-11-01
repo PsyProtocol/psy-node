@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/lib/require-pinned-image.sh"
 source "$(dirname "$0")/lib/common.sh"
+# After common.sh so that a pin in config.env counts; nothing runs before this check.
+require_pinned_image NATS_IMAGE
 
 NAME="${NATS_VM_NAME:-parth-nats-1}"
 provision_vm "$NAME"
 run_remote_script "$NAME" "$GCP_DIR/remote/install-nats.sh" \
-  "NATS_IMAGE=${NATS_IMAGE:-nats:2.11-alpine}" \
+  "NATS_IMAGE=$NATS_IMAGE" \
   "NATS_MAX_MEMORY_STORE=${NATS_MAX_MEMORY_STORE:-4G}" \
   "NATS_MAX_FILE_STORE=${NATS_MAX_FILE_STORE:-80G}" \
   "NATS_MAX_ACK_PENDING=${NATS_MAX_ACK_PENDING:-200000}" \

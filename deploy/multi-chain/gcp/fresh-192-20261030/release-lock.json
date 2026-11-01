@@ -12,8 +12,8 @@
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
     "worker_whitelist": "d55077d02c67cb2a9f1cf9ba8b3620d98134c9416deb6b7fd4b8274cd3b1540c",
     "risk_acceptance": "b05874b9d98ee4397c6a5ccdb0a7d0dfeb8e50a9d3209645e5f6662f5cc9b333",
-    "retired_state": "a53ccac87c53b2a5b2e20822165ac51b87eb9a000f53c31593aa0d17b309ca10",
-    "retained_paths": "2a73330561d572b6d8895b0756fd2bd33d3e552ac3a76f636819a3ab572bd417"
+    "retired_state": "c6e26ffab17b1121700127dc41c4a9216048a4fcd7b4af39dc5a167d25c2f3f0",
+    "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
     "runtime": "15d6316d1bd28bb535698a4797e3c6261e6c9597",
@@ -138,6 +138,10 @@
     "postgres": "postgres@sha256:71e27bf60b70bded003791b5573f8b808365613f341df20ffcf0c1ed7bc13ddf",
     "nostr": "scsibug/nostr-rs-relay@sha256:03f54bfbffff80a50db62c9287913bd25a2dec08033b56d2122bc2550363d5c5"
   },
+  "nostr": {
+    "home": "/opt/nostr-relay-r2-20261027",
+    "network": "nostr-relay_nostr-net"
+  },
   "groth16": {
     "setup_manifest_sha256": "",
     "verifiers": {
@@ -187,6 +191,7 @@
     "activate_bridge.py": "cd8762d5f1e2800ee5bb86b9ada15ec83f3305c2e7adb60660b3d497bdd4332e",
     "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
     "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
+    "clear_host_state.py": "5cf1e6a3322a444bf01b41789e2577ceca17e8d43463646501f4e7258b0115a0",
     "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
     "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
     "fresh_l1.py": "91c9f3f673c91605ad7e02e27f18783898d7316a8936b2423895864ee559526d",
@@ -202,6 +207,7 @@
     "prepare_proxies.py": "0d91693df906575f55c6031f711f9172023bc7adecf32eedde8aacaa97d0743c",
     "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
     "prepare_workers.py": "4592a624249e798d61ef9c786774a4c60ad12f3d1e253733ccd343d708f8d4c4",
+    "probe_databases.py": "74efabf7874d7a2e156e496cd0d6aa0e70c7b08dba5b1d996ca8cb0c18198c68",
     "relayer_exec.py": "98befed16fc38214bf7c6c444158b4a4c61d77035eec2352261e66f9386e6fb6"
   }
 }

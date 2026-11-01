@@ -73,6 +73,22 @@ These `create-*` names are kept for continuity, but they now mean "initialize
 the existing SSH host". Each script waits for SSH, installs the service, starts
 it, and runs a health check.
 
+### Image pins
+
+`create-scylla.sh`, `create-redis.sh`, `create-nats.sh`, `create-postgres.sh` and
+`create-nostr.sh` refuse to run unless their image variable holds an image pinned by
+digest (`name@sha256:...`), in `config.env` or in the environment, and never fall back to
+a tag: `SCYLLA_IMAGE`, `VALKEY_IMAGE`, `NATS_IMAGE`, `POSTGRES_IMAGE`,
+`NOSTR_RELAY_IMAGE`. The check runs right after `lib/common.sh`, before any host is touched.
+The installers under `remote/` check the same rule themselves.
+
+Flows that now need these pins: `multi-chain/gcp/steps.tsv` and `fresh-topology/steps.tsv`
+steps 05-08, `fresh-staging/17_deploy_caddy_entrypoints.sh` (it runs `create-nostr.sh`),
+`deploy-staging-stack.sh`, and the follow-up commands printed by
+`admin/recreate-redis-nats.sh`. The release deployment (`core-only/deploy_clear_steps.py`)
+takes the digests from the release lock and does not use `config.env` for them.
+`remote/install-nostr-relay.sh` rebuilds only the relay container and leaves Caddy alone.
+
 Scylla is started with `SCYLLA_SMP=4` by default and `SCYLLA_MEMORY=28g`.
 `SCYLLA_MEMORY` is applied as the Docker/cgroup memory cap for the container,
 so Scylla sizes its row cache against the capped memory while leaving several

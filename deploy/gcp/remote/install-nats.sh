@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+require_pinned_image() {
+  [[ "${!1:-}" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || {
+    echo "$1 must be set to an image pinned by digest (name@sha256:...)" >&2
+    exit 1
+  }
+}
+require_pinned_image NATS_IMAGE
+
 if ! command -v docker >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -8,7 +16,6 @@ if ! command -v docker >/dev/null 2>&1; then
   systemctl enable --now docker
 fi
 
-: "${NATS_IMAGE:=nats:2.11-alpine}"
 : "${NATS_CLIENT_PORT:=4222}"
 : "${NATS_MONITOR_PORT:=8222}"
 : "${NATS_STORE_DIR:=/var/lib/parth/nats/jetstream}"

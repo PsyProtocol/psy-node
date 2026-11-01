@@ -13,7 +13,7 @@ from deploy_remote import DeployContext, OperatorPending, Remote, ResultRefused,
 
 
 # Step modules to import; each exports one or more NAME_STEPS dicts of Step.
-STEP_MODULES = ("deploy_prepare_steps",)
+STEP_MODULES = ("deploy_prepare_steps", "deploy_clear_steps")
 EXIT_FAILURE = 1
 EXIT_UNKNOWN_STEP = 2
 EXIT_PENDING = 3

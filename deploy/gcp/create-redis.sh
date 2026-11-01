@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/lib/require-pinned-image.sh"
 source "$(dirname "$0")/lib/common.sh"
+# After common.sh so that a pin in config.env counts; nothing runs before this check.
+require_pinned_image VALKEY_IMAGE
 
 NAME="${REDIS_VM_NAME:-parth-redis-1}"
 provision_vm "$NAME"
 run_remote_script "$NAME" "$GCP_DIR/remote/install-valkey.sh" \
+  "VALKEY_IMAGE=$VALKEY_IMAGE" \
   "VALKEY_MAXMEMORY=${VALKEY_MAXMEMORY:-24gb}" \
   "VALKEY_MAXMEMORY_POLICY=${VALKEY_MAXMEMORY_POLICY:-noeviction}" \
   "VALKEY_APPENDONLY=${VALKEY_APPENDONLY:-yes}" \

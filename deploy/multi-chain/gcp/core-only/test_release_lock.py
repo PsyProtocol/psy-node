@@ -96,6 +96,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
         "images": {"scylla": "scylladb/scylla@sha256:" + "b" * 64, "valkey": "valkey/valkey@sha256:" + "c" * 64,
                    "nats": "nats@sha256:" + "d" * 64, "postgres": "postgres@sha256:" + "e" * 64,
                    "nostr": "scsibug/nostr-rs-relay@sha256:" + "f" * 64},
+        "nostr": {"home": "/opt/nostr-relay-test", "network": "nostr-test_net"},
         "groth16": {"setup_manifest_sha256": digest("setup"),
                     "verifiers": {name: digest(name) for name in lock_module.GROTH16_VERIFIERS}},
         "l1": {"signer": "0x" + "9" * 40, "signer_host": "gcp-faucet", "output_root": "/var/lib/psy-fresh-test",
@@ -386,8 +387,8 @@ class RetirementListTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gcp-scylla retain lists a path twice"):
             self.check()
         self.retired["hosts"]["gcp-scylla"]["retain"].pop()
-        self.retired["hosts"]["gcp-scylla"]["containers"] = ["x"]
-        self.retired["hosts"]["gcp-scylla"]["stop"] = ["x"]
+        self.retired["hosts"]["gcp-scylla"]["containers"] = ["x.service"]
+        self.retired["hosts"]["gcp-scylla"]["stop"] = ["x.service"]
         with self.assertRaisesRegex(ValueError, "stop and containers"):
             self.check()
         self.retired["hosts"]["gcp-scylla"]["stop"] = ["old.service"]
@@ -453,6 +454,77 @@ class RetirementListTests(unittest.TestCase):
         self.retired["hosts"]["gcp-unknown"] = {"stop": [], "containers": [], "retain": [], "clear": []}
         with self.assertRaisesRegex(ValueError, "retired state host set"):
             self.check()
+
+    def test_clear_allow_is_optional_and_typed(self):
+        self.check()
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["clear_allow"] = ["/opt/old-release/old-cohort-groth16.bin"]
+        self.check()
+        for bad in ("/opt/old-release", [5], ["relative"], ["/opt/old-release/../x"], ["/opt/elsewhere/x.bin"],
+                    ["/opt/old-release/a", "/opt/old-release/a"]):
+            entry["clear_allow"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "clear_allow"):
+                self.check()
+
+    def test_clear_allow_must_not_reach_into_a_retained_path(self):
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["clear"] = ["/var/lib/clear-me"]
+        entry["clear_allow"] = [entry["retain"][0] + "/x.key"]
+        with self.assertRaisesRegex(ValueError, "clear_allow"):
+            self.check()
+
+    def test_unknown_retirement_key_is_still_rejected(self):
+        self.retired["hosts"]["gcp-scylla"]["clear_alow"] = []
+        with self.assertRaisesRegex(ValueError, "retired state gcp-scylla fields"):
+            self.check()
+
+    def test_clear_host_state_is_a_pinned_remote_tool(self):
+        self.assertIn("clear_host_state.py", lock_module.TOOL_NAMES)
+        self.assertIn("probe_databases.py", lock_module.TOOL_NAMES)
+
+    def test_stop_accepts_service_timer_and_socket_names_only(self):
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["stop"] = ["psy-a.service", "psy-a.timer", "psy-a.socket"]
+        self.check()
+        for bad in ("psy-a.target", "psy-a", "psy-a.service.d"):
+            entry["stop"] = [bad]
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "stop names a unit"):
+                self.check()
+
+    def test_glob_characters_are_refused_in_every_path_list(self):
+        for key in ("clear", "retain"):
+            retired, retained = build_test_retirement()
+            retired["hosts"]["gcp-scylla"][key].append("/opt/old-release/w@*.service")
+            if key == "retain":
+                retained["paths"].append({"host": "gcp-scylla", "path": "/opt/old-release/w@*.service", "kind": "secret"})
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "glob"):
+                lock_module.validate_retirement(retired, retained)
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["clear_allow"] = ["/opt/old-release/a?b"]
+        with self.assertRaisesRegex(ValueError, "glob|clear_allow"):
+            self.check()
+
+    def test_nested_clear_entries_are_refused(self):
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["clear"] = ["/opt/old-release", "/opt/old-release/sub"]
+        with self.assertRaisesRegex(ValueError, "nested"):
+            self.check()
+
+    def test_clear_allow_equal_to_a_clear_entry_is_refused(self):
+        entry = self.retired["hosts"]["gcp-scylla"]
+        entry["clear_allow"] = ["/opt/old-release"]
+        with self.assertRaisesRegex(ValueError, "strictly inside"):
+            self.check()
+        entry["clear_allow"] = ["/opt/old-release/node_modules"]
+        self.check()
+
+    def test_the_lock_names_the_nostr_relay_home_and_network(self):
+        self.assertEqual(sorted(build_test_lock()["nostr"]), ["home", "network"])
+        lock = build_test_lock()
+        for bad in ({"home": "relative", "network": "n"}, {"home": "/opt/x", "network": ""}, {"home": "/opt/x"}):
+            lock["nostr"] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                lock_module.check_chain_values(lock, lock_module.Walk())
 
 
 if __name__ == "__main__":

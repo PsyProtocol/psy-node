@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+require_pinned_image() {
+  [[ "${!1:-}" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || {
+    echo "$1 must be set to an image pinned by digest (name@sha256:...)" >&2
+    exit 1
+  }
+}
+require_pinned_image SCYLLA_IMAGE
+
 if ! command -v docker >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -9,7 +17,6 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 : "${SCYLLA_SMP:=4}"
-: "${SCYLLA_IMAGE:=scylladb/scylla:latest}"
 # Scylla uses available memory aggressively for cache; cap the container so the
 # host keeps OS headroom on small staging VMs.
 : "${SCYLLA_MEMORY:=28g}"

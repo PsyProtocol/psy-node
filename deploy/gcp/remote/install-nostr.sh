@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+require_pinned_image() {
+  [[ "${!1:-}" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || {
+    echo "$1 must be set to an image pinned by digest (name@sha256:...)" >&2
+    exit 1
+  }
+}
+require_pinned_image NOSTR_RELAY_IMAGE
+
 : "${NOSTR_HOME:=/opt/nostr-relay}"
-: "${NOSTR_RELAY_IMAGE:=scsibug/nostr-rs-relay:latest}"
 : "${NOSTR_RELAY_URL:?NOSTR_RELAY_URL is required}"
 : "${NOSTR_DOMAIN:?NOSTR_DOMAIN is required}"
 : "${NOSTR_NAME:=devruntime-nostr-stg}"

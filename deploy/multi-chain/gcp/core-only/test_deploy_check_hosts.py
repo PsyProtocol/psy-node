@@ -68,6 +68,10 @@ class CheckHostsTests(PrepareTestCase):
             path.write_text(json.dumps(budget))
             ws.lock["l1"]["gas_budget_sha256"][chain] = sha(path.read_bytes())
         self.chain_ids = {"sepolia": 11155111, "bscTestnet": 97, "baseSepolia": 84532}
+        import deploy_clear_steps
+        self.fleet = unittest.mock.patch.object(deploy_clear_steps, "dry_run_fleet", return_value={"hosts": 3})
+        self.fleet_mock = self.fleet.start()
+        self.addCleanup(self.fleet.stop)
 
     def reports(self, **changes):
         result = []
@@ -86,6 +90,24 @@ class CheckHostsTests(PrepareTestCase):
 
     def run_step(self, remote):
         return run_all(steps.PREPARE_STEPS["check_hosts"], self.ws.context(remote))
+
+    def test_check_hosts_runs_the_clearing_dry_run_over_the_fleet_as_a_gate(self):
+        result = self.run_step(self.remote())
+        self.fleet_mock.assert_called_once()
+        self.assertEqual(result["clear_dry_run"], {"hosts": 3})
+
+    def test_a_fleet_refusal_fails_check_hosts_together_with_the_other_findings(self):
+        self.fleet_mock.side_effect = ValueError("gcp-edge-1: 1 refusal(s)\n  key-like name under a clear target: /x/operators.json")
+        remote = self.remote(l1=self.reports(baseSepolia={"balance_wei": "9999"}))
+        with self.assertRaises(ValueError) as raised:
+            self.run_step(remote)
+        self.assertIn("operators.json", str(raised.exception))
+        self.assertIn("baseSepolia: balance 9999 below required", str(raised.exception))
+
+    def test_the_fleet_gate_never_ends_in_pending(self):
+        self.fleet_mock.side_effect = ValueError("refused")
+        with self.assertRaises(ValueError):
+            self.run_step(self.remote())
 
     def test_check_hosts_reports_operator_hosts_without_sudo(self):
         remote = self.remote()

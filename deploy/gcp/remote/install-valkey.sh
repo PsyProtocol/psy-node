@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bash /tmp/install-docker.sh 2>/dev/null || true
+require_pinned_image() {
+  [[ "${!1:-}" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || {
+    echo "$1 must be set to an image pinned by digest (name@sha256:...)" >&2
+    exit 1
+  }
+}
+require_pinned_image VALKEY_IMAGE
+
 if ! command -v docker >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -30,7 +37,7 @@ docker run -d \
   --restart unless-stopped \
   -p 6379:6379 \
   -v /var/lib/parth/redis:/data \
-  valkey/valkey:latest \
+  "$VALKEY_IMAGE" \
   valkey-server \
     --dir /data \
     --dbfilename dump.rdb \

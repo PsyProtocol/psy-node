@@ -548,10 +548,12 @@ def hosts_verify(ctx):
     reports = signer and collect(failures, lambda: read_l1_reports(ctx, signer))
     for chain in release_lock.CHAINS if reports else ():
         l1[chain] = collect(failures, lambda: check_chain(ctx, chain, reports[chain], failures))
+    import deploy_clear_steps  # imported here: that module imports this one
+    fleet = collect(failures, lambda: deploy_clear_steps.dry_run_fleet(ctx))
     if failures:
         raise ValueError("\n".join(failures))
     return {"hosts": hosts, "operator_hosts": sorted(host for host, found in hosts.items() if found["sudo"] == "operator"),
-            "local_paths": len(local_paths), "l1": l1}
+            "local_paths": len(local_paths), "l1": l1, "clear_dry_run": fleet}
 
 
 def nothing(ctx):

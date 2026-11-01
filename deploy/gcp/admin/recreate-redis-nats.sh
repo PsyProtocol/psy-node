@@ -290,9 +290,9 @@ Expected deploy/gcp/config.env endpoint values:
 
 Next steps:
   1. Update local ~/.ssh/config with the new external IPs from the final VM list.
-  2. Redeploy Redis/Valkey:
+  2. Redeploy Redis/Valkey (VALKEY_IMAGE must be pinned by digest in config.env or the environment):
        bash deploy/gcp/create-redis.sh
-  3. Redeploy NATS:
+  3. Redeploy NATS (NATS_IMAGE must be pinned by digest as well):
        bash deploy/gcp/create-nats.sh
   4. Restart Parth services that connect to Redis/NATS.
 EOF

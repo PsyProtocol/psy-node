@@ -233,7 +233,22 @@ never committed). Every file named there is hash-checked against the lock or
 | --- | --- | --- |
 | `build` | `source`, `builder_image`, `caches` (`cargo`, `target`, `go`, `go_build`), `output_root`, `jobs` | Inputs of the pinned Node build. All paths absolute. |
 | `files` | `config`, `canonical_config`, `genesis`, `genesis_contracts`, `compiler_stamp`, `groth16_setup_manifest`, `gnark_groth16_verifier`, `deposit_batch_verifier`, `withdrawal_claim_verifier`, `psy_services`, `psy_indexer`, `l1_bundle_manifest`, `l1_policy` | Frozen release inputs. `l1_bundle_manifest` is the `manifest.json` at the root of the L1 bundle directory. |
+| `databases` | `postgres_password_file` | Absolute path of a file whose single line is the PostgreSQL superuser password for the rebuilt database host (step `rebuild_databases`). The controller sends it on stdin; the installer exports it and `docker` takes it from the environment, so it is in no command line. |
 | `packages.core` | `registration_keys`, `faucet_operators`, `p2p_keys`, `output` | Inputs of the core host packages; `output` must not exist before the first run. All absolute. |
+
+Steps 61-64 read the private `retired-state.json` (`stop`, `containers`, `retain`, `clear`, and the optional `clear_allow`).
+`stop` may name services, timers and sockets (timers and sockets are stopped first, and every listed unit is disabled and
+stopped). `clear_allow` names exact paths strictly below a clear entry (never the entry itself) whose key-like file names
+are known harmless: a file, or a directory whose whole subtree is exempt, such as `node_modules`. The clearing tool walks
+every clear target and refuses the whole host on any other key-like name, on nested clear entries, on glob characters, on
+a symlink that reaches a retained path, and on a mount point. `retained-paths.json` kind `secret` paths are hashed before
+and after each clear (files by content, directories by names, sizes and mtimes to depth 3); kind `infrastructure` paths
+are only checked for existence, which is why `/opt/nostr-relay/caddy_data` (Caddy rewrites it while running) is listed as
+infrastructure. The first hashes seen before a delete are kept in `state/retained_baseline.json`, bound to the lock hash.
+Operator hosts (x1, x2, x3) are stopped and cleared by one printed command (step `stop_operator_hosts`) whose files and
+result live in a mode 0700 directory under the operator's home; step `clear_node_state` only verifies their results.
+The release check (`check_hosts`, step 55) and `stop_services` both run the whole clearing request of every host without
+`--apply` (unprivileged on operator hosts) and fail on any refusal.
 
 Build attempts live in `<output_root>/<release id>-<first 12 of the runtime commit>-build-<n>`.
 A completed attempt of the same commit is verified and reused; a failed attempt

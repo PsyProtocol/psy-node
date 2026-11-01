@@ -15,7 +15,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 MAX_BYTES = 4 * 1024 * 1024
 TOP_LEVEL = ("schema_version", "release_id", "network", "network_magic", "inputs", "sources", "binaries", "paths",
-             "units", "hosts", "services", "envio", "faucet", "images", "groth16", "l1", "ingress", "gates",
+             "units", "hosts", "services", "envio", "faucet", "images", "nostr", "groth16", "l1", "ingress", "gates",
              "tool_sha256")
 INPUTS = ("release_profile", "topology", "artifacts", "runtime_config", "canonical_config", "genesis",
           "worker_whitelist", "risk_acceptance", "retired_state", "retained_paths")
@@ -29,11 +29,12 @@ IMAGES = ("scylla", "valkey", "nats", "postgres", "nostr")
 CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
 GROTH16_VERIFIERS = ("gnark_groth16_verifier", "deposit_batch_verifier", "withdrawal_claim_verifier")
 # Every file that is loaded or executed on a remote host, keyed by file name in this directory.
-TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "enable_services_nostr.py",
+TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "clear_host_state.py",
+              "enable_services_nostr.py",
               "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_envio.py",
               "install_guardian.py", "install_host.py", "install_relayer.py", "install_services.py",
               "prepare_bridge_forwarders.py", "prepare_faucet.py", "prepare_proxies.py",
-              "prepare_relayer_credential.py", "prepare_workers.py", "relayer_exec.py")
+              "prepare_relayer_credential.py", "prepare_workers.py", "probe_databases.py", "relayer_exec.py")
 SECRET_MARKERS = ("keystore", "/keys", ".key", ".cred", "operator", "/wireguard", "id_ed25519", "credential", "/.ssh",
                   "/etc/ssh", ".psy")
 ALL_HOSTS = ("gcp-cp-ce", "gcp-realm-processor", "realm-processors-b", "realm-processors-c", "gcp-edge-1", "gcp-edge-2",
@@ -65,6 +66,9 @@ for _alias, _needles in {
         "arc99x2": ["/etc/wireguard", "credential.secret", "/var/lib/parth/.psy", "/etc/psy-faucet"],
         "arc99x3": ["/etc/wireguard", "credential.secret"]}.items():
     REQUIRED_RETAIN[_alias] += _needles
+# clear_host_state.UNIT_NAME is the same pattern; a test pins them equal (the remote tool has no sibling import).
+UNIT_NAME = re.compile(r"[A-Za-z0-9:_.@\\-]+\.(service|timer|socket)")
+GLOB_CHARACTERS = frozenset("*?[]")
 HASH = re.compile(r"[0-9a-f]{64}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}")
@@ -256,6 +260,9 @@ def check_chain_values(lock, walk):
     images = fields(lock["images"], IMAGES, "images")
     for name in IMAGES:
         walk.image(images[name], name)
+    nostr = fields(lock["nostr"], ("home", "network"), "nostr")
+    walk.absolute(nostr["home"], "nostr.home")
+    walk.text(nostr["network"], "nostr.network")
     groth16 = fields(lock["groth16"], ("setup_manifest_sha256", "verifiers"), "groth16")
     walk.digest(groth16["setup_manifest_sha256"], "groth16.setup_manifest_sha256")
     for name in GROTH16_VERIFIERS:
@@ -303,17 +310,34 @@ def validate_release_lock(lock, release_dir, is_complete, private_dir=None):
     require(not (is_complete and walk.pending), "release lock incomplete: " + ", ".join(walk.pending))
 
 
+def check_clear_allow(alias, entry, kept):
+    """clear_allow names known harmless key-like paths below a clear entry; it can never reach a retained path."""
+    allow = entry.get("clear_allow", [])
+    require(isinstance(allow, list) and all(isinstance(i, str) and i.startswith("/") and ".." not in i.split("/")
+                                            and not i.endswith("/") for i in allow)
+            and len(allow) == len(set(allow)), f"{alias} clear_allow must list normal absolute paths once")
+    for item in allow:
+        path = Path(item)
+        require(not GLOB_CHARACTERS & set(item), f"{alias} clear_allow holds a glob character: {item}")
+        require(any(Path(c) in path.parents for c in entry["clear"]),
+                f"{alias} clear_allow must be strictly inside a clear entry: {item}")
+        require(not any(path == k or k in path.parents or path in k.parents for k in kept),
+                f"{alias} clear_allow touches a retained path: {item}")
+
+
 def validate_retirement(retired, retained):
     fields(retired, ("hosts",), "retired state")
     hosts = retired["hosts"]
     keep = {}
     for alias, entry in hosts.items():
-        fields(entry, ("stop", "containers", "retain", "clear"), f"retired state {alias}")
+        require(isinstance(entry, dict) and set(entry) - {"clear_allow"} == {"stop", "containers", "retain", "clear"},
+                f"retired state {alias} fields")
         for name in ("stop", "containers", "retain", "clear"):
             require(isinstance(entry[name], list) and all(isinstance(i, str) and i for i in entry[name]),
                     f"{alias}.{name} must list strings")
         require(not any("/" in i or i.startswith("docker:") for i in entry["stop"] + entry["containers"]),
                 f"{alias} stop and containers hold names, not paths")
+        require(all(UNIT_NAME.fullmatch(i) for i in entry["stop"]), f"{alias} stop names a unit that is not a service, timer or socket")
         require(len(entry["clear"]) == len(set(entry["clear"])), f"{alias} clear lists a path twice")
         require(len(entry["retain"]) == len(set(entry["retain"])), f"{alias} retain lists a path twice")
         require(not set(entry["stop"]) & set(entry["containers"]), f"{alias} lists a name in stop and containers")
@@ -322,7 +346,13 @@ def validate_retirement(retired, retained):
         for item in entry["retain"] + entry["clear"]:
             require(item.startswith("/") and ".." not in item.split("/") and (item == "/" or not item.endswith("/")),
                     f"{alias} path must be absolute and normal: {item}")
+            require(not GLOB_CHARACTERS & set(item), f"{alias} path holds a glob character: {item}")
+        for position, first in enumerate(entry["clear"]):
+            for second in entry["clear"][position + 1:]:
+                require(not (Path(first) in Path(second).parents or Path(second) in Path(first).parents),
+                        f"{alias} clear entries are nested: {first} ~ {second}")
         keep[alias] = [Path(i) for i in entry["retain"]]
+        check_clear_allow(alias, entry, keep[alias])
         for item in entry["clear"]:
             require(not any(marker in item for marker in SECRET_MARKERS), f"{alias} clear names key material: {item}")
             clear = Path(item)

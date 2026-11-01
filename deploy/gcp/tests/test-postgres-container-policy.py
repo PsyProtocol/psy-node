@@ -6,7 +6,7 @@ import unittest
 
 
 SCRIPT = (Path(__file__).resolve().parents[1] / "remote/install-postgres.sh").read_text()
-RUN = shlex.split(SCRIPT.split("docker run -d", 1)[1].replace("\\\n", " ").split('"postgres:', 1)[0])
+RUN = shlex.split(SCRIPT.split("docker run -d", 1)[1].replace("\\\n", " ").split('"$POSTGRES_IMAGE"', 1)[0])
 
 
 class PostgresContainerPolicyTests(unittest.TestCase):
