@@ -25,7 +25,9 @@ PUBLIC_SETUP_FILES = tuple(f"{prefix}{name}_groth16.bin" for prefix in ("", "dep
                            for name in ("circuit", "pk", "vk"))
 FETCH_SECONDS = 30
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
-SCRIPT_REFERENCE = re.compile(r"""(?:src|href)=["']([^"']+\.js)["']|["'](\./[A-Za-z0-9_.-]+\.js)["']|["'](/assets/[A-Za-z0-9_.-]+\.js)["']""")
+# Three reference shapes: tags in the page; "./x.js" or "../x.js" relative to the chunk that holds it; and Vite's
+# preload map entries "assets/x.js" or "/assets/x.js", which are relative to the site root.
+SCRIPT_REFERENCE = re.compile(r"""(?:src|href)=["']([^"']+\.js)["']|["'](\.{1,2}/[A-Za-z0-9_.-]+\.js)["']|["'](/?assets/[A-Za-z0-9_.-]+\.js)["']""")
 BUNDLE_FILE_LIMIT = 300
 TRUST_ARCHIVE_LEVEL = 6
 CREDENTIAL_NAMES = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")
@@ -322,23 +324,28 @@ def head_length(url):
 
 
 def bundle_texts(site_url, fetch_function=None):
-    """The served page and every script it reaches by relative reference, lowercased; capped in file count."""
+    """The served page and every script reachable from it, lowercased; capped in file count.
+
+    A "./x.js" reference is resolved against the chunk that holds it, a bare "assets/x.js" against the site root.
+    """
     fetch_function = fetch_function or fetch
+    root = site_url if site_url.endswith("/") else site_url + "/"
     status, page = fetch_function(site_url)
     require(status == 200, f"{site_url} did not answer 200")
-    pending, seen, texts = [page.decode("utf-8", errors="replace")], set(), []
-    while pending and len(seen) < BUNDLE_FILE_LIMIT:
-        text = pending.pop()
+    pending, seen, texts = [(site_url, page.decode("utf-8", errors="replace"))], {site_url}, []
+    while pending:
+        origin, text = pending.pop()
         texts.append(text.lower())
         for found in SCRIPT_REFERENCE.finditer(text):
             reference = next(group for group in found.groups() if group)
-            url = urllib.request.urljoin(site_url, reference)
-            if url in seen or not url.startswith(site_url.rstrip("/") + "/"):
+            bare = reference.lstrip("/").startswith("assets/") and not reference.startswith(".")
+            url = urllib.request.urljoin(root if bare else origin, reference)
+            if url in seen or not url.startswith(root) or len(seen) >= BUNDLE_FILE_LIMIT:
                 continue
             seen.add(url)
             status, body = fetch_function(url)
             if status == 200:
-                pending.append(body.decode("utf-8", errors="replace"))
+                pending.append((url, body.decode("utf-8", errors="replace")))
     return texts
 
 

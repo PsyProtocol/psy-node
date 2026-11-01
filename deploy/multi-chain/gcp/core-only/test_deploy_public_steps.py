@@ -154,6 +154,40 @@ class ArchiveTests(unittest.TestCase):
                 leftover.unlink(missing_ok=True)
 
 
+class BundleCrawlTests(unittest.TestCase):
+    SITE = "https://site.example/"
+    FILES = {
+        "": '<script type="module" src="/assets/index-1.js"></script>',
+        "assets/index-1.js": 'import("./chainConfig-2.js"); const deps=["assets/lazy-3.js"];',
+        "assets/chainConfig-2.js": 'import("./nested-4.js");',
+        "assets/nested-4.js": 'const psy="0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";',
+        "assets/lazy-3.js": 'import("../assets/deep/never.js"); const old="0x1111111111111111111111111111111111111111";',
+    }
+
+    def fetch(self, url, limit=None):
+        key = url.removeprefix(self.SITE)
+        return (200, self.FILES[key].encode()) if key in self.FILES else (404, b"")
+
+    def test_a_chunk_reachable_only_through_a_nested_relative_import_is_read(self):
+        text = "\n".join(pr.bundle_texts(self.SITE, self.fetch))
+        self.assertIn("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text)
+        self.assertIn("0x1111111111111111111111111111111111111111", text, "the root-relative preload entry is read too")
+
+    def test_relative_references_resolve_against_the_referring_chunk_not_the_site_root(self):
+        asked = []
+        pr.bundle_texts(self.SITE, lambda url, limit=None: asked.append(url) or self.fetch(url))
+        self.assertIn(self.SITE + "assets/nested-4.js", asked)
+        self.assertNotIn(self.SITE + "chainConfig-2.js", asked)
+
+    def test_check_bundle_finds_the_new_address_and_flags_an_old_one_in_a_nested_chunk(self):
+        new = {"sepolia.PSY": "0x" + "a" * 40}
+        pr.check_bundle(self.SITE, new, [], self.fetch)
+        with self.assertRaisesRegex(ValueError, "previous release"):
+            pr.check_bundle(self.SITE, new, ["0x" + "1" * 40], self.fetch)
+        with self.assertRaisesRegex(ValueError, "does not serve the new address"):
+            pr.check_bundle(self.SITE, {"sepolia.PSY": "0x" + "c" * 40}, [], self.fetch)
+
+
 class TrustStepTests(PublicWorld):
     def setUp(self):
         super().setUp()
