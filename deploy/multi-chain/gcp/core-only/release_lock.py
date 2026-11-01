@@ -413,6 +413,21 @@ def write_faucet_operators(lock_path, operators_path):
     replace_lock(lock_path, lock)
 
 
+def write_gas_budget_hashes(lock_path):
+    """Set l1.gas_budget_sha256 from the budget files that sit next to the lock."""
+    import fresh_l1
+    lock = read_release_lock(lock_path)
+    directory = Path(lock_path).resolve().parent
+    hashes = {}
+    for chain in CHAINS:
+        path = directory / f"fresh_l1_gas_budget.{chain}.json"
+        require(path.is_file(), f"gas budget file missing: {chain}")
+        fresh_l1.validate_budget(read_document(path), chain)
+        hashes[chain] = sha256_file(path)
+    lock["l1"] = {**lock["l1"], "gas_budget_sha256": hashes}
+    replace_lock(lock_path, lock)
+
+
 def replace_lock(lock_path, lock):
     text = json.dumps(lock, indent=2) + "\n"
     directory = Path(lock_path).resolve().parent
@@ -439,6 +454,8 @@ def main(argv=None):
     pin = commands.add_parser("update-faucet-operators", help="pin the hash of the Genesis faucet operator file")
     pin.add_argument("--lock", type=Path, required=True)
     pin.add_argument("--operators", type=Path, required=True)
+    budgets = commands.add_parser("update-budgets", help="rewrite l1.gas_budget_sha256 from the budget files")
+    budgets.add_argument("--lock", type=Path, required=True)
     inputs = commands.add_parser("update-inputs", help="rewrite inputs from the current files")
     inputs.add_argument("--lock", type=Path, required=True)
     inputs.add_argument("--private-dir", type=Path)
@@ -449,6 +466,9 @@ def main(argv=None):
             validate_release_lock(lock, args.lock.resolve().parent, args.require_complete, args.private_dir)
             check_tool_hashes(lock, HERE)
             print("release lock ok")
+        elif args.command == "update-budgets":
+            write_gas_budget_hashes(args.lock)
+            print("gas budget hashes updated")
         elif args.command == "update-inputs":
             write_inputs(args.lock, args.lock.resolve().parent, args.private_dir)
             print("inputs updated")

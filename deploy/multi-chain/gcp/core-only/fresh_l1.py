@@ -4,11 +4,15 @@
 pack --contracts DIR --contracts-commit SHA --verifiers JSON --verifiers-sha256 SHA --output NEW_DIR
   JSON is exactly {"src/<Verifier>.sol": "sha256", ...} for all four verifiers.
   Requires frozen pnpm dependencies and freshly compiled Hardhat artifacts.
-check --bundle DIR --manifest-sha256 SHA
+  SHA is the release lock's sources.contracts; the checkout HEAD must equal it.
+check --bundle DIR --manifest-sha256 SHA --contracts-commit SHA
 status --rpc-config /etc/parth/bridge-relayer.toml [--secret-env FILE ...]
-prepare --bundle DIR --manifest-sha256 SHA --output NEW_DIR
-deploy --bundle DIR --manifest-sha256 SHA --output PREPARED_DIR --network NAME
-       --policy JSON --policy-sha256 SHA --execute --node /path/to/node
+prepare --bundle DIR --manifest-sha256 SHA --contracts-commit SHA --output NEW_DIR
+estimate --bundle DIR --manifest-sha256 SHA --contracts-commit SHA --network NAME
+         --gas-budget JSON --gas-budget-sha256 SHA   (read-only live eth_estimateGas)
+attempts --root DIR --manifest-sha256 SHA            (read-only attempt directory states)
+deploy --bundle DIR --manifest-sha256 SHA --contracts-commit SHA --output PREPARED_DIR
+       --network NAME --policy JSON --policy-sha256 SHA --execute --node /path/to/node
        --gas-budget JSON --gas-budget-sha256 SHA
        [--secret-env /etc/parth/relayer.env] [--rpc-config FILE] [--keystore FILE]
 
@@ -37,6 +41,9 @@ Own-node RPC uses the private gateway in existing relayer config, ports
 18545/18645/18945. Fallbacks, if needed, come ONLY from explicitly supplied
 protected env files: SEPOLIA_RPC_FALLBACK_URL, BSC_TESTNET_RPC_FALLBACK_URL,
 BASE_SEPOLIA_RPC_FALLBACK_URL. RPC URLs and child diagnostics are never printed.
+deploy refuses unless a live eth_estimateGas of every creation bytecode, with a
+20% margin, fits maxGasPerTransaction, and the signer's latest and pending nonces
+are equal when re-read immediately before the first broadcast.
 No secrets belong in the bundle, policy, output files, or command arguments.
 """
 import argparse
@@ -57,8 +64,11 @@ import urllib.parse
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-BASE = "394153fa7b4eb1b5f041131d15036a38321620f0"
 SIGNER = "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad"
+WALLET_ENV = "/etc/parth/relayer.env"
+FALLBACK_ENV = "/etc/parth/l1-rpc-fallback.env"
+ESTIMATE_MARGIN_PERCENT = 120
+STACK_TRANSACTIONS = 41  # transactions of one full chain deployment, as measured on the last release
 NETWORKS = {"sepolia": (11155111, 0, 18545, "SEPOLIA"),
             "bscTestnet": (97, 1, 18645, "BSC_TESTNET"),
             "baseSepolia": (84532, 2, 18945, "BASE_SEPOLIA")}
@@ -187,9 +197,6 @@ def pack(args):
     require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), "full contracts commit required")
     require(git("rev-parse", "HEAD").decode().strip() == commit, "wrong contracts commit")
     require(not git("status", "--porcelain", "--untracked-files=no").strip(), "contracts tracked worktree must be clean")
-    git("merge-base", "--is-ancestor", BASE, commit)
-    changed = set(git("diff", "--name-only", BASE, commit).decode().splitlines())
-    require(changed.issubset(VERIFIERS), "candidate changes more than four exported verifiers")
     exports = read_json(args.verifiers, args.verifiers_sha256)
     tracked = git("ls-files", "-z").decode().split("\0")
     selected = [name for name in tracked if name and
@@ -197,8 +204,7 @@ def pack(args):
     require(SOURCE_FILES.issubset(selected), "incomplete contracts source")
     for name in selected:
         require(not (source / name).is_symlink(), "source symlink forbidden")
-        if name not in VERIFIERS:
-            require((source / name).read_bytes() == git("show", f"{BASE}:{name}"), "modified contracts base")
+        require((source / name).read_bytes() == git("show", f"{commit}:{name}"), "source differs from the pinned commit")
     require(not (source / ".env").exists(), "contracts .env forbidden")
     require((source / "node_modules/.pnpm/lock.yaml").is_file(), "frozen pnpm install missing")
     validate_build(source, exports)
@@ -211,19 +217,20 @@ def pack(args):
         shutil.copytree(source / name, output / "contracts" / name, symlinks=True)
     shutil.copyfile(HERE / "fresh_l1.cjs", output / "fresh_l1.cjs")
     shutil.copyfile(HERE / "fresh_l1.py", output / "fresh_l1.py")
-    manifest = {"version": 1, "contracts_base": BASE, "contracts_commit": commit, "signer": SIGNER,
+    manifest = {"version": 1, "contracts_commit": commit, "signer": SIGNER,
                 "verifiers": exports, "files": inventory(output)}
     write_json(output / "manifest.json", manifest)
     return {"prepared": True, "manifest_sha256": digest(output / "manifest.json"), "broadcast": False}
 
 
-def verify_bundle(bundle, expected):
+def verify_bundle(bundle, expected, contracts_commit):
+    """contracts_commit is the release lock's sources.contracts; the bundle must be built from exactly it."""
+    require(isinstance(contracts_commit, str) and re.fullmatch(r"[0-9a-f]{40}", contracts_commit),
+            "full contracts commit required")
     bundle = safe_root(bundle)
     manifest = read_json(bundle / "manifest.json", expected)
-    require(set(manifest) == {"version", "contracts_base", "contracts_commit", "signer", "verifiers", "files"}
-            and manifest["version"] == 1 and manifest["contracts_base"] == BASE
-            and isinstance(manifest["contracts_commit"], str)
-            and re.fullmatch(r"[0-9a-f]{40}", manifest["contracts_commit"])
+    require(set(manifest) == {"version", "contracts_commit", "signer", "verifiers", "files"}
+            and manifest["version"] == 1 and manifest["contracts_commit"] == contracts_commit
             and manifest["signer"] == SIGNER, "bundle identity mismatch")
     actual = inventory(bundle)
     actual.pop("manifest.json")
@@ -290,7 +297,7 @@ def own_rpc(config, network):
 
 def rpc(url, method, params):
     require(method in {"eth_chainId", "eth_getBalance", "eth_gasPrice", "eth_getBlockByNumber", "eth_syncing",
-                       "eth_getTransactionCount"}, "read-only RPC method required")
+                       "eth_getTransactionCount", "eth_estimateGas"}, "read-only RPC method required")
     parsed = urllib.parse.urlsplit(url)
     require(parsed.scheme in ("http", "https") and parsed.hostname, "invalid RPC endpoint")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -356,13 +363,54 @@ def validate_budget(budget, network):
             "Base L1 data-fee reserve required")
 
 
+def creation_bytecodes(bundle):
+    """Creation bytecode of the largest deployments: Bridge and the four verifiers, none with constructor arguments."""
+    root = Path(bundle) / "contracts/artifacts/hardhat"
+    paths = {"Bridge": root / "src/Bridge.sol/Bridge.json"}
+    paths.update({PurePosixPath(name).stem: root / name / "Verifier.json" for name in sorted(VERIFIERS)})
+    codes = {}
+    for label, path in paths.items():
+        artifact = read_json(path)
+        code = artifact["bytecode"]
+        require(isinstance(code, str) and re.fullmatch(r"0x(?:[0-9a-f]{2})+", code) and "__$" not in code,
+                "creation bytecode unusable")
+        require(not any(row.get("type") == "constructor" and row.get("inputs") for row in artifact["abi"]),
+                "creation bytecode needs constructor arguments")
+        codes[label] = code
+    return codes
+
+
+def estimate_creation(network, endpoint, bundle, budget):
+    """Live eth_estimateGas per creation bytecode; a Hardhat figure is never a valid substitute."""
+    estimates = {label: int(rpc(endpoint, "eth_estimateGas", [{"from": SIGNER, "data": code}]), 16)
+                 for label, code in creation_bytecodes(bundle).items()}
+    required = max(estimates.values()) * ESTIMATE_MARGIN_PERCENT // 100
+    limit = int(budget["maxGasPerTransaction"])
+    return {"network": network, "estimates": estimates, "required_with_margin": required,
+            "max_gas_per_transaction": limit, "within_budget": 0 < required <= limit}
+
+
+def recheck_nonce(args, report, primary, secrets):
+    """Immediately before the first broadcast: latest equals pending and nothing moved since the preflight."""
+    again, _ = status(args.network, primary, secrets.get(NETWORKS[args.network][3] + "_RPC_FALLBACK_URL"),
+                      args.rpc_preference)
+    require(again["nonce_latest"] == again["nonce_pending"] == report["nonce_latest"],
+            "signer nonce moved or has pending transactions; not broadcasting")
+
+
+def stack_within_spend(budget, gas_price_wei):
+    """The whole stack must fit the spend ceiling at the current price, or the guard would stop it half way."""
+    cost = gas_price_wei * int(budget["maxTotalGas"]) + int(budget["l1FeeReserveWeiPerTransaction"]) * STACK_TRANSACTIONS
+    return cost <= int(budget["maxNativeSpendWei"])
+
+
 def deploy(args):
     require(args.execute, "broadcast requires --execute after independent review")
     policy = read_json(args.policy, args.policy_sha256)
     validate_policy(policy)
     budget = read_json(args.gas_budget, args.gas_budget_sha256)
     validate_budget(budget, args.network)
-    bundle = verify_bundle(args.bundle, args.manifest_sha256)
+    bundle = verify_bundle(args.bundle, args.manifest_sha256, args.contracts_commit)
     output = safe_root(args.output)
     require(read_json(output / "prepared.json") == {"manifest_sha256": args.manifest_sha256},
             "output belongs to another bundle")
@@ -382,10 +430,16 @@ def deploy(args):
                               args.rpc_preference)
     require(int(report["balance_wei"]) >= int(budget["maxNativeSpendWei"]), "balance below full approved gas budget")
     require(int(report["gas_price_wei"]) <= int(budget["maxGasPriceWei"]), "current gas price exceeds approved cap")
+    require(report["nonce_latest"] == report["nonce_pending"], "signer has pending transactions; not broadcasting")
+    require(stack_within_spend(budget, int(report["gas_price_wei"])),
+            "whole-stack cost at the current gas price exceeds the approved spend ceiling")
+    require(estimate_creation(args.network, endpoint, bundle, budget)["within_budget"],
+            "creation gas estimate exceeds the approved per-transaction budget")
     request = {"execute": False, "password": secrets["WALLET_PASSWORD"], "keystore": str(key),
                "rpc": endpoint, "public_rpc": primary, "policy": policy["networks"][args.network],
                "pause_deposits": True, "budget": budget}
     child(args.node, bundle, output, args.network, request)
+    recheck_nonce(args, report, primary, secrets)
     write_json(output / f"attempt-{args.network}.json", {"manifest_sha256": args.manifest_sha256,
                "policy_sha256": args.policy_sha256, "gas_budget_sha256": args.gas_budget_sha256,
                "status": "attempted-no-automatic-retry", "preflight": report, "gas_budget": budget})
@@ -397,38 +451,113 @@ def deploy(args):
     return {"network": args.network, "completed": True}
 
 
+ATTEMPT = re.compile(r"attempt-([1-9][0-9]*)")
+PROCESS_ROOT = Path("/proc")
+
+
+def network_state(attempt, manifest_sha256):
+    """completed needs the marker plus its evidence; any other trace of work is partial; no trace is untouched."""
+    states = {}
+    for network in NETWORKS:
+        marker = attempt / f"completed-{network}.json"
+        traces = [attempt / f"{kind}-{network}.{suffix}" for kind, suffix in
+                  (("attempt", "json"), ("stages", "jsonl"), ("flow", "json"), ("policy", "json"))]
+        traces += [attempt / "deployments" / network, attempt / "receipts" / network]
+        evidence = [attempt / "deployments" / network / "deployed-contracts.json",
+                    attempt / "deployments" / network / "Bridge_Proxy.json", attempt / f"readback-{network}.json"]
+        if marker.exists():
+            document = read_json(marker)
+            require(isinstance(document, dict), "completion marker must be a JSON object")
+            ok = (set(document) == {"manifest_sha256", "policy_sha256"} and document["manifest_sha256"] == manifest_sha256
+                  and all(path.is_file() for path in evidence))
+            states[network] = {"state": "completed" if ok else "partial",
+                               "policy_sha256": document.get("policy_sha256")}
+        else:
+            states[network] = {"state": "partial" if any(path.exists() for path in traces) else "untouched",
+                               "policy_sha256": None}
+    return states
+
+
+def active_deploys(root):
+    """Running fresh_l1 deploy processes whose --output lies under root; the scan is read-only."""
+    found = 0
+    for entry in PROCESS_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            words = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        text = [word.decode("utf-8", "replace") for word in words]
+        under = str(root) + "/"
+        if "deploy" in text and "--output" in text and text[text.index("--output") + 1].startswith(under):
+            found += 1
+        # The Node helper (argv: script, contracts, output, network) can outlive its Python parent.
+        helper = [i for i, word in enumerate(text) if word.endswith("fresh_l1.cjs")]
+        if helper and len(text) > helper[0] + 2 and text[helper[0] + 2].startswith(under):
+            found += 1
+    return found
+
+
+def attempts(args):
+    """Read-only: every attempt-<n> directory under root with its per-network state."""
+    require(re.fullmatch(r"[0-9a-f]{64}", args.manifest_sha256), "manifest hash required")
+    root = Path(os.path.abspath(args.root))
+    if not root.exists():
+        return {"attempts": [], "active_deploys": 0}
+    root = safe_root(root)
+    rows = []
+    for entry in sorted(root.iterdir()):
+        match = ATTEMPT.fullmatch(entry.name)
+        if not match:
+            continue
+        require(not entry.is_symlink() and entry.is_dir(), "attempt path must be a plain directory")
+        prepared = entry / "prepared.json"
+        belongs = prepared.is_file() and read_json(prepared) == {"manifest_sha256": args.manifest_sha256}
+        rows.append({"number": int(match.group(1)), "path": str(entry), "prepared_for_bundle": belongs,
+                     "networks": network_state(entry, args.manifest_sha256)})
+    return {"attempts": sorted(rows, key=lambda row: row["number"]), "active_deploys": active_deploys(root)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("pack")
     for name in ("contracts", "contracts-commit", "verifiers", "verifiers-sha256", "output"):
         p.add_argument("--" + name, required=True)
-    for name in ("check", "prepare", "deploy"):
+    for name in ("check", "prepare", "deploy", "estimate"):
         p = commands.add_parser(name)
         p.add_argument("--bundle", required=True)
         p.add_argument("--manifest-sha256", required=True)
-        if name != "check":
+        p.add_argument("--contracts-commit", required=True)
+        if name in ("prepare", "deploy"):
             p.add_argument("--output", required=True)
-        if name == "deploy":
+        if name in ("deploy", "estimate"):
             p.add_argument("--network", choices=NETWORKS, required=True)
+            p.add_argument("--gas-budget", required=True)
+            p.add_argument("--gas-budget-sha256", required=True)
+        if name == "deploy":
             p.add_argument("--policy", required=True)
             p.add_argument("--policy-sha256", required=True)
             p.add_argument("--execute", action="store_true")
             p.add_argument("--node", required=True)
-            p.add_argument("--gas-budget", required=True)
-            p.add_argument("--gas-budget-sha256", required=True)
             p.add_argument("--keystore", default="/var/lib/parth/.psy/keystore/bridge-relayer-dev")
+    p = commands.add_parser("attempts")
+    p.add_argument("--root", required=True)
+    p.add_argument("--manifest-sha256", required=True)
     commands.add_parser("status")
-    for name in ("status", "deploy"):
+    for name in ("status", "deploy", "estimate"):
         p = commands.choices[name]
         p.add_argument("--rpc-preference", choices=("own-node", "protected-env-backup"), default="own-node")
         p.add_argument("--rpc-config", default="/etc/parth/bridge-relayer.toml")
         p.add_argument("--secret-env", action="append", default=None)
     args = parser.parse_args(argv)
     if hasattr(args, "secret_env"):
-        args.secret_env = args.secret_env or ["/etc/parth/relayer.env"]
+        args.secret_env = args.secret_env or [WALLET_ENV]
     if args.command == "pack":
         return pack(args)
+    if args.command == "attempts":
+        return attempts(args)
     if args.command == "status":
         secrets = secret_env(args.secret_env)
         return [status(n, own_rpc(args.rpc_config, n), secrets.get(v[3] + "_RPC_FALLBACK_URL"),
@@ -436,7 +565,14 @@ def main(argv=None):
                 for n, v in NETWORKS.items()]
     if args.command == "deploy":
         return deploy(args)
-    verify_bundle(args.bundle, args.manifest_sha256)
+    bundle = verify_bundle(args.bundle, args.manifest_sha256, args.contracts_commit)
+    if args.command == "estimate":
+        budget = read_json(args.gas_budget, args.gas_budget_sha256)
+        validate_budget(budget, args.network)
+        secrets = secret_env(args.secret_env)
+        _, endpoint = status(args.network, own_rpc(args.rpc_config, args.network),
+                             secrets.get(NETWORKS[args.network][3] + "_RPC_FALLBACK_URL"), args.rpc_preference)
+        return estimate_creation(args.network, endpoint, bundle, budget)
     if args.command == "prepare":
         output = safe_root(args.output, new=True)
         write_json(output / "prepared.json", {"manifest_sha256": args.manifest_sha256})

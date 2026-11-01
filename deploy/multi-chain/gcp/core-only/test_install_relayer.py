@@ -1,5 +1,7 @@
 import copy
 import contextlib
+import dataclasses
+import hashlib
 import importlib.util
 import io
 import ipaddress
@@ -15,6 +17,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import test_release_lock
+
 
 HERE = Path(__file__).resolve().parent
 
@@ -26,7 +30,11 @@ def load(name):
     return module
 
 
+LOCK = test_release_lock.build_test_lock()
+for tool in ("install_guardian.py", "install_relayer.py"):
+    LOCK["tool_sha256"][tool] = hashlib.sha256((HERE / tool).read_bytes()).hexdigest()
 installer = load("install_relayer")
+installer.bind_helper(LOCK)
 wrapper = load("relayer_exec")
 credential_helper = load("prepare_relayer_credential")
 ADDRESS = str(ipaddress.IPv4Address((172 << 24) + (30 << 16) + 1))
@@ -38,14 +46,13 @@ class InstallTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for constant in ("RELEASE", "STATE", "CREDENTIALS", "UNITS"):
-            path = self.root / constant.lower()
-            if constant == "UNITS":
-                path.mkdir()
-            patcher = patch.object(installer, constant, path)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.network = {"magic": installer.g.MAGIC, "membership": ["retained"],
+        (self.root / "units").mkdir()
+        patcher = patch.object(installer, "UNITS", self.root / "units")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.release = dataclasses.replace(installer.load_release(LOCK), release=self.root / "release",
+                                           state=self.root / "state", credentials=self.root / "credentials")
+        self.network = {"magic": self.release.magic, "membership": ["retained"],
                         "guardian_initial_member_hashes": [f"{i:064x}" for i in (1, 2, 3)],
                         "guardian_configs": [{"id": i, "listen_address": f"{ADDRESS}:{9700+i}"} for i in (1, 2, 3)],
                         "guardian_history": {"listen_address": f"{ADDRESS}:9700", "rpc_url": f"http://{ADDRESS}:9700"},
@@ -57,7 +64,9 @@ class InstallTests(unittest.TestCase):
         self.rpc["networks"]["testnet"]["coordinator_configs"][0]["rpc_url"] = [f"http://{OTHER}:15370"]
         canonical = self.input("canonical.json", self.canonical)
         binary = b"\x7fELF\x02\x01" + b"\0" * 12 + b"\x3e\x00" + b"synthetic"
-        build = {"source_commit": installer.g.RUNTIME_SOURCE, "network": "testnet",
+        self.release = dataclasses.replace(self.release, runtime_config_sha256=canonical["sha256"],
+                                           relayer_sha256=installer.g.digest(binary))
+        build = {"source_commit": self.release.runtime_source, "network": "testnet",
                  "config_sha256": canonical["sha256"], "binaries": {"psy_relayer_cli": installer.g.digest(binary)}}
         self.spec = {"version": 3, "hostname": "relayer.example", "address": ADDRESS,
                      "guardian_history": copy.deepcopy(self.network["guardian_history"]),
@@ -69,9 +78,6 @@ class InstallTests(unittest.TestCase):
                      "l1_keystore": {"path": str(self.root / "unread-key"), "sha256": "a" * 64},
                      "password_credential": {"path": str(self.root / "unread-credential"), "sha256": "b" * 64},
                      "l1_documents": {}}
-        patcher = patch.object(installer.g, "BUILD_HASH", self.spec["build"]["sha256"])
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.spec_path = self.root / "spec.json"
         self.daemon = self.daemon_text()
         self.spec["daemon_config"] = self.input("daemon.toml", self.daemon.encode())
@@ -87,16 +93,19 @@ class InstallTests(unittest.TestCase):
         return self.input("spec.json", self.spec)["sha256"]
 
     def daemon_text(self):
-        values = {"rpc_config": str(installer.RELEASE / "rpc.json"), "guardian_root": str(installer.STATE),
-                  "proof_dir": str(installer.STATE / "proofs"), "services_url": f"http://{ADDRESS}:3000",
+        values = {"rpc_config": str(self.release.release / "rpc.json"), "guardian_root": str(self.release.state),
+                  "proof_dir": str(self.release.state / "proofs"), "services_url": f"http://{ADDRESS}:3000",
                   "withdraw_method_id": 3055054724, "max_concurrent_l2_batches": 1}
         text = "".join(f"{key} = {json.dumps(value)}\n" for key, value in values.items())
         for name, (index, _) in installer.g.CHAINS.items():
             row = {"family": "evm", "network_id": name, "deployments_network": name, "chain_index": index,
                    "rpc_urls": [f"http://{ADDRESS}:{18545+index}"],
-                   "keystore_path": str(installer.RELEASE / "home/.psy/keystore/bridge-relayer.keystore.json"),
+                   "keystore_path": str(self.release.release / "home/.psy/keystore/bridge-relayer.keystore.json"),
                    "password_env": installer.PASSWORD_ENV}
             text += "\n[[chains]]\n" + "".join(f"{key} = {json.dumps(value)}\n" for key, value in row.items())
+            if name == "bscTestnet":
+                text += ("\n[chains.fee_policy]\nexpected_chain_id = 97\nmin_priority_fee_wei = 1000000000\n"
+                         "max_priority_fee_wei = 2000000000\nmax_fee_per_gas_wei = 10000000000\n")
         return text
 
     def documents(self):
@@ -114,7 +123,7 @@ class InstallTests(unittest.TestCase):
 
     def test_pending_plan_parses_toml_without_custody_or_host_access(self):
         with patch.object(installer, "host_checks") as host, patch.object(installer.g, "write") as write:
-            result = installer.run("plan", self.spec_path, self.save())
+            result = installer.run("plan", self.spec_path, self.save(), self.release)
         host.assert_not_called()
         write.assert_not_called()
         self.assertTrue(result["offline_config_validated"] and result["l1_documents_pending"])
@@ -122,8 +131,12 @@ class InstallTests(unittest.TestCase):
 
     def test_offline_cli_plan_dispatch_and_structured_result(self):
         output = io.StringIO()
-        with patch.object(sys, "argv", ["install_relayer.py", "plan", "--spec", str(self.spec_path),
-                                       "--spec-sha256", self.save()]), patch.object(installer.os, "umask"), \
+        lock = self.root / "lock.json"
+        lock.write_text(json.dumps(LOCK))
+        with patch.object(sys, "argv", ["install_relayer.py", "plan", "--release-lock", str(lock),
+                                       "--release-lock-sha256", hashlib.sha256(lock.read_bytes()).hexdigest(),
+                                       "--spec", str(self.spec_path), "--spec-sha256", self.save()]), \
+                patch.object(installer.os, "umask"), patch.object(installer, "load_release", return_value=self.release), \
                 contextlib.redirect_stdout(output):
             installer.main()
         self.assertTrue(json.loads(output.getvalue())["offline_config_validated"])
@@ -132,7 +145,7 @@ class InstallTests(unittest.TestCase):
         for mode, apply in (("install", False), ("install", True), ("check-host", False), ("plan", True)):
             with self.subTest(mode=mode, apply=apply), patch.object(installer, "host_checks") as host:
                 with self.assertRaises(ValueError):
-                    installer.run(mode, self.spec_path, self.save(), apply)
+                    installer.run(mode, self.spec_path, self.save(), self.release, apply)
                 host.assert_not_called()
 
     def test_toml_rejects_private_keys_unknown_fields_duplicates_and_bad_types(self):
@@ -144,36 +157,36 @@ class InstallTests(unittest.TestCase):
                      self.daemon.replace('withdraw_method_id = 3055054724', 'withdraw_method_id = 0'),
                      self.daemon.replace('withdraw_method_id = 3055054724', 'withdraw_method_id = 4294967296'),
                      'guardian_root = "old"\n' + self.daemon,
-                     self.daemon.replace(str(installer.STATE), '/var/lib/old-relayer')):
+                     self.daemon.replace(str(self.release.state), '/var/lib/old-relayer')):
             with self.subTest(text=text[:70]), self.assertRaises(ValueError):
-                installer.validate_daemon(text.encode())
+                installer.validate_daemon(text.encode(), self.release)
 
     def test_toml_requires_private_services_and_rpc_origins_without_secrets(self):
         for endpoint in ('https://public.example:3000', f'http://user:secret@{ADDRESS}:3000',
                          f'http://{ADDRESS}:3000/?token=secret', f'http://{ADDRESS}:3000/secret', 'http://127.0.0.1:3000'):
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
-                installer.validate_daemon(self.daemon.replace(f'http://{ADDRESS}:3000', endpoint).encode())
+                installer.validate_daemon(self.daemon.replace(f'http://{ADDRESS}:3000', endpoint).encode(), self.release)
         with self.assertRaises(ValueError):
-            installer.validate_daemon(self.daemon.replace(f'http://{ADDRESS}:18545', 'https://rpc.example:443').encode())
+            installer.validate_daemon(self.daemon.replace(f'http://{ADDRESS}:18545', 'https://rpc.example:443').encode(), self.release)
 
     def test_chain_schema_rejects_wrong_identity_duplicate_and_credential_override(self):
-        original = installer.validate_daemon(self.daemon.encode())["chains"][0]
+        original = installer.validate_daemon(self.daemon.encode(), self.release)["chains"][0]
         for field, value in (("chain_index", 1), ("chain_index", False), ("network_id", "mainnet"),
                              ("deployments_network", "old"), ("family", "other"), ("password_env", "WALLET_PASSWORD"),
                              ("keystore_path", "/old/key"), ("private_key", "synthetic"), ("bridge_address", "0x" + "1" * 40)):
             chain = {**original, field: value}
             with self.subTest(field=field), self.assertRaises(ValueError):
-                installer.validate_chain(chain)
+                installer.validate_chain(chain, self.release)
         with self.assertRaises(ValueError):
-            installer.validate_daemon(self.daemon.replace('network_id = "baseSepolia"', 'network_id = "sepolia"').encode())
+            installer.validate_daemon(self.daemon.replace('network_id = "baseSepolia"', 'network_id = "sepolia"').encode(), self.release)
 
     def test_rpc_providers_and_bsc_fee_policy(self):
-        chain = installer.validate_daemon(self.daemon.encode())["chains"][1]
+        chain = installer.validate_daemon(self.daemon.encode(), self.release)["chains"][1]
         url = chain.pop("rpc_urls")[0]
         chain["rpc_providers"] = [{"name": "primary", "url": url, "priority_weight": 10, "operator": "self", "quota_group": "primary"}]
         chain["fee_policy"] = {"expected_chain_id": 97, "min_priority_fee_wei": 1,
                                "max_priority_fee_wei": 2, "max_fee_per_gas_wei": 3}
-        installer.validate_chain(chain)
+        installer.validate_chain(chain, self.release)
         for mutate in (lambda c: c.update(rpc_urls=[url]), lambda c: c["rpc_providers"][0].update(token="synthetic"),
                        lambda c: c["rpc_providers"][0].update(priority_weight=0),
                        lambda c: c["fee_policy"].update(expected_chain_id=56),
@@ -181,7 +194,27 @@ class InstallTests(unittest.TestCase):
             altered = copy.deepcopy(chain)
             mutate(altered)
             with self.assertRaises(ValueError):
-                installer.validate_chain(altered)
+                installer.validate_chain(altered, self.release)
+
+    def test_bsc_fee_policy_is_required_and_strategy_is_conservative_or_recent_history(self):
+        daemon = installer.validate_daemon(self.daemon.encode(), self.release)
+        bsc = daemon["chains"][1]
+        self.assertEqual(bsc["network_id"], "bscTestnet")
+        installer.validate_chain(bsc, self.release)
+        for strategy in ("conservative", "recent_history"):
+            installer.validate_chain({**bsc, "fee_policy": {**bsc["fee_policy"], "quote_strategy": strategy}}, self.release)
+        for strategy in ("aggressive", "", None, 1):
+            with self.subTest(strategy=strategy), self.assertRaises(ValueError):
+                installer.validate_chain({**bsc, "fee_policy": {**bsc["fee_policy"], "quote_strategy": strategy}}, self.release)
+        missing = {key: value for key, value in bsc.items() if key != "fee_policy"}
+        with self.assertRaisesRegex(ValueError, "BSC needs a fee policy"):
+            installer.validate_chain(missing, self.release)
+        text = self.daemon.replace("[chains.fee_policy]", "[chains.unused]")
+        with self.assertRaises(ValueError):
+            installer.validate_daemon(text.encode(), self.release)
+        other = {**daemon["chains"][0], "fee_policy": dict(bsc["fee_policy"])}
+        with self.assertRaisesRegex(ValueError, "only BSC"):
+            installer.validate_chain(other, self.release)
 
     def test_canonical_membership_history_magic_and_other_network_preserved(self):
         for mutate in (lambda d: d["networks"]["testnet"].update(membership=[]),
@@ -192,22 +225,22 @@ class InstallTests(unittest.TestCase):
             altered = copy.deepcopy(self.rpc)
             mutate(altered)
             with self.assertRaises(ValueError):
-                installer.validate_rpc(self.canonical, altered, self.spec)
+                installer.validate_rpc(self.canonical, altered, self.spec, self.release)
         self.spec["address"] = OTHER
         with self.assertRaisesRegex(ValueError, "history bind"):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_manifest_binary_launcher_and_artifact_pins(self):
         self.save()
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, "f" * 64)
+            installer.load_plan(self.spec_path, "f" * 64, self.release)
         self.spec["wrapper"] = self.input("wrong-wrapper", b"unapproved")
         with self.assertRaisesRegex(ValueError, "sibling launcher"):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
         self.spec["wrapper"] = self.input("wrapper.py", (HERE / "relayer_exec.py").read_bytes())
         Path(self.spec["binary"]["path"]).write_bytes(b"tampered")
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_absent_history_can_only_be_filled_from_approved_spec(self):
         for null in (False, True):
@@ -216,20 +249,20 @@ class InstallTests(unittest.TestCase):
                 canonical["networks"]["testnet"]["guardian_history"] = None
             else:
                 del canonical["networks"]["testnet"]["guardian_history"]
-            self.assertEqual(installer.validate_rpc(canonical, self.rpc, self.spec), 9700)
+            self.assertEqual(installer.validate_rpc(canonical, self.rpc, self.spec, self.release), 9700)
             for mutate in (lambda d: d["networks"]["testnet"]["guardian_history"].update(rpc_url=f"http://{OTHER}:9700"),
                            lambda d: d["networks"]["testnet"].update(guardian_initial_member_hashes=["1"]*3)):
                 changed = copy.deepcopy(self.rpc)
                 mutate(changed)
                 with self.assertRaises(ValueError):
-                    installer.validate_rpc(canonical, changed, self.spec)
+                    installer.validate_rpc(canonical, changed, self.spec, self.release)
         self.spec["version"] = 1
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
         self.spec["version"] = 3
         del self.spec["guardian_history"]
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_guardian_l1_transport_matches_native_validation(self):
         for origin in (f"https://{ADDRESS}:18545", "http://127.0.0.1:18545"):
@@ -241,40 +274,40 @@ class InstallTests(unittest.TestCase):
         canonical = copy.deepcopy(self.canonical)
         canonical["networks"]["testnet"]["guardian_configs"][0]["rpc_url"] = f"https://{ADDRESS}:9701"
         with self.assertRaisesRegex(ValueError, "origins must use HTTP"):
-            installer.validate_rpc(canonical, canonical, self.spec)
+            installer.validate_rpc(canonical, canonical, self.spec, self.release)
 
     def test_user_proxy_transport_and_system_private_or_loopback(self):
         for origin in (f"https://{ADDRESS}:19999", "http://127.0.0.1:19999"):
             rpc = copy.deepcopy(self.rpc)
             rpc["networks"]["testnet"]["prove_proxy_url"] = [origin]
             rpc["networks"]["testnet"]["system_prove_proxy_url"] = ["http://127.0.0.1:19998"]
-            installer.validate_rpc(self.canonical, rpc, self.spec)
+            installer.validate_rpc(self.canonical, rpc, self.spec, self.release)
         for origin in (f"http://{ADDRESS}:19999", "https://public.example:443", "http://127.0.0.1:19999/?secret=x"):
             rpc = copy.deepcopy(self.rpc)
             rpc["networks"]["testnet"]["prove_proxy_url"] = [origin]
             with self.assertRaises(ValueError):
-                installer.validate_rpc(self.canonical, rpc, self.spec)
+                installer.validate_rpc(self.canonical, rpc, self.spec, self.release)
 
     def test_operator_permissions_root_identity_and_unsafe_paths(self):
         sha = self.save()
         self.spec_path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "private file"):
-            installer.load_plan(self.spec_path, sha)
+            installer.load_plan(self.spec_path, sha, self.release)
         self.spec["service_user"] = "root"
         with self.assertRaisesRegex(ValueError, "non-root"):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
         self.spec["service_user"] = installer.USER
         self.spec["password_credential"]["path"] = "/tmp/../key"
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_l1_documents_complete_and_consistent(self):
         self.documents()
-        _, files, _ = installer.load_plan(self.spec_path, self.save())
+        _, files, _ = installer.load_plan(self.spec_path, self.save(), self.release)
         self.assertEqual(len([name for name in files if name.startswith("deployments/")]), 6)
         del self.spec["l1_documents"]["baseSepolia"]
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_l1_receipt_must_show_success_and_matching_transaction(self):
         self.documents()
@@ -288,7 +321,7 @@ class InstallTests(unittest.TestCase):
             mutate(altered)
             fields["receipt"] = self.input("receipt-invalid.json", altered)
             with self.assertRaises(ValueError):
-                installer.load_plan(self.spec_path, self.save())
+                installer.load_plan(self.spec_path, self.save(), self.release)
     def test_l1_deployment_fields_reject_wrong_network_and_contracts(self):
         self.documents()
         fields = self.spec["l1_documents"]["sepolia"]
@@ -303,11 +336,11 @@ class InstallTests(unittest.TestCase):
             mutate(altered)
             fields["summary"] = self.input("bad-summary.json", altered)
             with self.assertRaises(ValueError):
-                installer.load_plan(self.spec_path, self.save())
+                installer.load_plan(self.spec_path, self.save(), self.release)
         self.documents()
         self.spec["l1_documents"]["sepolia"]["receipt"] = self.input("bad-receipt.json", {"address": "0x" + "f"*40, "receipt": {"blockNumber": 123}})
         with self.assertRaises(ValueError):
-            installer.load_plan(self.spec_path, self.save())
+            installer.load_plan(self.spec_path, self.save(), self.release)
 
     def test_install_frozen_bytes_private_state_preserves_custody_and_never_starts(self):
         self.documents()
@@ -327,26 +360,26 @@ class InstallTests(unittest.TestCase):
         old_unit.write_bytes(b"retained old Relayer unit")
         with patch.object(installer, "host_checks", side_effect=checked), patch.object(installer.g.os, "fchown"), \
                 patch.object(installer.g, "command") as command:
-            result = installer.run("install", self.spec_path, self.save(), True)
+            result = installer.run("install", self.spec_path, self.save(), self.release, True)
         command.assert_called_once_with(["systemctl", "daemon-reload"])
-        self.assertEqual((installer.RELEASE / "psy_relayer_cli").read_bytes(), expected)
+        self.assertEqual((self.release.release / "psy_relayer_cli").read_bytes(), expected)
         self.assertEqual(Path(source_key["path"]).read_bytes(), key)
         self.assertEqual(Path(source_credential["path"]).read_bytes(), credential)
-        for path in (installer.STATE / "db", installer.STATE / "proofs", installer.CREDENTIALS, installer.RELEASE / "home/.psy/keystore"):
+        for path in (self.release.state / "db", self.release.state / "proofs", self.release.credentials, self.release.release / "home/.psy/keystore"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
-        for path in (installer.CREDENTIALS / "l1-password.cred", installer.RELEASE / "home/.psy/keystore/bridge-relayer.keystore.json"):
+        for path in (self.release.credentials / "l1-password.cred", self.release.release / "home/.psy/keystore/bridge-relayer.keystore.json"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertFalse((installer.STATE / "db/relayer.redb").exists())
+        self.assertFalse((self.release.state / "db/relayer.redb").exists())
         self.assertFalse(result["started"] or result["enabled"])
         self.assertEqual(old_unit.read_bytes(), b"retained old Relayer unit")
         with patch.object(installer.g.os, "fchown"), self.assertRaises(FileExistsError):
-            installer.g.write(installer.UNITS / installer.UNIT, b"replacement")
+            installer.g.write(installer.UNITS / self.release.unit, b"replacement")
 
     def test_unit_has_no_secrets_and_scopes_credential_state_and_enable_target(self):
-        unit = installer.unit(self.spec).decode()
+        unit = installer.unit(self.spec, self.release).decode()
         self.assertIn("User=psy-core-relayer\n", unit)
         self.assertIn("LoadCredentialEncrypted=psy-core-relayer-l1-password:", unit)
-        self.assertIn(f"ReadWritePaths={installer.STATE}/db {installer.STATE}/proofs\n", unit)
+        self.assertIn(f"ReadWritePaths={self.release.state}/db {self.release.state}/proofs\n", unit)
         self.assertNotIn("Environment=", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertIn("StartLimitBurst=3", unit)
@@ -362,8 +395,10 @@ class InstallTests(unittest.TestCase):
                 return json.dumps([{"addr_info": [{"local": ADDRESS}]}])
             if argv == ["systemctl", "--version"]:
                 return "systemd 255"
+            if argv[:2] in (["systemctl", "list-unit-files"], ["systemctl", "list-units"]):
+                return "psy-core-relayer-previous.service disabled enabled\n" if argv[1] == "list-unit-files" else ""
             if argv[:2] == ["systemctl", "show"]:
-                if argv[2] == "psy-core-relayer-r2.service":
+                if argv[2] == "psy-core-relayer-previous.service":
                     return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return "LoadState=not-found\n"
             if argv[:2] == ["systemctl", "list-jobs"]:
@@ -378,14 +413,20 @@ class InstallTests(unittest.TestCase):
                 patch.object(installer.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=4321)), \
                 patch.object(installer.g, "command", side_effect=command):
             with self.assertRaisesRegex(ValueError, "history port occupied"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             altered = {**self.spec, "address": OTHER}
             with self.assertRaisesRegex(ValueError, "address not assigned"):
-                installer.host_checks(altered, 9700)
+                installer.host_checks(altered, 9700, self.release)
 
     def test_offline_cli_suppresses_unapproved_spec_diagnostics(self):
         self.spec["daemon_config"] = self.input("daemon.toml", b'private_key = "DO_NOT_PRINT_SECRET"\n')
+        lock = self.root / "lock.json"
+        lock.write_text(json.dumps({**LOCK, "paths": {**LOCK["paths"], "relayer": {
+            "release": str(self.release.release), "config": str(self.release.credentials),
+            "state": str(self.release.state)}}, "inputs": {**LOCK["inputs"], "runtime_config": self.release.runtime_config_sha256},
+            "binaries": {**LOCK["binaries"], "psy_relayer_cli": self.release.relayer_sha256}}))
         result = subprocess.run([sys.executable, "-I", "-B", str(HERE / "install_relayer.py"), "plan",
+                                 "--release-lock", str(lock), "--release-lock-sha256", hashlib.sha256(lock.read_bytes()).hexdigest(),
                                  "--spec", str(self.spec_path), "--spec-sha256", self.save()],
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -403,6 +444,7 @@ class InstallTests(unittest.TestCase):
         read = installer.g.read
         host_state = {"unit": "LoadState=not-found\n\n", "jobs": ""}
         overrides = {}
+        known = ["psy-core-relayer-previous.service"]
 
         def root_read(path, private=False, uid=None, limit=8*1024*1024):
             return read(path, private=private, uid=os.getuid() if uid == 0 else uid, limit=limit)
@@ -415,9 +457,13 @@ class InstallTests(unittest.TestCase):
             if argv[:2] == ["systemctl", "show"]:
                 if argv[2] in overrides:
                     return overrides[argv[2]]
-                if argv[2] == "psy-core-relayer-r2.service" and host_state["unit"].strip() == "LoadState=not-found":
+                if argv[2] == "psy-core-relayer-previous.service" and host_state["unit"].strip() == "LoadState=not-found":
                     return "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
                 return host_state["unit"]
+            if argv[:2] == ["systemctl", "list-unit-files"]:
+                return "".join(f"{name} disabled enabled\n" for name in known)
+            if argv[:2] == ["systemctl", "list-units"]:
+                return ""
             if argv[:2] == ["systemctl", "list-jobs"]:
                 return host_state["jobs"]
             if argv[0] == "ss":
@@ -433,90 +479,142 @@ class InstallTests(unittest.TestCase):
                 patch.object(installer.g, "command", side_effect=command), \
                 patch.object(installer.g, "trusted_directory"), patch.object(installer.g, "read", side_effect=root_read):
             self.root.chmod(0o755)
-            actual, actual_key, actual_credential = installer.host_checks(self.spec, 9700)
+            actual, actual_key, actual_credential = installer.host_checks(self.spec, 9700, self.release)
             self.assertEqual((actual, actual_key, actual_credential), (service, key, credential))
             credential_parent = self.root / "root-only-credentials"
             credential_parent.mkdir(mode=0o700)
-            with patch.object(installer, "CREDENTIALS", credential_parent / "fresh"):
-                self.assertEqual(installer.host_checks(self.spec, 9700)[2], credential)
+            with patch.object(self, "release", dataclasses.replace(self.release, credentials=credential_parent / "fresh")):
+                self.assertEqual(installer.host_checks(self.spec, 9700, self.release)[2], credential)
             self.root.chmod(0o700)
             with self.assertRaisesRegex(ValueError, "service ancestor blocks traversal"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             self.root.chmod(0o755)
             good = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled\n"
-            for name in ("psy-core-relayer.service", "psy-core-relayer-r2.service", installer.UNIT):
+            for name in ("psy-core-relayer-previous.service", "parth-bridge-relayer.service", self.release.unit):
                 overrides[name] = good.replace("inactive", "active")
                 with self.subTest(unit=name), self.assertRaisesRegex(ValueError, "unit active or enabled"):
-                    installer.host_checks(self.spec, 9700)
+                    installer.host_checks(self.spec, 9700, self.release)
                 overrides.clear()
-            for output in ("LoadState=not-found\n", good.replace("disabled", "static"),
-                           good.replace("disabled", "enabled"), good.replace("MainPID=0", "MainPID=42")):
-                overrides["psy-core-relayer-r2.service"] = output
-                with self.subTest(r2=output), self.assertRaisesRegex(ValueError, "unit active or enabled"):
-                    installer.host_checks(self.spec, 9700)
+            for output in (good.replace("disabled", "static"), good.replace("disabled", "enabled"),
+                           good.replace("MainPID=0", "MainPID=42")):
+                overrides["psy-core-relayer-previous.service"] = output
+                with self.subTest(previous=output), self.assertRaisesRegex(ValueError, "unit active or enabled"):
+                    installer.host_checks(self.spec, 9700, self.release)
             overrides.clear()
+            known[:] = []
+            host_state["unit"] = "LoadState=not-found\n"
+            installer.host_checks(self.spec, 9700, self.release)
+            known[:] = ["psy-core-relayer-previous.service"]
+            host_state["unit"] = "LoadState=not-found\n\n"
             for active, enabled in (("active", "disabled"), ("inactive", "enabled"), ("inactive", "masked"), ("inactive", "static")):
                 host_state["unit"] = f"LoadState=loaded\nActiveState={active}\nUnitFileState={enabled}\nMainPID=0\n"
                 with self.assertRaisesRegex(ValueError, "unit active or enabled"):
-                    installer.host_checks(self.spec, 9700)
+                    installer.host_checks(self.spec, 9700, self.release)
             host_state["unit"] = "LoadState=not-found\n"
             host_state["jobs"] = "42 parth-bridge-relayer.service start waiting\n"
             with self.assertRaisesRegex(ValueError, "job queued"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             host_state["jobs"] = ""
-            installer.STATE.mkdir()
+            self.release.state.mkdir()
             with self.assertRaisesRegex(ValueError, "destination exists"):
-                installer.host_checks(self.spec, 9700)
-            installer.STATE.rmdir()
+                installer.host_checks(self.spec, 9700, self.release)
+            self.release.state.rmdir()
             dropin = installer.UNITS / "psy-.service.d"
             dropin.mkdir()
             with self.assertRaisesRegex(ValueError, "inherited drop-in"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             dropin.rmdir()
             key_path = Path(self.spec["l1_keystore"]["path"])
             key_path.chmod(0o640)
-            self.assertEqual(installer.host_checks(self.spec, 9700)[1], key)
+            self.assertEqual(installer.host_checks(self.spec, 9700, self.release)[1], key)
             custody.pw_uid = os.getuid() + 1
             with self.assertRaisesRegex(ValueError, "owner/mode"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             custody.pw_uid = os.getuid()
             key_path.chmod(0o644)
             with self.assertRaisesRegex(ValueError, "owner/mode"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             key_path.chmod(0o600)
             self.spec["l1_keystore"]["sha256"] = "f" * 64
             with self.assertRaisesRegex(ValueError, "keystore hash"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             self.spec["l1_keystore"]["sha256"] = installer.g.digest(key)
             bad_key = b'{"version":3,"crypto":{"ciphertext":"synthetic"},"private_key":"synthetic"}'
             key_path.write_bytes(bad_key)
             self.spec["l1_keystore"]["sha256"] = installer.g.digest(bad_key)
             with self.assertRaisesRegex(ValueError, "encrypted V3"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             key_path.write_bytes(key)
             self.spec["l1_keystore"]["sha256"] = installer.g.digest(key)
             self.spec["password_credential"]["sha256"] = "f" * 64
             with self.assertRaisesRegex(ValueError, "credential hash"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
             self.spec["password_credential"]["sha256"] = installer.g.digest(credential)
             Path(self.spec["password_credential"]["path"]).chmod(0o644)
             with self.assertRaisesRegex(ValueError, "private file"):
-                installer.host_checks(self.spec, 9700)
+                installer.host_checks(self.spec, 9700, self.release)
 
-    def test_r3_paths_and_unfrozen_build_fail_closed(self):
-        self.assertEqual(installer.UNIT, "psy-core-relayer-r3.service")
-        actual = load("install_relayer")
-        for path in (actual.RELEASE, actual.STATE, actual.CREDENTIALS):
-            self.assertTrue(str(path).endswith("core-testnet-20261027-r3"))
-        with patch.object(installer.g, "BUILD_HASH", None):
-            with self.assertRaisesRegex(ValueError, "approved build manifest"):
-                installer.load_plan(self.spec_path, self.save())
+    def test_paths_unit_and_sources_come_from_the_lock(self):
+        release = installer.load_release(LOCK)
+        paths = LOCK["paths"]["relayer"]
+        self.assertEqual((release.release, release.state, release.credentials),
+                         (Path(paths["release"]), Path(paths["state"]), Path(paths["config"])))
+        self.assertEqual(release.unit, LOCK["units"]["relayer"])
+        self.assertEqual(release.runtime_source, LOCK["sources"]["runtime"])
+        self.assertEqual(release.relayer_sha256, LOCK["binaries"]["psy_relayer_cli"])
+
+    def test_build_document_must_agree_with_the_release_lock(self):
+        for field, value in (("source_commit", "f" * 40), ("config_sha256", "f" * 64)):
+            build = json.loads(Path(self.spec["build"]["path"]).read_bytes())
+            build[field] = value
+            self.spec["build"] = self.input("build.json", build)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                installer.load_plan(self.spec_path, self.save(), self.release)
+        build = json.loads(Path(self.spec["build"]["path"]).read_bytes())
+        build.update(source_commit=self.release.runtime_source, config_sha256=self.release.runtime_config_sha256)
+        self.spec["build"] = self.input("build.json", build)
+        installer.load_plan(self.spec_path, self.save(), self.release)
+        for field, value in (("runtime_config_sha256", "f" * 64), ("relayer_sha256", "f" * 64)):
+            with self.subTest(release=field), self.assertRaisesRegex(ValueError, "release lock"):
+                installer.load_plan(self.spec_path, self.save(), dataclasses.replace(self.release, **{field: value}))
+
+    def test_relayer_install_requires_no_previous_generation_unit(self):
+        source = (HERE / "install_relayer.py").read_text()
+        for literal in ("psy-core-relayer-" + "r2", "psy-core-relayer-" + "r3", "core-testnet-" + "2026"):
+            self.assertNotIn(literal, source)
+        self.assertIn("g.inactive_units(sorted({*relayer_unit_names(), release.unit}), set())", source)
+
+    def test_daemon_config_contains_finalized_admission_setting(self):
+        # The post-launch finalized deposit admission lives in the lock's relayer binary; there is no daemon key
+        # for it. The package therefore pins that binary through the lock and needs no unit override.
+        installer.load_plan(self.spec_path, self.save(), self.release)
+        unit = installer.unit(self.spec, self.release).decode()
+        self.assertEqual(unit.count("ExecStart="), 1)
+        self.assertIn(f"ExecStart=/usr/bin/python3 -I -B {self.release.release}/relayer_exec.py\n", unit)
+        self.documents()
+        _, files, _ = installer.load_plan(self.spec_path, self.save(), self.release)
+        self.assertEqual(installer.g.digest(files["psy_relayer_cli"]), self.release.relayer_sha256)
+        wrong = dataclasses.replace(self.release, relayer_sha256="f" * 64)
+        with self.assertRaisesRegex(ValueError, "release lock"):
+            installer.load_plan(self.spec_path, self.save(), wrong)
+
+    def test_release_lock_is_hash_checked_before_it_is_parsed(self):
+        path = self.root / "lock.json"
+        path.write_text("{}")
+        with self.assertRaisesRegex(SystemExit, "release lock hash mismatch"):
+            installer.read_release_lock(path, "0" * 64)
+        self.assertEqual(installer.read_release_lock(path, hashlib.sha256(b"{}").hexdigest()), {})
 
     def test_rejects_changed_helper_before_executing_it(self):
         script = self.root / "install_relayer.py"
         script.write_bytes((HERE / "install_relayer.py").read_bytes())
         (self.root / "install_guardian.py").write_text('raise RuntimeError("DO_NOT_EXECUTE")\n')
-        result = subprocess.run([sys.executable, "-I", "-B", str(script), "--help"], capture_output=True, text=True)
+        lock = self.root / "lock.json"
+        lock.write_text(json.dumps(LOCK))
+        result = subprocess.run([sys.executable, "-I", "-B", str(script), "plan", "--release-lock", str(lock),
+                                 "--release-lock-sha256", hashlib.sha256(lock.read_bytes()).hexdigest(),
+                                 "--spec", str(self.spec_path), "--spec-sha256", "a" * 64],
+                                capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sibling hash mismatch", result.stderr)
         self.assertNotIn("DO_NOT_EXECUTE", result.stdout + result.stderr)
@@ -536,6 +634,7 @@ class CredentialPreparationTests(unittest.TestCase):
             info = fstat(fd)
             return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink, st_uid=0)
 
+        credential_helper.bind_siblings(LOCK)
         patcher = patch.object(credential_helper.os, "fstat", side_effect=root_stat)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -639,14 +738,38 @@ class CredentialPreparationTests(unittest.TestCase):
 
     def test_cli_withholds_secret_diagnostics(self):
         output = io.StringIO()
-        with patch.object(sys, "argv", ["prepare_relayer_credential.py", "--env-file", str(self.env_file),
+        lock = self.root / "lock.json"
+        lock.write_text(json.dumps(LOCK))
+        with patch.object(sys, "argv", ["prepare_relayer_credential.py", "--release-lock", str(lock),
+                                       "--release-lock-sha256", hashlib.sha256(lock.read_bytes()).hexdigest(),
+                                       "--env-file", str(self.env_file),
                                        "--output", str(self.root / "new.cred"), "--apply"]), \
+                patch.object(credential_helper, "bind_siblings"), \
                 patch.object(credential_helper.os, "umask"), \
                 patch.object(credential_helper, "prepare", side_effect=ValueError("DO_NOT_PRINT_SECRET")), \
                 contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as error:
                 credential_helper.main()
         self.assertNotIn("DO_NOT_PRINT_SECRET", str(error.exception) + output.getvalue())
+
+
+class CredentialSiblingTests(unittest.TestCase):
+    def test_siblings_are_bound_only_when_both_match_the_lock(self):
+        module = credential_helper.bind_siblings(LOCK)
+        self.assertIs(credential_helper.r, module)
+        self.assertEqual(module.CREDENTIAL, "psy-core-relayer-l1-password")
+        for tool in ("install_relayer.py", "install_guardian.py"):
+            lock = json.loads(json.dumps(LOCK))
+            lock["tool_sha256"][tool] = "0" * 64
+            with self.subTest(tool=tool), self.assertRaises((RuntimeError, SystemExit)):
+                credential_helper.bind_siblings(lock)
+
+    def test_release_lock_is_hash_checked_before_it_is_parsed(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "lock.json"
+            path.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "release lock hash mismatch"):
+                credential_helper.read_release_lock(path, "0" * 64)
 
 
 class LauncherTests(unittest.TestCase):

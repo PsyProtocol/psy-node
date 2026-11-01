@@ -1,0 +1,7 @@
+{
+  "maxGasPriceWei": "300000000",
+  "maxGasPerTransaction": "12000000",
+  "maxTotalGas": "300000000",
+  "maxNativeSpendWei": "30000000000000000",
+  "l1FeeReserveWeiPerTransaction": "0"
+}

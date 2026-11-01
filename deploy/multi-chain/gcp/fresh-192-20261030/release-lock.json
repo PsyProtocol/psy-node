@@ -158,9 +158,9 @@
     "bundle_sha256": "",
     "policy_sha256": "",
     "gas_budget_sha256": {
-      "sepolia": "",
-      "bscTestnet": "",
-      "baseSepolia": ""
+      "sepolia": "49d45dcfad7842a0c2edb832516cb3dd9aa4207c91853c680b16dbef6f986f71",
+      "bscTestnet": "2e12b66b9a79f0eb1fe025d91b655259dd5f21bf6d2321c87e1e4896121cd6e9",
+      "baseSepolia": "19267b206806c61f20ecc755858784b580e6db7a30e31dc6e0209ab02c237f7a"
     }
   },
   "ingress": {
@@ -190,25 +190,25 @@
     "worker_queue_ack_wait_ms": 30000
   },
   "tool_sha256": {
-    "activate_bridge.py": "cd8762d5f1e2800ee5bb86b9ada15ec83f3305c2e7adb60660b3d497bdd4332e",
+    "activate_bridge.py": "d4100211b1b736bf159eec67c6093dd41de245a3374c9ae7156eac2d5edbb642",
     "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
     "activate_services.py": "8843b826d669f13c4e17009ec105d3b224683d26abba7b1779ac3d1103788413",
     "caddy_ingress.py": "c961a48b123a325ad189167423b16e1517b67365bb17d5a316df88f99f080b14",
     "clear_host_state.py": "5cf1e6a3322a444bf01b41789e2577ceca17e8d43463646501f4e7258b0115a0",
     "enable_services_nostr.py": "5440d64ce7413dca99ef9580cc8104f521e7be954d9844969ae4aac8de8e6f02",
-    "fresh_l1.cjs": "159cca965b54742855aceda49322bb30b9af1d443834b524efbdca74a083f29e",
-    "fresh_l1.py": "91c9f3f673c91605ad7e02e27f18783898d7316a8936b2423895864ee559526d",
-    "guardian_exec.py": "edaef4870cf666b9478911fafdc5d69c3a4c6b2e0a4d8280892db5caf1a0b9d1",
+    "fresh_l1.cjs": "5a70cbc8b729b017d7dccc2deaded5a2fc8e6e027ccba55e03d8b49bd0647e47",
+    "fresh_l1.py": "f28d91b91161cbce1ace515d9bf98edd2d4d51c2683147701aa942a4c786061a",
+    "guardian_exec.py": "965c325ef2e0d4477beb73a2f9415a0952e214cadd4e31d098198e7fd5489762",
     "indexer_backup_mirror.py": "fea7793cfca5b69ab88a26f1f4774196a3966dacc942f29e3ed574886810c1d7",
     "install_envio.py": "d251bde36b6173a51873a42053fb884494d62de994ca75a58b4c5dd858fbb309",
-    "install_guardian.py": "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a",
+    "install_guardian.py": "a6191d562ea5ee7cf0c7f07f7ebc9dd1a0e8357a3cb073530985e17a99558bd2",
     "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
-    "install_relayer.py": "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9",
+    "install_relayer.py": "1e47a3cc2595f6612f11f3c93f0a8a822c71dea0c86599962d046aa7cf21e919",
     "install_services.py": "3de33d91a1110779e8b270a5e490ad4607b3111b948823775d2f01f4be286e55",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
     "prepare_faucet.py": "ef39b4e15ee739bd3ce2a9ea15662a7d92df02131bbb884bf83c9476b73d33d2",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
-    "prepare_relayer_credential.py": "cceed73ab6cc213e9c377d499c8cd91c567766f4ddcc8924ef899f92ed31f77b",
+    "prepare_relayer_credential.py": "bad8ba5f20d8e4b7deda67fbefa06b94fda5bb2fa67002df052ba1c5f0a9cf1c",
     "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",
     "probe_databases.py": "409189181240e5cbc767a3ddaf41dee18b5e5be1b4e92dee6280b31ca33bda69",
     "relayer_exec.py": "98befed16fc38214bf7c6c444158b4a4c61d77035eec2352261e66f9386e6fb6"

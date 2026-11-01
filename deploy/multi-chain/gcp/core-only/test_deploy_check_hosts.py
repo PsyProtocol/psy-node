@@ -126,6 +126,13 @@ class CheckHostsTests(PrepareTestCase):
         with self.assertRaisesRegex(ValueError, r"retained path #\d+ missing"):
             self.run_step(remote)
 
+    def test_signer_host_needs_2_gib_and_other_hosts_5_gib(self):
+        self.run_step(self.remote(avail={self.SERVICES: steps.MIN_SIGNER_FREE_BYTES}))
+        with self.assertRaisesRegex(ValueError, f"{self.SERVICES}: free disk 1 GiB below 2 GiB"):
+            self.run_step(self.remote(avail={self.SERVICES: steps.MIN_SIGNER_FREE_BYTES - 1}))
+        with self.assertRaisesRegex(ValueError, f"{self.CP}: free disk 4 GiB below 5 GiB"):
+            self.run_step(self.remote(avail={self.CP: 4 * GIB + 1}))
+
     def test_check_hosts_rejects_balance_below_gas_budget(self):
         remote = self.remote(l1=self.reports(baseSepolia={"balance_wei": "9999"}))
         with self.assertRaisesRegex(ValueError, "baseSepolia: balance 9999 below required 10000"):
@@ -189,7 +196,10 @@ class CheckHostsTests(PrepareTestCase):
         _, argv, stdin_text = remote.root_calls[0]
         self.assertEqual(stdin_text, "# fixture fresh_l1.py\n")
         self.assertEqual(argv, steps.STATUS_ARGV)
-        self.assertEqual(argv[-2:], ["--rpc-preference", "protected-env-backup"])
+        self.assertEqual(argv[argv.index("--rpc-preference"):argv.index("--rpc-preference") + 2],
+                         ["--rpc-preference", "protected-env-backup"])
+        self.assertEqual([argv[i + 1] for i, word in enumerate(argv) if word == "--secret-env"],
+                         ["/etc/parth/relayer.env", "/etc/parth/l1-rpc-fallback.env"])
         self.assertTrue(remote.show_stderr)
 
     def test_tool_changed_between_check_and_send_is_refused_by_hashing_the_sent_bytes(self):

@@ -4,13 +4,20 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest.mock import patch
+
+import test_release_lock
 
 HERE = Path(__file__).resolve().parent
 loader = importlib.util.spec_from_file_location("activate_bridge", HERE / "activate_bridge.py")
 a = importlib.util.module_from_spec(loader)
 loader.loader.exec_module(a)
+LOCK = test_release_lock.build_test_lock()
+for tool in ("install_guardian.py", "install_relayer.py"):
+    LOCK["tool_sha256"][tool] = hashlib.sha256((HERE / tool).read_bytes()).hexdigest()
+a.load_helpers(LOCK)
 
 
 class ActivateTests(unittest.TestCase):
@@ -18,39 +25,66 @@ class ActivateTests(unittest.TestCase):
         self.spec = {"hostname": "signer.example", "address": "172.30.0.1", "guardian_id": 1,
                      "service_user": "psy-guardian-1", "l1_documents": {"synthetic": {}},
                      "binary": {"sha256": "a" * 64}, "custody_keystore_sha256": hashlib.sha256(b"cipher").hexdigest()}
-        self.network = {"magic": a.g.MAGIC, "guardian_initial_member_hashes": ["1", "2", "3"],
+        self.guardian = a.g.load_release(LOCK)
+        self.network = {"magic": self.guardian.magic, "guardian_initial_member_hashes": ["1", "2", "3"],
                         "guardian_configs": [{"rpc_url": f"http://172.30.0.{i}:9700"} for i in (1, 2, 3)]}
         self.files = {"rpc.json": json.dumps({"networks": {"testnet": self.network}}).encode()}
-        self.name = "psy-guardian-r3-1.service"
-        self.release, self.state = a.g.RELEASES / "guardian-1", a.g.STATES / "guardian-1"
+        self.name = self.guardian.unit_name(1)
+        self.release, self.state = self.guardian.releases / "guardian-1", self.guardian.states / "guardian-1"
         self.data = (self.spec, self.files, self.network, self.release, self.state, self.name,
-                     ["psy-guardian-1.service", "psy-guardian-r2-1.service"], {"psy-guardian-r2-1.service"}, {"psy-guardian-1.service"})
+                     ["psy-guardian-1.service", "psy-guardian-previous-1.service"], set(), {"psy-guardian-1.service"},
+                     self.guardian)
         self.value = {"Id": self.name, "LoadState": "loaded", "ActiveState": "inactive", "MainPID": "0",
                       "Job": "", "FragmentPath": str(a.g.UNITS / self.name), "DropInPaths": "",
                       "NeedDaemonReload": "no", "UnitFileState": "enabled"}
 
     def test_context_uses_pinned_planners_and_requires_documents_and_root(self):
+        previous = ["psy-guardian-1.service", "psy-guardian-previous-2.service", self.guardian.unit_name(1)]
         with patch.object(a.os, "geteuid", return_value=0), \
-                patch.object(a.g, "load_plan", return_value=(self.spec, self.files, self.network, 9700)):
-            data = a.context("guardian", Path("/spec"), "a" * 64)
+                patch.object(a.g, "guardian_unit_names", return_value=previous), \
+                patch.object(a.g, "load_plan", return_value=(self.spec, self.files, self.network, 9700)) as plan:
+            data = a.context("guardian", Path("/spec"), "a" * 64, LOCK)
+            plan.assert_called_once_with(Path("/spec"), "a" * 64, self.guardian)
             self.assertEqual(data[5], self.name)
             self.assertNotIn(self.name, data[6])
-            self.assertIn("psy-guardian-r3-2.service", data[6])
-            self.assertEqual(data[7], {"psy-guardian-r2-1.service"})
+            self.assertEqual(data[6], ["psy-guardian-1.service", "psy-guardian-previous-2.service"])
+            self.assertEqual(data[7], set())
             self.spec["l1_documents"] = {}
             with self.assertRaisesRegex(ValueError, "documents pending"):
-                a.context("guardian", Path("/spec"), "a" * 64)
+                a.context("guardian", Path("/spec"), "a" * 64, LOCK)
         with patch.object(a.os, "geteuid", return_value=1000), self.assertRaisesRegex(ValueError, "root"):
-            a.context("relayer", Path("/spec"), "a" * 64)
+            a.context("relayer", Path("/spec"), "a" * 64, LOCK)
         self.spec["l1_documents"] = {"synthetic": {}}
         with patch.object(a.os, "geteuid", return_value=0), \
+                patch.object(a.r, "relayer_unit_names", return_value=["psy-core-relayer-previous.service", LOCK["units"]["relayer"]]), \
                 patch.object(a.r, "load_plan", return_value=(self.spec, self.files, 9700)):
-            data = a.context("relayer", Path("/spec"), "a" * 64)
-            self.assertEqual(data[5], "psy-core-relayer-r3.service")
-            self.assertEqual(data[7], {"psy-core-relayer-r2.service"})
+            data = a.context("relayer", Path("/spec"), "a" * 64, LOCK)
+            self.assertEqual(data[5], LOCK["units"]["relayer"])
+            self.assertEqual(data[6], ["psy-core-relayer-previous.service"])
+            self.assertEqual(data[7], set())
+            self.assertEqual(data[3], Path(LOCK["paths"]["relayer"]["release"]))
+
+    def test_activate_bridge_loads_siblings_by_lock_hash(self):
+        for tool, name in (("install_guardian.py", "install_guardian"), ("install_relayer.py", "install_relayer")):
+            lock = json.loads(json.dumps(LOCK))
+            lock["tool_sha256"][tool] = "0" * 64
+            with self.subTest(tool=tool), patch.object(Path, "read_bytes", return_value=(HERE / tool).read_bytes()):
+                with self.assertRaisesRegex(SystemExit, "hash mismatch"):
+                    a.load_helpers(lock)
+        with patch.object(Path, "read_bytes", return_value=b'raise RuntimeError("DO_NOT_EXECUTE")'), self.assertRaises(SystemExit):
+            a.helper("install_relayer", LOCK["tool_sha256"]["install_relayer.py"])
+        self.assertIs(a.r.g, a.g)
+
+    def test_release_lock_is_hash_checked_before_it_is_parsed(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "lock.json"
+            path.write_text("{}")
+            with self.assertRaisesRegex(SystemExit, "release lock hash mismatch"):
+                a.read_release_lock(path, "0" * 64)
+            self.assertEqual(a.read_release_lock(path, hashlib.sha256(b"{}").hexdigest()), {})
 
     def test_preflight_checks_installed_bytes_identity_and_unit_source(self):
-        public = {"node_source": a.g.KEY_SOURCE, "guardian_id": 1, "public_key_hash": "1"}
+        public = {"node_source": self.guardian.key_source, "guardian_id": 1, "public_key_hash": "1"}
         def read(path, **kwargs):
             if path.name == "rpc.json":
                 return self.files["rpc.json"]
@@ -88,7 +122,7 @@ class ActivateTests(unittest.TestCase):
             with patch.object(a, "context", return_value=self.data), patch.object(a, "preflight", return_value=active), \
                     patch.object(a, "process", return_value=123), patch.object(a, "show", return_value=self.value), \
                     patch.object(a.g, "command") as command, patch.object(a, "dependencies") as deps:
-                result = a.activate("guardian", Path("/spec"), "a" * 64, apply)
+                result = a.activate("guardian", Path("/spec"), "a" * 64, LOCK, apply)
                 self.assertFalse(result["checkpoint_progress_verified"] or result["l1_finalization_verified"])
                 if apply:
                     command.assert_called_once_with(["systemctl", "enable", self.name])
@@ -100,11 +134,46 @@ class ActivateTests(unittest.TestCase):
         with patch.object(a, "context", return_value=self.data), patch.object(a, "preflight", return_value=False), \
                 patch.object(a, "dependencies", side_effect=ValueError("not ready")), patch.object(a.g, "command") as command:
             with self.assertRaisesRegex(ValueError, "not ready"):
-                a.activate("relayer", Path("/spec"), "a" * 64, True)
+                a.activate("relayer", Path("/spec"), "a" * 64, LOCK, True)
             command.assert_not_called()
 
+    def test_relayer_start_refused_until_guardians_and_services_ready(self):
+        ready = {"schema_version": 3, "user_id": 524288, "network_magic": int(self.guardian.magic, 16),
+                 "runtime_initialized": True, "halted": False}
+        services = {"status": "ready", "details": {"database": {"status": "healthy"}, "cache": {"status": "healthy"}}}
+        self.files["daemon.toml"] = b"synthetic"
+        for broken, reason in (("guardian", "Guardian not ready"), ("services", "Services")):
+            guardians = {**ready, "halted": True} if broken == "guardian" else ready
+            backend = {**services, "status": "starting"} if broken == "services" else services
+            with self.subTest(broken=broken), patch.object(a, "context", return_value=self.data), \
+                    patch.object(a, "preflight", return_value=False), \
+                    patch.object(a.r, "validate_daemon", return_value={"services_url": "http://172.30.0.10:3001"}), \
+                    patch.object(a, "get_json", side_effect=lambda origin, path: guardians if path == "/v1/ready" else backend), \
+                    patch.object(a.g, "command") as command:
+                with self.assertRaisesRegex(ValueError, reason):
+                    a.activate("relayer", Path("/spec"), "a" * 64, LOCK, True)
+                command.assert_not_called()
+
+    def test_guardian_readiness_checked_from_relayer_host(self):
+        ready = {"schema_version": 3, "user_id": 524288, "network_magic": str(int(self.guardian.magic, 16)),
+                 "runtime_initialized": True, "halted": False}
+        rpc = json.dumps({"networks": {"testnet": self.network}}).encode()
+        asked = []
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "rpc.json"
+            path.write_bytes(rpc)
+            sha = hashlib.sha256(rpc).hexdigest()
+            with patch.object(a, "get_json", side_effect=lambda origin, route: asked.append((origin, route)) or ready):
+                self.assertEqual(a.readiness(path, sha), {"role": "guardian-readiness", "guardians_ready": 3})
+                self.assertEqual(asked, [(f"http://172.30.0.{i}:9700", "/v1/ready") for i in (1, 2, 3)])
+                with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                    a.readiness(path, "f" * 64)
+            ready["halted"] = True
+            with patch.object(a, "get_json", return_value=ready), self.assertRaisesRegex(ValueError, "Guardian not ready"):
+                a.readiness(path, sha)
+
     def test_readiness_schema_magic_account_and_services(self):
-        ready = {"schema_version": 3, "user_id": 524288, "network_magic": int(a.g.MAGIC, 16), "runtime_initialized": True, "halted": False}
+        ready = {"schema_version": 3, "user_id": 524288, "network_magic": int(self.guardian.magic, 16), "runtime_initialized": True, "halted": False}
         services = {"status": "ready", "details": {"database": {"status": "healthy"}, "cache": {"status": "healthy"}}}
         self.files["daemon.toml"] = b"synthetic"
         with patch.object(a.r, "validate_daemon", return_value={"services_url": "http://172.30.0.10:3001"}), \
@@ -134,10 +203,10 @@ class ActivateTests(unittest.TestCase):
                     patch.object(a.g, "command") as command, patch.object(a.time, "monotonic", side_effect=lambda: clock[0]), \
                     patch.object(a.time, "sleep", side_effect=lambda n: clock.__setitem__(0, clock[0] + n)):
                 if case == "transition":
-                    self.assertEqual(a.activate("guardian", Path("/spec"), "a" * 64, True)["pid"], 123)
+                    self.assertEqual(a.activate("guardian", Path("/spec"), "a" * 64, LOCK, True)["pid"], 123)
                 else:
                     with self.assertRaises(ValueError):
-                        a.activate("guardian", Path("/spec"), "a" * 64, True)
+                        a.activate("guardian", Path("/spec"), "a" * 64, LOCK, True)
                     self.assertEqual(clock[0], 15 if case == "permanent" else 0)
                 command.assert_called_once_with(["systemctl", "enable", "--now", self.name])
 
@@ -172,12 +241,24 @@ class ActivateTests(unittest.TestCase):
     def test_helper_hash_checked_before_exec_and_cli_hides_os_error(self):
         with patch.object(Path, "read_bytes", return_value=b'raise RuntimeError("DO_NOT_EXECUTE")'), self.assertRaises(SystemExit):
             a.helper("install_guardian", "0" * 64)
-        with patch("sys.argv", ["activate_bridge.py", "--role", "relayer", "--spec", "/spec", "--spec-sha256", "a" * 64]), \
-                patch.object(a, "activate", side_effect=OSError("PRIVATE_SENTINEL")):
-            with self.assertRaises(SystemExit) as error:
+        with tempfile.TemporaryDirectory() as root:
+            lock = Path(root) / "lock.json"
+            lock.write_text(json.dumps(LOCK))
+            common = ["activate_bridge.py", "--release-lock", str(lock), "--release-lock-sha256",
+                      hashlib.sha256(lock.read_bytes()).hexdigest()]
+            with patch("sys.argv", common + ["--role", "relayer", "--spec", "/spec", "--spec-sha256", "a" * 64]), \
+                    patch.object(a, "activate", side_effect=OSError("PRIVATE_SENTINEL")):
+                with self.assertRaises(SystemExit) as error:
+                    a.main()
+            self.assertNotIn("PRIVATE_SENTINEL", str(error.exception))
+            self.assertIn("OSError", str(error.exception))
+            with patch("sys.argv", common + ["--role", "guardian-readiness", "--spec", "/spec"]), \
+                    patch.object(a, "readiness") as readiness, self.assertRaisesRegex(SystemExit, "RPC config and its hash only"):
                 a.main()
-        self.assertNotIn("PRIVATE_SENTINEL", str(error.exception))
-        self.assertIn("OSError", str(error.exception))
+            readiness.assert_not_called()
+            with patch("sys.argv", common[:-1] + ["0" * 64, "--role", "relayer", "--spec", "/s", "--spec-sha256", "a" * 64]), \
+                    self.assertRaisesRegex(SystemExit, "release lock hash mismatch"):
+                a.main()
 
 
 if __name__ == "__main__":

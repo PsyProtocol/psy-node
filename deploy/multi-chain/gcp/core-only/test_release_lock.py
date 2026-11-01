@@ -298,6 +298,37 @@ class ReleaseLockTests(unittest.TestCase):
         lock_module.main(["update-inputs", "--lock", str(path), "--private-dir", str(self.private_dir)])
         self.assertEqual(json.loads(path.read_text())["inputs"], self.lock["inputs"])
 
+    def write_budgets(self, **override):
+        good = {"maxGasPriceWei": "1", "maxGasPerTransaction": "2", "maxTotalGas": "3", "maxNativeSpendWei": "4",
+                "l1FeeReserveWeiPerTransaction": "5"}
+        for chain in lock_module.CHAINS:
+            (self.release_dir / f"fresh_l1_gas_budget.{chain}.json").write_text(
+                json.dumps({**good, **override.get(chain, {})}) + "\n")
+
+    def test_update_budgets_sets_the_hash_of_each_budget_file(self):
+        path = self.release_dir / "lock.json"
+        lock = copy.deepcopy(self.lock)
+        lock["l1"]["gas_budget_sha256"] = {chain: "" for chain in lock_module.CHAINS}
+        path.write_text(json.dumps(lock))
+        self.write_budgets()
+        lock_module.main(["update-budgets", "--lock", str(path)])
+        updated = json.loads(path.read_text())
+        for chain in lock_module.CHAINS:
+            file = self.release_dir / f"fresh_l1_gas_budget.{chain}.json"
+            self.assertEqual(updated["l1"]["gas_budget_sha256"][chain], hashlib.sha256(file.read_bytes()).hexdigest())
+        self.assertEqual({k: v for k, v in updated["l1"].items() if k != "gas_budget_sha256"},
+                         {k: v for k, v in self.lock["l1"].items() if k != "gas_budget_sha256"})
+
+    def test_update_budgets_refuses_a_missing_or_invalid_budget(self):
+        path = self.release_dir / "lock.json"
+        path.write_text(json.dumps(self.lock))
+        self.write_budgets(baseSepolia={"l1FeeReserveWeiPerTransaction": "0"})
+        self.assertEqual(lock_module.main(["update-budgets", "--lock", str(path)]), 1)
+        self.write_budgets()
+        (self.release_dir / "fresh_l1_gas_budget.bscTestnet.json").unlink()
+        self.assertEqual(lock_module.main(["update-budgets", "--lock", str(path)]), 1)
+        self.assertEqual(json.loads(path.read_text()), self.lock)
+
     def test_validate_checks_the_retirement_lists_in_the_private_directory(self):
         retired, retained = build_test_retirement()
         retired["hosts"]["gcp-gateway"]["retain"] = ["/etc/ssh"]

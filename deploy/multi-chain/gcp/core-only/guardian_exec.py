@@ -38,9 +38,14 @@ def check_credential_access(fd, *, directory=False):
         raise ValueError("unsafe credential access")
 
 
-def launch(guardian_id):
+def launch(guardian_id, state_argument):
+    """The unit passes its own state directory; it must be the working directory systemd set for the unit."""
     if guardian_id not in (1, 2, 3):
         raise ValueError("invalid Guardian ID")
+    state = Path(state_argument)
+    if not state.is_absolute() or ".." in state.parts or state.name != f"guardian-{guardian_id}" \
+            or os.path.realpath(state) != os.getcwd():
+        raise ValueError("invalid state directory")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     name = f"psy-guardian-{guardian_id}-password"
     directory = os.open(os.environ["CREDENTIALS_DIRECTORY"],
@@ -59,7 +64,6 @@ def launch(guardian_id):
     if value.startswith("\ufeff"):
         raise ValueError("invalid credential")
     release = Path(__file__).absolute().parent
-    state = Path("/var/lib/psy-guardian/core-testnet-20261027-r3") / f"guardian-{guardian_id}"
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("GUARDIAN_")}
     environment[f"GUARDIAN_{guardian_id}_KEYSTORE_PASSWORD"] = value
@@ -72,8 +76,8 @@ def launch(guardian_id):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in ("1", "2", "3"):
+        if len(sys.argv) != 3 or sys.argv[1] not in ("1", "2", "3"):
             raise ValueError("invalid arguments")
-        launch(int(sys.argv[1]))
+        launch(int(sys.argv[1]), sys.argv[2])
     except Exception:
         raise SystemExit("Guardian credential adapter failed; details withheld") from None

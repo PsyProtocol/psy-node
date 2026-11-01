@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Local-only Guardian installation, reusing this host's retained custody.
 
-python3 -B install_guardian.py plan|check-host|install --spec FILE --spec-sha256 HASH [--apply]
+python3 -B install_guardian.py plan|check-host|install --release-lock FILE --release-lock-sha256 HASH
+    --spec FILE --spec-sha256 HASH [--apply]
 plan reads artifacts only. check-host is read-only/root-only. install needs --apply;
 it never enables/starts/stops services, generates keys, migrates DBs or uses SSH.
 Failures after writes retain the partial destination for operator inspection.
@@ -12,7 +13,8 @@ guardian_history: {listen_address, rpc_url}, explicitly approved private HTTP or
 proof_origins: {prove_proxy_url: [origins], system_prove_proxy_url: [origins]};
 service_user: psy-guardian-N (must already exist, non-root);
 memory_high_gib; memory_max_gib; custody_keystore_sha256;
-build, binary, canonical_config, rpc_config, wrapper: each {path, sha256};
+build, binary, canonical_config, rpc_config, wrapper: each {path, sha256}; the build document must
+agree with the release lock (source, config hash, relayer binary hash);
 l1_documents: {} while pending, otherwise exactly sepolia, bscTestnet,
 baseSepolia, each {summary: {path, sha256}, receipt: {path, sha256}}.
 All input paths are absolute without whitespace, substitutions or traversal.
@@ -31,16 +33,18 @@ Pending documents permit plan only. Real RPC/proof/membership acceptance and
 any service activation remain separate operator gates, even after installation.
 Before activation, confirm /usr/bin/python3 and its resolved executable are
 root-owned, executable and not group/other-writable on the target host.
-R3 uses new units/releases/state; retained units and custody are never changed.
-The assigned R2 Guardian must exist, be inactive with PID zero and disabled.
-R1/R2/R3 units are scanned; a static R1 Guardian additionally needs no aliases,
-drop-ins, enablement symlinks or queued jobs. This exception never applies to
-R2/R3/Relayer. Fresh L1 documents require separate operator approval; retained
-deployment documents are not authorization for the new L1 cohort.
+The release lock supplies the source commits, magic, custody, release and state paths and unit
+prefix. A fresh release uses new units/releases/state; retained units and custody are never changed.
+No previous Guardian unit has to exist. Every psy-guardian-*.service that systemd knows must be
+inactive with PID zero and disabled; a static R1 Guardian additionally needs no aliases, drop-ins,
+enablement symlinks or queued jobs. This exception never applies to later generations or the
+Relayer. Fresh L1 documents require separate operator approval; retained deployment documents are
+not authorization for the new L1 cohort.
 """
 
 import argparse
 import copy
+from dataclasses import dataclass
 import grp
 import hashlib
 import ipaddress
@@ -55,15 +59,47 @@ import subprocess
 from urllib.parse import urlsplit
 
 
-RUNTIME_SOURCE = "3d31758738f833a7eea6f9ff7fd680a69a0d9a44"
-KEY_SOURCE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-BUILD_HASH = "4432ea02ead2f2fd48a723b911049f5dcdb8d1ef80072518361759ab77628072"
-MAGIC = "0x1337CF514544CF69"
-CUSTODY = Path("/var/lib/psy-guardian-custody")
-RELEASES = Path("/opt/psy-guardian/releases/core-testnet-20261027-r3")
-STATES = Path("/var/lib/psy-guardian/core-testnet-20261027-r3")
 UNITS = Path("/etc/systemd/system")
 CHAINS = {"sepolia": (0, 11155111), "bscTestnet": (1, 97), "baseSepolia": (2, 84532)}
+GUARDIAN_UNIT = re.compile(r"psy-guardian-[A-Za-z0-9._-]+\.service")
+
+
+@dataclass(frozen=True)
+class GuardianRelease:
+    """Everything this installer used to hard-code, read from the release lock."""
+    release_id: str
+    runtime_source: str
+    key_source: str
+    magic: str
+    runtime_config_sha256: str
+    relayer_sha256: str
+    custody: Path
+    releases: Path
+    states: Path
+    unit_prefix: str
+
+    def unit_name(self, guardian_id):
+        return f"{self.unit_prefix}{guardian_id}.service"
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if digest(raw) != expected_sha256:
+        raise ValueError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_release(lock):
+    paths = lock["paths"]["guardian"]
+    for value in (paths["release"], paths["config"], paths["state"]):
+        path_value(value)
+    require(re.fullmatch(r"psy-guardian-[A-Za-z0-9.]+-", lock["units"]["guardian_prefix"]), "invalid Guardian unit prefix")
+    return GuardianRelease(
+        release_id=lock["release_id"], runtime_source=lock["sources"]["runtime"],
+        key_source=lock["sources"]["guardian_key"], magic=lock["network_magic"],
+        runtime_config_sha256=lock["inputs"]["runtime_config"], relayer_sha256=lock["binaries"]["psy_relayer_cli"],
+        custody=Path(paths["config"]), releases=Path(paths["release"]), states=Path(paths["state"]),
+        unit_prefix=lock["units"]["guardian_prefix"])
 
 
 def require(ok, message):
@@ -171,12 +207,12 @@ def guardian_origins(urls):
             private_ip(str(address))
 
 
-def validate_rpc(canonical, rpc, spec):
+def validate_rpc(canonical, rpc, spec, release):
     require(canonical["defaultNetwork"] == "testnet" and rpc["defaultNetwork"] == "testnet",
             "testnet selection required")
     base = canonical["networks"]["testnet"]
     network = rpc["networks"]["testnet"]
-    require(base["magic"] == MAGIC, "testnet magic mismatch")
+    require(base["magic"] == release.magic, "testnet magic mismatch")
     restored = copy.deepcopy(rpc)
     target = restored["networks"]["testnet"]
     for field, ids in (("coordinator_configs", [0]), ("realm_configs", [0, 1])):
@@ -255,7 +291,7 @@ def l1_files(documents):
     return files
 
 
-def load_plan(spec_path, spec_hash):
+def load_plan(spec_path, spec_hash, release):
     raw = read(path_value(str(spec_path)), private=True)
     require(digest(raw) == pin(spec_hash), "operator spec hash mismatch")
     spec = decode(raw)
@@ -274,12 +310,13 @@ def load_plan(spec_path, spec_hash):
     require(type(high) is int and type(maximum) is int and 1 <= high < maximum <= 64, "invalid memory bounds")
     pin(spec["custody_keystore_sha256"])
     build_raw = artifact(spec["build"])
-    require(digest(build_raw) == BUILD_HASH, "reviewed build manifest required")
     build = decode(build_raw)
-    require(build["source_commit"] == RUNTIME_SOURCE and build["network"] == "testnet", "runtime source mismatch")
+    require(build["source_commit"] == release.runtime_source and build["network"] == "testnet", "runtime source mismatch")
+    require(build["config_sha256"] == release.runtime_config_sha256
+            and build["binaries"]["psy_relayer_cli"] == release.relayer_sha256, "build document differs from the release lock")
     canonical, rpc = artifact(spec["canonical_config"]), artifact(spec["rpc_config"])
     require(digest(canonical) == build["config_sha256"], "canonical build config mismatch")
-    network, port = validate_rpc(decode(canonical), decode(rpc), spec)
+    network, port = validate_rpc(decode(canonical), decode(rpc), spec, release)
     binary = artifact(spec["binary"], limit=512 * 1024 * 1024)
     require(digest(binary) == build["binaries"]["psy_relayer_cli"] and binary[:6] == b"\x7fELF\x02\x01"
             and binary[18:20] == b"\x3e\x00", "reviewed x86_64 relayer required")
@@ -291,10 +328,10 @@ def load_plan(spec_path, spec_hash):
     return spec, files, network, port
 
 
-def unit(spec):
+def unit(spec, release_set):
     guardian_id = spec["guardian_id"]
     name = f"guardian-{guardian_id}"
-    release, state = RELEASES / name, STATES / name
+    release, state = release_set.releases / name, release_set.states / name
     credential = f"psy-guardian-{guardian_id}-password"
     return ("\n".join([
         "[Unit]", "Description=Psy testnet Guardian signer", "ConditionHost=" + spec["hostname"],
@@ -303,8 +340,8 @@ def unit(spec):
         "UMask=0077", "WorkingDirectory=" + str(state), "Environment=HOME=" + str(release / "home"),
         "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(release / "canonical.json"),
         "Environment=RUST_LOG=info", "Environment=RUST_MIN_STACK=134217728",
-        f"LoadCredentialEncrypted={credential}:{CUSTODY / name / (credential + '.cred')}",
-        f"ExecStart=/usr/bin/python3 -I -B {release / 'guardian_exec.py'} {guardian_id}",
+        f"LoadCredentialEncrypted={credential}:{release_set.custody / name / (credential + '.cred')}",
+        f"ExecStart=/usr/bin/python3 -I -B {release / 'guardian_exec.py'} {guardian_id} {state}",
         "ProtectSystem=strict", "ProtectHome=true", "PrivateTmp=true", "NoNewPrivileges=true",
         "ReadOnlyPaths=" + str(release), "ReadWritePaths=" + str(state / "db"),
         "CapabilityBoundingSet=", "RestrictSUIDSGID=true", "LimitCORE=0", "LimitNOFILE=65536",
@@ -374,7 +411,19 @@ def inactive_units(names, required, static_guardians=()):
             "unit job queued")
 
 
-def host_checks(spec, network, port):
+def guardian_unit_names():
+    """Every Guardian unit file or loaded unit that systemd knows, whatever generation it belongs to."""
+    names = set()
+    for argv in (["systemctl", "list-unit-files", "psy-guardian-*.service", "--no-legend", "--plain", "--no-pager"],
+                 ["systemctl", "list-units", "--all", "psy-guardian-*.service", "--no-legend", "--plain", "--no-pager"]):
+        for line in command(argv).splitlines():
+            fields = line.split()
+            if fields and GUARDIAN_UNIT.fullmatch(fields[0]):
+                names.add(fields[0])
+    return sorted(names)
+
+
+def host_checks(spec, network, port, release):
     require(os.geteuid() == 0, "host checks require root")
     require(socket.gethostname() == spec["hostname"] and os.uname().machine == "x86_64", "wrong host")
     addresses = json.loads(command(["ip", "-j", "-4", "address", "show"]))
@@ -384,20 +433,20 @@ def host_checks(spec, network, port):
             and grp.getgrnam(spec["service_user"]).gr_gid == account.pw_gid,
             "dedicated non-root account/group required")
     require(int(command(["systemctl", "--version"]).split()[1]) >= 250, "systemd 250+ required")
-    inactive_units([f"psy-guardian-{generation}{i}.service" for generation in ("", "r2-", "r3-") for i in (1, 2, 3)],
-                   {f"psy-guardian-r2-{spec['guardian_id']}.service"},
+    this_unit = release.unit_name(spec["guardian_id"])
+    inactive_units(sorted({*guardian_unit_names(), this_unit}), set(),
                    {f"psy-guardian-{i}.service" for i in (1, 2, 3)})
     require(not any(len(row) > 3 and row[3].rsplit(":", 1)[-1] == str(port)
                     for row in map(str.split, command(["ss", "-H", "-ltn"]).splitlines())), "Guardian port occupied")
     guardian_id = spec["guardian_id"]
     name = f"guardian-{guardian_id}"
-    custody = CUSTODY / name
-    for path in (CUSTODY, custody):
+    custody = release.custody / name
+    for path in (release.custody, custody):
         trusted_directory(path, private=True)
-    for parent in CUSTODY.parents:
+    for parent in release.custody.parents:
         trusted_directory(parent)
     public = decode(read(custody / "public.json", private=True, uid=0, limit=65536))
-    require(public["guardian_id"] == guardian_id and public["node_source"] == KEY_SOURCE
+    require(public["guardian_id"] == guardian_id and public["node_source"] == release.key_source
             and public["host"] == spec["address"] and public["destination"] == str(custody), "custody identity mismatch")
     require(commitment(public["public_key_hash"]) == commitment(network["guardian_initial_member_hashes"][guardian_id - 1]),
             "custody does not match Genesis commitment")
@@ -407,7 +456,7 @@ def host_checks(spec, network, port):
             and encrypted.get("crypto", encrypted.get("Crypto")), "encrypted keystore required")
     require(digest(key) == public["keystore_sha256"] == spec["custody_keystore_sha256"], "custody key pin mismatch")
     read(custody / f"psy-guardian-{guardian_id}-password.cred", private=True, uid=0, limit=65536)
-    for path in (RELEASES / name, STATES / name):
+    for path in (release.releases / name, release.states / name):
         require(not os.path.lexists(path), "destination exists; inspect partial install")
         for parent in path.parents:
             if os.path.lexists(parent):
@@ -416,7 +465,7 @@ def host_checks(spec, network, port):
     unit_paths = command(["systemd-analyze", "unit-paths"]).splitlines()
     require(str(UNITS) in unit_paths, "unit search paths invalid")
     for root in unit_paths:
-        for unit_name in (f"psy-guardian-r3-{guardian_id}.service", "psy-guardian-r3-.service",
+        for unit_name in (this_unit, release.unit_prefix[:-1] + "-.service",
                           "psy-guardian-.service", "psy-.service", "service"):
             for suffix in ("", ".d"):
                 require(not os.path.lexists(path_value(root) / (unit_name + suffix)), "existing unit or inherited drop-in")
@@ -460,49 +509,52 @@ def write(path, raw, mode=0o600, uid=0, gid=0):
         os.close(parent)
 
 
-def run(mode, spec_path, spec_hash, apply=False):
+def run(mode, spec_path, spec_hash, release, apply=False):
     require(mode in ("plan", "check-host", "install") and (apply == (mode == "install")), "install requires --apply only")
-    spec, files, network, port = load_plan(spec_path, spec_hash)
+    spec, files, network, port = load_plan(spec_path, spec_hash, release)
     pending = not spec["l1_documents"]
     if mode != "plan":
         require(not pending, "L1 deployment documents pending; plan only")
-        account, key = host_checks(spec, network, port)
+        account, key = host_checks(spec, network, port, release)
         if mode == "install":
             name = f"guardian-{spec['guardian_id']}"
-            release, state = RELEASES / name, STATES / name
-            parents = set(RELEASES.parents) | set(STATES.parents) | {RELEASES, STATES}
+            release_dir, state = release.releases / name, release.states / name
+            parents = set(release.releases.parents) | set(release.states.parents) | {release.releases, release.states}
             for path in sorted(parents, key=lambda value: len(value.parts)):
                 if not os.path.lexists(path):
                     mkdir(path)
-            mkdir(release)
+            mkdir(release_dir)
             mkdir(state)
             mkdir(state / "db", account.pw_uid, account.pw_gid, 0o700)
-            for part in (release / "home", release / "home/.psy", release / "home/.psy/keystore"):
+            for part in (release_dir / "home", release_dir / "home/.psy", release_dir / "home/.psy/keystore"):
                 mkdir(part, account.pw_uid, account.pw_gid, 0o700)
             for chain in CHAINS:
-                mkdir(release / chain)
+                mkdir(release_dir / chain)
             for name, raw in files.items():
-                write(release / name, raw, mode=0o600 if name == "operator.json" else
+                write(release_dir / name, raw, mode=0o600 if name == "operator.json" else
                       (0o755 if name == "psy_relayer_cli" else 0o644))
-            write(release / f"home/.psy/keystore/guardian-{spec['guardian_id']}.keystore.json", key,
+            write(release_dir / f"home/.psy/keystore/guardian-{spec['guardian_id']}.keystore.json", key,
                   uid=account.pw_uid, gid=account.pw_gid)
-            write(UNITS / f"psy-guardian-r3-{spec['guardian_id']}.service", unit(spec), mode=0o644)
+            write(UNITS / release.unit_name(spec["guardian_id"]), unit(spec, release), mode=0o644)
             command(["systemctl", "daemon-reload"])
-    return {"guardian_id": spec["guardian_id"], "mode": mode, "runtime_source": RUNTIME_SOURCE,
-            "key_source": KEY_SOURCE, "l1_documents_pending": pending, "started": False,
+    return {"guardian_id": spec["guardian_id"], "mode": mode, "runtime_source": release.runtime_source,
+            "key_source": release.key_source, "l1_documents_pending": pending, "started": False,
             "enabled": False, "deployment_ready": False, "release_approved": False}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", choices=("plan", "check-host", "install"))
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--spec-sha256", required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        print(json.dumps(run(args.mode, args.spec, args.spec_sha256, args.apply), sort_keys=True))
+        release = load_release(read_release_lock(args.release_lock, args.release_lock_sha256))
+        print(json.dumps(run(args.mode, args.spec, args.spec_sha256, release, args.apply), sort_keys=True))
     except Exception:
         raise SystemExit("Guardian install check failed; details withheld; never overwrite partial destinations") from None
 

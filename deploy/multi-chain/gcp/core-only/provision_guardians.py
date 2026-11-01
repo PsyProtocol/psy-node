@@ -17,9 +17,6 @@ import termios
 import time
 
 
-SOURCE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-USER_CLI_SHA256 = "a5dc1e3b4ad93af22c9843f8695fb0d25d5e155210ee43d07d287517dd92811d"
-
 
 def reject_symlink_components(path):
     for component in [*reversed(path.parents), path]:
@@ -83,10 +80,18 @@ def create_wallet(binary, home, keystore, result, password):
             os.close(slave)
 
 
-def provision(binary, root):
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise RuntimeError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def provision(binary, root, source, user_cli_sha256):
+    """source is the lock's guardian key source; user_cli_sha256 pins the User CLI built from that source."""
     reject_symlink_components(binary)
     reject_symlink_components(root)
-    if hashlib.sha256(binary.read_bytes()).hexdigest() != USER_CLI_SHA256:
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != user_cli_sha256:
         raise RuntimeError("unexpected User CLI binary")
     if root.exists():
         raise RuntimeError("custody directory exists; refusing overwrite or silent resume")
@@ -126,7 +131,7 @@ def provision(binary, root):
             raise RuntimeError("duplicate public commitment")
         commitments.append(commitment)
         print(f"Guardian {guardian_id}: encrypted keystore and host-bound password saved", flush=True)
-    summary = {"node_source": SOURCE, "user_cli_sha256": USER_CLI_SHA256,
+    summary = {"node_source": source, "user_cli_sha256": user_cli_sha256,
                "guardian_initial_member_hashes": commitments,
                "password_storage": "systemd user-scoped host-bound encrypted credentials"}
     with (root / "public-commitments.json").open("x") as output:
@@ -137,11 +142,15 @@ def provision(binary, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
+    parser.add_argument("--user-cli-sha256", required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     try:
-        provision(args.binary.absolute(), args.root.absolute())
+        source = read_release_lock(args.release_lock, args.release_lock_sha256)["sources"]["guardian_key"]
+        provision(args.binary.absolute(), args.root.absolute(), source, args.user_cli_sha256)
     except subprocess.CalledProcessError:
         raise SystemExit("Credential operation failed; retained custody must be inspected, not overwritten")
 

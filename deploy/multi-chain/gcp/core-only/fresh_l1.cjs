@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createRequire } = require("node:module");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const SIGNER = "0x490f8192725255C2C3dE0CbCE66312335Ca019Ad";
 const NETWORKS = { sepolia: [11155111, 0, "SEPOLIA_RPC_URL"],
   bscTestnet: [97, 1, "BSC_TESTNET_RPC_URL"], baseSepolia: [84532, 2, "BASE_SEPOLIA_RPC_URL"] };
@@ -111,6 +112,27 @@ async function pauseBridge(hre, signer = SIGNER) {
   assert.deepEqual(Array.from(flags).map(v => v.toString()), ["1", "0", "1"]);
 }
 
+const VERIFIERS = [["ZKVerifier", "src/GnarkGroth16Verifier.sol:Verifier"],
+  ["DepositBatchVerifier", "src/DepositBatchVerifier.sol:Verifier"],
+  ["WithdrawalClaimVerifier", "src/WithdrawalClaimVerifier.sol:Verifier"],
+  ["RewardClaimVerifier", "src/RewardClaimVerifier.sol:Verifier"]];
+
+// Read each verifier back from the chain: the deployed bytes must be the artifact's, and Bridge must point at them.
+async function verifierEvidence(hre, bridge) {
+  const evidence = {};
+  for (const [name, artifactName] of VERIFIERS) {
+    const deployment = await hre.deployments.get(name);
+    const code = (await hre.ethers.provider.getCode(deployment.address)).toLowerCase();
+    const expected = (await hre.artifacts.readArtifact(artifactName)).deployedBytecode.toLowerCase();
+    assert.ok(code.length > 2 && code === expected, `${name} on-chain bytecode differs from the artifact`);
+    evidence[name] = { address: deployment.address, code_sha256: crypto.createHash("sha256").update(code).digest("hex"), artifact: artifactName };
+  }
+  for (const [method, name] of [["depositBatchVerifier", "DepositBatchVerifier"], ["withdrawalClaimVerifier", "WithdrawalClaimVerifier"]]) {
+    assert.equal((await bridge[method]()).toLowerCase(), evidence[name].address.toLowerCase(), `Bridge ${method} is not the deployed ${name}`);
+  }
+  return evidence;
+}
+
 async function verifyReadback(hre, policy, tokens, signer = SIGNER) {
   assert.equal(tokens.native, hre.ethers.constants.AddressZero);
   assert.equal(new Set(Object.values(tokens).map(a => a.toLowerCase())).size, 3);
@@ -160,7 +182,8 @@ async function verifyReadback(hre, policy, tokens, signer = SIGNER) {
   // DefaultProxyAdmin is a hardhat-deploy builtin, not a compiled source artifact.
   assert.equal((await hre.deployments.read("DefaultProxyAdmin", "owner")).toLowerCase(),
     (await hre.deployments.get("ExecutorWithTimelock")).address.toLowerCase());
-  return { signer, proposer: true, bridge_admin: true, l1_acl_guardian: guardian,
+  const verifiers = await verifierEvidence(hre, bridge);
+  return { signer, proposer: true, bridge_admin: true, l1_acl_guardian: guardian, verifiers,
     deposits_paused: true, withdrawal_registration_paused: false, pending_claims_paused: false,
     deposit_mapping: depositMapping, tokens: checked };
 }

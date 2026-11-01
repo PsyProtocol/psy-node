@@ -222,6 +222,26 @@ acceptance and Guardian quorum before rollout. Keep generated configs outside
 Git and public client artifacts. Build final caches/artifacts with this exact
 accepted config; the earlier template-based checks are not that final build.
 
+## L1 Deployment, Guardians And Relayer (steps 69, 71, 74)
+
+Both `check_hosts` and `deploy_l1` run `fresh_l1.py` on the signer host with the protected route and read
+two root-owned files there: `/etc/parth/relayer.env` (the wallet entry) and
+`/etc/parth/l1-rpc-fallback.env` with exactly one entry each for `SEPOLIA_RPC_FALLBACK_URL`,
+`BSC_TESTNET_RPC_FALLBACK_URL` and `BASE_SEPOLIA_RPC_FALLBACK_URL` (mode 0600 or 0640). The second file is
+created by the operator and is not part of any package; the steps check names and modes only and never read a value.
+Node 18+ must exist at `/opt/psy-l1-bundles/node-v22.23.4`.
+
+The gas budgets are release inputs: `fresh_l1_gas_budget.<network>.json` next to the lock, hash-pinned with
+`release_lock.py update-budgets`. They never come from Hardhat figures: Sepolia reprices state creation
+(Bridge creation about 36.6M gas against 5.1M in Hardhat), so `check` also runs a live `eth_estimateGas` of every
+creation bytecode per chain and refuses when the estimate plus 20% exceeds `maxGasPerTransaction`.
+
+On the signer host each attempt is `<l1.output_root>/attempt-<n>`. Step 69 never rebroadcasts: a chain with a
+`completed-<network>.json` and its evidence is verified and skipped; any other trace of work in the latest attempt stops
+the step and prints the `fresh_l1.py prepare` command that creates `attempt-<n+1>`. After reviewing the stage journal and
+receipts, run that command and `deploy_all --from 69`. The recorded documents for step 70 are
+`<private dir>/state/deploy_l1.json` and `<private dir>/state/l1/attempt-<n>/<chain>/`.
+
 ## Local Inputs For The Preparation Steps
 
 The release lock pins hashes, not machine paths. The preparation steps read the

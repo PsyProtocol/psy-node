@@ -350,7 +350,8 @@ class VerifyArtifactsTests(PrepareTestCase):
     def test_l1_bundle_is_deeply_verified_against_the_locked_hash_before_any_wipe(self):
         run_all(steps.PREPARE_STEPS["verify_artifacts"], self.ws.context())
         self.verify_bundle.assert_called_once_with(self.paths["l1_bundle_manifest"].parent,
-                                                   self.ws.lock["l1"]["bundle_sha256"])
+                                                   self.ws.lock["l1"]["bundle_sha256"],
+                                                   self.ws.lock["sources"]["contracts"])
         self.verify_bundle.side_effect = steps.fresh_l1.GateError("bundle contents/hash mismatch")
         with self.assertRaisesRegex(ValueError, "bundle contents/hash mismatch"):
             steps.PREPARE_STEPS["verify_artifacts"].verify(self.ws.context())

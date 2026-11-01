@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Root-local R3 signer activation using the exact installed operator spec.
+"""Root-local signer activation using the exact installed operator spec.
 
---role guardian|relayer --spec FILE --spec-sha256 SHA [--apply]
+--release-lock FILE --release-lock-sha256 SHA --role guardian|relayer --spec FILE --spec-sha256 SHA [--apply]
+--release-lock FILE --release-lock-sha256 SHA --role guardian-readiness --rpc-config FILE --rpc-config-sha256 SHA
 Without --apply, validate only. Start Guardians first; Relayer additionally
 requires all three Guardian readiness responses and Services /health/ready.
+guardian-readiness only asks the three Guardians; run it on the Relayer host to prove they are reachable
+from there. The sibling installers are executed only when their bytes match the lock's tool_sha256.
 No SSH, reset-failed, DB changes, key generation or automatic rollback. Starting
 Relayer authorizes its normal daemon work, including L1 broadcasts; --apply must
 therefore be an explicit operator decision, not part of L1 preparation.
@@ -22,6 +25,10 @@ import types
 import urllib.request
 
 
+g = types.ModuleType("install_guardian")
+r = types.ModuleType("install_relayer")
+
+
 def helper(name, digest):
     path = Path(__file__).with_name(name + ".py")
     raw = path.read_bytes()
@@ -33,8 +40,19 @@ def helper(name, digest):
     return module
 
 
-g = helper("install_guardian", "b06acdaff8f1df6c3355b74729353b2eabb233d5994be9a2fdd31a9792e0525a")
-r = helper("install_relayer", "1a5f3e66b06e6ec979c8a81fadc11ffed1f071b5951657a5ea1c1494692bdbd9")
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise SystemExit("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def load_helpers(lock):
+    """Bind the sibling installers (g, r) once their bytes match the lock; r shares g's checked helpers."""
+    global g, r
+    g = helper("install_guardian", lock["tool_sha256"]["install_guardian.py"])
+    r = helper("install_relayer", lock["tool_sha256"]["install_relayer.py"])
+    r.g = g
 
 
 def show(name):
@@ -56,27 +74,28 @@ def process(name, binary, digest):
     return int(pid)
 
 
-def context(role, spec_path, spec_hash):
+def context(role, spec_path, spec_hash, lock):
     g.require(os.geteuid() == 0 and role in ("guardian", "relayer"), "root and explicit signer role required")
-    loaded = (g if role == "guardian" else r).load_plan(spec_path, spec_hash)
+    signer = (g if role == "guardian" else r).load_release(lock)
+    loaded = (g if role == "guardian" else r).load_plan(spec_path, spec_hash, signer)
     spec, files = loaded[:2]
     g.require(spec["l1_documents"], "fresh three-chain L1 documents pending")
     network = g.decode(files["rpc.json"])["networks"]["testnet"]
     if role == "guardian":
         ident = spec["guardian_id"]
-        release, state = g.RELEASES / f"guardian-{ident}", g.STATES / f"guardian-{ident}"
-        unit = f"psy-guardian-r3-{ident}.service"
-        old = [f"psy-guardian-{generation}{i}.service" for generation in ("", "r2-", "r3-") for i in (1, 2, 3)]
-        required, static = {f"psy-guardian-r2-{ident}.service"}, {f"psy-guardian-{i}.service" for i in (1, 2, 3)}
+        release, state = signer.releases / f"guardian-{ident}", signer.states / f"guardian-{ident}"
+        unit = signer.unit_name(ident)
+        old = g.guardian_unit_names()
+        required, static = set(), {f"psy-guardian-{i}.service" for i in (1, 2, 3)}
     else:
-        release, state, unit = r.RELEASE, r.STATE, r.UNIT
-        old = ["psy-core-relayer.service", "psy-core-relayer-r2.service", "parth-bridge-relayer.service", "parth-relayer.service"]
-        required, static = {"psy-core-relayer-r2.service"}, set()
-    return spec, files, network, release, state, unit, [n for n in old if n != unit], required, static
+        release, state, unit = signer.release, signer.state, signer.unit
+        old = r.relayer_unit_names()
+        required, static = set(), set()
+    return spec, files, network, release, state, unit, [n for n in old if n != unit], required, static, signer
 
 
 def preflight(role, data):
-    spec, files, network, release, state, unit, old, required, static = data
+    spec, files, network, release, state, unit, old, required, static, signer = data
     g.require(socket.gethostname() == spec["hostname"] and os.uname().machine == "x86_64", "wrong signer host")
     addresses = json.loads(g.command(["ip", "-j", "-4", "address", "show"]))
     g.require(any(a.get("local") == spec["address"] for i in addresses for a in i.get("addr_info", [])), "signer address mismatch")
@@ -96,7 +115,7 @@ def preflight(role, data):
     installer = g if role == "guardian" else r
     unit_path = installer.UNITS / unit
     g.trusted_directory(unit_path.parent)
-    g.require(g.read(unit_path) == installer.unit(spec), "installed signer unit mismatch")
+    g.require(g.read(unit_path) == installer.unit(spec, signer), "installed signer unit mismatch")
     info = unit_path.stat()
     g.require(info.st_uid == 0 and not info.st_mode & 0o022, "unsafe signer unit ownership/mode")
     value = show(unit)
@@ -107,13 +126,13 @@ def preflight(role, data):
     expected_key = spec["custody_keystore_sha256"] if role == "guardian" else spec["l1_keystore"]["sha256"]
     g.require(g.digest(g.read(key, private=True, uid=account.pw_uid, limit=65536)) == expected_key, "installed encrypted keystore mismatch")
     if role == "guardian":
-        custody = g.CUSTODY / f"guardian-{spec['guardian_id']}"
+        custody = signer.custody / f"guardian-{spec['guardian_id']}"
         public = g.decode(g.read(custody / "public.json", private=True, uid=0))
-        g.require(public["node_source"] == g.KEY_SOURCE and public["guardian_id"] == spec["guardian_id"]
+        g.require(public["node_source"] == signer.key_source and public["guardian_id"] == spec["guardian_id"]
                   and g.commitment(public["public_key_hash"]) == g.commitment(network["guardian_initial_member_hashes"][spec["guardian_id"] - 1]), "retained Guardian identity mismatch")
         g.read(custody / f"psy-guardian-{spec['guardian_id']}-password.cred", private=True, uid=0, limit=65536)
     else:
-        credential = g.read(r.CREDENTIALS / "l1-password.cred", private=True, uid=0, limit=65536)
+        credential = g.read(signer.credentials / "l1-password.cred", private=True, uid=0, limit=65536)
         g.require(g.digest(credential) == spec["password_credential"]["sha256"], "installed encrypted credential mismatch")
     active = value.get("ActiveState") == "active"
     if active:
@@ -136,8 +155,7 @@ def get_json(origin, path):
     return g.decode(raw)
 
 
-def dependencies(data):
-    _, files, network, *_ = data
+def guardians_ready(network):
     for guardian in network["guardian_configs"]:
         origin = guardian.get("rpc_url") or "http://" + guardian["listen_address"]
         value = get_json(origin, "/v1/ready")
@@ -147,14 +165,32 @@ def dependencies(data):
         g.require(value.get("schema_version") == 3 and value.get("user_id") == 524288
                   and int(magic) == int(network["magic"], 16)
                   and value.get("runtime_initialized") is True and value.get("halted") is False, "Guardian not ready for configured bridge account")
-    daemon = r.validate_daemon(files["daemon.toml"])
+
+
+def services_ready(files, signer):
+    daemon = r.validate_daemon(files["daemon.toml"], signer)
     value = get_json(daemon["services_url"], "/health/ready")
     g.require(value.get("status") == "ready" and all(value.get("details", {}).get(k, {}).get("status") == "healthy"
                                                      for k in ("database", "cache")), "Services dependencies not ready")
 
 
-def activate(role, spec_path, spec_hash, apply=False):
-    data = context(role, spec_path, spec_hash)
+def dependencies(data):
+    files, network, signer = data[1], data[2], data[9]
+    guardians_ready(network)
+    services_ready(files, signer)
+
+
+def readiness(rpc_path, rpc_sha256):
+    """Ask the three Guardians from this host; the RPC config is the one the Guardians were installed with."""
+    raw = g.read(g.path_value(str(rpc_path)))
+    g.require(g.digest(raw) == g.pin(rpc_sha256), "rpc config hash mismatch")
+    network = g.decode(raw)["networks"]["testnet"]
+    guardians_ready(network)
+    return {"role": "guardian-readiness", "guardians_ready": len(network["guardian_configs"])}
+
+
+def activate(role, spec_path, spec_hash, lock, apply=False):
+    data = context(role, spec_path, spec_hash, lock)
     spec, _, _, release, _, unit, *_ = data
     active = preflight(role, data)
     if role == "relayer":
@@ -180,13 +216,26 @@ def activate(role, spec_path, spec_hash, apply=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", choices=("guardian", "relayer"), required=True)
-    parser.add_argument("--spec", type=Path, required=True)
-    parser.add_argument("--spec-sha256", required=True)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
+    parser.add_argument("--role", choices=("guardian", "relayer", "guardian-readiness"), required=True)
+    parser.add_argument("--spec", type=Path)
+    parser.add_argument("--spec-sha256")
+    parser.add_argument("--rpc-config", type=Path)
+    parser.add_argument("--rpc-config-sha256")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     try:
-        print(json.dumps(activate(args.role, args.spec, args.spec_sha256, args.apply), sort_keys=True))
+        lock = read_release_lock(args.release_lock, args.release_lock_sha256)
+        load_helpers(lock)
+        if args.role == "guardian-readiness":
+            g.require(args.rpc_config and args.rpc_config_sha256 and not (args.spec or args.spec_sha256 or args.apply),
+                      "readiness takes the RPC config and its hash only")
+            print(json.dumps(readiness(args.rpc_config, args.rpc_config_sha256), sort_keys=True))
+            return
+        g.require(args.spec and args.spec_sha256 and not (args.rpc_config or args.rpc_config_sha256),
+                  "signer activation takes the spec and its hash only")
+        print(json.dumps(activate(args.role, args.spec, args.spec_sha256, lock, args.apply), sort_keys=True))
     except Exception as error:
         detail = str(error) if type(error) is ValueError else type(error).__name__
         raise SystemExit("Bridge activation failed: " + detail + "; no rollback; inspect selected unit") from None

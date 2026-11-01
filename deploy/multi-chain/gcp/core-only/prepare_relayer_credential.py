@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Create one host-bound Relayer credential; never edits the retained env/key.
 
-Requires Python 3.11+, root, an existing systemd host key and reviewed install_relayer.py
-and install_guardian.py siblings. Source env must be root-owned mode 0600/0640.
+Requires Python 3.11+, root, an existing systemd host key and the install_relayer.py and
+install_guardian.py siblings whose bytes match the release lock's tool_sha256.
+Source env must be root-owned mode 0600/0640.
 Only simple literal shell assignments are supported; no shell evaluation occurs.
 Single quotes support special characters; double/unquoted shell expansions and
 escape sequences and inline comments are rejected rather than guessed. This is
@@ -13,7 +14,7 @@ Use --apply after approval. Do not use shell tracing or pipe plaintext elsewhere
 """
 
 import argparse
-import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,13 +23,34 @@ import resource
 import shlex
 import stat
 import subprocess
+import types
 
 
-_spec = importlib.util.spec_from_file_location("relayer_install_files", Path(__file__).with_name("install_relayer.py"))
-r = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(r)
+r = types.ModuleType("relayer_install_files")
 HOST_KEY = Path("/var/lib/systemd/credential.secret")
 ENCRYPT = Path("/usr/bin/systemd-creds")
+
+
+def read_release_lock(path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise RuntimeError("release lock hash mismatch")
+    return json.loads(raw)
+
+
+def bind_siblings(lock):
+    """Execute install_relayer.py (and through it install_guardian.py) only when both match the lock."""
+    global r
+    path = Path(__file__).with_name("install_relayer.py")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != lock["tool_sha256"]["install_relayer.py"]:
+        raise RuntimeError("reviewed install_relayer.py sibling hash mismatch")
+    module = types.ModuleType("relayer_install_files")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    module.bind_helper(lock)
+    r = module
+    return module
 
 
 def password_from_env(path, variable):
@@ -91,6 +113,8 @@ def prepare(env_file, variable, output, apply=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--release-lock", type=Path, required=True)
+    parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--variable", default="WALLET_PASSWORD")
     parser.add_argument("--output", type=Path, required=True)
@@ -98,6 +122,7 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
+        bind_siblings(read_release_lock(args.release_lock, args.release_lock_sha256))
         print(json.dumps(prepare(args.env_file, args.variable, args.output, args.apply), sort_keys=True))
     except Exception:
         raise SystemExit("Relayer credential preparation failed; details withheld; source unchanged") from None

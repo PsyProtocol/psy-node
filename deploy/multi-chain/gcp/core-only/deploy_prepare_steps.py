@@ -27,6 +27,8 @@ GIB = 1024 ** 3
 MIN_BUILD_FREE_BYTES = 30 * GIB
 # A host receives one package of a few hundred MB plus logs; database hosts are rebuilt whole.
 MIN_HOST_FREE_BYTES = 5 * GIB
+# The signer host only receives the L1 bundle (about 0.7 GiB at its peak) and keeps no database.
+MIN_SIGNER_FREE_BYTES = 2 * GIB
 MAX_BUILD_ATTEMPTS = 20
 PREFLIGHT_TIMEOUT_SECONDS = 600
 BUILD_TIMEOUT_SECONDS = 3 * 3600
@@ -38,7 +40,9 @@ GAS_BUDGET_FIELDS = ("maxGasPriceWei", "maxTotalGas", "maxNativeSpendWei")
 SIGNER_CONFIG_PATH = "/etc/parth"
 SIGNER_KEYSTORE_PATH = "/var/lib/parth/.psy/keystore"
 SIGNER_KEYSTORE_FILE = SIGNER_KEYSTORE_PATH + "/bridge-relayer-dev"
-STATUS_ARGV = ["/usr/bin/python3", "-I", "-B", "/dev/stdin", "status", "--rpc-preference", "protected-env-backup"]
+# The fallback URLs live in their own protected file; relayer.env holds only the wallet entry.
+STATUS_ARGV = ["/usr/bin/python3", "-I", "-B", "/dev/stdin", "status", "--rpc-preference", "protected-env-backup",
+               "--secret-env", fresh_l1.WALLET_ENV, "--secret-env", fresh_l1.FALLBACK_ENV]
 
 
 def require(condition, message):
@@ -298,7 +302,7 @@ def artifacts_verify(ctx):
         verified[label] = actual
     bundle_manifest = local_path(ctx, "files", "l1_bundle_manifest")
     require(bundle_manifest.name == "manifest.json", "l1_bundle_manifest must be the manifest.json of the bundle")
-    fresh_l1.verify_bundle(bundle_manifest.parent, ctx.lock["l1"]["bundle_sha256"])
+    fresh_l1.verify_bundle(bundle_manifest.parent, ctx.lock["l1"]["bundle_sha256"], ctx.lock["sources"]["contracts"])
     return {"verified": verified, "gas_budgets": {chain: gas_budget(ctx, chain)[1] for chain in release_lock.CHAINS}}
 
 
@@ -633,8 +637,9 @@ def probe_host(ctx, host, paths, failures):
     values, states = parse_probe(host, ctx.remote.run_script(host, probe_script(mode, paths), HOST_TIMEOUT_SECONDS),
                                  len(paths))
     free = int(values["avail"])
-    if free < MIN_HOST_FREE_BYTES:
-        failures.append(f"{host}: free disk {free // GIB} GiB below {MIN_HOST_FREE_BYTES // GIB} GiB")
+    needed = MIN_SIGNER_FREE_BYTES if host == ctx.lock["l1"]["signer_host"] else MIN_HOST_FREE_BYTES
+    if free < needed:
+        failures.append(f"{host}: free disk {free // GIB} GiB below {needed // GIB} GiB")
     if mode == "passwordless" and values.get("sudo") != "ok":
         failures.append(f"{host}: no-prompt sudo denied")
     unverified = 0

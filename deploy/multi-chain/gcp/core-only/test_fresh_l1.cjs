@@ -28,6 +28,7 @@ function fixture(network = "sepolia") {
     Bridge: { owner: async () => SIGNER,
       getTokenFlowConfig: async token => configs[Object.keys(tokens).find(n => tokens[n] === token)],
       getPauseFlags: async () => flags, totalWithdrawalAmount: async () => 0n,
+      depositBatchVerifier: async () => address(1), withdrawalClaimVerifier: async () => address(1),
       pendingDepositCount: async () => 0n, provedDepositCount: async () => 0n,
       depositRoot: async () => "0xd65af5933a094e8329332a714327ba72b1e4dac93c0cde8ee479b9bb36c3fc43" },
     StateManager: { lastFinalizedCheckpointId: async () => 0n, checkpointTreeRootsClean: async () => true },
@@ -42,13 +43,13 @@ function fixture(network = "sepolia") {
     contracts.StateManager[method] = async () => HASHZERO;
   }
   const hre = {
-    artifacts: { readArtifact: async () => ({ abi: [
+    artifacts: { readArtifact: async () => ({ deployedBytecode: "0x6001", abi: [
       ["l1ToL2Token", "address", "bytes32"], ["l2ToL1Token", "bytes32", "address"],
       ["isTokenMapped", "address", "bool"],
     ].map(([name, input, output]) => ({ type: "function", name, stateMutability: "view",
       inputs: [{ type: input }], outputs: [{ type: output }] })) }) },
     ethers: { constants: { AddressZero: ZERO, HashZero: HASHZERO }, getContractAt: async name => contracts[name],
-      provider: { getBlockNumber: async () => 123 } },
+      provider: { getBlockNumber: async () => 123, getCode: async () => "0x6001" } },
     run: async (task, args) => { events.push(args.tags || "full"); },
     deployments: {
       get: async name => ({ address: ({ PsyToken: tokens.PSY, USDTToken: tokens.pUSDT, ExecutorWithTimelock: address(9) })[name] || address(1) }),
@@ -89,6 +90,25 @@ test("pause readback failure stops before gateways", async t => {
   f.setFlags([0, 0, 0]);
   await assert.rejects(runner.deployPhases(f.hre, { pause_deposits: true, policy: approved.networks.sepolia }, temporary(t), "sepolia"));
   assert.ok(!f.events.includes("gateways"));
+});
+
+test("readback records the four verifiers and compares bytecode and Bridge wiring", async () => {
+  const f = fixture();
+  const readback = await runner.verifyReadback(f.hre, approved.networks.sepolia, tokens);
+  assert.deepEqual(Object.keys(readback.verifiers), ["ZKVerifier", "DepositBatchVerifier", "WithdrawalClaimVerifier", "RewardClaimVerifier"]);
+  for (const row of Object.values(readback.verifiers)) {
+    assert.match(row.address, /^0x[0-9a-f]{40}$/);
+    assert.match(row.code_sha256, /^[0-9a-f]{64}$/);
+  }
+  const wrongCode = fixture();
+  wrongCode.hre.ethers.provider.getCode = async () => "0x6002";
+  await assert.rejects(runner.verifyReadback(wrongCode.hre, approved.networks.sepolia, tokens), /on-chain bytecode differs/);
+  const empty = fixture();
+  empty.hre.ethers.provider.getCode = async () => "0x";
+  await assert.rejects(runner.verifyReadback(empty.hre, approved.networks.sepolia, tokens), /on-chain bytecode differs/);
+  const unwired = fixture();
+  unwired.contracts.Bridge.withdrawalClaimVerifier = async () => address(7);
+  await assert.rejects(runner.verifyReadback(unwired.hre, approved.networks.sepolia, tokens), /Bridge withdrawalClaimVerifier is not the deployed/);
 });
 
 test("deposit token policy rejects native admission", async () => {
