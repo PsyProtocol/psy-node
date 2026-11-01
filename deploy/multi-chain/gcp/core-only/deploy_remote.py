@@ -305,6 +305,14 @@ class Remote:
         argv = ["ssh", *self._connection(host_access), host_access["ssh"], "/usr/bin/bash", "-s"]
         return self._run(host, argv, stdin=script.encode(), timeout=timeout_seconds, **options)
 
+    def tunnel_argv(self, host, forwards):
+        """argv of an ssh that forwards local loopback ports to loopback ports on the host: [(local, remote), ...]."""
+        host_access = self._access_of(host)
+        argv = ["ssh", *self._connection(host_access), "-N", "-o", "ExitOnForwardFailure=yes"]
+        for local, remote in forwards:
+            argv += ["-L", f"127.0.0.1:{local}:127.0.0.1:{remote}"]
+        return [*argv, host_access["ssh"]]
+
     def run_script(self, host, script, timeout_seconds):
         return self._run_script_bytes(host, script, timeout_seconds).decode("utf-8", errors="replace")
 

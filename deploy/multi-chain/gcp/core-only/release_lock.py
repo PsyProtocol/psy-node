@@ -30,7 +30,7 @@ CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
 ENVIO_PATCHES = ("history.py", "polling.py", "ordered.py", "reorg.py", "deposit-indexes.py")
 GROTH16_VERIFIERS = ("gnark_groth16_verifier", "deposit_batch_verifier", "withdrawal_claim_verifier")
 # Every file that is loaded or executed on a remote host, keyed by file name in this directory.
-TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "caddy_ingress.py",
+TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "admin_pause.py", "caddy_ingress.py",
               "clear_host_state.py",
               "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_envio.py",
               "install_guardian.py", "install_host.py", "install_relayer.py", "install_services.py",
