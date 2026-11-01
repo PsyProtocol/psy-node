@@ -392,6 +392,24 @@ def services_alias(placement):
     return next(alias for alias, group in placement["groups"].items() if "services" in group["roles"])
 
 
+ED25519_BLOB = re.compile(r"AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")
+
+
+def host_key_blob(value):
+    """The base64 blob of an ssh-ed25519 host key; the indexer mirror writes the type itself, so a typed value is unwrapped."""
+    words = value.split() if isinstance(value, str) else []
+    if len(words) == 2 and words[0] == "ssh-ed25519":
+        words = words[1:]
+    if len(words) != 1 or not ED25519_BLOB.fullmatch(words[0]):
+        raise ValueError("mirror host key must be an ssh-ed25519 key, either the base64 blob or 'ssh-ed25519 <blob>'")
+    return words[0]
+
+
+def mirror_sources(sources, keys):
+    return {name: {"host": row["host"], "host_key": host_key_blob(keys[row["host"]]), "roles": row["roles"]}
+            for name, row in sources.items()}
+
+
 def services_check(ctx):
     for tool in ("install_services.py", "activate_services.py", "indexer_backup_mirror.py"):
         prepare.check_tool_hash(ctx, tool)
@@ -401,6 +419,7 @@ def services_check(ctx):
     sources = read_placement(ctx)["mirror_sources"]
     prepare.require(isinstance(keys, dict) and all(isinstance(keys.get(row["host"]), str) for row in sources.values()),
                     "local-inputs packages.services.mirror_host_keys must hold a host key for every mirror source")
+    mirror_sources(sources, keys)
     database_login(ctx)
     prepare.require(hasura_status(ctx) == 200, "Hasura is not healthy; start Envio first")
 
@@ -482,9 +501,7 @@ def mirror_name(ctx):
 def mirror_config(ctx, placement):
     keys = prepare.local_value(ctx, "packages", "services")["mirror_host_keys"]
     reader = next(group["host"] for group in placement["groups"].values() if any(role.startswith("realm") for role in group["roles"]))
-    sources = {name: {"host": row["host"], "host_key": keys[row["host"]], "roles": row["roles"]}
-               for name, row in placement["mirror_sources"].items()}
-    return reader, bridge.encode({"reader": reader, "sources": sources})
+    return reader, bridge.encode({"reader": reader, "sources": mirror_sources(placement["mirror_sources"], keys)})
 
 
 def stage_mirror(ctx, alias, config_raw):

@@ -257,6 +257,25 @@ class PackageSetTests(unittest.TestCase):
             bridge.check_envio_build(built, self.world.lock)
 
 
+class MirrorHostKeyTests(unittest.TestCase):
+    BLOB = "AAAAC3NzaC1lZDI1NTE5AAAAI" + "A" * 43
+
+    def test_blob_and_typed_forms_both_become_the_blob(self):
+        self.assertEqual(steps.host_key_blob(self.BLOB), self.BLOB)
+        self.assertEqual(steps.host_key_blob("ssh-ed25519 " + self.BLOB + "\n"), self.BLOB)
+
+    def test_other_shapes_are_refused(self):
+        for value in ("k1", "", "ssh-rsa " + self.BLOB, "ssh-ed25519 ssh-ed25519 " + self.BLOB, self.BLOB + " comment", 7):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "host key"):
+                steps.host_key_blob(value)
+
+    def test_known_hosts_line_does_not_double_the_type(self):
+        sources = {"a": {"host": "10.0.0.25", "roles": ["coordinator"]}}
+        keys = {"10.0.0.25": "ssh-ed25519 " + self.BLOB}
+        row = steps.mirror_sources(sources, keys)["a"]
+        self.assertEqual(f"{row['host']} ssh-ed25519 {row['host_key']}", f"10.0.0.25 ssh-ed25519 {self.BLOB}")
+
+
 class VerifyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
