@@ -12,7 +12,7 @@ import tomllib
 
 import release_lock
 from release_lock import require
-from deploy_remote import OperatorPending, Step, redact_tail, wait_until
+from deploy_remote import OperatorPending, Step, redact_tail, run_operator_command, wait_until
 
 
 HERE = Path(__file__).resolve().parent
@@ -356,9 +356,10 @@ def adapter_failure(mode, run):
 
 
 def install_commands(stdout):
-    """The per-host installation commands the adapter printed for the offsite hosts."""
+    """(host, command) for each offsite install the adapter printed; the command runs on that host."""
     marker = "[monitoring] user action: "
-    return [line.removeprefix(marker).strip() for line in stdout.splitlines() if line.startswith(marker)]
+    rows = [line.removeprefix(marker).strip().split(None, 1) for line in stdout.splitlines() if line.startswith(marker)]
+    return [(host, command) for host, command in rows]
 
 
 def evaluate_status(status, hosts, chain_indexes, now_ms):
@@ -399,10 +400,11 @@ def monitoring_apply(ctx):
         return
     run = run_adapter(ctx, "--apply", work)
     if run.returncode == EXIT_PENDING:
-        commands = install_commands(run.stdout)
-        offsite = [line.split()[0] for line in (work / "hosts").read_text().splitlines() if line.split()[1] == "offsite"]
-        raise OperatorPending(offsite[0] if offsite else CONTROLLER_HOST, "; ".join(commands),
-                              str(ctx.run_dir / "deploy_monitoring.json"))
+        waiting = [(host, command) for host, command in install_commands(run.stdout)
+                   if not run_operator_command(ctx.remote, host, command)]
+        if waiting:
+            raise OperatorPending(waiting[0][0], waiting[0][1], str(ctx.run_dir / "deploy_monitoring.json"))
+        return
     if run.returncode != 0:
         raise RuntimeError(adapter_failure("--apply", run))
 

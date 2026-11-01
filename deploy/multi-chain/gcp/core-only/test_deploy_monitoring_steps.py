@@ -121,15 +121,22 @@ class FakeRemote:
     def __init__(self, units_by_host=None, state_manager="0x" + "ab" * 20, status=None, operator=()):
         self.units_by_host, self.state_manager, self.status = units_by_host or {}, state_manager, status
         self.operator, self.calls = set(operator), []
+        self.passwordless, self.ran = set(), []
 
     def missing_aliases(self, aliases):
         return []
+
+    def sudo_mode(self, host):
+        return "passwordless" if host in self.passwordless else "operator"
 
     def ssh_config(self):
         return "Host x\n"
 
     def run_script(self, host, script, timeout_seconds):
         self.calls.append((host, script))
+        if "install-collector.sh" in script:
+            self.ran.append((host, script))
+            return ""
         if "list-units" in script:
             return "".join(f"{unit} loaded active running {unit}\n" for unit in self.units_by_host.get(host, []))
         return json.dumps(self.status)
@@ -435,16 +442,40 @@ class StepTests(Fixture):
             return unittest.mock.Mock(returncode=next(outputs), stdout=stdout, stderr="")
         return run
 
-    def test_offsite_installation_is_pending_with_the_printed_commands(self):
-        printed = ("[monitoring] user action: ssh -t arc99x1 'cd ~/psy-notifier-install && sudo ./install-collector.sh'\n"
-                   "[monitoring] user action: ssh -t arc99x3 'cd ~/psy-notifier-install && sudo ./install-collector.sh'\n"
-                   "[monitoring] PENDING: cloud installed\n")
-        with unittest.mock.patch.object(steps, "run_adapter", self.adapter([1, 3], printed)):
+    PRINTED = ("[monitoring] user action: arc99x1 cd ~/psy-notifier-install && sudo ./install-collector.sh ./c ./c.toml ./c.service\n"
+               "[monitoring] user action: arc99x3 cd ~/psy-notifier-install && sudo ./install-collector.sh ./c ./c.toml ./c.service\n"
+               "[monitoring] PENDING: cloud installed\n")
+
+    def test_offsite_installation_is_pending_with_the_host_side_command(self):
+        with unittest.mock.patch.object(steps, "run_adapter", self.adapter([1, 3], self.PRINTED)):
             with self.assertRaises(OperatorPending) as raised:
                 steps.monitoring_apply(self.context(FakeRemote()))
         self.assertEqual(raised.exception.host, "arc99x1")
-        self.assertEqual(raised.exception.command.count("sudo ./install-collector.sh"), 2)
-        self.assertIn("ssh -t arc99x3", raised.exception.command)
+        self.assertTrue(raised.exception.command.startswith("cd ~/psy-notifier-install && sudo ./install-collector.sh"))
+        self.assertNotIn("ssh", raised.exception.command)
+
+    def test_adapter_prints_the_host_side_shape_the_step_parses(self):
+        script = (steps.ADAPTER.read_text())
+        line = next(row for row in script.splitlines() if "user action:" in row and "printf" in row)
+        self.assertNotIn("ssh -t", line)
+        self.assertEqual(steps.install_commands(self.PRINTED)[0][0], "arc99x1")
+        self.assertEqual(steps.install_commands("[monitoring] user action: h cd x && sudo y\n"), [("h", "cd x && sudo y")])
+
+    def test_passwordless_offsite_hosts_are_installed_through_the_remote(self):
+        remote = FakeRemote()
+        remote.passwordless = {"arc99x1", "arc99x3"}
+        with unittest.mock.patch.object(steps, "run_adapter", self.adapter([1, 3], self.PRINTED)):
+            steps.monitoring_apply(self.context(remote))
+        self.assertEqual([host for host, _ in remote.ran], ["arc99x1", "arc99x3"])
+
+    def test_only_the_hosts_without_passwordless_sudo_stay_pending(self):
+        remote = FakeRemote()
+        remote.passwordless = {"arc99x1"}
+        with unittest.mock.patch.object(steps, "run_adapter", self.adapter([1, 3], self.PRINTED)):
+            with self.assertRaises(OperatorPending) as raised:
+                steps.monitoring_apply(self.context(remote))
+        self.assertEqual(raised.exception.host, "arc99x3")
+        self.assertEqual([host for host, _ in remote.ran], ["arc99x1"])
 
     def test_ready_fleet_skips_installation(self):
         modes = []

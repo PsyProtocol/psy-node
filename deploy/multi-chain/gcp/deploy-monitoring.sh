@@ -133,7 +133,8 @@ if [[ "$mode" == --apply ]]; then
       --config "$(collector_config "$host")" \
       --controller-endpoint "$SENTINEL_CONTROLLER_OFFSITE_ENDPOINT" \
       --binary "$binaries/psy-notifier-collector"
-    printf "[monitoring] user action: ssh -t %s 'cd ~/psy-notifier-install && sudo ./install-collector.sh ./psy-notifier-collector ./collector.toml ./parth-sentinel-collector.service'\n" "$host"
+    # "<host> <command>": the command runs on that host, by ssh from step 85 or by the operator at its prompt.
+    printf '[monitoring] user action: %s cd ~/psy-notifier-install && sudo ./install-collector.sh ./psy-notifier-collector ./collector.toml ./parth-sentinel-collector.service\n' "$host"
   done
   echo '[monitoring] PENDING: cloud installed; offsite packages staged, not activated. Run --status after user installation.'
   exit 3
