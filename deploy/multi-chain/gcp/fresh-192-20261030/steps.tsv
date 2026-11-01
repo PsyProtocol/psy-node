@@ -1,0 +1,30 @@
+# ID<TAB>py:<step> or py-cutover:<step><TAB>description; py-cutover steps require both cutover confirmations
+50	py:verify_release	Verify the release lock, preflight and risk record
+51	py:rebuild_binaries	Rebuild the five CLIs and compare hashes
+52	py:verify_artifacts	Verify Genesis, config, contract bundle, setup and Services binaries
+53	py:prepare_packages	Prepare core, Worker, Proxy and Faucet packages
+54	py:plan_bridge_packages	Plan Guardian, Relayer, Services and Envio packages in pending mode
+55	py:check_hosts	Check SSH, disk, keystore, L1 balances and nonces
+60	py-cutover:fence_ingress	Fence public ingress with Caddy 503
+61	py-cutover:stop_services	Stop services on the cloud hosts
+62	py-cutover:stop_operator_hosts	Stop x1, x2 and x3 (operator, PENDING)
+63	py-cutover:clear_node_state	Clear node state
+64	py-cutover:rebuild_databases	Clear and rebuild the databases
+65	py-cutover:start_core	Start the 16 core units
+66	py-cutover:start_workers	Start the three Workers
+67	py-cutover:gate_l2_stability	Pass the L2 stability gate
+68	py-cutover:start_proxies	Start the x1 and x3 Proxies (operator, PENDING)
+69	py-cutover:deploy_l1	Deploy the three L1 chains
+70	py-cutover:prepare_bridge_packages	Package the bridge components with the real L1 documents
+71	py-cutover:start_guardians	Start the three Guardians
+72	py-cutover:start_envio	Start Envio and Hasura
+73	py-cutover:start_services	Start Services and the indexers
+74	py-cutover:start_relayer	Start the Relayer and wait for the first settlement
+75	py-cutover:open_ingress	Remove the L2, Proxy and Services maintenance routes and check each route; Faucet stays 503
+76	py-cutover:start_faucet	Start the Faucet on x2 (operator, PENDING), issue one private grant, then remove the Faucet maintenance route
+80	py:accept_entrypoints	Check the public entrypoints (step 18)
+81	py:accept_p2p_rotation	Accept P2P rotation and recovery
+82	py:accept_faucet_batch	Accept concurrent Faucet batches
+83	py:accept_five_withdrawals	Accept batch_append_withdrawals_5
+84	py:accept_three_chains	Accept all three chains; always restore the pause
+85	py:deploy_monitoring	Deploy monitoring
