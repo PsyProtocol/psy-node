@@ -339,6 +339,37 @@ class RemoteTests(unittest.TestCase):
             remote_with(FakeRunner(stdout=big)).read_text("inner", "/x")
 
 
+class LocalBashRunner:
+    """Runs the script an ssh call would feed to bash -s in a real local bash, so the command shape is exercised."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return subprocess.run(["/usr/bin/bash", "-s"], input=kwargs["input"], capture_output=True, timeout=30)
+
+
+class OperatorCommandTests(unittest.TestCase):
+    def test_passwordless_host_runs_the_command_in_a_real_bash(self):
+        marker = Path(KEY_DIR) / "ran"
+        command = f"echo hello | grep -q hello && touch {marker}"
+        self.assertTrue(deploy_remote.run_operator_command(remote_with(LocalBashRunner()), "inner", command))
+        self.assertTrue(marker.exists())
+
+    def test_a_failing_command_surfaces_instead_of_passing_as_pending(self):
+        with self.assertRaisesRegex(RemoteError, "exit 1"):
+            deploy_remote.run_operator_command(remote_with(LocalBashRunner()), "inner", "echo nope | grep -q yes && true")
+
+    def test_operator_host_is_left_to_a_human(self):
+        runner = LocalBashRunner()
+        self.assertFalse(deploy_remote.run_operator_command(remote_with(runner), "oper", "true"))
+        self.assertEqual(runner.calls, [])
+        with self.assertRaises(OperatorPending) as pending:
+            deploy_remote.settle_operator_command(remote_with(runner), "oper", "true", "/r.json", lambda: False)
+        self.assertEqual((pending.exception.host, pending.exception.result_path), ("oper", "/r.json"))
+
+
 class OperatorPendingTests(unittest.TestCase):
     def test_carries_fields_and_message(self):
         pending = OperatorPending("x1", "sudo /opt/i --sha256 abc", "/var/lib/r.json")

@@ -24,14 +24,27 @@ class FakeRemote:
         self.reports, self.copies, self.scripts, self.rpc = {}, [], [], []
         self.pids, self.restarts, self.answers, self.binary_hashes = {}, {}, {}, {}
         self.panicked = set()
+        self.activations = []
         self.copy_failure = None
 
     def missing_aliases(self, aliases):
         return []
 
+    sudo = "operator"
+
+    def sudo_mode(self, host):
+        return self.sudo
+
+    on_activate = None
+
     def run_script(self, host, script, timeout):
         self.scripts.append((host, script))
         role = next(name for name, alias in HOSTS.items() if alias == host)
+        if " activate " in script and "sha256sum -c -" in script:
+            self.activations.append(role)
+            if self.on_activate:
+                self.on_activate(role)
+            return ""
         if script.startswith("systemctl show"):
             return f"ActiveState=active\nMainPID={self.pids.get(role, 0)}\nNRestarts={self.restarts.get(role, 0)}\n"
         if "echo missing" in script:
@@ -89,6 +102,15 @@ class ProxyStepTests(base.PrepareTestCase):
         with self.assertRaises(OperatorPending) as raised:
             STEP.apply(self.ctx)
         return raised.exception
+
+    def test_passwordless_hosts_take_the_command_through_the_remote(self):
+        self.remote.sudo = "passwordless"
+        self.remote.on_activate = lambda role: self.remote.reports.__setitem__(role, self.good_report(role))
+        STEP.check(self.ctx)
+        STEP.apply(self.ctx)
+        self.assertEqual(self.remote.activations, ["system", "user"])
+        STEP.apply(self.ctx)
+        self.assertEqual(self.remote.activations, ["system", "user"])
 
     def test_pending_command_contains_lock_hash(self):
         STEP.check(self.ctx)

@@ -24,9 +24,21 @@ class FakeRemote:
     def missing_aliases(self, aliases):
         return []
 
+    sudo = "operator"
+
+    def sudo_mode(self, host):
+        return self.sudo
+
+    on_activate = None
+
     def run_script(self, host, script, timeout):
         self.scripts.append((host, script))
         assert host == HOST
+        if " activate " in script and "sha256sum -c -" in script:
+            self.activations = getattr(self, "activations", 0) + 1
+            if self.on_activate:
+                self.on_activate()
+            return ""
         if script.startswith("systemctl show"):
             return f"ActiveState={self.state}\nMainPID={self.pid}\nNRestarts=3\n"
         if "echo missing" in script:
@@ -106,6 +118,21 @@ class FaucetStepTests(base.PrepareTestCase):
 
     def progress(self):
         return json.loads((self.ws.state_dir / "start_faucet.json").read_text())
+
+    def test_passwordless_host_runs_the_command_through_the_remote_instead_of_pending(self):
+        self.remote.sudo = "passwordless"
+        self.remote.on_activate = lambda: setattr(self.remote, "report", self.good_report())
+        STEP.check(self.ctx)
+        STEP.apply(self.ctx)
+        self.assertEqual(self.remote.activations, 1)
+        self.assertEqual(self.progress()["validated"]["pid"], 4321)
+        STEP.apply(self.ctx)
+        self.assertEqual(self.remote.activations, 1)
+
+    def test_passwordless_host_whose_command_leaves_no_report_fails_loudly(self):
+        self.remote.sudo = "passwordless"
+        with self.assertRaisesRegex(RuntimeError, "ran but its result is not valid"):
+            STEP.apply(self.ctx)
 
     def test_pending_until_operator_result(self):
         STEP.check(self.ctx)

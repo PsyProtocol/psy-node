@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 import release_lock
 from deploy_prepare_steps import PROXY_ROLES, check_tool_hash, file_sha256, read_state, require, write_state
-from deploy_remote import OperatorPending, RemoteConnectionError, RemoteError, Step, wait_until
+from deploy_remote import RemoteConnectionError, RemoteError, Step, settle_operator_command, wait_until
 
 PROXY_HOSTS = {"system": "arc99x1", "user": "arc99x3"}
 STATE_NAME = "start_proxies"
@@ -187,15 +187,20 @@ def settle_host(ctx, role, progress):
         request = progress["requests"][role] = {"nonce": secrets.token_hex(32)}
         write_state(ctx, STATE_NAME, progress)
     digest = request_digest(ctx, role, request["nonce"])
-    try:
-        document = read_report(ctx, role)
-        if document is not None:
+
+    def is_settled():
+        try:
+            document = read_report(ctx, role)
+            if document is None:
+                return False
             progress["validated"][role] = validate_report(ctx, role, document, digest)
             write_state(ctx, STATE_NAME, progress)
-            return
-    except ReportRejected as rejected:
-        print(f"[deploy] activation report refused: {rejected}")
-    raise OperatorPending(PROXY_HOSTS[role], operator_command(ctx, role, digest), report_path(ctx, role))
+            return True
+        except ReportRejected as rejected:
+            print(f"[deploy] activation report refused: {rejected}")
+            return False
+    settle_operator_command(ctx.remote, PROXY_HOSTS[role], operator_command(ctx, role, digest), report_path(ctx, role),
+                            is_settled)
 
 
 def recheck_validated(ctx, role, record):

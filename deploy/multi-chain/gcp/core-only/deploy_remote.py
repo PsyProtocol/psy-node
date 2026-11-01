@@ -162,6 +162,28 @@ class Step:
     cutover: bool = False
 
 
+OPERATOR_COMMAND_SECONDS = 1800
+
+
+def run_operator_command(remote, host, command, timeout_seconds=OPERATOR_COMMAND_SECONDS):
+    """Run an operator command through ssh when the host has no-prompt sudo; False means a human has to run it."""
+    if remote.sudo_mode(host) != "passwordless":
+        return False
+    remote.run_script(host, "set -euo pipefail\n" + command + "\n", timeout_seconds)
+    return True
+
+
+def settle_operator_command(remote, host, command, result_path, is_settled):
+    """Done when is_settled(); otherwise run the command here on a passwordless host, or ask the operator for it."""
+    if is_settled():
+        return
+    if run_operator_command(remote, host, command):
+        if not is_settled():
+            raise RuntimeError(f"{host}: the operator command ran but its result is not valid")
+        return
+    raise OperatorPending(host, command, result_path)
+
+
 def wait_until(is_ready, read_failure, poll_seconds, timeout_seconds, label):
     if not (isinstance(poll_seconds, int) and 1 <= poll_seconds <= MAX_POLL_SECONDS):
         raise ValueError(f"poll_seconds must be 1..{MAX_POLL_SECONDS}")

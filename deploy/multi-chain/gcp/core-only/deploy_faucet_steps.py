@@ -17,7 +17,7 @@ import shlex
 import release_lock
 from deploy_prepare_steps import (check_tool_hash, faucet_host, file_sha256, local_inputs, read_state, require,
                                   write_state)
-from deploy_remote import OperatorPending, RemoteConnectionError, RemoteError, Step, wait_until
+from deploy_remote import RemoteConnectionError, RemoteError, settle_operator_command, Step, wait_until
 
 STATE_NAME = "start_faucet"
 STAGE_ROOT = "/var/tmp"
@@ -203,15 +203,19 @@ def settle_host(ctx, progress):
         progress["request"] = {"nonce": secrets.token_hex(32)}
         write_state(ctx, STATE_NAME, progress)
     digest = request_digest(ctx, progress["request"]["nonce"])
-    try:
-        document = read_report(ctx)
-        if document is not None:
+
+    def is_settled():
+        try:
+            document = read_report(ctx)
+            if document is None:
+                return False
             progress["validated"] = validate_report(ctx, document, digest)
             write_state(ctx, STATE_NAME, progress)
-            return
-    except ReportRejected as rejected:
-        print(f"[deploy] activation report refused: {rejected}")
-    raise OperatorPending(faucet_host(ctx), operator_command(ctx, digest), report_path(ctx))
+            return True
+        except ReportRejected as rejected:
+            print(f"[deploy] activation report refused: {rejected}")
+            return False
+    settle_operator_command(ctx.remote, faucet_host(ctx), operator_command(ctx, digest), report_path(ctx), is_settled)
 
 
 def rpc_call(ctx, body, timeout):
