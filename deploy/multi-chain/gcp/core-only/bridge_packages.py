@@ -244,7 +244,7 @@ def check_envio_build(built, lock):
     """The build script's output must carry its own verified evidence; the installer repeats this on the host."""
     build_path = built / "build.json"
     prepare.require(build_path.is_file(), "the Envio build produced no build.json")
-    build = release_lock.read_document(build_path)
+    build = release_lock.parse(build_path.read_bytes())  # lists every file, so it exceeds the document size cap
     flags = ("frozen_install_verified", "patches_verified", "native_help_verified", "generated_config_verified")
     prepare.require(build.get("source_commit") == lock["sources"]["runtime"] and build.get("node_sha256") == lock["envio"]["node_sha256"]
                     and all(build.get(flag) is True for flag in flags), "the Envio build is not verified against the lock")
