@@ -248,6 +248,26 @@ class ThreeChainTests(World):
         self.assertTrue(state["unverified"]["reward_claim"].startswith("unverified"))
         self.assertIsNone(find_secret(state))
 
+    def test_a_rerun_after_a_settle_timeout_withdraws_nothing_again(self):
+        sent = []
+        self.patch(withdraw_one=lambda *a, **k: sent.append((a[3], k["nonce"])))
+        outcomes = iter([TimeoutError("not settled")] + [None] * 10)
+
+        def wait_balance(*args):
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+        self.patch(wait_balance=wait_balance)
+        with self.assertRaises(TimeoutError):
+            steps.three_chains_apply(self.ctx)
+        first = list(sent)
+        self.assertEqual([chain for chain, _ in first], ["sepolia"])
+        steps.three_chains_apply(self.ctx)
+        self.assertEqual(sent[0], first[0], "the recorded withdrawal is not sent again")
+        self.assertEqual([chain for chain, _ in sent], list(CHAINS))
+        claims = [event for event in self.events if event[0] == "claim"]
+        self.assertEqual(len(claims), 3, "a claimed deposit is not claimed again")
+
     def test_a_rerun_after_a_finished_chain_does_not_deposit_again(self):
         steps.three_chains_apply(self.ctx)
         self.events.clear()
@@ -300,6 +320,56 @@ class FiveWithdrawalTests(World):
         self.assertEqual(self.events and [e for e in self.events if e[0] == "deposit"], [], "the five deposits are not repeated")
         self.assertEqual(steps.five_verify(self.ctx)["batch_5_lines"], 1)
 
+    def test_any_quarantine_line_fails_the_five_withdrawals_and_the_record_never_passes(self):
+        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        self.remote.journals[("relayer.service", "quarantining withdrawal")] = "quarantining withdrawal event 9\n"
+        with self.assertRaisesRegex(ValueError, "1 quarantining withdrawal line"):
+            steps.five_apply(self.ctx)
+        self.assertNotIn("settled", json.loads((self.state / "accept_five_withdrawals.json").read_text()))
+        self.put_state("accept_five_withdrawals", settled={"batch_5_lines": 1, "quarantine_lines": 3})
+        with self.assertRaisesRegex(ValueError, "quarantine line was recorded"):
+            steps.five_verify(self.ctx)
+
+    def test_a_rerun_after_a_settle_timeout_reuses_the_recorded_withdrawals_and_baseline(self):
+        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        sent, balances = [], iter([1000, 9999, 9999, 9999])
+        self.patch(withdraw_one=lambda *a, **k: sent.append((a[5], k["nonce"])))
+        waits = iter([TimeoutError("not settled"), None])
+        self.patch(wait_balance=lambda *a: self.wait_or_raise(waits, a))
+        with unittest.mock.patch.object(ac, "read_balance", lambda *a: next(balances)):
+            with self.assertRaises(TimeoutError):
+                steps.five_apply(self.ctx)
+            first = list(sent)
+            steps.five_apply(self.ctx)
+        self.assertEqual(sent, first, "no second withdrawal and no fresh nonce")
+        state = json.loads((self.state / "accept_five_withdrawals.json").read_text())
+        self.assertEqual(state["withdrawal"]["baseline"], 1000)
+        self.assertEqual(len(first), 5)
+        self.assertEqual(len({nonce for _, nonce in first}), 5)
+
+    def test_a_failed_withdrawal_is_resent_with_its_own_nonce_and_the_others_are_not(self):
+        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        sent, fail = [], {"five-u03"}
+
+        def withdraw(*a, **k):
+            if a[5] in fail:
+                raise RuntimeError("cli failed")
+            sent.append((a[5], k["nonce"]))
+        self.patch(withdraw_one=withdraw)
+        with self.assertRaisesRegex(RuntimeError, "cli failed"):
+            steps.five_apply(self.ctx)
+        nonce = json.loads((self.state / "accept_five_withdrawals.json").read_text())["withdrawal"]["nonces"]["u03"]
+        fail.clear()
+        steps.five_apply(self.ctx)
+        self.assertEqual(len(sent), 5)
+        self.assertEqual([n for label, n in sent if label == "five-u03"], [nonce])
+
+    @staticmethod
+    def wait_or_raise(waits, args):
+        outcome = next(waits)
+        if outcome is not None:
+            raise outcome
+
     def test_the_five_users_are_claimed_at_consecutive_deposit_indexes(self):
         self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
         steps.five_apply(self.ctx)
@@ -327,12 +397,54 @@ class PsyWithdrawalTests(World):
         self.assertEqual(report["address_from_documents"], "0x" + "9" * 40)
 
 
-class OpenDepositTests(World):
+class PsyQuarantineTests(World):
     def setUp(self):
         super().setUp()
-        for name in ("accept_entrypoints", "accept_p2p_rotation", "accept_faucet_batch", "accept_five_withdrawals", "accept_three_chains",
-                     "accept_psy_withdrawal"):
-            self.put_state(name)
+        self.docs = documents()
+        self.put_state("accept_faucet_batch", burst={})
+        self.patch(user_check=lambda ctx: None, l1_documents=lambda ctx: self.docs,
+                   driver_env=lambda ctx, d: {"E2E_WALLET_ADDRESS": ADDRESS, "E2E_WORK_DIR": str(self.work)},
+                   ensure_user=lambda ctx, env, name: {"name": name, "id": 1, "key": Path("/k")},
+                   withdraw_one=lambda *a, **k: self.events.append(("withdraw", k["nonce"])), wait_balance=lambda *a: None)
+        for name, value in (("read_balance", lambda *a: 5), ("gateway_tunnel", unittest.mock.MagicMock())):
+            patcher = unittest.mock.patch.object(ac, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_three_quarantine_lines_fail_the_psy_withdrawal(self):
+        self.remote.journals[("relayer.service", "quarantining withdrawal")] = "q 1\nq 2\nq 3\n"
+        with self.assertRaisesRegex(ValueError, "3 quarantining withdrawal line"):
+            steps.psy_apply(self.ctx)
+        self.assertNotIn("settled", json.loads((self.state / "accept_psy_withdrawal.json").read_text()))
+        self.put_state("accept_psy_withdrawal", settled={"quarantine_lines": 3})
+        with self.assertRaisesRegex(ValueError, "quarantine line was recorded"):
+            steps.psy_verify(self.ctx)
+
+    def test_a_rerun_after_the_quarantine_failure_does_not_withdraw_again(self):
+        self.remote.journals[("relayer.service", "quarantining withdrawal")] = "q\n"
+        with self.assertRaises(ValueError):
+            steps.psy_apply(self.ctx)
+        with self.assertRaises(ValueError):
+            steps.psy_apply(self.ctx)
+        self.assertEqual(len([event for event in self.events if event[0] == "withdraw"]), 1)
+
+
+class OpenDepositTests(World):
+    def write_acceptance_records(self, **overrides):
+        records = {
+            "accept_entrypoints": {"checks": 25, "deferred": [], "head_age_seconds": {}},
+            "accept_p2p_rotation": {"restarted": {"0": {}, "1": {}}, "rotation": {}},
+            "accept_faucet_batch": {"burst": {"recipients": 10, "batches": 1}, "memory": {}},
+            "accept_five_withdrawals": {"settled": {"batch_5_lines": 1, "quarantine_lines": 0}},
+            "accept_three_chains": {"chains": {chain: {"settled": {"returned": 1}} for chain in CHAINS}},
+            "accept_psy_withdrawal": {"settled": {"quarantine_lines": 0}}}
+        records.update(overrides)
+        for name, fields in records.items():
+            self.put_state(name, **fields)
+
+    def setUp(self):
+        super().setUp()
+        self.write_acceptance_records()
         self.open = set()
 
         def admin(ctx, chain, target, execute):
@@ -367,6 +479,25 @@ class OpenDepositTests(World):
         self.patch(require_frontends_current=lambda ctx: None, prepare=SimpleNamespace(check_tool_hash=lambda ctx, name: None))
         with self.assertRaisesRegex(ValueError, "no recorded state for accept_five_withdrawals"):
             steps.open_check(self.ctx)
+
+    def test_open_runs_the_verify_of_each_step_so_partial_progress_does_not_pass(self):
+        self.patch(require_frontends_current=lambda ctx: None, prepare=SimpleNamespace(check_tool_hash=lambda ctx, name: None))
+        steps.open_check(self.ctx)
+        partial = {chain: ({"settled": {"returned": 1}} if chain == "sepolia" else {"deposit_index": 3, "window": "closed"}) for chain in CHAINS}
+        self.write_acceptance_records(accept_three_chains={"chains": partial})
+        with self.assertRaisesRegex(ValueError, "every chain must have settled"):
+            steps.open_check(self.ctx)
+        self.write_acceptance_records(accept_five_withdrawals={"first_index": 3, "window": "closed"})
+        with self.assertRaises(ValueError):
+            steps.open_check(self.ctx)
+        self.write_acceptance_records(accept_psy_withdrawal={"started": "now"})
+        with self.assertRaisesRegex(ValueError, "did not settle"):
+            steps.open_check(self.ctx)
+
+    def test_open_stays_possible_to_rerun_once_chains_are_open(self):
+        self.patch(require_frontends_current=lambda ctx: None, prepare=SimpleNamespace(check_tool_hash=lambda ctx, name: None))
+        self.open.update(CHAINS)
+        steps.open_check(self.ctx)
 
     def test_a_failed_readback_does_not_record_the_chain_as_open(self):
         bad = lambda ctx, chain, target, execute: {"ok": True, "flags": [[1, 0, 1]] * 3, "flagsBefore": [[1, 0, 1]] * 3}

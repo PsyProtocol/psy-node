@@ -429,10 +429,14 @@ def claim_one(ctx, env, chain, user, label, result, index, amount):
                result, index, amount, out)
 
 
-def withdraw_one(ctx, env, documents, chain, user, label, asset, amount, contract_id=None):
+def new_nonce():
+    return "0x" + secrets.token_hex(32)
+
+
+def withdraw_one(ctx, env, documents, chain, user, label, asset, amount, contract_id=None, nonce=None):
     result = work_dir(ctx) / "withdrawals" / f"{chain}-{label}.json"
     result.parent.mkdir(mode=0o700, exist_ok=True)
-    nonce = "0x" + secrets.token_hex(32)
+    nonce = nonce or new_nonce()
     args = [chain, ac.CHAIN_INDEX[chain], user["key"], asset, amount, env["E2E_WALLET_ADDRESS"], nonce, result]
     run_driver(env, "withdraw.sh", *args, *([contract_id] if contract_id is not None else []))
 
@@ -442,15 +446,54 @@ def wait_balance(chain, asset, wallet, wanted):
                f"{chain} L1 settlement")
 
 
-def settle_amount(ctx, env, documents, chain, user, label, amount, index):
+def withdrawal_plan(ctx, name, progress, holder, keys, read_baseline):
+    """Nonces and the L1 balance baseline are recorded before the first send, so a rerun reuses both."""
+    plan = holder.setdefault("withdrawal", {})
+    if "baseline" not in plan:
+        plan.update(baseline=read_baseline(), nonces={key: new_nonce() for key in keys}, sent=[])
+        write_state(ctx, name, progress)
+    return plan
+
+
+def send_withdrawals(ctx, name, progress, plan, send):
+    """Send every withdrawal not yet recorded as sent, in parallel, with its recorded nonce; successes are recorded
+    even when another one fails, and the first failure is raised."""
+    todo = [key for key in plan["nonces"] if key not in plan["sent"]]
+    first_error = None
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            futures = {key: pool.submit(send, key, plan["nonces"][key]) for key in todo}
+            for key, future in futures.items():
+                try:
+                    future.result()
+                    plan["sent"].append(key)
+                except Exception as error:
+                    first_error = first_error or error
+        write_state(ctx, name, progress)
+    if first_error is not None:
+        raise first_error
+
+
+def claim_recorded(ctx, name, progress, holder, key, claim):
+    claimed = holder.setdefault("claimed", [])
+    if key not in claimed:
+        claim()
+        claimed.append(key)
+        write_state(ctx, name, progress)
+
+
+def settle_amount(ctx, env, documents, chain, user, label, amount, index, progress, leg):
     """After a deposit: wait for the proof, claim on L2, withdraw half, wait for the L1 balance to return."""
     core, wallet = documents[chain]["core"], env["E2E_WALLET_ADDRESS"]
+    name = "accept_three_chains"
     wait_proved(chain, core["Bridge"], index)
-    claim_one(ctx, env, chain, user, label, work_dir(ctx) / "deposits" / f"{chain}-{label}.result.json", index, amount)
-    before = ac.read_balance(chain, core["USDTToken"], wallet)
-    withdraw_one(ctx, env, documents, chain, user, label, core["USDTToken"], amount // 2)
-    wait_balance(chain, core["USDTToken"], wallet, before + amount // 2)
-    return {"balance_before": before, "returned": amount // 2}
+    claim_recorded(ctx, name, progress, leg, label, lambda: claim_one(
+        ctx, env, chain, user, label, work_dir(ctx) / "deposits" / f"{chain}-{label}.result.json", index, amount))
+    plan = withdrawal_plan(ctx, name, progress, leg, [label], lambda: ac.read_balance(chain, core["USDTToken"], wallet))
+    send_withdrawals(ctx, name, progress, plan, lambda key, nonce: withdraw_one(
+        ctx, env, documents, chain, user, label, core["USDTToken"], amount // 2, nonce=nonce))
+    wait_balance(chain, core["USDTToken"], wallet, plan["baseline"] + amount // 2)
+    return {"balance_before": plan["baseline"], "returned": amount // 2}
 
 
 def three_chains_check(ctx):
@@ -479,16 +522,21 @@ def three_chains_apply(ctx):
                               lambda: deposit_once(ctx, env, documents, chain, user, "main", DEPOSIT_AMOUNT))
                 leg["window"] = "closed"
                 write_state(ctx, "accept_three_chains", progress)
-            leg["settled"] = settle_amount(ctx, env, documents, chain, user, "main", DEPOSIT_AMOUNT, leg["deposit_index"])
+            leg["settled"] = settle_amount(ctx, env, documents, chain, user, "main", DEPOSIT_AMOUNT, leg["deposit_index"], progress, leg)
             write_state(ctx, "accept_three_chains", progress)
     progress.update(skipped=SKIPPED, unverified=UNVERIFIED)
     write_state(ctx, "accept_three_chains", progress)
 
 
-def three_chains_verify(ctx):
+def three_chains_settled(ctx):
     state = recorded(ctx, "accept_three_chains")
-    require(sorted(state["chains"]) == sorted(release_lock.CHAINS) and all(row.get("settled") for row in state["chains"].values()),
+    require(sorted(state.get("chains", {})) == sorted(release_lock.CHAINS) and all(row.get("settled") for row in state["chains"].values()),
             "every chain must have settled a deposit and a withdrawal")
+    return state
+
+
+def three_chains_verify(ctx):
+    state = three_chains_settled(ctx)
     left = ac.unpaused_chains(ctx)
     require(not left, "deposits are open on " + ", ".join(left))
     return {"chains": {chain: row["settled"] for chain, row in state["chains"].items()}, "skipped": SKIPPED, "unverified": UNVERIFIED}
@@ -528,22 +576,28 @@ def five_apply(ctx):
             write_state(ctx, "accept_five_withdrawals", progress)
         wait_proved(chain, core["Bridge"], progress["first_index"] + len(users) - 1)
         for offset, user in enumerate(users):
-            claim_one(ctx, env, chain, user, f"five-{user['name']}", work_dir(ctx) / "deposits" / f"{chain}-five-{user['name']}.result.json",
-                      progress["first_index"] + offset, FIVE_DEPOSIT)
-        before = ac.read_balance(chain, core["USDTToken"], env["E2E_WALLET_ADDRESS"])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(users)) as pool:
-            list(pool.map(lambda user: withdraw_one(ctx, env, documents, chain, user, f"five-{user['name']}", core["USDTToken"], FIVE_WITHDRAW), users))
-        wait_balance(chain, core["USDTToken"], env["E2E_WALLET_ADDRESS"], before + FIVE_WITHDRAW * len(users))
+            claim_recorded(ctx, "accept_five_withdrawals", progress, progress, user["name"], lambda user=user, offset=offset: claim_one(
+                ctx, env, chain, user, f"five-{user['name']}", work_dir(ctx) / "deposits" / f"{chain}-five-{user['name']}.result.json",
+                progress["first_index"] + offset, FIVE_DEPOSIT))
+        wallet = env["E2E_WALLET_ADDRESS"]
+        plan = withdrawal_plan(ctx, "accept_five_withdrawals", progress, progress, [user["name"] for user in users],
+                               lambda: ac.read_balance(chain, core["USDTToken"], wallet))
+        by_name = {user["name"]: user for user in users}
+        send_withdrawals(ctx, "accept_five_withdrawals", progress, plan, lambda key, nonce: withdraw_one(
+            ctx, env, documents, chain, by_name[key], f"five-{key}", core["USDTToken"], FIVE_WITHDRAW, nonce=nonce))
+        wait_balance(chain, core["USDTToken"], wallet, plan["baseline"] + FIVE_WITHDRAW * len(users))
     batch = relayer_lines(ctx, "batch_append_withdrawals_5", started)
     require(batch, "the Relayer never resolved batch_append_withdrawals_5 for these withdrawals")
-    progress["settled"] = {"returned": FIVE_WITHDRAW * len(users), "batch_5_lines": len(batch),
-                           "quarantine_lines": len(relayer_lines(ctx, "quarantining withdrawal", started))}
+    quarantined = relayer_lines(ctx, "quarantining withdrawal", started)
+    require(not quarantined, f"the Relayer logged {len(quarantined)} quarantining withdrawal line(s) since the five withdrawals began")
+    progress["settled"] = {"returned": FIVE_WITHDRAW * len(users), "batch_5_lines": len(batch), "quarantine_lines": 0}
     write_state(ctx, "accept_five_withdrawals", progress)
 
 
 def five_verify(ctx):
     state = recorded(ctx, "accept_five_withdrawals")
     require(state.get("settled") and state["settled"]["batch_5_lines"] > 0, "the five-withdrawal batch was not recorded")
+    require(state["settled"].get("quarantine_lines") == 0, "a quarantine line was recorded for the five withdrawals")
     return state["settled"]
 
 
@@ -563,18 +617,22 @@ def psy_apply(ctx):
     user, chain = ensure_user(ctx, env, "u00"), "sepolia"
     psy = documents[chain]["core"]["PsyToken"]
     started = progress.setdefault("started", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+    wallet = env["E2E_WALLET_ADDRESS"]
     with ac.gateway_tunnel(ctx):
-        before = ac.read_balance(chain, psy, env["E2E_WALLET_ADDRESS"])
-        withdraw_one(ctx, env, documents, chain, user, "psy", psy, PSY_WITHDRAW_AMOUNT, contract_id=0)
-        wait_balance(chain, psy, env["E2E_WALLET_ADDRESS"], before + PSY_WITHDRAW_AMOUNT)
-    progress["settled"] = {"asset": "PSY", "amount": PSY_WITHDRAW_AMOUNT, "address_from_documents": psy.lower(),
-                           "quarantine_lines_in_window": len(relayer_lines(ctx, "quarantining withdrawal", started))}
+        plan = withdrawal_plan(ctx, "accept_psy_withdrawal", progress, progress, ["psy"], lambda: ac.read_balance(chain, psy, wallet))
+        send_withdrawals(ctx, "accept_psy_withdrawal", progress, plan, lambda key, nonce: withdraw_one(
+            ctx, env, documents, chain, user, "psy", psy, PSY_WITHDRAW_AMOUNT, contract_id=0, nonce=nonce))
+        wait_balance(chain, psy, wallet, plan["baseline"] + PSY_WITHDRAW_AMOUNT)
+    quarantined = relayer_lines(ctx, "quarantining withdrawal", started)
+    require(not quarantined, f"the Relayer logged {len(quarantined)} quarantining withdrawal line(s) since the PSY withdrawal began")
+    progress["settled"] = {"asset": "PSY", "amount": PSY_WITHDRAW_AMOUNT, "address_from_documents": psy.lower(), "quarantine_lines": 0}
     write_state(ctx, "accept_psy_withdrawal", progress)
 
 
 def psy_verify(ctx):
     state = recorded(ctx, "accept_psy_withdrawal")
     require(state.get("settled"), "the PSY withdrawal did not settle on L1")
+    require(state["settled"].get("quarantine_lines") == 0, "a quarantine line was recorded for the PSY withdrawal")
     return state["settled"]
 
 
@@ -583,9 +641,9 @@ def psy_verify(ctx):
 def open_check(ctx):
     require_frontends_current(ctx)
     prepare.check_tool_hash(ctx, "admin_pause.py")
-    for name in ("accept_entrypoints", "accept_p2p_rotation", "accept_faucet_batch", "accept_five_withdrawals", "accept_three_chains",
-                 "accept_psy_withdrawal"):
-        recorded(ctx, name)
+    # Opening needs every acceptance step to have finished, not merely to have written progress.
+    for verify in (entrypoints_verify, p2p_verify, faucet_verify, five_verify, three_chains_settled, psy_verify):
+        verify(ctx)
 
 
 def open_apply(ctx):
