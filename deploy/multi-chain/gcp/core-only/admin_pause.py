@@ -9,19 +9,22 @@ Run it as `python3 -I -B /dev/stdin --request-base64 B64 --request-sha256 HASH`,
 """
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
 import re
 import resource
 import shlex
+import signal
 import subprocess
 import sys
+import time
 
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 CHAINS = {"sepolia": 11155111, "bscTestnet": 97, "baseSepolia": 84532}
 FIELDS = {"chain", "target", "execute", "signer", "chain_id", "port", "bridge", "acl", "tokens", "keystore", "env_file", "node",
-          "ethers", "max_gas", "max_fee_gwei"}
+          "ethers", "max_gas", "max_fee_gwei", "lock_path", "lock_wait_seconds", "pending_polls", "pending_poll_ms"}
 PASSWORD_NAME = "WALLET_" + "PASSWORD"
 NODE_TIMEOUT_SECONDS = 300
 JS = r'''
@@ -32,6 +35,11 @@ let stage='input';
  stage='rpc'; const p=new ethers.providers.JsonRpcProvider('http://127.0.0.1:'+C.port);
  if(Number(BigInt(await p.send('eth_chainId',[])))!==C.chainId) throw Error('chain id');
  const rd=async(to,n,a=[])=>ABI.decodeFunctionResult(n,await p.call({to,data:ABI.encodeFunctionData(n,a)}));
+ const sleep=ms=>new Promise(x=>setTimeout(x,ms));
+ // Latest and pending nonce of the signer agree once nothing of ours is still in the pool; null when they never do.
+ const settled=async()=>{for(let i=0;i<C.pendingPolls;i++){const n=await p.getTransactionCount(ADMIN,'latest'); if(n===await p.getTransactionCount(ADMIN,'pending'))return n; await sleep(C.pendingPollMs);} return null;};
+ // A pause must act on the state after an earlier unpause that may still be in the pool has mined or been dropped.
+ stage='pending'; if(r.target===1&&await settled()===null) throw Error('signer has a pending transaction that did not settle');
  stage='baseline'; const flags=async()=>{const o=[];for(const t of C.tokens)o.push(Array.from(await rd(C.bridge,'getPauseFlags',[t]),Number));return o;};
  const before=await flags();
  if(r.target===1&&before.every(f=>f[0]===1&&f[1]===0&&f[2]===1)) {console.log(JSON.stringify({ok:true,flagsBefore:before,flags:before,broadcast:false}));return;}
@@ -44,8 +52,7 @@ let stage='input';
  const restoring=r.target===1;
  const price=(await p.getGasPrice()).mul(2); if(!restoring&&price.gt(ethers.utils.parseUnits(String(C.maxFeeGwei),'gwei'))) throw Error('fee above the cap');
  const gasLimit=gas.mul(125).div(100).add(5000);
- stage='nonce'; let nonce; for(let i=0;i<30;i++){nonce=await p.getTransactionCount(ADMIN,'latest'); if(nonce===await p.getTransactionCount(ADMIN,'pending'))break; await new Promise(x=>setTimeout(x,2000));}
- if(nonce!==await p.getTransactionCount(ADMIN,'pending')) throw Error('signer has a pending transaction');
+ stage='nonce'; const nonce=await settled(); if(nonce===null) throw Error('signer has a pending transaction');
  const bal=await p.getBalance(ADMIN); if(bal.lt(gasLimit.mul(price).mul(restoring?1:3))) throw Error('signer balance is low');
  const rep={estimate:gas.toString(),gasLimit:gasLimit.toString(),gasPrice:price.toString(),nonce,signerBalance:bal.toString()};
  if(!r.execute){console.log(JSON.stringify({ok:true,dry:true,flagsBefore:before,flags:before,broadcast:false,...rep}));return;}
@@ -80,7 +87,9 @@ def read_request(encoded, expected_sha256):
     require(type(request["port"]) is int and 1024 <= request["port"] <= 65535, "port out of range")
     require(type(request["max_gas"]) is int and request["max_gas"] > 0 and type(request["max_fee_gwei"]) is int and request["max_fee_gwei"] > 0,
             "gas ceiling and fee cap must be positive integers")
-    for name in ("keystore", "env_file", "node", "ethers"):
+    for name in ("lock_wait_seconds", "pending_polls", "pending_poll_ms"):
+        require(type(request[name]) is int and request[name] > 0, f"{name} must be a positive integer")
+    for name in ("keystore", "env_file", "node", "ethers", "lock_path"):
         require(isinstance(request[name], str) and request[name].startswith("/") and ".." not in request[name].split("/"),
                 f"{name} must be an absolute path")
     return request
@@ -99,16 +108,44 @@ def read_password(env_file):
 
 def run_node(request):
     config = {key: request[key] for key in ("signer", "port", "bridge", "acl", "tokens")}
-    config.update(chainId=request["chain_id"], maxGas=request["max_gas"], maxFeeGwei=request["max_fee_gwei"])
+    config.update(chainId=request["chain_id"], maxGas=request["max_gas"], maxFeeGwei=request["max_fee_gwei"],
+                  pendingPolls=request["pending_polls"], pendingPollMs=request["pending_poll_ms"])
     payload = {"cfg": config, "target": request["target"], "execute": request["execute"]}
     if request["execute"]:
         with open(request["keystore"]) as stream:
             payload.update(encrypted=stream.read(), password=read_password(request["env_file"]))
     process = subprocess.Popen([request["node"], "-e", JS], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/root", "ETHERS": request["ethers"]})
-    out, err = process.communicate(json.dumps(payload), timeout=NODE_TIMEOUT_SECONDS)
+                               text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/root", "ETHERS": request["ethers"]},
+                               start_new_session=True)
+    try:
+        out, err = process.communicate(json.dumps(payload), timeout=NODE_TIMEOUT_SECONDS)
+    finally:
+        # Whatever ends this process (timeout, TERM, a failure), the script must not outlive it and broadcast later.
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
     sys.stderr.write(err[-300:])
     return out.strip(), process.returncode
+
+
+def acquire_lock(path, wait_seconds, sleep=time.sleep, clock=time.monotonic):
+    """One pause run at a time on the host. An earlier run whose ssh client died may still be running; a later run
+    (the re-pause) waits for it to finish, then reads the state it left."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deadline = clock() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if clock() >= deadline:
+                os.close(descriptor)
+                raise ValueError("another pause run still holds the lock") from None
+            sleep(1)
+
+
+def end_on_signal(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 def main(argv=None, geteuid=os.geteuid):
@@ -119,7 +156,13 @@ def main(argv=None, geteuid=os.geteuid):
     try:
         require(geteuid() == 0, "root is required")
         request = read_request(args.request_base64, args.request_sha256)
-        out, code = run_node(request)
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, end_on_signal)
+        lock = acquire_lock(request["lock_path"], request["lock_wait_seconds"])
+        try:
+            out, code = run_node(request)
+        finally:
+            os.close(lock)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(json.dumps({"ok": False, "stage": "request", "msg": str(error)[:160]}))
         return 1

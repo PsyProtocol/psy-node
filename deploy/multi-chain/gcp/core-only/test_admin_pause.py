@@ -2,6 +2,8 @@
 import base64
 import contextlib
 import hashlib
+import os
+import time
 import io
 import json
 from pathlib import Path
@@ -16,12 +18,15 @@ import admin_pause as m
 
 HERE = Path(__file__).resolve().parent
 ADDRESS = "0x" + "ab" * 20
+LOCK_DIR = tempfile.mkdtemp()
+COUNTER = __import__("itertools").count()
 
 
 def request(**changes):
     value = {"chain": "sepolia", "target": 0, "execute": False, "signer": ADDRESS, "chain_id": 11155111, "port": 18545,
              "bridge": ADDRESS, "acl": ADDRESS, "tokens": [ADDRESS] * 3, "keystore": "/k/keystore", "env_file": "/k/env",
-             "node": "/n/node", "ethers": "/n/ethers", "max_gas": 300000, "max_fee_gwei": 5}
+             "node": "/n/node", "ethers": "/n/ethers", "max_gas": 300000, "max_fee_gwei": 5,
+             "lock_path": str(Path(LOCK_DIR) / f"lock-{next(COUNTER)}"), "lock_wait_seconds": 5, "pending_polls": 3, "pending_poll_ms": 1}
     value.update(changes)
     return value
 
@@ -33,8 +38,9 @@ def encode(value):
 
 class ValidationTests(unittest.TestCase):
     def test_a_valid_request_round_trips_and_a_wrong_hash_is_refused(self):
-        encoded, digest = encode(request())
-        self.assertEqual(m.read_request(encoded, digest), request())
+        value = request()
+        encoded, digest = encode(value)
+        self.assertEqual(m.read_request(encoded, digest), value)
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             m.read_request(encoded, "0" * 64)
 
@@ -130,7 +136,11 @@ exports.providers = { JsonRpcProvider: class {
   async send() { return '0x' + state.chainId.toString(16); }
   async call(tx) { if (tx.data.startsWith('getPauseFlags')) return JSON.stringify(state.flags[0]); if (tx.data.startsWith('isBridgeAdmin')) return JSON.stringify([true]); return '[]'; }
   async estimateGas() { return new N(state.gas); } async getGasPrice() { return new N(state.price); }
-  async getTransactionCount() { return 1; } async getBalance() { return new N(state.balance); }
+  async getTransactionCount(address, tag) {
+    if (tag === 'latest') { state.polls = (state.polls || 0) + 1;
+      if (state.pending > state.latest && state.mineAfter !== null && state.polls >= state.mineAfter) {
+        state.latest = state.pending; state.flags = state.flags.map(() => [0, 0, 0]); } return state.latest; }
+    return state.pending; } async getBalance() { return new N(state.balance); }
   async sendTransaction(raw) { const target = JSON.parse(raw).target; state.flags = state.flags.map(() => [target, 0, target]); }
   async waitForTransaction() { return { status: 1, blockNumber: 7, gasUsed: new N(50000), effectiveGasPrice: new N(state.price) }; } } };
 exports.Wallet = { fromEncryptedJson: async () => ({ address: state.signer,
@@ -142,7 +152,7 @@ exports.Wallet = { fromEncryptedJson: async () => ({ address: state.signer,
 class EmbeddedScriptTests(unittest.TestCase):
     """The embedded node script against a fake ethers module: fee cap and balance margin apply to opening only."""
 
-    def run_tool(self, target, price, balance):
+    def run_tool(self, target, price, balance, latest=1, pending=1, mine_after=None, flags=None):
         import os
         import shutil
         root = Path(tempfile.mkdtemp())
@@ -150,8 +160,9 @@ class EmbeddedScriptTests(unittest.TestCase):
         (root / "ethers.js").write_text(FAKE_ETHERS)
         (root / "env").write_text("export WALLET_PASSWORD=pw\n")
         (root / "keystore").write_text("{}")
-        flags = [[1, 0, 1]] * 3 if target == 0 else [[0, 0, 0]] * 3
-        chain = {"chainId": 11155111, "flags": flags, "gas": 55000, "price": price, "balance": balance, "signer": ADDRESS}
+        flags = flags or ([[1, 0, 1]] * 3 if target == 0 else [[0, 0, 0]] * 3)
+        chain = {"chainId": 11155111, "flags": flags, "gas": 55000, "price": price, "balance": balance, "signer": ADDRESS,
+                 "latest": latest, "pending": pending, "mineAfter": mine_after}
         os.environ["FAKE_CHAIN"], os.environ["FAKE_TARGET"] = json.dumps(chain), str(target)
         self.addCleanup(os.environ.pop, "FAKE_CHAIN")
         self.addCleanup(os.environ.pop, "FAKE_TARGET")
@@ -169,6 +180,21 @@ class EmbeddedScriptTests(unittest.TestCase):
             code = m.main(["--request-base64", encoded, "--request-sha256", digest], geteuid=lambda: 0)
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
+    def test_a_pause_waits_for_a_pending_unpause_that_mines_and_then_sends_the_pause(self):
+        code, report = self.run_tool(1, 10 ** 9, 10 ** 30, latest=5, pending=6, mine_after=2, flags=[[1, 0, 1]] * 3)
+        self.assertEqual((code, report["ok"], report["broadcast"]), (0, True, True))
+        self.assertEqual(report["flagsBefore"], [[0, 0, 0]] * 3, "the pause acted on the state after the unpause mined")
+        self.assertEqual(report["flags"], [[1, 0, 1]] * 3)
+
+    def test_a_pause_fails_when_a_pending_transaction_never_settles(self):
+        code, report = self.run_tool(1, 10 ** 9, 10 ** 30, latest=5, pending=6, mine_after=None, flags=[[1, 0, 1]] * 3)
+        self.assertEqual((code, report["ok"]), (1, False))
+        self.assertIn("pending transaction that did not settle", report["msg"])
+
+    def test_a_pause_with_nothing_pending_and_the_chain_paused_still_broadcasts_nothing(self):
+        code, report = self.run_tool(1, 10 ** 9, 10 ** 30, flags=[[1, 0, 1]] * 3)
+        self.assertEqual((code, report["ok"], report["broadcast"]), (0, True, False))
+
     HIGH_PRICE, LOW_BALANCE = 100 * 10 ** 9, 55000 * 2 * 100 * 10 ** 9 * 2
 
     def test_opening_is_refused_above_the_fee_cap(self):
@@ -185,6 +211,86 @@ class EmbeddedScriptTests(unittest.TestCase):
         code, report = self.run_tool(0, 10 ** 9, 55000 * 2 * 10 ** 9 * 2)
         self.assertEqual(code, 1)
         self.assertIn("balance is low", report["msg"])
+
+
+class LockAndSignalTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.env = self.root / "env"
+        self.env.write_text("export WALLET_PASSWORD=pw\n")
+        self.log = self.root / "log"
+        self.pids = self.root / "pids"
+
+    def stub(self, seconds):
+        node = self.root / f"node-{seconds}"
+        node.write_text("#!" + sys.executable + "\n" + (
+            "import json, os, sys, time\n"
+            f"open({str(self.log)!r}, 'a').write('start %f\\n' % time.time())\n"
+            f"open({str(self.pids)!r}, 'a').write(str(os.getpid()) + '\\n')\n"
+            f"time.sleep({seconds})\n"
+            f"open({str(self.log)!r}, 'a').write('end %f\\n' % time.time())\n"
+            "print(json.dumps({'ok': True}))\n"))
+        node.chmod(0o700)
+        return node
+
+    def encoded(self, node, lock, wait=20):
+        return encode(request(node=str(node), env_file=str(self.env), keystore=str(self.root / "k"), lock_path=str(lock),
+                              lock_wait_seconds=wait))
+
+    def child(self, node, lock, wait=20):
+        encoded, digest = self.encoded(node, lock, wait)
+        code = ("import sys; sys.path.insert(0, %r); import admin_pause as m; sys.exit(m.main(%r, geteuid=lambda: 0))"
+                % (str(HERE), ["--request-base64", encoded, "--request-sha256", digest]))
+        return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_a_later_run_waits_for_an_earlier_run_that_is_still_alive(self):
+        lock = self.root / "lock"
+        first = self.child(self.stub(2), lock)
+        deadline = time.time() + 10
+        while not self.log.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        second = self.child(self.stub(0), lock)
+        for process in (first, second):
+            out, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, out)
+        lines = [line.split() for line in self.log.read_text().splitlines()]
+        first_end = next(float(value) for kind, value in lines if kind == "end")
+        starts = [float(value) for kind, value in lines if kind == "start"]
+        self.assertGreaterEqual(starts[1], first_end, "the second run began only after the first had finished")
+
+    def test_a_run_that_cannot_get_the_lock_in_time_fails_without_starting_the_script(self):
+        lock = self.root / "lock"
+        first = self.child(self.stub(4), lock)
+        deadline = time.time() + 10
+        while not self.log.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        second = self.child(self.stub(0), lock, wait=1)
+        out, _ = second.communicate(timeout=30)
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("still holds the lock", out)
+        first.communicate(timeout=30)
+        self.assertEqual(len(self.pids.read_text().split()), 1, "the script ran once, for the first run only")
+
+    def test_a_terminated_run_takes_the_script_down_with_it(self):
+        lock = self.root / "lock"
+        process = self.child(self.stub(60), lock)
+        deadline = time.time() + 10
+        while not self.pids.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        node_pid = int(self.pids.read_text().split()[0])
+        process.terminate()
+        process.communicate(timeout=30)
+        for _ in range(100):
+            try:
+                os.kill(node_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(node_pid, 9)
+            self.fail("the node script outlived the terminated tool")
 
 
 if __name__ == "__main__":
