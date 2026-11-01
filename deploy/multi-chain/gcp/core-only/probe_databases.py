@@ -218,7 +218,9 @@ def probe_scylla(run=command):
     scylla_cql("DROP KEYSPACE psy_deploy_verify", run)
     if value not in readback:
         raise ProbeFailed("scylla read-back differs from the write")
-    user = sorted(name for name in scylla_cql("DESCRIBE KEYSPACES", run).split() if not name.startswith("system"))
+    # Scylla creates the audit keyspace itself on a fresh data directory.
+    user = sorted(name for name in scylla_cql("DESCRIBE KEYSPACES", run).split()
+                  if not name.startswith("system") and name != "audit")
     if user:
         raise ProbeFailed("old keyspaces are still present: " + ", ".join(user))
     return {"component": "scylla", "read_write": True, "user_keyspaces": user}
