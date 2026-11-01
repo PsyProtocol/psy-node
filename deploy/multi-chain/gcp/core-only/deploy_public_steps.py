@@ -26,6 +26,7 @@ from deploy_remote import OperatorPending, Step, redact_tail, wait_until
 TRUST_STATE = "publish_trust_setup"
 CONFIG_STATE = "publish_public_config"
 FRONTEND_STATE = "publish_frontends"
+PENDING_STATE = "publish_frontends_pending"
 UPLOAD_SECONDS = 7200
 INSTALL_SECONDS = 900
 LIVE_POLL_SECONDS = 15
@@ -385,14 +386,15 @@ def frontends_apply(ctx):
     if wallet is not None and not wallet_published(public, wallet[1]):
         commands.append(wallet_command(wallet[0], wallet[2], public, credentials_file))
     if commands and not frontends_allowed(ctx):
-        raise OperatorPending("local", "; ".join(commands), str(ctx.state_dir / f"{FRONTEND_STATE}.json"))
+        raise OperatorPending("local", "; ".join(commands), str(ctx.state_dir / f"{PENDING_STATE}.json"))
     if head != remote:
         git(repo, "push", "origin", f"HEAD:refs/heads/{branch}")
     if wallet is not None and not wallet_published(public, wallet[1]):
         run_wallet(wallet, public, cloudflare_credentials(ctx))
-    write_state(ctx, FRONTEND_STATE, {"lock_sha256": ctx.lock_sha256, "dapp_commit": head, "config_sha256": config["config_sha256"],
-                                      "wallet_commit": wallet[1] if wallet else None,
-                                      "deposits_paused_setting": next(iter(deposit_flags(repo, public).values()))})
+    (ctx.state_dir / f"{FRONTEND_STATE}.json").unlink(missing_ok=True)
+    write_state(ctx, PENDING_STATE, {"lock_sha256": ctx.lock_sha256, "dapp_commit": head, "config_sha256": config["config_sha256"],
+                                     "wallet_commit": wallet[1] if wallet else None,
+                                     "deposits_paused_setting": next(iter(deposit_flags(repo, public).values()))})
 
 
 def run_wallet(wallet, public, credentials):
@@ -432,19 +434,33 @@ def new_psy_addresses(documents):
     return {f"{chain}.PSY": document["protocol"]["tokens"]["PSY"]["l1Address"].lower() for chain, document in documents.items()}
 
 
+def check_live_frontends(ctx, public, config):
+    """What is served right now: the live config is the recorded one, every bundle site holds the new PSY addresses
+    (and, where flagged, none of the previous release's), every public site answers 200. Any network failure fails."""
+    _, live = live_config(public)
+    require(live and pr.sha256_bytes(live) == config["config_sha256"], "the live config is not the recorded one")
+    documents = l1_documents(ctx)
+    new = new_psy_addresses(documents)
+    checks = {site: pr.check_bundle(public["sites"][site], new, config["previous_addresses"] if flag else {})
+              for site, flag in public["bundle_sites"].items()}
+    served = {site: pr.fetch(url)[0] for site, url in public["sites"].items()}
+    require(all(code == 200 for code in served.values()), "a public site does not answer 200: " + json.dumps(served, sort_keys=True))
+    return checks, served
+
+
 def frontends_verify(ctx):
+    """Checks CI and the served sites; only a pass records the step as complete."""
     public = pr.read_public(ctx.release_dir)
-    recorded = read_recorded(ctx, FRONTEND_STATE)
+    pending = read_recorded(ctx, PENDING_STATE)
     config = read_recorded(ctx, CONFIG_STATE)
-    require(recorded["config_sha256"] == config["config_sha256"], "frontends were published for another config than the live one")
+    require(pending["config_sha256"] == config["config_sha256"], "frontends were published for another config than the live one")
     repo, branch = public_path(ctx, "dapp_checkout"), public["dapp"]["branch"]
     remote = git(repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0]
     shown = subprocess.run(["git", "-C", str(repo), "show", f"{remote}:{public['dapp']['l1_file']}"], capture_output=True,
                            timeout=GIT_SECONDS, check=False)
     require(shown.returncode == 0, "the pushed dapp branch has no config file")
-    committed = shown.stdout
     _, live = live_config(public)
-    require(pr.sha256_bytes(committed) == pr.sha256_bytes(live) == config["config_sha256"],
+    require(pr.sha256_bytes(shown.stdout) == pr.sha256_bytes(live) == config["config_sha256"],
             "the committed dapp config differs from the live config; CI builds from the live one")
     repository, verdict = repository_of(repo), {}
 
@@ -453,24 +469,22 @@ def frontends_verify(ctx):
         return verdict["value"] is True
     wait_until(settled, lambda: verdict.get("value") if isinstance(verdict.get("value"), str) else None, CI_POLL_SECONDS, CI_WAIT_SECONDS,
                "frontend workflows")
-    documents = l1_documents(ctx)
-    new = new_psy_addresses(documents)
-    checks = {site: pr.check_bundle(public["sites"][site], new, config["previous_addresses"] if flag else {})
-              for site, flag in public["bundle_sites"].items()}
-    served = {site: pr.fetch(url)[0] for site, url in public["sites"].items()}
-    require(all(code == 200 for code in served.values()), "a public site does not answer 200: " + json.dumps(served, sort_keys=True))
-    if recorded["wallet_commit"]:
-        require(wallet_published(public, recorded["wallet_commit"]), "the published wallet release is not the recorded commit")
+    checks, served = check_live_frontends(ctx, public, config)
+    if pending["wallet_commit"]:
+        require(wallet_published(public, pending["wallet_commit"]), "the published wallet release is not the recorded commit")
+    write_state(ctx, FRONTEND_STATE, dict(pending, dapp_commit=remote))
     return {"dapp_commit": remote, "workflows": public["workflows"], "bundles": checks, "sites": served,
-            "wallet_commit": recorded["wallet_commit"]}
+            "wallet_commit": pending["wallet_commit"]}
 
 
 def require_frontends_current(ctx):
-    """Acceptance and the release table refuse to continue unless step 79 recorded this lock and the live config."""
+    """Acceptance and the release table continue only when step 79 completed for this lock and the live sites still
+    serve this deployment; a network error is a refusal, never a pass."""
     recorded = read_recorded(ctx, FRONTEND_STATE)
     config = read_recorded(ctx, CONFIG_STATE)
     require(recorded.get("config_sha256") == config.get("config_sha256"),
             "the frontends were published for another config than the recorded live one; rerun step 79")
+    check_live_frontends(ctx, pr.read_public(ctx.release_dir), config)
 
 
 PUBLIC_STEPS = {

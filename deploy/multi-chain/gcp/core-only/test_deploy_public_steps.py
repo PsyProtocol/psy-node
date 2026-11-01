@@ -63,10 +63,20 @@ class PublicWorld(base.PrepareTestCase):
             self.addCleanup(patcher.stop)
         self.remote = FakeRemote()
         self.ctx = self.ws.context(self.remote)
-        patcher = unittest.mock.patch.object(steps, "wait_until", side_effect=lambda ready, failure, *a: (
-            self.assertIsNone(failure()), self.assertTrue(ready(), "wait_until condition not met")))
+        patcher = unittest.mock.patch.object(steps, "wait_until", side_effect=self.wait_once)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def wait_once(is_ready, read_failure, poll_seconds, timeout_seconds, label):
+        """The real wait_until with no sleeping: one look, then the same errors the real one raises."""
+        for _ in range(2):
+            failure = read_failure()
+            if failure:
+                raise RuntimeError(f"{label}: failed while waiting: {failure}")
+            if is_ready():
+                return
+        raise TimeoutError(f"{label}: not ready after {timeout_seconds}s")
 
     def write_documents(self, salt=""):
         chains = {}
@@ -429,8 +439,9 @@ class FrontendTests(PublicWorld):
         self.assertEqual(git("show", "deploy/testnet:deploy/common/public-l1-r3.json", cwd=self.origin).encode() + b"\n", self.config_raw)
         self.step.apply(self.ctx)
         self.assertEqual(self.remote_head(), pushed)
-        state = json.loads((self.ws.state_dir / "publish_frontends.json").read_text())
+        state = json.loads((self.ws.state_dir / "publish_frontends_pending.json").read_text())
         self.assertEqual((state["dapp_commit"], state["config_sha256"]), (pushed, self.config_sha))
+        self.assertFalse((self.ws.state_dir / "publish_frontends.json").exists(), "apply alone never records completion")
 
     def test_a_diverged_remote_is_refused_and_nothing_is_forced(self):
         other = self.ws.root / "other"
@@ -545,7 +556,41 @@ class FrontendTests(PublicWorld):
         report = self.step.verify(self.ctx)
         self.assertEqual(sorted(report["bundles"]), ["account", "app"])
         self.assertTrue(all(code == 200 for code in report["sites"].values()))
+        self.assertTrue((self.ws.state_dir / "publish_frontends.json").exists())
         steps.require_frontends_current(self.ctx)
+
+    def test_a_workflow_still_running_times_out_without_recording_completion(self):
+        running = [dict(self.GREEN[0], status="in_progress", conclusion=""), *self.GREEN[1:]]
+        self.verify_world(running)
+        with self.assertRaises(TimeoutError):
+            self.step.verify(self.ctx)
+        self.assertFalse((self.ws.state_dir / "publish_frontends.json").exists())
+
+    def test_the_gate_checks_what_is_live_and_fails_closed_on_a_network_error(self):
+        self.verify_world(self.GREEN)
+        self.step.verify(self.ctx)
+        steps.require_frontends_current(self.ctx)
+        url = self.public["sites"]["app"].rstrip("/") + "/assets/app.js"
+        saved = self.web[url]
+        self.serve(url, "an older deployment")
+        with self.assertRaisesRegex(ValueError, "does not serve the new address"):
+            steps.require_frontends_current(self.ctx)
+        self.web[url] = saved
+        steps.require_frontends_current(self.ctx)
+        del self.web[self.public["sites"]["app"]]
+        with self.assertRaisesRegex(ValueError, "did not answer 200"):
+            steps.require_frontends_current(self.ctx)
+        self.serve(self.public["sites"]["app"], '<script src="/assets/app.js"></script>')
+        self.serve(self.public["frontends"]["config"].rstrip("/") + "/config.json", b"{}")
+        with self.assertRaisesRegex(ValueError, "live config is not the recorded one"):
+            steps.require_frontends_current(self.ctx)
+
+    def test_a_new_apply_withdraws_an_earlier_completion(self):
+        self.verify_world(self.GREEN)
+        self.step.verify(self.ctx)
+        self.assertTrue((self.ws.state_dir / "publish_frontends.json").exists())
+        self.step.apply(self.ctx)
+        self.assertFalse((self.ws.state_dir / "publish_frontends.json").exists())
 
     def test_a_previous_release_address_in_the_app_bundle_fails_but_the_account_dead_data_does_not(self):
         self.verify_world(self.GREEN, account_text=" " + OLD["sepolia"])
@@ -564,8 +609,11 @@ class FrontendTests(PublicWorld):
     def test_a_failed_or_missing_workflow_blocks_the_step(self):
         failed = [dict(self.GREEN[0], conclusion="failure"), *self.GREEN[1:]]
         self.verify_world(failed)
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(RuntimeError, "workflow failed for this commit: Deploy Testnet Frontends"):
             self.step.verify(self.ctx)
+        self.assertFalse((self.ws.state_dir / "publish_frontends.json").exists())
+        with self.assertRaisesRegex(ValueError, "no recorded state for publish_frontends"):
+            steps.require_frontends_current(self.ctx)
         self.assertEqual(steps.workflow_verdict(failed, ["Deploy Testnet Frontends"]), "workflow failed for this commit: Deploy Testnet Frontends")
         self.assertIsNone(steps.workflow_verdict(self.GREEN[:3], [run["workflowName"] for run in self.GREEN]))
         self.assertIsNone(steps.workflow_verdict([dict(self.GREEN[0], status="in_progress", conclusion="")], ["Deploy Testnet Frontends"]))
@@ -578,6 +626,7 @@ class FrontendTests(PublicWorld):
 
     def test_acceptance_is_blocked_for_frontends_built_for_another_config(self):
         self.verify_world(self.GREEN)
+        self.step.verify(self.ctx)
         state = json.loads((self.ws.state_dir / "publish_frontends.json").read_text())
         state["config_sha256"] = "f" * 64
         (self.ws.state_dir / "publish_frontends.json").write_text(json.dumps(state))
