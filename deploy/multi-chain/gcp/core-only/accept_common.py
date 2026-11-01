@@ -10,6 +10,7 @@ import base64
 from contextlib import contextmanager
 import hashlib
 import json
+import signal
 import socket
 import subprocess
 import time
@@ -127,8 +128,16 @@ def run_admin(ctx, chain, target, execute, documents=None):
     return report
 
 
+class WindowSignal(BaseException):
+    """SIGTERM or SIGHUP during a window: unwinds like Ctrl-C so the pause is restored."""
+
+
+def raise_window_signal(signum, frame):
+    raise WindowSignal(signal.Signals(signum).name)
+
+
 def restore_pause(ctx, chain, admin, sleep=time.sleep):
-    """Pause again, with a few attempts; success needs the read-back flags of all three assets."""
+    """Pause again, with a few attempts; a further interrupt during an attempt only costs that attempt."""
     last = None
     for attempt in range(REPAUSE_ATTEMPTS):
         try:
@@ -136,36 +145,60 @@ def restore_pause(ctx, chain, admin, sleep=time.sleep):
             if report.get("flags") == [PAUSED] * 3:
                 return report
             last = f"read-back flags {report.get('flags')}"
-        except Exception as error:
-            last = str(error)
+        except BaseException as error:
+            last = f"{type(error).__name__}: {error}"
         if attempt + 1 < REPAUSE_ATTEMPTS:
-            sleep(REPAUSE_PAUSE_SECONDS)
+            try:
+                sleep(REPAUSE_PAUSE_SECONDS)
+            except BaseException:
+                pass
     raise RuntimeError(f"{chain}: deposits are still OPEN, pause them by hand now ({last})")
 
 
 @contextmanager
+def window_signals():
+    """Route SIGTERM and SIGHUP into the exception path; outside the main thread the handlers stay as they are."""
+    previous = {}
+    try:
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            previous[number] = signal.signal(number, raise_window_signal)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+@contextmanager
 def unpaused_chain(ctx, chain, admin=None, sleep=time.sleep):
-    """Unpause one chain, yield, and restore and read back the pause on any exit; the original error stays visible."""
+    """Unpause one chain, yield, and restore and read back the pause on any exit; the original error stays visible.
+
+    The guarded region starts before the unpause is sent: a timeout, a bad read-back or an interrupt after the
+    broadcast still ends in a re-pause attempt, which is harmless when the chain never opened.
+    """
     admin = admin or run_admin
     if OPEN_CHAINS:
         raise RuntimeError(f"{OPEN_CHAINS[0]} is still unpaused; windows open one chain at a time")
-    opened = admin(ctx, chain, 0, True)
-    require(opened.get("flags") == [OPEN] * 3, f"{chain}: the unpause was not read back as open")
     OPEN_CHAINS.append(chain)
     original = None
-    try:
-        yield opened
-    except BaseException as error:
-        original = error
-        raise
-    finally:
+    with window_signals():
         try:
-            restore_pause(ctx, chain, admin, sleep)
-            OPEN_CHAINS.remove(chain)
-        except RuntimeError as failure:
-            if original is not None:
-                raise RuntimeError(f"{failure}; the window ended with {type(original).__name__}: {original}") from original
+            opened = admin(ctx, chain, 0, True)
+            require(opened.get("flags") == [OPEN] * 3, f"{chain}: the unpause was not read back as open")
+            yield opened
+        except BaseException as error:
+            original = error
             raise
+        finally:
+            try:
+                restore_pause(ctx, chain, admin, sleep)
+                OPEN_CHAINS.remove(chain)
+            except RuntimeError as failure:
+                if original is not None:
+                    raise RuntimeError(f"{failure}; the window ended with {type(original).__name__}: {original}") from original
+                raise
 
 
 def unpaused_chains(ctx, admin=None):

@@ -1,7 +1,10 @@
 """The pause window: restore on every exit, one chain at a time, illegal deposits first; gateway reads and the tunnel."""
 import http.server
 import json
+import os
+import signal
 import sys
+import time
 import threading
 import unittest
 import unittest.mock
@@ -9,17 +12,22 @@ from types import SimpleNamespace
 
 import accept_common as ac
 import test_deploy_remote as remote_tests
-from deploy_remote import Remote
+from deploy_remote import Remote, RemoteError
 
 
 class FakeAdmin:
     """Records every call; flags follow the last executed target, as the real read-back would."""
 
-    def __init__(self, fail_pause=0, wrong_readback=False):
+    def __init__(self, fail_pause=0, wrong_readback=False, open_raises=None, pause_raises=()):
         self.calls, self.fail_pause, self.wrong_readback = [], fail_pause, wrong_readback
+        self.open_raises, self.pause_raises = open_raises, list(pause_raises)
 
     def __call__(self, ctx, chain, target, execute):
         self.calls.append((chain, target, execute))
+        if target == 0 and execute and self.open_raises is not None:
+            raise self.open_raises
+        if target == 1 and execute and self.pause_raises:
+            raise self.pause_raises.pop(0)
         if target == 1 and execute and self.fail_pause > 0:
             self.fail_pause -= 1
             raise RuntimeError("signer unreachable")
@@ -87,6 +95,52 @@ class WindowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not read back as open"):
             with window(bad):
                 self.fail("the body must not run")
+
+    def test_a_failure_after_the_unpause_was_broadcast_still_repauses(self):
+        for error in (TimeoutError("receipt timeout"), KeyboardInterrupt(), RemoteError("signer: exit 1: readback mismatch")):
+            ac.OPEN_CHAINS.clear()
+            admin = FakeAdmin(open_raises=error)
+            with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
+                with window(admin):
+                    self.fail("the body must not run")
+            self.assertEqual(admin.calls, [("sepolia", 0, True), ("sepolia", 1, True)])
+            self.assertEqual(ac.OPEN_CHAINS, [])
+
+    def test_an_unpause_that_reads_back_wrong_is_repaused(self):
+        admin = FakeAdmin()
+        bad = lambda ctx, chain, target, execute: admin(ctx, chain, target, execute) | ({"flags": [[1, 0, 1]] * 3} if target == 0 else {})
+        with self.assertRaisesRegex(ValueError, "not read back as open"):
+            with window(bad):
+                pass
+        self.assertEqual(admin.calls[-1], ("sepolia", 1, True))
+
+    def test_a_second_interrupt_during_the_restore_keeps_the_still_open_error(self):
+        admin = FakeAdmin(pause_raises=[KeyboardInterrupt(), KeyboardInterrupt(), KeyboardInterrupt()])
+        with self.assertRaises(RuntimeError) as caught:
+            with window(admin):
+                raise ValueError("first problem")
+        self.assertIn("still OPEN", str(caught.exception))
+        self.assertIn("first problem", str(caught.exception))
+
+    def test_a_second_interrupt_costs_one_attempt_and_the_pause_still_returns(self):
+        admin = FakeAdmin(pause_raises=[KeyboardInterrupt()])
+        with self.assertRaises(KeyboardInterrupt):
+            with window(admin):
+                raise KeyboardInterrupt
+        self.assertEqual(len([call for call in admin.calls if call[1] == 1]), 2)
+        self.assertEqual(ac.OPEN_CHAINS, [])
+
+    def test_sigterm_and_sighup_restore_the_pause(self):
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            ac.OPEN_CHAINS.clear()
+            admin = FakeAdmin()
+            before = signal.getsignal(number)
+            with self.subTest(signal=number.name), self.assertRaises(ac.WindowSignal):
+                with window(admin):
+                    os.kill(os.getpid(), number)
+                    time.sleep(1)
+            self.assertEqual(admin.calls[-1], ("sepolia", 1, True))
+            self.assertIs(signal.getsignal(number), before, "the handler is put back")
 
     def test_chains_are_unpaused_one_at_a_time(self):
         admin = FakeAdmin()
