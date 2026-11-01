@@ -2,21 +2,32 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=deploy/gcp/lib/common.sh
-source "$SCRIPT_DIR/lib/common.sh"
-# shellcheck source=deploy/gcp/lib/multichain.sh
-source "$SCRIPT_DIR/lib/multichain.sh"
+if [ "${CHECK_PUBLIC_STANDALONE:-0}" = "1" ]; then
+  # The release orchestrator passes every domain; no deployment config is read.
+  : "${PUBLIC_NOSTR_DOMAIN:?}" "${CORS_ORIGIN:?}"
+  PUBLIC_RPC_DOMAIN="${PUBLIC_RPC_DOMAIN:-}"
+  PUBLIC_L1_RPC_ROUTES_JSON="${PUBLIC_L1_RPC_ROUTES_JSON:-}"
+  : "${PUBLIC_TRUST_SETUP_DOMAIN:=${PUBLIC_NOSTR_DOMAIN}}"
+  : "${PUBLIC_TRUST_SETUP_PATH:=/trust-setup}"
+  : "${TRUST_SETUP_ARCHIVE_NAME:=psy-groth16-trust-setup.tar.gz}"
+  : "${CHECK_PUBLIC_TRUST_SETUP:=1}"
+else
+  # shellcheck source=deploy/gcp/lib/common.sh
+  source "$SCRIPT_DIR/lib/common.sh"
+  # shellcheck source=deploy/gcp/lib/multichain.sh
+  source "$SCRIPT_DIR/lib/multichain.sh"
 
-: "${PUBLIC_NOSTR_DOMAIN:=${NOSTR_DOMAIN}}"
-: "${PUBLIC_RPC_DOMAIN:=${PUBLIC_L1_RPC_DOMAIN:-}}"
-: "${PUBLIC_TRUST_SETUP_DOMAIN:=${PUBLIC_NOSTR_DOMAIN}}"
-: "${PUBLIC_TRUST_SETUP_PATH:=/trust-setup}"
-: "${TRUST_SETUP_ARCHIVE_NAME:=psy-groth16-trust-setup.tar.gz}"
-: "${CHECK_PUBLIC_TRUST_SETUP:=1}"
-: "${CORS_ORIGIN:=${PUBLIC_PRIVACY_BRIDGE_ORIGIN}}"
-PUBLIC_L1_RPC_ROUTES_JSON="${PUBLIC_L1_RPC_ROUTES_JSON:-}"
-if multichain_enabled; then
-  PUBLIC_L1_RPC_ROUTES_JSON="$(multichain_public_rpc_routes_json)"
+  : "${PUBLIC_NOSTR_DOMAIN:=${NOSTR_DOMAIN}}"
+  : "${PUBLIC_RPC_DOMAIN:=${PUBLIC_L1_RPC_DOMAIN:-}}"
+  : "${PUBLIC_TRUST_SETUP_DOMAIN:=${PUBLIC_NOSTR_DOMAIN}}"
+  : "${PUBLIC_TRUST_SETUP_PATH:=/trust-setup}"
+  : "${TRUST_SETUP_ARCHIVE_NAME:=psy-groth16-trust-setup.tar.gz}"
+  : "${CHECK_PUBLIC_TRUST_SETUP:=1}"
+  : "${CORS_ORIGIN:=${PUBLIC_PRIVACY_BRIDGE_ORIGIN}}"
+  PUBLIC_L1_RPC_ROUTES_JSON="${PUBLIC_L1_RPC_ROUTES_JSON:-}"
+  if multichain_enabled; then
+    PUBLIC_L1_RPC_ROUTES_JSON="$(multichain_public_rpc_routes_json)"
+  fi
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -202,7 +213,8 @@ main() {
       -H 'Cache-Control: no-cache' \
       "https://${PUBLIC_TRUST_SETUP_DOMAIN}${trust_setup_path}/${TRUST_SETUP_ARCHIVE_NAME}?check=${trust_setup_cache_bust}"
   else
-    pass "public trust setup archive skipped"
+    # Named, not silent: the check depends on the trust setup publication step and is reported as deferred.
+    printf '[DEFERRED] %s\n' "public trust setup archive (depends on the trust setup publication)"
   fi
 
   jsonrpc_expect_result "coordinator edge" "https://${PUBLIC_COORDINATOR_DOMAIN}/" "psy_get_latest_checkpoint_id"
