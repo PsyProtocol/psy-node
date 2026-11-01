@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ from deploy_remote import OperatorPending, RemoteConnectionError, RemoteError, f
 
 HOSTS = {"system": "arc99x1", "user": "arc99x3"}
 STEP = proxy.PROXY_STEPS["start_proxies"]
-REAL_MANIFEST = Path("/home/peter/git/bridge_zilong/tmp/fresh-runtime-release-r4-20261101/manifest.json")
+REAL_MANIFEST = Path(os.environ.get("PSY_REAL_RUNTIME_MANIFEST", "/nonexistent"))
 
 
 class FakeRemote:
@@ -376,7 +377,7 @@ class ProxyPackageBuilderTests(base.PrepareTestCase):
         module.validate_public(document)
         self.assertEqual(document["binaries"]["psy_user_cli"], self.manifest["binaries"]["psy_user_cli"])
 
-    @unittest.skipUnless(REAL_MANIFEST.is_file(), "real runtime build record not on this machine")
+    @unittest.skipUnless(REAL_MANIFEST.is_file(), "set PSY_REAL_RUNTIME_MANIFEST to a real runtime build record")
     def test_real_runtime_build_record_narrows_to_a_valid_document(self):
         document = prepare.narrow_build_document(json.loads(REAL_MANIFEST.read_text()))
         tool = importlib.util.spec_from_file_location("prepare_proxies", Path(prepare.__file__).with_name("prepare_proxies.py"))
