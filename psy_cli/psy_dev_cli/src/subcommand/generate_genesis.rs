@@ -848,7 +848,7 @@ mod tests {
     fn default_faucet_policy_circuit_matches_genesis_and_exported_identity() {
         use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
         use psy_prover::wallet::memory_wallet::get_allow_method_sd_key_fingerprint;
-        use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
+        use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
 
         let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
         let relayer = PsyCompactUserDefinition {
