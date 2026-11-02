@@ -5,6 +5,8 @@ ROOT_DIR := $(shell cd .. && pwd)
 PROFILE := release
 BIN_DIR := $(ROOT_DIR)/target/$(PROFILE)
 ROOT_CONFIG_PATH := $(CURDIR)/../psy-genesis/config.json
+PSY_CONFIG_PATH ?= $(ROOT_CONFIG_PATH)
+export PSY_CONFIG_PATH
 GENESIS_DIR              := $(ROOT_DIR)/psy-genesis
 PRIVATE_KEYS_FILE ?= $(ROOT_DIR)/private_keys.json
 PSY_NETWORK ?= localhost
