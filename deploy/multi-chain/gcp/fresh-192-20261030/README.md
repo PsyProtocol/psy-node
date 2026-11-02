@@ -317,6 +317,25 @@ requires the retained paths to agree: that host must keep both `/etc/parth` and
 nonces with the pinned `fresh_l1.py status`, sent on stdin to that host and run
 with `--rpc-preference protected-env-backup`, the route the deployment uses.
 
+## L1 RPC Routing (step 56)
+
+Guardian, Services, Envio and the Relayer reach L1 through the gateway's private proxy on ports 18545, 18645 and 18945.
+Step 56 installs `core-only/l1_rpc_local_first.py` over the retained proxy wrappers and adds drop-in
+`91-local-first-20261102.conf`. Both paths sit inside the retained proxy directories, so a wipe keeps them. The step
+is idempotent and restarts the proxy only when the wrapper differs. It refuses to run if the retained wrapper hash
+differs from the one pinned in the source, and it passes only when all three local nodes report fresh.
+
+| Request | Order | Falls back when |
+|---|---|---|
+| Read | Local node, then both Alchemy keys | Local is stale or without peers, the call fails, or it answers a non-revert error or a null receipt, transaction or block |
+| Nonce read | Alchemy keys, then local | Always, while sends stay on Alchemy: a lagging node hands out a used nonce |
+| Send | First Alchemy key, once | `SEND_VIA_LOCAL` is off until a real transaction has been seen to propagate from each local node |
+
+The null rule is required. Past its pruning window a node errors on logs but answers null for old receipts,
+transactions and BSC blocks, which a caller reads as "does not exist".
+
+Rollback: delete the drop-in, run `systemctl daemon-reload` and restart `psy-private-alchemy-20261027.service`.
+
 ## Public Release And Acceptance Steps (77-87)
 
 The table finishes the release end to end. Step 77 uploads the nine public Groth16 files (circuit, pk and vk of

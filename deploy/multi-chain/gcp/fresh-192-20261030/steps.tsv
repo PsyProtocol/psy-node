@@ -5,6 +5,7 @@
 53	py:prepare_packages	Prepare core, Worker, Proxy and Faucet packages
 54	py:plan_bridge_packages	Plan Guardian, Relayer, Services and Envio packages in pending mode
 55	py:check_hosts	Check SSH, disk, keystore, L1 balances and nonces
+56	py:ensure_l1_rpc_routing	Put the local L1 nodes first on the gateway RPC proxy and prove they are fresh
 60	py-cutover:fence_ingress	Fence public ingress with Caddy 503
 61	py-cutover:stop_services	Stop services on the cloud hosts
 62	py-cutover:stop_operator_hosts	Stop x1, x2 and x3 (operator, PENDING)
