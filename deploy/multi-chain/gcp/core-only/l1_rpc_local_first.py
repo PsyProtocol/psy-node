@@ -25,6 +25,8 @@ class LocalState:
         self.fresh = False
         self.good = 0
         self.reason = 'not probed'
+        self.local_head = 0
+        self.required_head = 0
         self.lock = threading.Lock()
         self.counts = {}
 
@@ -52,7 +54,17 @@ def local_answer_is_final(rows, result, batch):
             return False
     return True
 
-def probe_reason(call, chain, chain_id, now):
+def note_mined_blocks(state, rows, result, batch):
+    """Alchemy saw a receipt the local node lacks: reads stay there until local reaches that block, or a caller
+    checking contract state right after its own receipt would read the state from before the transaction."""
+    replies = {(type(row['id']).__name__, row['id']): row for row in (result if batch else [result])}
+    for row in rows:
+        answer = replies.get((type(row['id']).__name__, row['id']), {}).get('result')
+        if row['method'] == 'eth_getTransactionReceipt' and isinstance(answer, dict) and answer.get('blockNumber'):
+            with state.lock:
+                state.required_head = max(state.required_head, int(answer['blockNumber'], 16))
+
+def probe_reason(call, chain, chain_id, now, state):
     """Returns None when the node can serve this chain, otherwise a short public reason."""
     replies = call(json.dumps([
         {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_chainId', 'params': []},
@@ -65,6 +77,7 @@ def probe_reason(call, chain, chain_id, now):
         return 'no peers'
     if not rows.get(3):
         return 'no head'
+    state.local_head = int(rows[3]['number'], 16)
     if now - int(rows[3]['timestamp'], 16) > MAX_HEAD_AGE[chain]:
         return 'stale head'
     return None
@@ -103,6 +116,11 @@ def install(module, local_urls):
         if not fresh:
             state.count('read_while_stale')
             return base_forward(chain, remote + [local], body)
+        if state.local_head < state.required_head:
+            state.count('read_until_local_catches_up')
+            result = base_forward(chain, remote + [local], body)
+            note_mined_blocks(state, rows, result, batch)
+            return result
         try:
             result = module.checked_response(module.upstream(local['url'], body), rows, batch)
             if local_answer_is_final(rows, result, batch):
@@ -111,7 +129,9 @@ def install(module, local_urls):
             state.count('read_fallback_answer')
         except Exception:
             state.count('read_fallback_failure')
-        return base_forward(chain, remote, body)
+        result = base_forward(chain, remote, body)
+        note_mined_blocks(state, rows, result, batch)
+        return result
     module.forward = forward
     return states
 
@@ -121,7 +141,7 @@ def probe_loop(module, chain, url, state):
         return module.upstream_transport(url, body)
     while True:
         try:
-            reason = probe_reason(call, chain, chain_id, time.time())
+            reason = probe_reason(call, chain, chain_id, time.time(), state)
         except Exception as error:
             reason = type(error).__name__
         update(state, chain, reason)

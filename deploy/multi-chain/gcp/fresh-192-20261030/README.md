@@ -329,6 +329,7 @@ differs from the one pinned in the source, and it passes only when all three loc
 |---|---|---|
 | Read | Local node, then both Alchemy keys | Local is stale or without peers, the call fails, or it answers a non-revert error or a null receipt, transaction or block |
 | Nonce read | Alchemy keys, then local | Always, while sends stay on Alchemy: a lagging node hands out a used nonce |
+| Read after a receipt | Alchemy keys, then local | Alchemy reported a receipt in a block the local node has not reached: until it does, a caller would check state from before its own transaction |
 | Send | First Alchemy key, once | `SEND_VIA_LOCAL` is off until a real transaction has been seen to propagate from each local node |
 
 The null rule is required. Past its pruning window a node errors on logs but answers null for old receipts,
