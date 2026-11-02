@@ -1,4 +1,21 @@
-type Deposit @entity {
+# Secondary indexes serve the registered Services read paths (see
+# psy_bridge_reader_api/sql/queries.sql). Envio 2.32.10 creates them only when it initializes
+# an empty schema, with names "<table>_<fields joined by _>".
+#   Deposit_shield_address_chain_index_chain_local_deposit_index: wallet list
+#     by shield address, one protocol chain, in dense per-chain order.
+#   Deposit_chain_index_deposit_index: row by global deposit_index and the
+#     global-to-local probe (last row with deposit_index < N, descending).
+#   Deposit_tx_hash: lookup of a deposit by its L1 transaction hash.
+#   WithdrawalClaim_chain_id_block_number_id: the Bridge Reader's follow loop and
+#     start-up load of claims, paged by the (block_number, id) cursor on one chain.
+#   FinalizedBatch_chain_id_block_number_id: the same cursor paging for finalized
+#     batches in the Reader's follow loop and start-up load.
+# chain_index leads because chain_local_deposit_index is dense per chain_index
+# (DepositTreeMeta is keyed by it) and every Services read binds it; chain_id
+# is functionally dependent on chain_index (asserted by the handler).
+type Deposit @entity
+  @index(fields: ["shield_address", "chain_index", "chain_local_deposit_index"])
+  @index(fields: ["chain_index", "deposit_index"]) {
   id: ID!
   chain_id: Int!
   deposit_index: Int!               # global L1 bridge deposit index
@@ -11,10 +28,40 @@ type Deposit @entity {
   chain_index: Int!
   leaf_hash: String!
   block_number: Int!
-  tx_hash: String!
+  block_timestamp: BigInt!          # L1 block time, Unix seconds
+  tx_hash: String! @index
 }
 
-type FinalizedBatch @entity {
+# ── Dense per-chain deposit leaves ──────────────────────────────────────────
+# One row per leaf of the per-chain Poseidon deposit tree, written in the same
+# handler call as Deposit, so it follows Envio's reorg rollback together with
+# it. A proof or a partial-block root reads one contiguous range by
+# (chain_index, chain_local_deposit_index).
+type DepositLeaf @entity
+  @index(fields: ["chain_index", "chain_local_deposit_index"]) {
+  id: ID!                             # "{chain_index}-{chain_local_deposit_index}"
+  chain_index: Int!
+  chain_local_deposit_index: Int!     # dense from 0 per chain_index
+  deposit_index: Int!                 # global L1 bridge deposit index
+  chain_id: Int!
+  poseidon_leaf_hash: String!         # same encoding as DepositTreeNode.hash at level 0
+  block_number: Int!
+}
+
+# ── Per-account deposit totals ──────────────────────────────────────────────
+# Maintained at write time so wallet lists never count rows per request.
+type AccountDepositStats @entity {
+  id: ID!                             # "{chain_index}-{shield_address}"
+  shield_address: String!
+  chain_index: Int!
+  chain_id: Int!
+  deposit_count: Int!
+  last_chain_local_deposit_index: Int!
+  last_block_number: Int!
+}
+
+type FinalizedBatch @entity
+  @index(fields: ["chain_id", "block_number", "id"]) {
   id: ID!
   chain_id: Int!
   finalized_checkpoint_id: BigInt!
@@ -63,8 +110,14 @@ type DepositTreeNode @entity {
   tx_hash: String!
 }
 
-type WithdrawalClaim @entity {
-  id: ID!
+# id "{chain_id}-{nullifier}" is the primary key, so (chain_id, nullifier) is
+# unique by construction; Envio has no UNIQUE directive. The handler fails
+# instead of silently overwriting an existing claim. The composite index serves
+# lookups by nullifier list on one chain.
+type WithdrawalClaim @entity
+  @index(fields: ["chain_id", "nullifier"])
+  @index(fields: ["chain_id", "block_number", "id"]) {
+  id: ID!                         # "{chain_id}-{nullifier}"
   chain_id: Int!
   nullifier: String!
   recipient: String!
