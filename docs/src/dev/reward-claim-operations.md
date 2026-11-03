@@ -216,6 +216,8 @@ Each record is **173 bytes**, concatenated without a JSON wrapper. Offsets below
 
 ## 2. Select Eligible Work
 
+`claim-rewards` filters backup records to GUTA coordinates (`2 <= level <= 21`, `index < 2^(level-2)`) before querying checkpoint mappings or proofs. It logs the number skipped and leaves the original backup unchanged. Deploy, update, registration, and upper aggregation records are excluded; a backup with no supported records is rejected.
+
 Select owned work in the GUTA reward subtree. The relevant work circuit IDs are **7–14, 55–60, and 63** (`psy_core/src/job/job_id.rs:141-149,183-192`):
 
 | IDs | Circuits |
@@ -239,6 +241,8 @@ For each selected coordinate require:
 - Recognition requires `checkpointTreeRootsClean()` and a nonzero `checkpointTreeRootCheckpointId(bytes32)` registration no greater than the finalized tip (`psy-contracts/src/StateManager.sol:46-47`; recognition check: `psy-contracts/src/PsyToken.sol:90-94`). After a real force-set, the administrator revokes the approved abandoned roots by name with `revokeCheckpointTreeRoots(bytes32[])` (governed task `state-manager:revoke-checkpoint-tree-roots --roots-json <file-or-json-array>`; `psy-contracts/src/StateManager.sol:166-171`; `psy-contracts/tasks/upgrade.ts:82-89`) and then explicitly re-enables with `state-manager:set-checkpoint-tree-roots-clean --clean true` (`psy-contracts/src/StateManager.sol:173-175`). There is no root count or enumeration: identify abandoned roots from settlement evidence, never by on-chain scanning. Revocation never resets claimed pairs. The automated claim path reads recognition through those same `checkpointTreeRootsClean()` / `checkpointTreeRootCheckpointId(bytes32)` selectors (`client_prover/psy_prover/src/local/reward_client.rs:979-987`).
 
 ## 3. Query Before Claiming
+
+L1 `eth_getCode` and `eth_call` reads retry `block not found` errors up to six total attempts, waiting 1, 2, 4, 8, and 16 seconds. Retries keep the original block hash and canonicality requirement. Other errors and transaction submissions are not retried by this policy.
 
 Confirm registration through [Common Operations](common-operations.md), then query the owner's state and each backup pending ID:
 
