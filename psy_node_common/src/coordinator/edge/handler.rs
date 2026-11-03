@@ -911,14 +911,17 @@ impl<
             if record.old_realm_root == submitted_old_realm_root.into_owned_32bytes()
                 && committed_checkpoint_id < open_from_checkpoint_id
             {
-                anyhow::bail!(
-                    "GUTA update for realm_id {} from old root {:?} is already in flight: accepted at checkpoint {}, committed checkpoint is {}; it can be resubmitted from checkpoint {}",
-                    realm_id,
-                    submitted_old_realm_root,
-                    record.accepted_at_checkpoint_id,
-                    committed_checkpoint_id,
-                    open_from_checkpoint_id
-                );
+                return Err(GutaSubmitError::retryable(
+                    RealmFinalizeSubmitCode::Busy,
+                    format!(
+                        "GUTA update for realm_id {} from old root {:?} is already in flight: accepted at checkpoint {}, committed checkpoint is {}; it can be resubmitted from checkpoint {}",
+                        realm_id,
+                        submitted_old_realm_root,
+                        record.accepted_at_checkpoint_id,
+                        committed_checkpoint_id,
+                        open_from_checkpoint_id
+                    ),
+                ).into());
             }
         }
         let accepted_record = GutaInFlightRecord {
@@ -2152,6 +2155,10 @@ pub(crate) mod tests {
 
         assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
         assert!(err.to_string().contains("resubmitted from checkpoint 3"), "unexpected error: {err}");
+        // A Realm keeps its gatherer for a retryable rejection instead of re-entering init catch-up.
+        let submit = err.downcast_ref::<GutaSubmitError>().expect("typed GUTA submit rejection");
+        assert!(submit.is_retryable(), "in-flight rejection must be retryable: {submit:?}");
+        assert_eq!(submit.reason(), RealmFinalizeSubmitCode::Busy);
         assert_eq!(env.guta_queue.published_count(), 1);
         // rejected before the per-batch marker is set, so it cannot block a later attempt
         assert_eq!(
