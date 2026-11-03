@@ -64,9 +64,13 @@ cargo check -p psy_node_common
 
 The Redis tests require `redis-server` on PATH. Each starts its own disposable server on a private Unix socket with AOF and `appendfsync always`, without connecting to existing services. They check concurrent edge instances, exactly-once activation, penalty persistence across abrupt restarts, rate limits, challenge capacity, policy conflicts, corrupt storage and generations above JavaScript's precise integer range.
 
-## Task leases (library only)
+## V2 task protocol (observe, opt-in)
 
-`lease.rs` implements the task lease state machine on a multi-record Redis transaction. **It is not called by any edge handler, queue or RPC yet**; legacy task paths are unchanged and `task_enforcement` stays false.
+With `PSY_WORKER_ADMISSION_MODE=observe` and `PSY_WORKER_ADMISSION_TASKS=v2`, realm and coordinator edges also serve `psy_worker_claim_task_v2` and `psy_worker_submit_proof_v2` through `flow::TaskFlow`, and run reclaim, keepalive and outbox publication every 5 s. Workers opt in with `PSY_WORKER_TASK_PROTOCOL=v2` and recover admission by PoW automatically. V2 shares the legacy queue: enable it only where every worker speaks V2. Invalid proofs return the job without punishment unless `FlowConfig::attribute_invalid_proofs` is set. No end-to-end proving run has been done yet.
+
+## Task leases
+
+`lease.rs` implements the task lease state machine on a multi-record Redis transaction. Legacy task paths are unchanged and `task_enforcement` stays false.
 
 | Call | Effect, in one transaction |
 | --- | --- |
@@ -82,4 +86,4 @@ The Redis tests require `redis-server` on PATH. Each starts its own disposable s
 
 The Redis `COMMIT` script compares exact bytes of every record, type-checks every key and bounds every counter before its first write, so a refused transaction writes nothing. Capacity stays charged until the lease or reservation that holds it closes, including across a revocation. Lease records have no TTL and no garbage collection yet.
 
-Not implemented: V2 task RPCs and handler wiring, NATS progress ACK and per-delivery ACK receipts, staged proof storage and the publisher, verification semaphores, scoped timeout exemption during outages, lease record retention, and Redis persistence checks. The worker then adopts V2 task requests and automatic PoW recovery. Enforced rollout follows multi-edge and fault-injection validation.
+Not implemented: scoped timeout exemption during outages, lease record retention, per-circuit lease deadlines, and Redis persistence checks. Enforced rollout follows end-to-end, multi-edge and fault-injection validation.

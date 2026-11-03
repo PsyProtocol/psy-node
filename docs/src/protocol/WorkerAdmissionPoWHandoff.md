@@ -184,6 +184,26 @@ git diff --check
 
 仍未完成（按原顺序）：V2 任务 RPC 与 realm/coordinator handler 接入、NATS progress ACK 与按投递绑定的 ACK、不可变证明暂存和发布器、验证资源信号量、服务整体故障时的超时豁免、lease 记录保留策略、Redis 持久性检查、worker 自动恢复。
 
+## 2026 年 11 月 3 日续接（二）：任务流程接入 edge 与 worker
+
+分支 `feat/worker-admission-pow`（从 `feat/rollback-r1` 的 `b958d7be` 拉出，仅本地，未 push）。提交按模块拆分，`git log b958d7be..` 可见。
+
+| 提交内容 | 说明 |
+| --- | --- |
+| `flow.rs` | `TaskFlow`：领取、验证、接受、发布、最终 ACK 的顺序与失败处理；edge 只实现 `TaskQueue` 和 `ProofPipeline`。验证并发用信号量限制；发布失败留在 outbox，由 `maintain` 重试且不重复加分 |
+| 安全开关 | `FlowConfig::attribute_invalid_proofs` 默认关闭：确定性验证失败只退回任务，不处罚。验证器失败类别未经证实前，不让验证器故障误罚诚实 worker |
+| 领取签名 | V2 领取签名覆盖 worker 自己的 reward tag；绑定的 tag 不一致时拒绝 |
+| 证明暂存 | 接受前把证明按内容摘要写入 admission Redis，读取时重新校验摘要 |
+| NATS | `worker_queue_control_job`：progress、延迟 NAK、立即 NAK、最终 ACK。真实 nats-server 实测：ACK 作用于消息，重投后用旧投递的 reply 仍能确认；progress 能阻止重投；延迟 NAK 生效 |
+| Realm 与 coordinator edge | `task_adapter.rs` 复用旧路径的输入加载、子 tag、验证与奖励树写入，不写旧 claim 和旧信誉。仅在 `PSY_WORKER_ADMISSION_MODE=observe` 且 `PSY_WORKER_ADMISSION_TASKS=v2` 时注册 `psy_worker_claim_task_v2`、`psy_worker_submit_proof_v2`，并每 5 秒运行回收、保活和发布 |
+| Worker | `PSY_WORKER_TASK_PROTOCOL=v2` 时 basic fetcher 改走 V2；遇到 `POW_REQUIRED` 或 `ADMISSION_STALE` 按作用域串行完成一次 PoW 恢复。默认仍是旧协议 |
+
+修复的两个问题：处理实例 ID 在节点里是 u128（原先按 u64 处理）；最终 ACK 是不等待确认的 publish，丢失后已发布任务的重投会被无限延迟，现在直接 ACK。
+
+验证：`psy_worker_admission` 43 项测试（含 12 项真实 Redis），`psy_node_nats` 的 5 项真实 nats-server 测试，worker 钱包签名与 edge 校验的交叉测试，均通过；`psy_node_cli`、`psy_worker_cli` 编译通过。**尚未做真实 proving 端到端运行**：本机当前没有运行 Scylla 和 NATS，需要启动本地栈（coordinator processor、开启 V2 的 coordinator edge、`PSY_WORKER_TASK_PROTOCOL=v2` 的 worker）后验证一个 checkpoint 完整走通。
+
+已知限制：V2 与旧协议共用同一个队列，旧 worker 领取同一任务不受租约约束，因此只能在全部 worker 都使用 V2 的隔离环境开启；租约期限固定 300 秒；lease 记录尚无 GC；enforce 模式仍不可选。
+
 ## 下一阶段任务租约闭环
 
 优先按以下顺序实现，保持 observe 和 enforce 的边界清楚。
