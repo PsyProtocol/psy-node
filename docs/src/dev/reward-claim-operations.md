@@ -125,7 +125,7 @@ Removing the former root enumeration changed the clean flag's storage slot. Do n
 
 The browser prepares one unsigned token transaction of at most 64 eligible checkpoint groups. An external Ethereum signer submits it. `prepareRewardClaim` and `confirmRewardClaim` are the provider methods (`psy-sdk/psy-ts-sdk/packages/psy-sdk/src/local-web-prover/provider.ts:179-193`). The TypeScript boundary uses `PsyJSON`, not `JSON.stringify`, so a `u64` above `2^53-1` stays exact.
 
-`PrepareRewardClaimRequest` carries `rewardToken`, `userId`, `recipient`, `jobs`, `l1RpcUrl`, `proveProxyUrl`, and optional `proveProxyToken` and `aggregateCaches`. Addresses are `0x` plus 40 lowercase hex characters. `proveProxyToken` is a bearer credential for `psy_prove_reward_claim_groth16` and is not copied into the prepared claim or a page message.
+`PrepareRewardClaimRequest` carries `rewardToken`, `userId`, `recipient`, `jobs`, `l1RpcUrl`, `proveProxyUrl`, and optional `proveProxyToken` and `aggregateCaches`. Input addresses are `0x` plus 40 hex characters, accepting either case; prepared addresses are serialized in lowercase. `proveProxyToken` is a bearer credential for `psy_prove_reward_claim_groth16` and is not copied into the prepared claim or a page message.
 
 `RewardClaimPreparation` is one of three statuses:
 
@@ -273,7 +273,7 @@ This returns `claim_amount` for those two L2 users; omitting `--checkpoint-id` s
 
 Set up the registered ZK wallet using [Common Operations](common-operations.md). Supply its keystore through `--keystore-path` and password securely through `WALLET_PASSWORD`. Supply the **separate Ethereum signing key** through `L1_PRIVATE_KEY`; it signs the EVM transaction, while the held ZK key proves registration ownership (`client_prover/psy_core/psy_common/src/args.rs:91-100`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:46-50,130-175`; `client_prover/psy_prover/src/local/reward_client.rs:1029-1051`).
 
-> **Address casing:** supply both `--reward-token` and `--recipient` as `0x` plus exactly 40 **lowercase** hexadecimal characters. `lowercase_address` validates; it does not convert checksummed input. Deployment discovery validates the token through this same helper, so an uppercase token fails with `recipient must be 0x plus 40 lowercase hex characters` even when the recipient is valid. The error names `recipient` regardless of which address failed (`client_prover/psy_prover/src/local/reward_client.rs:749-753,1156-1158,1177-1178`).
+> **Address casing:** `--reward-token` and `--recipient` accept `0x` plus exactly 40 hexadecimal characters, including mixed-case addresses. Address bytes are decoded without a case restriction and prepared addresses are serialized in lowercase. Length, hex format, and nonzero-address checks still apply.
 
 ```bash
 ./target/release/psy_user_cli claim-rewards \
@@ -323,7 +323,7 @@ Braces below denote values interpolated by the source. Do not replace these resp
 
 | Response | Meaning and required action | Source |
 |---|---|---|
-| `recipient must be 0x plus 40 lowercase hex characters` | Token **or** recipient address has invalid casing/format. Supply both as `0x` plus 40 lowercase hex characters; the error always names recipient. | `client_prover/psy_prover/src/local/reward_client.rs:749-753,1156-1158,1177-1178` |
+| `reward address must be 0x plus 40 hex characters` | Supply the token and recipient as `0x` plus exactly 40 hexadecimal characters; mixed case is accepted. | `client_prover/psy_prover/src/local/reward_client.rs:749-753,1156-1158,1177-1178` |
 | `reward source is newer than the recognized anchor` | Source checkpoint exceeds the L1 anchor. Wait for settlement to advance the recognized anchor, then retry with unchanged jobs. | `client_prover/psy_prover/src/local/reward_client.rs:541-544` |
 | `Failed to open backup file: {error}` | Backup cannot be opened for append (for example, unwritable destination). Mining continues **without durable claim metadata**. Fix the destination before mining more work. | `psy_worker_core/src/api/basic_job_fetcher.rs:59-70` |
 | `reward registration leaf does not match the private key` | Unregistered or different held ZK key at the anchor. Confirm registration and use the matching wallet; the Ethereum signer cannot substitute. | `client_prover/psy_prover/src/local/reward_client.rs:1043-1045` |

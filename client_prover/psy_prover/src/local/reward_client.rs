@@ -780,7 +780,7 @@ pub fn chain_id_word(value: [u8; 32]) -> Result<u64> {
 }
 
 fn lowercase_address(value: &str) -> Result<[u8; 20]> {
-    anyhow::ensure!(value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "recipient must be 0x plus 40 lowercase hex characters");
+    anyhow::ensure!(value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit()), "reward address must be 0x plus 40 hex characters");
     let address = decode_address(value)?;
     anyhow::ensure!(address != [0; 20], "reward recipient must be nonzero");
     Ok(address)
@@ -1743,6 +1743,16 @@ mod status_tests {
         assert_eq!(address_word(&word).unwrap(), [3; 20]);
         assert!(lowercase_address("0x111111111111111111111111111111111111111").is_err());
         assert!(lowercase_address("0xGG11111111111111111111111111111111111111").is_err());
+        for value in [
+            "0x78Cc5853f613961c9dd5e20Cf9Ba7e6ec82Fc934",
+            "0x700e814e63c473771A634678FE6d7A6Cc1E0E243",
+        ] {
+            assert_eq!(lowercase_address(value).unwrap(), lowercase_address(&value.to_ascii_lowercase()).unwrap());
+            assert_eq!(lowercase_address(value).unwrap(), lowercase_address(&format!("0x{}", value[2..].to_ascii_uppercase())).unwrap());
+        }
+        assert!(lowercase_address("0x0000000000000000000000000000000000000000").is_err());
+        assert!(lowercase_address("0x111111111111111111111111111111111111111111").is_err());
+        assert!(lowercase_address("700e814e63c473771a634678fe6d7a6cc1e0e243").is_err());
     }
 
     #[test]
