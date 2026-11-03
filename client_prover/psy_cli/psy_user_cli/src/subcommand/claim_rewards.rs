@@ -65,7 +65,7 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
     let token = format!("0x{}", hex::encode(deployment.token));
     let state_manager_address = format!("0x{}", hex::encode(deployment.state_manager));
     let loaded = validate_and_deduplicate_jobs(load_reward_jobs(&args.jobs_file)?, u64::from(user_id), &args.jobs_file)?;
-    anyhow::ensure!(loaded.jobs_len() != 0, "no reward jobs selected");
+    anyhow::ensure!(loaded.jobs_len() != 0, "no supported GUTA reward jobs selected");
     let grouped = client.group_reward_jobs(loaded.into(), user_id, recipient).await?;
     let unloaded_ids = grouped.unloaded.keys().copied().collect::<Vec<_>>();
     let groups = grouped.groups;
@@ -369,6 +369,7 @@ fn load_reward_jobs(path: &str) -> Result<ClaimRewardJobsWithRealm> {
         record_size
     );
 
+    let mut skipped = 0usize;
     for (record_index, record_data) in buffer.chunks_exact(record_size).enumerate() {
         let offset = record_index * record_size;
         let metadata = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::psy_ser_from_slice(record_data)
@@ -379,6 +380,12 @@ fn load_reward_jobs(path: &str) -> Result<ClaimRewardJobsWithRealm> {
             offset,
             metadata.reward_tree_node_key.index
         );
+        let height = metadata.reward_tree_node_key.level;
+        let path_index = metadata.reward_tree_node_key.index;
+        if !(2..=21).contains(&height) || path_index >= (1u64 << (height - 2)) {
+            skipped += 1;
+            continue;
+        }
         let job = QProvingJobDataIDWithRewardPreimage::new(
             metadata.job_id,
             (u64::from(metadata.reward_tree_node_key.level) << 56) | metadata.reward_tree_node_key.index,
@@ -391,6 +398,9 @@ fn load_reward_jobs(path: &str) -> Result<ClaimRewardJobsWithRealm> {
         }
     }
 
+    if skipped != 0 {
+        tracing::warn!(skipped, "skipped jobs outside the supported GUTA reward subtree; original backup unchanged");
+    }
     Ok(claim_jobs)
 }
 
@@ -795,7 +805,7 @@ mod tests {
             unique_pending_id: 987,
             realm_id: 3,
             realm_sub_id: 0,
-            reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: 10 },
+            reward_tree_node_key: SimpleMerkleNodeKey { level: 6, index: 10 },
             reward_tree_hash_mode: 0,
             reward_tree_node_children: 0,
             node_type: 1,
@@ -823,7 +833,7 @@ mod tests {
                 unique_pending_id: 310,
                 realm_id: 0,
                 realm_sub_id: sub,
-                reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: sub },
+                reward_tree_node_key: SimpleMerkleNodeKey { level: 4, index: sub },
                 reward_tree_hash_mode: 0,
                 reward_tree_node_children: 0,
                 node_type: 1,
@@ -843,7 +853,7 @@ mod tests {
     #[test]
     fn backup_reward_path_roundtrips_through_rpc_job() {
         use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
-        let cases = [(1u8, 0u64, 1u8), (3, 7, 1), (0, 0, 0)];
+        let cases = [(2u8, 0u64, 1u8), (4, 3, 1), (21, 524287, 0), (4, 6, 0), (4, 7, 0), (1, 0, 0), (3, 2, 0), (22, 0, 0)];
         let mut bytes = Vec::new();
         for (level, index, node_type) in cases {
             let metadata = PsyProvingJobClaimMetadata {
@@ -866,10 +876,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("claim-rewards-path-{}", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let loaded = load_reward_jobs(path.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "filtering must preserve the original backup");
         std::fs::remove_file(&path).unwrap();
         let jobs = loaded.realm_jobs.into_iter().map(|(_, _, _, job)| job).chain(loaded.coordinator_jobs.into_iter().map(|(_, job)| job)).collect::<Vec<_>>();
-        assert_eq!(jobs.len(), cases.len());
-        for ((expected_level, expected_index, _), loaded_job) in cases.into_iter().zip(jobs) {
+        assert_eq!(jobs.len(), 3);
+        for ((expected_level, expected_index, _), loaded_job) in cases.into_iter().take(3).zip(jobs) {
             let request = psy_provider::request::QGenerateBatchProofMinerRewardProofsRPCRequest { unique_pending_id: 64, job_ids: vec![loaded_job.inner] };
             let packed = serde_json::to_value(&request).unwrap()["job_ids"][0]["reward_path_info"].as_u64().unwrap();
             assert_eq!(packed, (u64::from(expected_level) << 56) | expected_index);
