@@ -39,8 +39,8 @@ impl<'de> Deserialize<'de> for JobIdBytes {
 pub struct JobInstance {
     #[serde(with = "decimal")]
     pub unique_pending_id: u64,
-    #[serde(with = "decimal")]
-    pub unique_proc_id: u64,
+    #[serde(with = "decimal128")]
+    pub unique_proc_id: u128,
     pub job_id: JobIdBytes,
 }
 

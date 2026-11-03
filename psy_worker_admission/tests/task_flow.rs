@@ -205,3 +205,17 @@ async fn invalid_proofs_only_return_the_job_unless_attribution_is_enabled() {
     assert_eq!(env.reputation(&signer).await, (3, 0));
     assert_eq!((env.inflight(&signer), env.queue.count("release", 1)), (0, 1));
 }
+
+#[tokio::test]
+async fn redelivery_of_a_published_job_is_acknowledged_not_looped() {
+    let signer = secret(1); let env = env(&[&signer]).await;
+    env.queue.push(1);
+    let task = env.claim(&signer).await.unwrap();
+    env.submit(&signer, &task.lease, b"proof").await.unwrap();
+    assert_eq!(env.queue.count("complete", 1), 1);
+    // The fire-and-forget ACK was lost and the message comes back.
+    env.queue.push(1);
+    assert_eq!(env.claim(&signer).await.unwrap_err(), AdmissionError::NoWork);
+    assert_eq!((env.queue.count("complete", 1), env.queue.count("delay", 1)), (2, 0));
+    assert_eq!(env.pipeline.published.lock().unwrap()[&task.lease.job_key], 1);
+}

@@ -185,8 +185,12 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
                     self.queue_call(self.queue.delay(&job, wait).await);
                 }
                 Err(Error::JobAlreadyAccepted) => {
-                    // Accepted but maybe not published yet: the publisher ACKs it.
-                    self.queue_call(self.queue.delay(&job, 5_000).await);
+                    // Published: the final ACK was lost, acknowledge this delivery.
+                    // Accepted only: the publisher will ACK it after publishing.
+                    match self.leases.lease_record(&job).await? {
+                        Some(lease) if lease.state == LeaseState::Published => self.queue_call(self.queue.complete(&job).await),
+                        _ => self.queue_call(self.queue.delay(&job, 5_000).await),
+                    }
                 }
                 Err(error) => {
                     self.queue_call(self.queue.release(&job).await);

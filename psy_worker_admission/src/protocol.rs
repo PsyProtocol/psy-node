@@ -72,6 +72,21 @@ pub mod decimal {
     }
 }
 
+/// U128 values (processing instance IDs) use decimal strings too.
+pub mod decimal128 {
+    use super::*;
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<u128, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty() || value.len() > 39 || !value.bytes().all(|b| b.is_ascii_digit()) || (value.len() > 1 && value.starts_with('0')) {
+            return Err(de::Error::custom("invalid canonical decimal u128"));
+        }
+        value.parse().map_err(de::Error::custom)
+    }
+}
+
 pub fn digest(bytes: &[u8]) -> Hash32 {
     FixedBytes(Sha256::digest(bytes).into())
 }
