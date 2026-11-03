@@ -8061,6 +8061,7 @@ dependencies = [
  "psy_node_core",
  "psy_node_store_memory",
  "psy_serialize",
+ "psy_worker_admission",
  "rand 0.8.5",
  "rayon",
  "rkyv",
@@ -8760,6 +8761,24 @@ dependencies = [
  "tracing",
  "ts-rs",
  "twox-hash 1.6.3",
+]
+
+[[package]]
+name = "psy_worker_admission"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "jsonrpsee",
+ "rand 0.8.5",
+ "redis 0.30.0",
+ "secp256k1 0.31.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
 ]
 
 [[package]]

@@ -65,6 +65,11 @@ pub async fn start_coordinator_edge_rpc_server<
     let mut rpc_module = RpcModule::new(handler.clone());
     rpc_module.merge(NodeEdgeWorkerRpcServer::into_rpc(handler.clone()))?;
     rpc_module.merge(CoordinatorEdgeRpcServer::into_rpc(handler.clone()))?;
+    if let Some(admission) = psy_worker_admission::rpc::observe_rpc_from_env(
+        2, realm_id.try_into()?, realm_sub_id.try_into()?,
+    ).await? {
+        rpc_module.merge(admission)?;
+    }
     let handle = server.start(rpc_module);
     print_cf_log_indicator("PSY_COORDINATOR_EDGE_RPC_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
     tracing::info!("Coordinator Edge RPC Server started on {}", addr);
