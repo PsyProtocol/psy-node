@@ -8862,6 +8862,7 @@ dependencies = [
  "psy_io",
  "psy_provider",
  "psy_serialize",
+ "psy_worker_admission",
  "rand 0.8.5",
  "rayon",
  "rkyv",
