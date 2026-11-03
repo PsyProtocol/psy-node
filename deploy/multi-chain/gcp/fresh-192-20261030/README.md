@@ -223,10 +223,15 @@ the rules for every validator here; Edges with labels support refuse a policy
 that breaks them, so check before installing. Labels never change admission.
 Edges from before labels support ignore the field. Edges with it add a
 `worker_label` field to worker reputation logs and reread the config every 30
-seconds, so a label change needs no restart. The config hash still changes,
-so the release lock's `runtime_config` and `worker_whitelist` pins must be
-updated with it, or step 66 refuses the Edge configs. Labels are operational
-names: keep personal names and private addresses out of them.
+seconds, so a label change needs no restart. Labels are operational names:
+keep personal names and private addresses out of them.
+
+A live whitelist change makes the installed config differ from the lock's
+`runtime_config`. Do not re-pin the lock to follow it: the Guardian and Relayer
+build records pin the same hash, and their install checks would refuse. Record
+the change outside the lock instead. Before a redeploy that should keep the
+new keys, bake them into `worker-whitelist.json` and the runtime config of the
+next release. Until then, step 66 refuses the changed Edge configs.
 
 ```sh
 python3 -B deploy/multi-chain/gcp/fresh-192-20261030/prepare_config.py \
