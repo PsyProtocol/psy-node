@@ -12,7 +12,7 @@ use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key, tt_get_guta_in_flight_key, GutaInFlightRecord, QTempDBGutaInFlightStore,
         tt_get_end_cap_redelivery_key, EndCapRedeliveryRecord, QTempDBEndCapRedeliveryStore, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES,
-        TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES,
+        TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, TEMP_TABLE_ID_END_CAP_REDELIVERY_DISCARDED_BYTES, TEMP_TABLE_ID_END_CAP_REDELIVERY_USERS_BYTES,
         CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, QTempDBJobClaimRecordStore, JobClaimRecord, WorkerReputationRecord, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
@@ -1147,6 +1147,68 @@ impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVWriterBase + QTempDatab
         let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_CURSOR_BYTES, 0);
         let observed = observed.map(u64::to_le_bytes);
         self.qtdb_raw_kv_compare_and_set(&key, observed.as_ref().map(|bytes| bytes.as_slice()), &next.to_le_bytes()).await
+    }
+
+    async fn add_discarded_end_cap_generation(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        update_discarded_end_cap_generations(self, rid, |generations| {
+            if !generations.contains(&unique_pending_id) { generations.push(unique_pending_id); }
+        }).await
+    }
+
+    async fn get_discarded_end_cap_generations(&self, rid: &QRealmIdentifier) -> anyhow::Result<Vec<u64>> {
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_DISCARDED_BYTES, 0);
+        decode_pending_ids(&self.qtdb_raw_kv_get_value(&key).await?.unwrap_or_default())
+    }
+
+    async fn remove_discarded_end_cap_generation(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        update_discarded_end_cap_generations(self, rid, |generations| generations.retain(|id| *id != unique_pending_id)).await
+    }
+}
+
+fn decode_pending_ids(bytes: &[u8]) -> anyhow::Result<Vec<u64>> {
+    anyhow::ensure!(bytes.len() % 8 == 0, "discarded EndCap generation list has {} bytes", bytes.len());
+    bytes.chunks_exact(8).map(|chunk| Ok(u64::from_le_bytes(chunk.try_into()?))).collect()
+}
+
+async fn update_discarded_end_cap_generations<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync>(
+    store: &T,
+    rid: &QRealmIdentifier,
+    update: impl Fn(&mut Vec<u64>),
+) -> anyhow::Result<()> {
+    let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_DISCARDED_BYTES, 0);
+    for _ in 0..END_CAP_REDELIVERY_USER_LIST_ATTEMPTS {
+        let observed = store.qtdb_raw_kv_get_value(&key).await?.filter(|bytes| !bytes.is_empty());
+        let mut generations = decode_pending_ids(observed.as_deref().unwrap_or_default())?;
+        update(&mut generations);
+        let bytes: Vec<u8> = generations.iter().flat_map(|id| id.to_le_bytes()).collect();
+        if store.qtdb_raw_kv_compare_and_set(&key, observed.as_deref(), &bytes).await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("could not update the discarded EndCap generation list after {} attempts", END_CAP_REDELIVERY_USER_LIST_ATTEMPTS)
+}
+
+#[cfg(test)]
+mod discarded_end_cap_generation_tests {
+    use parth_core::node::realm_identifier::QRealmIdentifier;
+
+    use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
+    use crate::psy_temp_db::QTempDBEndCapRedeliveryStore;
+
+    #[tokio::test]
+    async fn discarded_generations_are_listed_once_per_realm_and_removed_individually() -> anyhow::Result<()> {
+        let store = SimpleMemoryTempStore::new();
+        let realm = QRealmIdentifier::new(0, 1);
+        let other = QRealmIdentifier::new(0, 2);
+        store.add_discarded_end_cap_generation(&realm, 7).await?;
+        store.add_discarded_end_cap_generation(&realm, 9).await?;
+        store.add_discarded_end_cap_generation(&realm, 7).await?;
+        store.add_discarded_end_cap_generation(&other, 3).await?;
+        assert_eq!(store.get_discarded_end_cap_generations(&realm).await?, vec![7, 9]);
+        store.remove_discarded_end_cap_generation(&realm, 7).await?;
+        assert_eq!(store.get_discarded_end_cap_generations(&realm).await?, vec![9]);
+        assert_eq!(store.get_discarded_end_cap_generations(&other).await?, vec![3]);
+        Ok(())
     }
 }
 

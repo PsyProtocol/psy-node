@@ -635,7 +635,13 @@ mod end_cap_handoff_tests {
         assert_one_end_cap(fixture, second, next, 2).await?;
         fixture.assert_backup(2, first_end_tree, second, Some(next)).await?;
         assert!(fixture.config.future_pending_end_cap_jobs.read().unwrap().is_empty());
+        assert!(discarded_generations(fixture).await?.is_empty());
         Ok(())
+    }
+
+    async fn discarded_generations(fixture: &HandoffFixture) -> anyhow::Result<Vec<u64>> {
+        let realm_identifier = fixture.config.status.read().unwrap().realm_identifier;
+        psy_node_core::psy_temp_db::QTempDBEndCapRedeliveryStore::get_discarded_end_cap_generations(fixture.config.temp_db.as_ref(), &realm_identifier).await
     }
 
     #[tokio::test]
@@ -655,6 +661,9 @@ mod end_cap_handoff_tests {
         let tree = overlapped.fixture.tree.read().await;
         assert_eq!(tree.get_root(), first_end_root);
         assert_eq!(tree.get_leaf_value(0), overlapped.item.new_user_leaf_hash);
+        drop(tree);
+        // The Edge settles the discarded generation's admitted EndCap without waiting for inclusion.
+        assert_eq!(discarded_generations(&overlapped.fixture).await?, vec![2]);
         Ok(())
     }
 }

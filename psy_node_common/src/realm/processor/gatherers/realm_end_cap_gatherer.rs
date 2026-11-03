@@ -1316,11 +1316,20 @@ impl<
         if planner_realm_root_proof.value != self.start_global_user_tree_root
             && !self.recreate_planner_on_proof_base(tree, &authenticated).await?
         {
-            tracing::warn!(
-                "Discarding EndCap generation whose proof base {} does not authenticate cycle start {:?}",
-                planner_checkpoint_id,
-                self.start_global_user_tree_root
-            );
+            let accepted_end_cap_count = self.guta_planner.total_end_caps_processed;
+            let deferred_end_cap_count = self.guta_planner.future_pending_end_cap_jobs.len();
+            if accepted_end_cap_count == 0 && deferred_end_cap_count == 0 {
+                tracing::info!(
+                    "Discarding empty EndCap generation for pending id {} whose proof base {} does not authenticate cycle start {:?}",
+                    self.status.gathering_unique_pending_id, planner_checkpoint_id, self.start_global_user_tree_root
+                );
+            } else {
+                tracing::warn!(
+                    accepted_end_cap_count, deferred_end_cap_count,
+                    "Discarding EndCap generation for pending id {} whose proof base {} does not authenticate cycle start {:?}; the Edge redelivers its accepted EndCaps",
+                    self.status.gathering_unique_pending_id, planner_checkpoint_id, self.start_global_user_tree_root
+                );
+            }
             tree.revert_changes();
             self.guta_planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
             *self.config.current_validator_user_leaf.lock()
@@ -1330,6 +1339,10 @@ impl<
             self.config.status.write()
                 .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
                 .gathering_realm_start_root = reverted_root;
+            // Deferred EndCaps return to the next generation on drop, so only a generation without them is final.
+            if accepted_end_cap_count > 0 && deferred_end_cap_count == 0 {
+                self.config.temp_db.add_discarded_end_cap_generation(&authenticated.realm_identifier, self.status.gathering_unique_pending_id).await?;
+            }
             return Ok(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],
