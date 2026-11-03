@@ -53,7 +53,8 @@ def build_config(canonical, retained, release):
         if type(guardian["id"]) is not int or guardian["id"] != identifier:
             raise ValueError("ordered Guardian ids required")
         public_url(guardian["rpc_url"])
-    fields(previous["whitelist"], ("enabled", "secp256k1"))
+    fields(previous["whitelist"], preflight.worker_labels.policy_fields(previous["whitelist"]))
+    preflight.worker_labels.check_labels(previous["whitelist"], preflight.preflight_require)
     if previous.get("coordinator_configs") != release["coordinator_configs"]:
         raise ValueError("Coordinator endpoints differ from approved internal placement")
     for coordinator in previous["coordinator_configs"]:

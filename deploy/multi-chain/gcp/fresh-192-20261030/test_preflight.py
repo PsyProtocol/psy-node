@@ -78,6 +78,17 @@ class Fresh192PreflightTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 preflight.config_checks(config, self.release)
 
+    def test_worker_labels_are_optional_but_validated(self):
+        key = self.config["networks"]["testnet"]["whitelist"]["secp256k1"][0]
+        self.config["networks"]["testnet"]["whitelist"]["labels"] = {key: "c4d-coordinator"}
+        preflight.config_checks(self.config, self.release)
+        for whitelist_update in ({"labels": {"03" + "1" * 64: "outsider"}}, {"labels": {key: "bad name"}},
+                                 {"names": {}}):
+            config = copy.deepcopy(self.config)
+            config["networks"]["testnet"]["whitelist"].update(whitelist_update)
+            with self.subTest(update=whitelist_update), self.assertRaises(ValueError):
+                preflight.config_checks(config, self.release)
+
     def test_guardian_alias_duplicates_and_missing_members_reject(self):
         for members in (["1", "01", "2"], ["0", "1", "2"], ["1", "2"]):
             self.config["networks"]["testnet"]["guardian_initial_member_hashes"] = members

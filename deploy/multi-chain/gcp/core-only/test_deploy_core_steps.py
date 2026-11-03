@@ -615,6 +615,18 @@ class WorkerStepTests(StepTestCase):
         self.fixture.write_policy(self.fixture.whitelist)
         steps.workers_verify(ctx)
 
+    def test_workers_verify_compares_worker_labels(self):
+        ctx = self.start(active=True)
+        keys = self.fixture.whitelist["networks"]["testnet"]["whitelist"]["secp256k1"]
+        labelled = json.loads(json.dumps(self.fixture.whitelist))
+        labelled["networks"]["testnet"]["whitelist"]["labels"] = {keys[0]: "c4d-coordinator"}
+        self.fixture.write_policy(labelled, listed=labelled)
+        self.remote.edge_config_sha256 = self.fixture.lock["inputs"]["runtime_config"]
+        steps.workers_verify(ctx)
+        self.fixture.write_policy(labelled)
+        with self.assertRaisesRegex(ValueError, "worker labels differ from the lock whitelist"):
+            steps.workers_verify(ctx)
+
     def test_a_worker_identity_missing_from_the_whitelist_is_refused(self):
         ctx = self.start(active=True)
         short = {"networks": {"testnet": {"whitelist": {"enabled": True, "secp256k1": ["03" + "cd" * 32]}}}}

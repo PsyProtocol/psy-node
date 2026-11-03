@@ -9,6 +9,7 @@ import re
 from urllib.parse import urlsplit
 
 import release_lock
+import worker_labels
 
 
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
@@ -189,7 +190,7 @@ def validate_whitelist(doc):
     fields(doc["networks"], ("testnet",), "runtime worker whitelist networks")
     fields(doc["networks"]["testnet"], ("whitelist",), "worker network")
     policy = doc["networks"]["testnet"]["whitelist"]
-    fields(policy, ("enabled", "secp256k1"), "worker policy")
+    fields(policy, worker_labels.policy_fields(policy), "worker policy")
     require(policy["enabled"] is True, "worker whitelist must be enabled")
     keys = policy["secp256k1"]
     require(isinstance(keys, list) and 1 <= len(keys) <= 10000, "worker whitelist must not be empty")
@@ -199,6 +200,7 @@ def validate_whitelist(doc):
                 "invalid compressed worker public key encoding")
         canonical.append(key.lower().removeprefix("0x"))
     require(len(set(canonical)) == len(canonical), "duplicate worker public key")
+    worker_labels.check_labels(policy, require)
     return policy
 
 

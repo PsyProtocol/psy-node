@@ -274,6 +274,16 @@ class AssemblyTests(unittest.TestCase):
         result = self.assemble()
         self.assertEqual(result["networks"]["testnet"]["whitelist"]["secp256k1"], keys)
 
+    def test_worker_labels_are_carried_into_the_config(self):
+        policy = self.whitelist["networks"]["testnet"]["whitelist"]
+        policy["labels"] = {WORKER_KEY: "c4d-coordinator"}
+        self.assertEqual(self.assemble()["networks"]["testnet"]["whitelist"]["labels"], {WORKER_KEY: "c4d-coordinator"})
+        for labels in ({"03" + WORKER_KEY[2:]: "outsider"}, {WORKER_KEY: "bad name"}):
+            with self.subTest(labels=labels):
+                policy["labels"] = labels
+                with self.assertRaises(prepare.PrepareError):
+                    self.assemble()
+
     def test_guardian_order_preserved_and_invalid_commitments_rejected(self):
         self.commitments["guardian_initial_member_hashes"].reverse()
         self.assertEqual(self.assemble()["networks"]["testnet"]["guardian_initial_member_hashes"],

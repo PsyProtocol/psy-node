@@ -426,6 +426,8 @@ def worker_policy(ctx):
     require(whitelist["enabled"] is True, "the worker whitelist is not enforced in the runtime config")
     require(set(whitelist["secp256k1"]) == set(listed["secp256k1"]),
             "the runtime config whitelist differs from the lock whitelist")
+    require(whitelist.get("labels", {}) == listed.get("labels", {}),
+            "the runtime config worker labels differ from the lock whitelist")
     require(set(prepare_workers.PUBLIC_KEYS.values()) <= set(whitelist["secp256k1"]),
             "a Worker identity is not on the whitelist")
     return len(whitelist["secp256k1"])

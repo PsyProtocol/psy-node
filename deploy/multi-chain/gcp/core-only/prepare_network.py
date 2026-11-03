@@ -22,6 +22,7 @@ import stat
 import sys
 
 import release_lock
+import worker_labels
 
 
 MAX_PUBLIC_INPUT_BYTES = 64 * 1024 * 1024
@@ -192,7 +193,7 @@ def validate_whitelist(document):
     fields(document["networks"], ("testnet",), "worker whitelist networks")
     fields(document["networks"]["testnet"], ("whitelist",), "worker network")
     policy = document["networks"]["testnet"]["whitelist"]
-    fields(policy, ("enabled", "secp256k1"), "worker policy")
+    fields(policy, worker_labels.policy_fields(policy), "worker policy")
     require(policy["enabled"] is True, "worker whitelist must be enabled")
     keys = policy["secp256k1"]
     require(isinstance(keys, list) and 1 <= len(keys) <= 10000, "worker whitelist must not be empty")
@@ -211,6 +212,7 @@ def validate_whitelist(document):
                 "worker public key is not a secp256k1 point")
         canonical.append(encoded)
     require(len(set(canonical)) == len(canonical), "duplicate worker public key")
+    worker_labels.check_labels(policy, require)
     return copy.deepcopy(policy)
 
 

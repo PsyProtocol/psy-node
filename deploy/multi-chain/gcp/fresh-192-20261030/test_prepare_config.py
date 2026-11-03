@@ -92,6 +92,15 @@ class ConfigPreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare.build_config(self.canonical, retained, self.release)
 
+    def test_worker_labels_are_retained_and_validated(self):
+        whitelist = self.retained["networks"]["testnet"]["whitelist"]
+        whitelist["labels"] = {whitelist["secp256k1"][0]: "c4d-coordinator"}
+        config = prepare.build_config(self.canonical, self.retained, self.release)
+        self.assertEqual(config["networks"]["testnet"]["whitelist"], whitelist)
+        whitelist["labels"] = {whitelist["secp256k1"][0]: "bad name"}
+        with self.assertRaises(ValueError):
+            prepare.build_config(self.canonical, self.retained, self.release)
+
     def test_missing_optional_guardian_history_does_not_copy_template_history(self):
         self.retained["networks"]["testnet"].pop("guardian_history")
         self.canonical["networks"]["testnet"]["guardian_history"] = ["template-not-retained"]

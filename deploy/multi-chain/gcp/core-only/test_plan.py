@@ -473,6 +473,31 @@ class PlanTests(unittest.TestCase):
         self.w = {"networks": {"localhost": {"whitelist": {"enabled": True, "secp256k1": [WORKER_KEY]}}}}
         self.reject("runtime worker whitelist networks")
 
+    def test_worker_labels_accepted_when_both_policies_carry_them(self):
+        labelled = {"enabled": True, "secp256k1": [WORKER_KEY], "labels": {WORKER_KEY: "c4d-coordinator"}}
+        self.w["networks"]["testnet"]["whitelist"] = copy.deepcopy(labelled)
+        self.c["networks"]["testnet"]["whitelist"] = copy.deepcopy(labelled)
+        self.assertTrue(self.report()["input_consistency_passed"])
+        self.c["networks"]["testnet"]["whitelist"]["labels"] = {WORKER_KEY: "other"}
+        self.reject("testnet whitelist differs from dedicated policy")
+
+    def test_invalid_worker_labels_rejected(self):
+        outsider = "03" + WORKER_KEY[2:]
+        for labels, message in (({outsider: "outsider"}, "not whitelisted"),
+                                ({WORKER_KEY: "has space"}, "worker label must be"),
+                                ({WORKER_KEY: ""}, "worker label must be"),
+                                ({WORKER_KEY: "x" * 65}, "worker label must be"),
+                                ({WORKER_KEY: "a", "0x" + WORKER_KEY: "b"}, "labelled twice"),
+                                ({"bad": "name"}, "invalid worker label key"),
+                                ([WORKER_KEY], "must be an object")):
+            with self.subTest(labels=labels):
+                policy = {"enabled": True, "secp256k1": [WORKER_KEY], "labels": labels}
+                self.w["networks"]["testnet"]["whitelist"] = copy.deepcopy(policy)
+                self.c["networks"]["testnet"]["whitelist"] = copy.deepcopy(policy)
+                self.reject(message)
+        self.w["networks"]["testnet"]["whitelist"] = {"enabled": True, "secp256k1": [WORKER_KEY], "names": {}}
+        self.reject("worker policy: unexpected or missing fields")
+
     def test_embedded_and_dedicated_testnet_policies_must_match(self):
         for policy in (None, {"enabled": False, "secp256k1": [WORKER_KEY]},
                        {"enabled": True, "secp256k1": []},

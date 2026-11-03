@@ -207,6 +207,27 @@ history rejects and no history is copied. The two input hashes must match
 config files and the release profile, never keystores or private-key files;
 it does not modify inputs or contact hosts. Inputs remain operator-trusted.
 
+### Worker labels
+
+A whitelist policy may name its workers with an optional `labels` object
+alongside `enabled` and `secp256k1`:
+
+```json
+"whitelist": {"enabled": true, "secp256k1": ["02..."],
+              "labels": {"02...": "c4d-coordinator"}}
+```
+
+Each label key must be a whitelisted key, each name 1-64 characters of
+`[A-Za-z0-9._-]`, and names must be unique. `core-only/worker_labels.py` holds
+the rules for every validator here; Edges with labels support refuse a policy
+that breaks them, so check before installing. Labels never change admission.
+Edges from before labels support ignore the field. Edges with it add a
+`worker_label` field to worker reputation logs and reread the config every 30
+seconds, so a label change needs no restart. The config hash still changes,
+so the release lock's `runtime_config` and `worker_whitelist` pins must be
+updated with it, or step 66 refuses the Edge configs. Labels are operational
+names: keep personal names and private addresses out of them.
+
 ```sh
 python3 -B deploy/multi-chain/gcp/fresh-192-20261030/prepare_config.py \
   --canonical "$CANONICAL_CONFIG" --canonical-sha256 "$CANONICAL_SHA256" \

@@ -8,9 +8,13 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 
 
 HERE = Path(__file__).resolve().parent
+# Shared with the core-only validators; appended so it never shadows a module here.
+sys.path.append(str(HERE.parent / "core-only"))
+import worker_labels  # noqa: E402
 
 
 def release_checks(release):
@@ -48,6 +52,11 @@ def release_checks(release):
     coordinators = release["coordinator_configs"]
     if coordinators != [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}]:
         raise ValueError("unapproved internal Coordinator placement")
+
+
+def preflight_require(condition, message):
+    if not condition:
+        raise ValueError(message)
 
 
 def unique_object(pairs):
@@ -113,6 +122,9 @@ def config_checks(config, release):
         raise ValueError("owned worker whitelist must be enabled and nonempty")
     if any(not isinstance(key, str) or not re.fullmatch(r"0[23][0-9a-f]{64}", key) for key in keys) or len(set(keys)) != len(keys):
         raise ValueError("invalid or duplicate worker public keys")
+    if set(whitelist) != set(worker_labels.policy_fields(whitelist)):
+        raise ValueError("unexpected worker whitelist fields")
+    worker_labels.check_labels(whitelist, preflight_require)
     members = network.get("guardian_initial_member_hashes", [])
     if not isinstance(members, list) or len(members) != 3 or any(
             not isinstance(member, str) or not re.fullmatch(r"[0-9a-fA-F]{1,64}", member) or int(member, 16) == 0
