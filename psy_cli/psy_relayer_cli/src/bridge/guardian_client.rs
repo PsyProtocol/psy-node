@@ -736,6 +736,7 @@ impl RelayerDb {
                 }
                 None => 0,
             };
+            ensure!(decoded.session_nonce >= cursor, "relayer request does not extend the imported account cursor");
             // A journal rebuilt by `restore-bridge-state` keeps the account cursor but no
             // request rows. The predecessor Included row is required everywhere except exactly
             // at that boundary, where the row the cursor names was erased on purpose.
@@ -953,7 +954,7 @@ impl RelayerDb {
 
     /// Included transition, changed deposit-tree states, latest-inclusion session-nonce metadata, and the sole account checkpoint in one commit.
     /// `checkpoint_hash` is the authenticated checkpoint leaf hash. A conflicting replay of an included nonce halts and never rewinds.
-    /// Retention prunes every request row older than the imported nonce in this same commit; at most one pending successor survives.
+    /// Retention keeps the latest `RETAINED_SESSION_COUNT` Included rows in this same commit; at most one pending successor survives.
     pub(crate) fn import_verified(&self, config: &protocol::GuardianConfig, session: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: protocol::Hash4) -> anyhow::Result<()> {
         let request = session.record.validate(config).map_err(|error| anyhow::anyhow!(error))?;
         let identity = self.current_identity(config, &request)?;
@@ -1045,12 +1046,11 @@ impl RelayerDb {
             let mut requests = tx.open_table(RELAYER_REQUEST)?;
             let bytes = encode(&included_row)?;
             requests.insert(session.nonce, bytes.as_slice())?;
-            // Retention: the just-advanced imported cursor makes every older row dead weight, so
-            // they leave in this same commit; at most one pending successor survives and a larger
-            // future tail fails closed instead of being silently dropped.
+            // Retention: rows below the retained window leave in this same commit; at most one
+            // pending successor survives and a larger future tail fails closed.
             let successor = session.nonce.checked_add(1).context("relayer nonce overflow")?;
             let mut stale = Vec::new();
-            for row in requests.range::<u64>(..session.nonce)? { stale.push(row?.0.value()); }
+            for row in requests.range::<u64>(..protocol::oldest_retained_session_nonce(session.nonce))? { stale.push(row?.0.value()); }
             for nonce in stale { requests.remove(nonce)?; }
             let mut successors = 0u64;
             for row in requests.range::<u64>(successor..)? {
@@ -1382,7 +1382,7 @@ pub(crate) async fn prove_pending_request(
     use psy_vm::ups::multisig::MultisigSignatureWitness;
     let request = request_json.decode()?;
     request.validate_authorization(config)?;
-    let trace = request.decode_trace()?;
+    let mut trace = request.decode_trace()?;
     let witness = match trace.steps.last() {
         Some(TraceStep::ZkSign(step)) if matches!(step.sign_circuit_source, TraceSignCircuitSource::Multisig) => serde_json::from_slice::<MultisigSignatureWitness>(&step.sign_witness)?,
         _ => anyhow::bail!("guardian request is not a multisig trace"),
@@ -1404,6 +1404,7 @@ pub(crate) async fn prove_pending_request(
         crate::guardian::verify::verify_cached_endcap_proof(wallet, &proof, &trace.finalization.submit_end_cap_input).await?;
         return Ok(proof);
     }
+    trace.contract_codes = crate::guardian::verify::load_trace_contract_codes(&wallet.st_provider, &trace).await?;
     let schedule = wallet.prepare_trace_proof_schedule(&trace).await?;
     let mut outputs = vec![wallet.prove_ups_start_job(trace.meta.public_key, &trace).await?];
     for seed in &schedule.seeds {
@@ -1871,36 +1872,32 @@ mod tests {
     }
 
     #[test]
-    fn import_prunes_older_rows_and_keeps_the_pending_successor() {
+    fn import_keeps_the_retained_window_and_the_pending_successor() {
         let (path, db) = fresh();
         let s1 = include_session(&db, 1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8), 1, QHashOut::from_values(1, 1, 1, 1));
         assert_eq!(retained_keys(&db), vec![1]);
         let s2 = include_session(&db, 2, s1.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9), 2, QHashOut::from_values(2, 2, 2, 2));
-        assert_eq!(retained_keys(&db), vec![2]);
+        assert_eq!(retained_keys(&db), vec![1, 2]);
         let s3 = include_session(&db, 3, s2.ending_leaf_hash, QHashOut::from_values(1, 2, 3, 4), 3, QHashOut::from_values(3, 3, 3, 3));
-        assert_eq!(retained_keys(&db), vec![3]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3]);
         let next = import_request(4, s3.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6));
         let next_frozen = JsonText::from_value(&next).unwrap();
         db.save_request(&fixture_config(), &next_frozen, &[], &[]).unwrap();
-        assert_eq!(retained_keys(&db), vec![3, 4]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3, 4]);
         assert!(matches!(db.row(3).unwrap(), Some(Request::Included { .. })));
         assert!(matches!(db.row(4).unwrap(), Some(Request::Request { .. })));
         assert_eq!(db.pending_request().unwrap().unwrap().as_str(), next_frozen.as_str());
         assert_eq!(db.load_account(next.network_magic, next.user_id).unwrap().unwrap().imported_nonce, Some(3));
-        // Exact one behind recovers; an older gap serves the retained base without claiming contiguity.
-        let behind = db.sessions(2, 1).unwrap();
-        assert_eq!(behind.sessions.len(), 1);
-        behind.validate_page(2, 1).unwrap();
-        let gapped = db.sessions(0, 1).unwrap();
-        assert_eq!(gapped.next_after_nonce, 3);
-        gapped.validate_page(0, 1).unwrap();
+        for after in 0..3 {
+            let page = db.sessions(after, 1).unwrap();
+            assert_eq!(page.next_after_nonce, after + 1);
+            page.validate_page(after, 1).unwrap();
+        }
         drop(db);
         let reopened = RelayerDb::open(&path).unwrap();
-        assert_eq!(retained_keys(&reopened), vec![3, 4]);
+        assert_eq!(retained_keys(&reopened), vec![1, 2, 3, 4]);
         assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), next_frozen.as_str());
-        assert!(reopened.load_session(1, next.request_id().unwrap()).is_err());
-        // The marker-3 validator accepts the non-1 suffix with no schema bump.
-        assert_eq!(migrate_relayer_journal(&reopened.db, &fixture_config()).unwrap(), 2);
+        assert_eq!(migrate_relayer_journal(&reopened.db, &fixture_config()).unwrap(), 4);
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -1910,23 +1907,22 @@ mod tests {
         let s1 = include_session(&db, 1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8), 1, QHashOut::from_values(1, 1, 1, 1));
         let s2 = include_session(&db, 2, s1.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9), 2, QHashOut::from_values(2, 2, 2, 2));
         let s3 = include_session(&db, 3, s2.ending_leaf_hash, QHashOut::from_values(1, 2, 3, 4), 3, QHashOut::from_values(3, 3, 3, 3));
-        assert_eq!(retained_keys(&db), vec![3]);
-        // With cursor A = 3 a stale nonce 1 would have silently grown a row below the pruned suffix;
-        // previous == 0 skips the previous-row check, so only the cursor check can stop it.
+        assert_eq!(retained_keys(&db), vec![1, 2, 3]);
+        // With cursor A = 3 a stale nonce 1 is refused even though its Included row is still retained.
         let stale = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         let error = db.save_request(&fixture_config(), &JsonText::from_value(&stale).unwrap(), &[], &[]).unwrap_err();
         assert_eq!(error.to_string(), "relayer request does not extend the imported account cursor");
-        assert_eq!(retained_keys(&db), vec![3]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3]);
         let next = import_request(4, s3.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6));
         db.save_request(&fixture_config(), &JsonText::from_value(&next).unwrap(), &[], &[]).unwrap();
-        assert_eq!(retained_keys(&db), vec![3, 4]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3, 4]);
         let beyond = import_request(5, s3.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6));
         assert!(db.save_request(&fixture_config(), &JsonText::from_value(&beyond).unwrap(), &[], &[]).is_err());
-        assert_eq!(retained_keys(&db), vec![3, 4]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3, 4]);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
-    fn transitional_full_history_stays_valid_until_the_next_import_prunes() {
+    fn transitional_full_history_stays_valid_and_keeps_the_retained_window() {
         let (path, db) = fresh();
         let s1 = include_session(&db, 1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8), 1, QHashOut::from_values(1, 1, 1, 1));
         let first = db.row(1).unwrap().unwrap();
@@ -1941,7 +1937,7 @@ mod tests {
         assert_eq!(retained_keys(&db), vec![1, 2, 3, 4]);
         assert_eq!(migrate_relayer_journal(&db.db, &fixture_config()).unwrap(), 4);
         include_session(&db, 4, s3.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6), 4, QHashOut::from_values(4, 4, 4, 4));
-        assert_eq!(retained_keys(&db), vec![4]);
+        assert_eq!(retained_keys(&db), vec![1, 2, 3, 4]);
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -1957,10 +1953,10 @@ mod tests {
         let pending4 = db.row(4).unwrap().unwrap();
         let account = fixture_account(&s3, 3, QHashOut::from_values(3, 3, 3, 3));
         let validate = |config: &protocol::GuardianConfig| migrate_relayer_journal(&db.db, config);
-        assert_eq!(validate(&fixture_config()).unwrap(), 2);
+        assert_eq!(validate(&fixture_config()).unwrap(), 4);
         // Removing the pending successor alone stays valid.
         remove_raw_request(&db, 4);
-        assert_eq!(validate(&fixture_config()).unwrap(), 1);
+        assert_eq!(validate(&fixture_config()).unwrap(), 3);
         write_raw_request(&db, 4, &pending4);
         // A gap inside the retained suffix.
         let sixth = import_request(6, s3.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6));
@@ -2057,23 +2053,30 @@ mod tests {
     }
 
     #[test]
-    fn retained_latest_replay_is_idempotent_and_pruned_replay_is_refused_without_halt() {
+    fn retained_replay_is_idempotent_and_pruned_replay_is_refused_without_halt() {
         let (path, db) = fresh();
-        let s1 = include_session(&db, 1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8), 1, QHashOut::from_values(1, 1, 1, 1));
-        let s2 = include_session(&db, 2, s1.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9), 2, QHashOut::from_values(2, 2, 2, 2));
-        // Nonce 1 left with its import commit; the retained latest replay stays idempotent.
-        assert_eq!(retained_keys(&db), vec![2]);
-        db.import_verified(&fixture_config(), &s2, &[], 2, QHashOut::from_values(2, 2, 2, 2)).unwrap();
-        let account = db.load_account(s2.network_magic, s2.user_id).unwrap().unwrap();
+        let last = protocol::RETAINED_SESSION_COUNT + 2;
+        let mut sessions = vec![include_session(&db, 1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8), 1, QHashOut::from_values(1, 1, 1, 1))];
+        for nonce in 2..=last {
+            let start = sessions.last().unwrap().ending_leaf_hash;
+            sessions.push(include_session(&db, nonce, start, QHashOut::from_values(nonce, nonce, 1, 9), nonce, QHashOut::from_values(nonce, nonce, nonce, nonce)));
+        }
+        let oldest = protocol::oldest_retained_session_nonce(last);
+        assert_eq!(retained_keys(&db), (oldest..=last).collect::<Vec<_>>());
+        assert_eq!(db.sessions(oldest, 1).unwrap().next_after_nonce, oldest + 1);
+        for nonce in [last, oldest] {
+            db.import_verified(&fixture_config(), &sessions[nonce as usize - 1], &[], nonce, QHashOut::from_values(nonce, nonce, nonce, nonce)).unwrap();
+        }
+        let account = db.load_account(sessions[0].network_magic, sessions[0].user_id).unwrap().unwrap();
         assert_eq!(account.state, guardian_common::protocol::GuardianAccountState::Active);
-        assert_eq!(account.imported_nonce, Some(2));
-        // A replay of a pruned nonce can no longer be byte-checked: typed refusal, never a halt.
-        let error = db.import_verified(&fixture_config(), &s1, &[], 1, QHashOut::from_values(1, 1, 1, 1)).unwrap_err();
+        assert_eq!(account.imported_nonce, Some(last));
+        // A replay below the window can no longer be byte-checked: typed refusal, never a halt.
+        let error = db.import_verified(&fixture_config(), &sessions[0], &[], 1, QHashOut::from_values(1, 1, 1, 1)).unwrap_err();
         assert_typed(&error, GuardianSignError::SessionHistoryUnavailable);
-        let refused = db.load_account(s2.network_magic, s2.user_id).unwrap().unwrap();
+        let refused = db.load_account(sessions[0].network_magic, sessions[0].user_id).unwrap().unwrap();
         assert_eq!(refused.state, guardian_common::protocol::GuardianAccountState::Active);
         assert_eq!(refused.halt_reason, None);
-        assert_eq!(refused.imported_nonce, Some(2));
+        assert_eq!(refused.imported_nonce, Some(last));
         std::fs::remove_dir_all(path).unwrap();
     }
     fn withdrawal_burn(sender: u32, nonce: u32) -> guardian_common::protocol::WithdrawalBurnRecord {
