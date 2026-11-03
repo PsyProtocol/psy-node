@@ -271,6 +271,8 @@ Admission 是权限数据，不能使用无持久化的缓存实例或启用可�
 
 消息的 ACK wait 是传输层重投计时，不能直接作为信誉超时依据。Edge 或共享 reconciler 可以在有效租约期间发送 NATS progress ACK，间隔小于 ACK wait；若已发生提前重投，查到有效 lease 后延迟重投该消息，不创建新租约也不处罚 worker。NATS 的 [ACK 和重投机制](https://docs.nats.io/learn/jetstream/acknowledgment)仍需在真实故障场景下验证。
 
+2026 年 11 月 3 日在本机 nats-server v2.12.1 上用与 worker consumer 相同的显式 ACK 策略实测（`psy_node_nats/tests/worker_ack_semantics.rs`）：每次投递有不同的 reply subject，但 ACK 作用于消息本身。重投之后，通过较早投递的 reply 发送 ACK 仍会完成该消息（ack_pending 归零、不再重投）；通过旧投递发送 progress 也能阻止重投；带 2.5 秒延迟的 NAK 在 2.501 秒后重投。因此可覆盖的 KV reply 不会确认另一条消息，真正的风险是过早确认：完成 ACK 只能在持久发布之后由发布器发出，失败或 stale 的提交不能发 ACK。
+
 租约硬期限到达后，`expire_lease` 以 lease_id、lease_version 和 generation 条件更新，只扣一次分并允许重新领取。即使 worker 永远不提交，也会触发这条路径。服务整体故障导致的超时使用有范围的故障豁免或暂停自动扣分，不批量误罚。
 
 任务重分配时增加 lease_version 并产生新 lease_id。旧 worker 的迟到提交返回 LEASE_STALE；不能拿旧 tag 与新租约的 tag 比较后处罚旧 worker。
