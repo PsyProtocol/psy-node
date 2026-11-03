@@ -107,3 +107,69 @@ async fn progress_through_a_stale_delivery_still_extends_the_message() {
     eprintln!("progress via the earlier delivery holds the message: {held}");
     second.ack_with(AckKind::Ack).await.unwrap();
 }
+
+mod client {
+    use std::time::Duration;
+
+    use parth_core::data::queue::queue_key::{PCoreQueueItemBase, QPBaseQueueType, QPStandardUniqueIdQueueKey};
+    use psy_node_core::queue::{infrastructure::QStandardQueueBase, worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber, WorkerJobControl}};
+    use psy_node_nats::queue::NatsJetStreamClient;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Item(u64);
+    impl PCoreQueueItemBase for Item {
+        fn is_queue_item(data: &[u8]) -> bool { data.len() == 8 }
+        fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> { Ok(Self(u64::from_le_bytes(data.try_into()?))) }
+        fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> { Ok(self.0.to_le_bytes().to_vec()) }
+        fn get_restorable_job_id(&self) -> Vec<u8> { self.0.to_le_bytes().to_vec() }
+        fn get_size_hint() -> usize { 8 }
+        fn has_fixed_size() -> bool { true }
+    }
+    type Key = QPStandardUniqueIdQueueKey<7, Item>;
+    const KEY: Key = QPStandardUniqueIdQueueKey { realm_id: 1, realm_sub_id: 0, unique_id: 5, task_group: 0,
+        queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData };
+
+    async fn client(url: &str) -> NatsJetStreamClient {
+        let worker = async_nats::jetstream::consumer::pull::Config { ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            ack_wait: Duration::from_millis(1_000), max_deliver: 50, ..Default::default() };
+        let ephemeral = async_nats::jetstream::consumer::pull::Config { ack_wait: Duration::from_millis(1_000), ..Default::default() };
+        for _ in 0..100 {
+            if let Ok(c) = NatsJetStreamClient::new_connection("acktest".into(), url, ephemeral.clone(), worker.clone(), Default::default()).await { NatsJetStreamClient::ensure_stream(&c).await.unwrap(); return c; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("nats-server did not start");
+    }
+
+    async fn next(queue: &NatsJetStreamClient) -> Option<Item> {
+        queue.get_next_worker_queue_item_or_none(&KEY, 1, 0, 5, 0).await.unwrap()
+    }
+    async fn control(queue: &NatsJetStreamClient, item: u64, control: WorkerJobControl) -> bool {
+        queue.worker_queue_control_job(&KEY, 1, 0, 5, 0, &item.to_le_bytes(), control).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires nats-server on PATH"]
+    async fn worker_job_control_through_the_node_client() {
+        let server = super::Server::start();
+        let queue = client(&server.url).await;
+        QStandardQueueBase::ensure_consumer(&queue, &KEY, 1, 0, 5, 0).await.unwrap();
+        queue.publish_worker_queue_item_ref(&KEY, 1, 0, 5, 0, &Item(42)).await.unwrap();
+        assert_eq!(next(&queue).await, Some(Item(42)));
+        for _ in 0..4 {
+            assert!(control(&queue, 42, WorkerJobControl::Progress).await);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(next(&queue).await, None, "held by progress");
+        }
+        assert!(control(&queue, 42, WorkerJobControl::Delay(2_000)).await);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(next(&queue).await, None, "delayed past ack_wait");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(next(&queue).await, Some(Item(42)), "redelivered after the delay");
+        assert!(control(&queue, 42, WorkerJobControl::Release).await);
+        assert!(!control(&queue, 42, WorkerJobControl::Complete).await, "handle dropped on release");
+        assert_eq!(next(&queue).await, Some(Item(42)), "released for anyone at once");
+        assert!(control(&queue, 42, WorkerJobControl::Complete).await);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(next(&queue).await, None, "completed");
+    }
+}

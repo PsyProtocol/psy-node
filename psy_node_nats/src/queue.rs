@@ -22,7 +22,7 @@ use parth_core::{
 use psy_node_core::queue::{
     infrastructure::QStandardQueueBase,
     ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-    worker_queue::{QStandardWorkerQueue, QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
+    worker_queue::{QStandardWorkerQueue, QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber, WorkerJobControl},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -792,6 +792,25 @@ impl NatsJetStreamClient {
         }
     }
 
+
+    /// Progress, delayed NAK, NAK or ACK through the stored reply of the job's
+    /// latest delivery. The handle is dropped once the message leaves this consumer.
+    pub async fn control_message_dq(&self, subject: &str, report_id: &[u8], control: WorkerJobControl) -> anyhow::Result<bool> {
+        let kv_key = format!("{}.{}", subject, hex::encode(report_id));
+        let Some(reply_bytes) = self.kv.get(&kv_key).await? else { return Ok(false) };
+        let reply = String::from_utf8(reply_bytes.to_vec())?;
+        let body: Bytes = match control {
+            WorkerJobControl::Progress => Bytes::from_static(b"+WPI"),
+            WorkerJobControl::Delay(ms) => format!("-NAK {{\"delay\":{}}}", u128::from(ms) * 1_000_000).into(),
+            WorkerJobControl::Release => Bytes::from_static(b"-NAK"),
+            WorkerJobControl::Complete => Bytes::from_static(b"+ACK"),
+        };
+        self.jetstream.publish(reply, body).await?;
+        if matches!(control, WorkerJobControl::Release | WorkerJobControl::Complete) {
+            self.kv.delete(&kv_key).await?;
+        }
+        Ok(true)
+    }
 
     pub async fn report_message_completed_dq(&self, subject: &str, report_id: &[u8]) -> anyhow::Result<bool> {
         let kv_key = format!("{}.{}", subject, hex::encode(report_id));
@@ -1651,6 +1670,20 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
     ) -> anyhow::Result<bool> {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_topic, task_group);
         self.report_message_completed_dq(&subject, &item.get_restorable_job_id()).await
+    }
+
+    async fn worker_queue_control_job<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_topic: u128,
+        task_group: u32,
+        restorable_job_id: &[u8],
+        control: WorkerJobControl,
+    ) -> anyhow::Result<bool> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_topic, task_group);
+        self.control_message_dq(&subject, restorable_job_id, control).await
     }
 
     async fn delete_worker_queue_consumer<QK: PCoreStandardQueueKeyForRealm>(

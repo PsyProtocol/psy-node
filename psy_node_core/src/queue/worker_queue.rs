@@ -55,6 +55,20 @@ pub trait QStandardWorkerQueuePublisher: QStandardWorkerQueue {
     ) -> anyhow::Result<Self::PublishBarrier>;
 }
 
+/// Queue control for one delivered job, addressed by its restorable job ID.
+/// JetStream applies these to the message, whichever delivery's reply is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerJobControl {
+    /// Extend the ACK deadline: a live lease holds the job.
+    Progress,
+    /// Redeliver no sooner than this many milliseconds.
+    Delay(u64),
+    /// Redeliver now.
+    Release,
+    /// Final ACK.
+    Complete,
+}
+
 #[async_trait]
 pub trait QStandardWorkerQueueSubscriber: QStandardWorkerQueue {
     async fn wait_for_worker_queue_item<QK: PCoreStandardQueueKeyForRealm>(
@@ -103,6 +117,20 @@ pub trait QStandardWorkerQueueSubscriber: QStandardWorkerQueue {
         task_group: u32,
         item: &QK::QueueItem,
     ) -> anyhow::Result<bool>;
+
+    /// Returns false when no delivery handle for the job is known on this queue.
+    async fn worker_queue_control_job<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        _queue_key: &QK,
+        _realm_id: u64,
+        _realm_sub_id: u64,
+        _unique_topic: u128,
+        _task_group: u32,
+        _restorable_job_id: &[u8],
+        _control: WorkerJobControl,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("worker job control is not supported by this queue")
+    }
 
     async fn delete_worker_queue_consumer<QK: PCoreStandardQueueKeyForRealm>(
         &self,
