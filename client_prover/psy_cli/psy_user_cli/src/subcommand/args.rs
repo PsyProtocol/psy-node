@@ -632,8 +632,6 @@ pub struct ClaimRewardsArgs {
     pub reward_token: String,
     #[clap(long, env, help = "Ethereum reward recipient address")]
     pub recipient: String,
-    #[clap(long, env, help = "Reward owner user id on L2")]
-    pub user_id: u64,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
     #[clap(long, default_value = "worker.backup", help = "Original binary worker job metadata; never consumed or deleted")]
@@ -644,8 +642,6 @@ pub struct ClaimRewardsArgs {
     pub l1_rpc_url: String,
     #[clap(long, env = "L1_PRIVATE_KEY", hide_env_values = true, help = "EVM private key signing the L1 claimReward transaction; distinct from the ZK wallet source")]
     pub l1_private_key: String,
-    #[clap(long, env, help = "Prove-proxy JSON-RPC URL for the Groth16 reward claim wrap")]
-    pub prove_proxy_url: String,
     #[clap(long, env, hide_env_values = true, help = "Prove-proxy bearer token")]
     pub prove_proxy_token: Option<String>,
 }

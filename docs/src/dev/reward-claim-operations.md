@@ -152,7 +152,7 @@ The executable sections below are the CLI path through this protocol.
 1. Create a ZK wallet and register it; wait for its assigned user ID using [Common Operations §2–3](common-operations.md#3-register-an-account) (`client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:25-46`).
 2. **Start the worker before user operations**, with `--user <registered-id>` and a writable backup, following [Section 1](#1-mine-and-preserve-job-metadata). Attribution is attached to the worker's work request, not retroactively to the transaction sender; starting after the transition's GUTA jobs are taken cannot reattribute them (`psy_worker_core/src/api/basic_job_fetcher.rs:45-55,218-224`).
 3. Fund the operating wallet through [Common Operations §5.1](common-operations.md#51-fund-psy-through-the-faucet), then execute contract 0 method `claim` with the returned faucet operator ID. Wait for confirmation before further calls (`docs/src/dev/common-operations.md:110-134`).
-4. Submit real state-changing `call` operations and wait for committed confirmation; a query or idle checkpoint is not payable work. The faucet `claim` above is itself a state-changing call (`docs/src/dev/common-operations.md:123-134`; `psy_plonky2_circuits/src/guta/gadgets/guta_no_change_gadget.rs:50-65`). Any registered key can operate its own account and transact; it need not be the reward owner. **The claim keystore must hold the key registered at `--user-id`**, regardless of who submitted the proved transactions (`psy_worker_core/src/api/basic_job_fetcher.rs:45-55,218-224`; `client_prover/psy_prover/src/local/reward_client.rs:1040-1051`).
+4. Submit real state-changing `call` operations and wait for committed confirmation; a query or idle checkpoint is not payable work. The faucet `claim` above is itself a state-changing call (`docs/src/dev/common-operations.md:123-134`; `psy_plonky2_circuits/src/guta/gadgets/guta_no_change_gadget.rs:50-65`). Any registered key can operate its own account and transact; it need not be the reward owner. **The claim keystore must hold the registered ZK key owning the backup jobs**, regardless of who submitted the proved transactions (`psy_worker_core/src/api/basic_job_fetcher.rs:45-55,218-224`; `client_prover/psy_prover/src/local/reward_client.rs:1040-1051`).
 5. Preserve the full backup and select complete records for eligible circuits **and matching preimage user**, following [Section 2](#2-select-eligible-work); circuit IDs alone are insufficient (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:326-341,346-382`).
 6. Run the `get-claim-amount` precheck in [Section 3](#3-query-before-claiming) for the relevant L2 source/claiming users. It checks L2 user-to-user claims, **not** an Ethereum mining-reward quote; separately check Section 2's selected-job arithmetic (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_amount.rs:7-25`).
 7. Run `claim-rewards` with the selected jobs and registered owner's keystore using [Section 4](#4-submit-the-claim); require `confirmed`, not merely `proof_only`, under [Section 5](#5-interpret-results-and-cache-state) (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-255`).
@@ -276,12 +276,10 @@ Set up the registered ZK wallet using [Common Operations](common-operations.md).
   --rpc-config '<rpc-config.json>' \
   --reward-token '<ethereum-reward-token-address>' \
   --recipient '<ethereum-recipient-address>' \
-  --user-id '<reward-owner-user-id>' \
   --sign-type zk --keystore-path '<registered-wallet-keystore.json>' \
   --jobs-file worker.backup \
   --proof-cache-dir reward-proof-cache \
   --l1-rpc-url '<ethereum-rpc-url>' \
-  --prove-proxy-url '<prove-proxy-url>' \
   --result-file reward-claim-result.json
 ```
 
@@ -292,17 +290,17 @@ Exact claim-specific flags (`client_prover/psy_cli/psy_user_cli/src/subcommand/a
 | `--rpc-config` | Psy RPC configuration; default `config.json`. |
 | `--reward-token` | Ethereum reward-token address; its addresses provider discovers StateManager. |
 | `--recipient` | Independent, nonzero 160-bit Ethereum address, not derived from the registration key or required to equal the transaction signer. |
-| `--user-id` | L2 reward owner; CLI accepts an integer then requires conversion to `u32`. Must equal each backup tag preimage's first limb. |
+| Reward owner | Queried from the selected L2 ZK wallet public-key hash; must equal each backup tag preimage's first limb. An unregistered wallet is rejected. |
 | `--jobs-file` | Original binary backup, default `worker.backup`; not consumed or deleted. |
 | `--proof-cache-dir` | Disposable aggregate cache, default `reward-proof-cache`; keep original jobs outside it. |
 | `--l1-rpc-url` | Ethereum RPC for roots, claimed pairs, transaction submission and receipt checks. |
 | `--l1-private-key` | Ethereum transaction signer; use `L1_PRIVATE_KEY` instead of a literal command-line key. |
-| `--prove-proxy-url` | Groth16 reward-wrap proof service. |
+| `system_prove_proxy_url` in the selected network config | First nonblank URL is used for the Groth16 reward-wrap proof service (role `system` or `all`); an empty pool is an error. No fallback to the user proof pool. |
 | `--prove-proxy-token` | Optional bearer token; use its environment input rather than a literal in shared history. |
 
 The flattened wallet flags are `--sign-type` (default `zk`), `--private-key`/`-p`, `--keystore-path`, `--wallet-password`, `--fingerprint`, `--sd-key-allowed-contract-id`, `--sd-key-allowed-method-id`, and `--sd-key-expected-tx-count` (default `2`). Private key and keystore conflict. Reward claims accept only ZK authorization, so do not use the software-defined-key flags to bypass that restriction (`client_prover/psy_core/psy_common/src/args.rs:91-111`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:46-50`). `--result-file` is a global option (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:70-71`).
 
-Recipient decoding accepts 20 bytes or zero-padded 32 bytes, rejects high bits and zero, and passes the chosen address into the authenticated claim statement. `--user-id` is separately checked against backup preimages and the registered held key (`client_prover/psy_prover/src/local/reward_client.rs:135-155,1029-1051`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:42-44,117-123,326-341`). Supported Ethereum chain identities are `1`, `31337`, and `11155111` (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:51-53`).
+Recipient decoding accepts 20 bytes or zero-padded 32 bytes, rejects high bits and zero, and passes the chosen address into the authenticated claim statement. The user ID queried from the wallet public-key hash is checked against backup preimages and the registered held key (`client_prover/psy_prover/src/local/reward_client.rs:135-155,1029-1051`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:42-44,117-123,326-341`). Supported Ethereum chain identities are `1`, `31337`, and `11155111` (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:51-53`).
 
 ## 5. Interpret Results and Cache State
 

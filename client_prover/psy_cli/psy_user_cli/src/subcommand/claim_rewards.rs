@@ -39,14 +39,23 @@ use psy_client_data::config::store_config::PsyHasher;
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
 pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
-    let user_id = u32::try_from(args.user_id)?;
     let recipient = decode_address(&args.recipient)?;
     anyhow::ensure!(recipient != [0; 20], "reward recipient must be nonzero");
 
+    let settings = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
+    let network = settings.get_current_network()?;
+    let prove_proxy_url = network.system_prove_proxy_url.iter()
+        .map(|url| url.trim())
+        .find(|url| !url.is_empty())
+        .context("loaded network has no `system_prove_proxy_url`; reward claims require a prove-proxy running role=system or role=all")?;
     let wallet = Some(load_wallet_key_info(&args.wallet, false)?);
-    let (client, circuits) = RewardClient::load(&args.rpc_config)?;
+    let client = RewardClient::new(RpcProvider::new_with_config(network)?);
     let wallet = wallet.context("reward root requires the selected ZK private key")?;
     anyhow::ensure!(wallet.sign_type == SignType::ZKSign, "reward root accepts only ZK authorization");
+    let ids = client.rpc_provider.get_user_ids_for_public_key(wallet.public_key_hash).await?;
+    let user_id = u32::try_from(ids.first().copied().context("reward wallet is not registered on L2")?)?;
+    tracing::info!(user_id, "resolved reward owner from L2 wallet");
+    let circuits = UserRewardCircuits::build()?;
     let signer = ZKUser::new(SimplePsyPrivateKey { private_key: wallet.private_key });
     let chain_id_hex: String = serde_json::from_value(rpc_call(&args.l1_rpc_url, "eth_chainId", serde_json::json!([])).await?)?;
     let chain_id = chain_id_word(canonical_quantity(&chain_id_hex)?)?;
@@ -55,7 +64,7 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
     let deployment = client.discover_reward_deployment(&args.l1_rpc_url, &block, &args.reward_token).await?;
     let token = format!("0x{}", hex::encode(deployment.token));
     let state_manager_address = format!("0x{}", hex::encode(deployment.state_manager));
-    let loaded = validate_and_deduplicate_jobs(load_reward_jobs(&args.jobs_file)?, args.user_id, &args.jobs_file)?;
+    let loaded = validate_and_deduplicate_jobs(load_reward_jobs(&args.jobs_file)?, u64::from(user_id), &args.jobs_file)?;
     anyhow::ensure!(loaded.jobs_len() != 0, "no reward jobs selected");
     let grouped = client.group_reward_jobs(loaded.into(), user_id, recipient).await?;
     let unloaded_ids = grouped.unloaded.keys().copied().collect::<Vec<_>>();
@@ -118,7 +127,7 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
         let anchor = client.load_finalized_reward_anchor(anchor_id, root_word, chunk.first().context("reward claim has no payable group")?).await?;
         let wrapped = signer.prove_reward_claim(&client, &checkpoint_circuit, &proof, &anchor, deployment.token, deployment.state_manager).await?;
         let request_proof = RewardClaimWrapProofInput { reward_claim_wrap_proof_hex: hex::encode(bincode::serialize(&wrapped)?) };
-        let wrap = client.prove_reward_claim_groth16(&args.prove_proxy_url, args.prove_proxy_token.as_deref(), &request_proof).await?;
+        let wrap = client.prove_reward_claim_groth16(prove_proxy_url, args.prove_proxy_token.as_deref(), &request_proof).await?;
         tracing::info!("Groth16 reward claim proof generated");
         let data = encode_reward_claim_calldata(&wrap.solidity_proof, user_id, recipient, &statement)?;
         let block = client.read_l1_block(&args.l1_rpc_url).await?;
@@ -554,10 +563,10 @@ mod tests {
         std::fs::write(cache_dir.join(&cache_name).join("occupied"), []).unwrap();
         let token = format!("0x{}", "05".repeat(20));
         let args = ClaimRewardsArgs {
-            rpc_config: String::new(), reward_token: String::new(), recipient: String::new(), user_id: 7,
+            rpc_config: String::new(), reward_token: String::new(), recipient: String::new(),
             wallet: crate::subcommand::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: None, wallet_password: None, fingerprint: None, sd_key_allowed_contract_id: vec![], sd_key_allowed_method_id: vec![], sd_key_min_tx_count: Some(2), sd_key_max_tx_count: Some(2), sd_key_definition: None },
             jobs_file: jobs_file.to_str().unwrap().to_owned(), proof_cache_dir: cache_dir.to_str().unwrap().to_owned(),
-            l1_rpc_url: fixture.server.url.clone(), l1_private_key: String::new(), prove_proxy_url: String::new(), prove_proxy_token: None,
+            l1_rpc_url: fixture.server.url.clone(), l1_private_key: String::new(), prove_proxy_token: None,
         };
         let paid_hash = format!("0x{}", "cd".repeat(32));
         let error = preaggregate_remaining(&fixture.client, &circuits, &args, &token, vec![originals], Some(&paid_hash)).await.unwrap_err();

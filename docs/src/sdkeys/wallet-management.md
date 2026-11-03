@@ -275,13 +275,12 @@ psy_user_cli claim-rewards \
   --keystore-path <home>/.psy/keystore/miner0.json \
   --jobs-file worker.backup \
   --recipient 0xYOUR_REWARD_RECIPIENT \
-  --user-id YOUR_USER_ID \
   --proof-cache-dir ./reward-proof-cache \
   --l1-rpc-url http://127.0.0.1:8545 \
-  --l1-private-key "$L1_PRIVATE_KEY" \
-  --prove-proxy-url http://127.0.0.1:9001
+  --l1-private-key "$L1_PRIVATE_KEY"
 ```
 
+The first nonblank `system_prove_proxy_url` in the selected network config supplies the Groth16 proof service; an empty pool is an error.
 Eligible checkpoint mints are confirmed on L1 before remaining jobs are preaggregated.
 `--rpc-config` is the only configuration file: it supplies the reward token and the circuits.
 Keep `worker.backup` outside the disposable cache directory. The cache retains network magic,
