@@ -61,7 +61,7 @@ impl<
         ProofStore,
     >
 {
-    async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
+    pub(crate) async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
         if let Some(proof) = self
             .proof_store
             .get_proof_bytes_by_job_id(job_id.get_output_id(), unique_pending_id)

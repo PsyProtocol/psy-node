@@ -65,10 +65,25 @@ pub async fn start_coordinator_edge_rpc_server<
     let mut rpc_module = RpcModule::new(handler.clone());
     rpc_module.merge(NodeEdgeWorkerRpcServer::into_rpc(handler.clone()))?;
     rpc_module.merge(CoordinatorEdgeRpcServer::into_rpc(handler.clone()))?;
-    if let Some(admission) = psy_worker_admission::rpc::observe_rpc_from_env(
-        2, realm_id.try_into()?, realm_sub_id.try_into()?,
-    ).await? {
-        rpc_module.merge(admission)?;
+    if let Some(admission) = psy_worker_admission::rpc::AdmissionEnv::from_env(2, realm_id.try_into()?, realm_sub_id.try_into()?)? {
+        let store = admission.connect().await?;
+        rpc_module.merge(admission.admission_rpc(store.clone())?)?;
+        if admission.tasks_v2 {
+            // V2 tasks share the legacy queue. Enable only where every worker
+            // speaks V2: a legacy claim of the same job is outside the lease.
+            let adapter = std::sync::Arc::new(crate::coordinator::edge::task_adapter::CoordinatorTaskAdapter {
+                handler: handler.clone(),
+                staging: std::sync::Arc::new(store.clone()),
+                lease_ms: 300_000,
+                staging_ttl_ms: admission.policy.receipt_retention_ms,
+            });
+            let flow = psy_worker_admission::flow::TaskFlow::new(
+                admission.lease_service(store)?, adapter.clone(), adapter, psy_worker_admission::flow::FlowConfig::default(),
+            );
+            rpc_module.merge(psy_worker_admission::rpc::WorkerTaskRpcServer::into_rpc(psy_worker_admission::rpc::TaskRpc::new(flow.clone())))?;
+            tokio::spawn(psy_worker_admission::rpc::run_maintenance(flow, std::time::Duration::from_secs(5)));
+            tracing::warn!("worker V2 task protocol enabled in observe mode");
+        }
     }
     let handle = server.start(rpc_module);
     print_cf_log_indicator("PSY_COORDINATOR_EDGE_RPC_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
