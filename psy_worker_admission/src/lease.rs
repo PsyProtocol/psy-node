@@ -189,6 +189,20 @@ impl LeaseRecord {
     }
 }
 
+/// Signed body of a V2 claim. The reward tag is the worker's own; it is bound
+/// into the lease and every later submission is checked against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimRequest { pub reward_tag: Hash32 }
+
+impl ClaimRequest {
+    pub fn payload_hash(&self) -> Hash32 {
+        let mut bytes = b"psy-worker-claim-v1\0".to_vec();
+        bytes.extend(self.reward_tag.0);
+        digest(&bytes)
+    }
+}
+
 /// What the edge attaches to a reservation once it has a queue message and its inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

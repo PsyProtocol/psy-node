@@ -10,6 +10,10 @@ use tokio::sync::Semaphore;
 
 use crate::{lease::*, protocol::*, store::RevocationReceipt, AdmissionError as Error, LeaseService, Result};
 
+/// Who a job is being prepared for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimContext { pub owner: WorkerKey, pub reward_tag: Hash32 }
+
 /// One queue delivery the edge has pulled and prepared for a worker.
 pub struct TaskDelivery {
     pub binding: JobBinding,
@@ -23,7 +27,8 @@ pub struct TaskDelivery {
 #[async_trait]
 pub trait TaskQueue: Send + Sync {
     /// Pull and prepare the next job. `Err` means the queue or its inputs failed.
-    async fn next(&self) -> std::result::Result<Option<TaskDelivery>, TaskFailure>;
+    /// The returned binding must carry `claim.reward_tag`.
+    async fn next(&self, claim: &ClaimContext) -> std::result::Result<Option<TaskDelivery>, TaskFailure>;
     /// Rebuild the payload of a job this edge or another one already leased,
     /// for a claim retried after its response was lost.
     async fn reload(&self, lease: &LeaseRecord) -> std::result::Result<Vec<u8>, TaskFailure>;
@@ -68,10 +73,14 @@ pub struct FlowConfig {
     pub verify_concurrency: usize,
     /// Deliveries skipped per claim because a live lease holds them.
     pub max_busy_skips: usize,
+    /// Zero a worker on a deterministic verification failure. Off by default:
+    /// until the verifier's failure classes are proven, an `Invalid` verdict
+    /// only returns the job, so a verifier fault cannot punish honest workers.
+    pub attribute_invalid_proofs: bool,
 }
 
 impl Default for FlowConfig {
-    fn default() -> Self { Self { max_proof_bytes: 4 << 20, verify_concurrency: 4, max_busy_skips: 8 } }
+    fn default() -> Self { Self { max_proof_bytes: 4 << 20, verify_concurrency: 4, max_busy_skips: 8, attribute_invalid_proofs: false } }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +96,8 @@ pub enum SubmitOutcome {
     Stale,
     /// Deterministically invalid or a signed tag mismatch: identity revoked.
     Revoked(RevocationReceipt),
+    /// Verification failed but punishment is disabled; the job was returned.
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -115,10 +126,10 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
 
     /// Reserve capacity, then pull a job, then bind it. Capacity is returned if
     /// no job could be bound; a retried request gets its original task back.
-    pub async fn claim(&self, auth: RequestAuth, payload_hash: Hash32) -> Result<ClaimedTask> {
+    pub async fn claim(&self, auth: RequestAuth, request: ClaimRequest) -> Result<ClaimedTask> {
         let owner = auth.public_key;
         let request_id = auth.request_id;
-        let reserved = self.leases.reserve_claim(auth, payload_hash).await?;
+        let reserved = self.leases.reserve_claim(auth, request.payload_hash()).await?;
         match reserved.claim.state {
             ClaimState::Leased => {
                 let lease = reserved.lease.ok_or(Error::StateCorrupt)?;
@@ -132,7 +143,7 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
             ClaimState::Released => return Err(Error::NoWork),
             ClaimState::Reserved => {}
         }
-        match self.bind_next(owner, request_id).await {
+        match self.bind_next(ClaimContext { owner, reward_tag: request.reward_tag }, request_id).await {
             Ok(task) => Ok(task),
             Err(error) => {
                 // Whatever went wrong, the reservation must not linger until its TTL.
@@ -145,14 +156,19 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
         }
     }
 
-    async fn bind_next(&self, owner: WorkerKey, request_id: RequestId) -> Result<ClaimedTask> {
+    async fn bind_next(&self, context: ClaimContext, request_id: RequestId) -> Result<ClaimedTask> {
+        let owner = context.owner;
         for _ in 0..=self.config.max_busy_skips {
-            let delivery = match self.queue.next().await {
+            let delivery = match self.queue.next(&context).await {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => return Err(Error::NoWork),
                 Err(failure) => { tracing::warn!(failure = %failure.0, "task queue failed"); return Err(Error::TaskInfrastructure); }
             };
             let job = delivery.binding.job.clone();
+            if delivery.binding.reward_tag != context.reward_tag {
+                self.queue_call(self.queue.release(&job).await);
+                return Err(Error::TaskInfrastructure);
+            }
             match self.leases.attach_lease(owner, request_id, delivery.binding).await {
                 Ok(lease) => {
                     let claim = self.leases.claim_record(owner, request_id).await?.ok_or(Error::StateCorrupt)?;
@@ -212,6 +228,12 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
         };
         match verdict {
             Ok(Verdict::Valid) => {}
+            Ok(Verdict::Invalid) if !self.config.attribute_invalid_proofs => {
+                tracing::warn!(job_key = ?ticket.job_key, "proof failed verification; punishment disabled, job returned");
+                self.leases.fail_verification(&ticket).await?;
+                self.queue_call(self.queue.release(&lease.job).await);
+                return Ok(SubmitOutcome::Rejected);
+            }
             Ok(Verdict::Invalid) => {
                 let receipt = self.leases.apply_attributable_violation(&ticket.invalid_proof()).await?;
                 self.queue_call(self.queue.release(&lease.job).await);

@@ -21,10 +21,10 @@ impl FakeQueue {
 }
 #[async_trait]
 impl TaskQueue for FakeQueue {
-    async fn next(&self) -> std::result::Result<Option<TaskDelivery>, TaskFailure> {
+    async fn next(&self, claim: &ClaimContext) -> std::result::Result<Option<TaskDelivery>, TaskFailure> {
         *self.pulls.lock().unwrap() += 1;
         if self.fail_next.swap(false, Ordering::SeqCst) { return Err(TaskFailure("nats down".into())); }
-        Ok(self.pending.lock().unwrap().pop_front().map(|n| TaskDelivery { binding: binding(n, 60_000), payload: format!("task {n}").into_bytes() }))
+        Ok(self.pending.lock().unwrap().pop_front().map(|n| TaskDelivery { binding: JobBinding { reward_tag: claim.reward_tag, ..binding(n, 60_000) }, payload: format!("task {n}").into_bytes() }))
     }
     async fn reload(&self, lease: &LeaseRecord) -> std::result::Result<Vec<u8>, TaskFailure> { Ok(format!("task {}", lease.job.unique_pending_id - 40).into_bytes()) }
     async fn progress(&self, job: &JobInstance) -> std::result::Result<(), TaskFailure> { self.record("progress", job); Ok(()) }
@@ -51,6 +51,8 @@ impl ProofPipeline for FakePipeline {
     }
 }
 
+fn claim_request(signer: &SecretKey) -> ClaimRequest { ClaimRequest { reward_tag: digest(&key(signer).0) } }
+
 struct Env { store: Arc<MemoryStore>, queue: Arc<FakeQueue>, pipeline: Arc<FakePipeline>, flow: TaskFlow<FakeQueue, FakePipeline> }
 
 async fn env(workers: &[&SecretKey]) -> Env {
@@ -58,13 +60,15 @@ async fn env(workers: &[&SecretKey]) -> Env {
     let leases = lease_service(store.clone(), AdmissionPolicy::for_base_bits(8));
     for signer in workers { activate(leases.admission(), signer, 0, store.time()).await; }
     let (queue, pipeline) = (Arc::new(FakeQueue::default()), Arc::new(FakePipeline::default()));
-    let flow = TaskFlow::new(leases, queue.clone(), pipeline.clone(), FlowConfig::default());
+    let config = FlowConfig { attribute_invalid_proofs: true, ..FlowConfig::default() };
+    let flow = TaskFlow::new(leases, queue.clone(), pipeline.clone(), config);
     Env { store, queue, pipeline, flow }
 }
 
 impl Env {
     async fn claim(&self, signer: &SecretKey) -> std::result::Result<ClaimedTask, AdmissionError> {
-        self.flow.claim(claim_auth(signer, 0, self.store.time()), digest(b"claim")).await
+        let request = claim_request(signer);
+        self.flow.claim(auth(signer, AdmissionMethod::ClaimTask, 0, request.payload_hash(), self.store.time()), request).await
     }
     async fn submit(&self, signer: &SecretKey, lease: &LeaseRecord, proof: &[u8]) -> std::result::Result<SubmitOutcome, AdmissionError> {
         let submission = submission(lease, proof);
@@ -81,11 +85,12 @@ impl Env {
 async fn valid_proof_is_accepted_published_and_acked_once() {
     let signer = secret(1); let env = env(&[&signer]).await;
     env.queue.push(1);
-    let request = claim_auth(&signer, 0, env.store.time());
-    let task = env.flow.claim(request.clone(), digest(b"claim")).await.unwrap();
+    let body = claim_request(&signer);
+    let request = auth(&signer, AdmissionMethod::ClaimTask, 0, body.payload_hash(), env.store.time());
+    let task = env.flow.claim(request.clone(), body.clone()).await.unwrap();
     assert_eq!(task.payload, b"task 1");
     // A lost response: the retry gets the same lease without pulling the queue again.
-    let retry = env.flow.claim(request, digest(b"claim")).await.unwrap();
+    let retry = env.flow.claim(request, body).await.unwrap();
     assert_eq!((retry.lease.lease_id, retry.payload), (task.lease.lease_id, task.payload.clone()));
     assert_eq!(*env.queue.pulls.lock().unwrap(), 1);
     let SubmitOutcome::Accepted { published: true, .. } = env.submit(&signer, &task.lease, b"proof").await.unwrap() else { panic!() };
@@ -187,4 +192,16 @@ async fn maintenance_keeps_live_leases_and_reclaims_silent_workers() {
     let report = env.flow.maintain(10).await.unwrap();
     assert_eq!((report.kept_alive, report.reconcile.leases_expired), (0, 1));
     assert_eq!(env.reputation(&signer).await, (2, 0));
+}
+
+#[tokio::test]
+async fn invalid_proofs_only_return_the_job_unless_attribution_is_enabled() {
+    let signer = secret(1); let mut env = env(&[&signer]).await;
+    env.flow = TaskFlow::new(env.flow.leases().clone(), env.queue.clone(), env.pipeline.clone(), FlowConfig::default());
+    env.queue.push(1);
+    let task = env.claim(&signer).await.unwrap();
+    assert_eq!(task.lease.reward_tag, digest(&key(&signer).0), "the worker's own signed tag");
+    assert_eq!(env.submit(&signer, &task.lease, b"bad").await.unwrap(), SubmitOutcome::Rejected);
+    assert_eq!(env.reputation(&signer).await, (3, 0));
+    assert_eq!((env.inflight(&signer), env.queue.count("release", 1)), (0, 1));
 }

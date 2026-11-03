@@ -185,6 +185,25 @@ impl RedisAdmissionStore {
     fn key(&self, key: &StoreKey) -> String { format!("{}:{}", self.prefix, key.name()) }
     fn index(&self, index: StoreIndex) -> String { format!("{}:{}", self.prefix, index.name()) }
     pub fn namespace(&self) -> &str { &self.prefix }
+
+    /// Immutable, content-addressed proof staging for accepted results awaiting
+    /// publication. Writing the same bytes again is a no-op.
+    pub async fn put_staged_proof(&self, proof: &[u8], ttl_ms: u64) -> Result<Hash32> {
+        let address = digest(proof);
+        let _: Option<String> = redis::cmd("SET").arg(format!("{}:staged:{}", self.prefix, hex::encode(address.0))).arg(proof)
+            .arg("NX").arg("PX").arg(ttl_ms.max(1)).query_async(&mut self.connection.clone()).await.map_err(|_| Error::StoreUnavailable)?;
+        Ok(address)
+    }
+
+    /// Returns the staged bytes only if they still hash to their address.
+    pub async fn get_staged_proof(&self, address: Hash32) -> Result<Option<Vec<u8>>> {
+        let bytes: Option<Vec<u8>> = redis::cmd("GET").arg(format!("{}:staged:{}", self.prefix, hex::encode(address.0)))
+            .query_async(&mut self.connection.clone()).await.map_err(|_| Error::StoreUnavailable)?;
+        match bytes {
+            Some(bytes) if digest(&bytes) != address => Err(Error::StateCorrupt),
+            other => Ok(other),
+        }
+    }
 }
 
 #[async_trait]

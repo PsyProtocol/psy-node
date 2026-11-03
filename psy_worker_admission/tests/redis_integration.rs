@@ -336,3 +336,18 @@ async fn redis_accept_and_revoke_race_resolves_to_one_order() {
     assert_eq!(accepted + stale, 12);
     eprintln!("accept first: {accepted}, revoke first: {stale}");
 }
+
+#[tokio::test]
+#[ignore = "requires redis-server"]
+async fn redis_staged_proofs_are_content_addressed_and_checked() {
+    let process = RedisProcess::start().await;
+    let policy = AdmissionPolicy::for_base_bits(8);
+    let store = RedisAdmissionStore::connect(&process.url, &scope(), &policy).await.unwrap();
+    let address = store.put_staged_proof(b"proof bytes", 60_000).await.unwrap();
+    assert_eq!(address, digest(b"proof bytes"));
+    assert_eq!(store.put_staged_proof(b"proof bytes", 60_000).await.unwrap(), address);
+    assert_eq!(store.get_staged_proof(address).await.unwrap().unwrap(), b"proof bytes");
+    assert_eq!(store.get_staged_proof(digest(b"absent")).await.unwrap(), None);
+    let _: () = process.connection().await.unwrap().set(format!("{}:staged:{}", store.namespace(), hex::encode(address.0)), "tampered").await.unwrap();
+    assert_eq!(store.get_staged_proof(address).await.unwrap_err(), AdmissionError::StateCorrupt);
+}
