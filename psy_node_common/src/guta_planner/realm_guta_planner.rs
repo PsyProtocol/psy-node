@@ -75,6 +75,7 @@ pub struct RealmGUTAValidatorProofs<F, Hash> {
     pub checkpoint_tree_proof: MerkleProofCore<Hash>,
     pub old_realm_root_proof: MerkleProofCore<Hash>,
     pub validator_tree_proof: MerkleProofCore<Hash>,
+    pub validator_leaves: Vec<Hash>,
     pub validator_user_tree_proof: MerkleProofCore<Hash>,
 }
 
@@ -169,6 +170,8 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
     where
         F: ToU64Value,
     {
+        anyhow::ensure!(proofs.validator_leaves.len() == 1 << psy_data::guta::realm_finalize::VALIDATOR_SUB_ID_BITS,
+            "finalizer requires every validator subtree slot");
         if let Some(current_leaf) = self.current_validator_user_leaf.as_ref() {
             anyhow::ensure!(current_leaf.user_id.to_u64_value() == proofs.validator.validator_user_id,
                 "validator proofs user {} does not match current account leaf user {}",
@@ -1082,6 +1085,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             validator_node_id_hash_limbs: node_limbs,
             validator_bls_hash_limbs: bls_limbs,
             validator_tree_proof: proofs.validator_tree_proof,
+            validator_leaves: proofs.validator_leaves,
             validator_user_leaf: proofs.validator_user_leaf,
             validator_user_tree_proof: proofs.validator_user_tree_proof,
             current_validator_user_leaf,

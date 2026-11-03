@@ -79,7 +79,6 @@ where
         default_user_state_tree_root: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
         checkpoints_per_epoch: u64,
-        validator_sub_ids: Vec<u16>,
     ) -> Self {
         let end_cap_common = get_end_cap_type_e_common_data::<C, D>();
         let known_end_cap_fingerprint = library.get_fingerprint(ProvingJobCircuitType::UserEndCap).unwrap();
@@ -98,7 +97,6 @@ where
             default_user_state_tree_root,
             worker_reward_tag,
             checkpoints_per_epoch,
-            validator_sub_ids,
 
         )
     }
@@ -116,7 +114,6 @@ where
         default_user_state_tree_root: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
         checkpoints_per_epoch: u64,
-        validator_sub_ids: Vec<u16>,
     ) -> Self {
         Self::new_with_config_and_chain_domain(
             end_cap_proof_common_data,
@@ -133,7 +130,6 @@ where
             worker_reward_tag,
             QHashOut::ZERO,
             checkpoints_per_epoch,
-            validator_sub_ids,
         )
     }
     pub fn new_with_config_and_chain_domain(
@@ -151,7 +147,6 @@ where
         worker_reward_tag: QHashOut<C::F>,
         chain_domain: QHashOut<C::F>,
         checkpoints_per_epoch: u64,
-        validator_sub_ids: Vec<u16>,
     ) -> Self {
 
         assert!(global_user_tree_height >= global_user_tree_realm_height, "global_user_tree_height must be >= global_user_tree_realm_height");
@@ -239,7 +234,6 @@ where
             global_user_tree_realm_height,
             chain_domain,
             checkpoints_per_epoch,
-            validator_sub_ids,
         );
         let mut guta_circuit_whitelist_proofs = SimpleMerkleTree::<C::Hasher, QHashOut<C::F>>::gen_fast_tree_inclusion_proofs(
             guta_circuit_whitelist_tree_height,
@@ -697,7 +691,6 @@ mod tests {
             default_user_state_tree_root,
             QHashOut::rand(), // public_key for testing
             10,
-            vec![1, 2],
         );
 
         assert_eq!(mgr.verify_single_end_cap.fingerprint, mgr.verify_single_end_cap_whitelist_proof.value,);

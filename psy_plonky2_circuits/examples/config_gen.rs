@@ -200,7 +200,6 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
 
 
     let network = psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet;
-    let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
     let guta_circuits = QEDGUTACircuitManager::<C,D>::new_with_config_and_chain_domain(
         &end_cap_common_data,
         end_cap_verifier_data.constants_sigmas_cap.height(),
@@ -216,8 +215,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
         default_user_state_tree_root,
         get_default_worker_rewards_tree_tag::<QHashOut<F>>(),
         psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<F, QHashOut<F>, <C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(network.get_chain_id()),
-        rotation.checkpoints_per_epoch,
-        rotation.validator_sub_ids,
+        psy_config::CHECKPOINTS_PER_EPOCH,
 
     );
 

@@ -535,6 +535,12 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         let anchor_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, psy_config::CHECKPOINTS_PER_EPOCH);
         let (preimage, validator_tree_proof, roots) =
             load_checkpoint_validator::<N, _>(self.tree_store.as_ref(), status, checkpoint_id).await?;
+        let validator_leaf_keys = psy_data::p2p::realm_validator_indexes(self.realm_id_u64 as u32)
+            .map(|(_, index)| parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey::new(
+                psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8, index))
+            .collect::<Vec<_>>();
+        let validator_leaves = self.tree_store.validator_tree_get_nodes(checkpoint_id, &validator_leaf_keys).await?;
+        anyhow::ensure!(validator_leaves.len() == validator_leaf_keys.len(), "incomplete validator subtree at proof base");
         let user_id = preimage.validator_user_id;
         let min_user_id = self.realm_id_u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         let max_user_id = (self.realm_id_u64 + 1) << N::REALM_GLOBAL_USER_TREE_HEIGHT;
@@ -581,6 +587,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             checkpoint_tree_proof,
             old_realm_root_proof,
             validator_tree_proof,
+            validator_leaves,
             validator_user_tree_proof,
         })
     }

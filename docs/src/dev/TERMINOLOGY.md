@@ -160,6 +160,7 @@ PARTH is a forest. Do not invent a second name for a tree that already has one.
 | GWT | Global withdrawal tree. |
 | IMT-indexed tree | Previous `next_append_index != 0` for that `(user_id, contract_id)` contract-state tree. |
 | Positional tree | Previous `next_append_index == 0`. Changed leaves on this tree do not require IMT records. |
+| Validator subtree (`validator_leaves`) | The 256 sub-ID leaf hashes for one Realm in the checkpoint validator tree, including empty slots. Circuit 63 authenticates the complete subtree and derives its occupied count, bounded by `MAX_VALIDATORS_PER_REALM`; this is not a second membership record. |
 | Rollback IMT key-index entry (`RollbackImtKeyIndexEntry`) | Frozen physical key `(tree_id, tree_sub_id, key_bucket, encoded_key)` and explicit nullable target for `set_imt_key_index`; null deletes, a row restores. |
 | Rollback IMT key-index row (`RollbackImtKeyIndexRow`) | Canonical sentinel target `(leaf_key, birth_checkpoint, leaf_index)` derived from the earliest retained leaf version at or before the rollback target, not the latest update. |
 

@@ -38,7 +38,6 @@ where C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Field
 
 
     let circuit_config = get_circuit_config_for_network(network);
-    let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
 
     let default_user_state_tree_root = QHashOut::<C::F>::from_u64x4(circuit_config.default_user_state_tree_root_hash_u64_x4);
 
@@ -74,8 +73,7 @@ where C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Field
         default_user_state_tree_root,
         get_default_worker_rewards_tree_tag::<QHashOut<C::F>>(),
         psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<C::F, QHashOut<C::F>, C::Hasher>(network.get_chain_id()),
-        rotation.checkpoints_per_epoch,
-        rotation.validator_sub_ids,
+        psy_config::CHECKPOINTS_PER_EPOCH,
     );
 
     gcv.register_circuit_triplet(

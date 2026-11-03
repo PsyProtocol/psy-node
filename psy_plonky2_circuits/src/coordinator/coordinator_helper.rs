@@ -84,7 +84,6 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         max_contract_state_tree_height: usize,
         public_key: QHashOut<C::F>,
         checkpoints_per_epoch: u64,
-        validator_sub_ids: Vec<u16>,
     ) -> Self {
         let guta_circuits = QEDGUTACircuitManager::<C, D>::new_with_library(
             library,
@@ -98,7 +97,6 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
             default_user_state_tree_root,
             public_key,
             checkpoints_per_epoch,
-            validator_sub_ids,
         );
         Self::new_with_guta(
             guta_circuits,

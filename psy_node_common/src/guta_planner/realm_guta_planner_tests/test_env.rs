@@ -315,6 +315,8 @@ impl RGPTestChainState {
                 checkpoint_leaf: self.finalizer_checkpoint_leaf.to_compact::<Hasher>(), global_state_roots: self.finalizer_state_roots,
             },
             checkpoint_tree_proof, old_realm_root_proof,
+            validator_leaves: psy_data::p2p::realm_validator_indexes(self.realm_id_u64 as u32)
+                .map(|(_, index)| self.validator_tree().get_leaf(index).value).collect(),
             validator_tree_proof: self.validator_tree().get_leaf((self.realm_id_u64 << 8) | self.realm_sub_id_u64), validator_user_tree_proof,
         })?;
         Ok(planner)

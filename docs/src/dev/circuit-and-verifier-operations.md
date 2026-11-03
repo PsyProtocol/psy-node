@@ -252,24 +252,11 @@ The command constructs `PsyUPSStepCircuitManager` with the compiled network magi
 
 ### 5.1 Cache-only command
 
-Cache loading calls `load_realm_rotation_config(LocalDevnet)`, which requires a runtime config whose `realm_configs[].validators` are nonempty. The official prerequisite is the existing `init-realm-p2p-keys` command; it reads `PSY_CONFIG_PATH=psy-genesis/config.json` and writes `local_checkpoints/realm_p2p/config.json` plus the real identity keys. It does not read or require `genesis.json`/`private_keys.json`. Genesis `validators` injection is a separate later step and is not a cache prerequisite. Run from `<repo-root>`:
+The cache circuit shape uses `MAX_VALIDATORS_PER_REALM` (64), not runtime membership. Generation does not load a validator configuration, create validator keys, or require `genesis.json`. Circuit 63 authenticates all 256 sub-ID leaf hashes of its proof-base Realm subtree against the checkpoint validator-tree root, derives the occupied count, requires `1..=64`, and selects the ascending-sub-ID member at the rotation index. The epoch anchor continues to authenticate the random seed; membership uses the proof-base checkpoint, matching native admission and routing. This change does not introduce epoch-snapshot membership or a second member commitment.
+
+Run the cache-only command from `<repo-root>`:
 
 ```bash
-PSY_CONFIG_PATH=psy-genesis/config.json \
-PSY_NETWORK=localhost \
-PSY_REALM_P2P_PUBLIC_HOST=127.0.0.1 \
-./target/release/psy_node_cli init-realm-p2p-keys \
-  --out-dir local_checkpoints/realm_p2p \
-  --realm-ids 0,1 \
-  --validators-per-realm 3 \
-  --validator-user-ids 0,262144,786432,1048576,1572864,1310720 \
-  --edges-per-validator 1
-```
-
-This writes runtime membership and identity keys only. Then run the cache-only command with the runtime config selected:
-
-```bash
-PSY_CONFIG_PATH=<repo-root>/local_checkpoints/realm_p2p/config.json \
 PSY_NETWORK=localhost \
 RUST_MIN_STACK=134217728 \
 cargo run --release -p psy_plonky2_circuits \
@@ -285,7 +272,7 @@ psy_plonky2_circuits/src/generated/cached_circuit_library.rs
 psy_plonky2_circuits/src/generated/cached_common_data.rs
 ```
 
-Generate the pair only with the membership created above (two validators per Realm 0 and 1, four reserved ids); a different validator count changes the generated pair even though the second-run stability loop still passes.
+Changing valid runtime membership does not change the pair. Changing the capacity or rotation period remains a circuit change and requires regeneration.
 
 The writer compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:448-474`).
 

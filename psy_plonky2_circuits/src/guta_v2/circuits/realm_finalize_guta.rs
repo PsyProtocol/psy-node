@@ -10,7 +10,7 @@ use parth_core::{
 use plonky2::{
     field::{
         extension::Extendable,
-        types::{Field, PrimeField64},
+        types::{Field, Field64, PrimeField64},
     },
     hash::hash_types::{HashOutTarget, RichField},
     iop::{
@@ -36,7 +36,7 @@ use psy_data::{
             RealmFinalizeGUTAAction, RealmFinalizeGUTAInput, RealmFinalizeGUTAPublicOutput,
         },
     },
-    p2p::DOMAIN_VALIDATOR_LEAF_FELT,
+    p2p::{DOMAIN_VALIDATOR_LEAF_FELT, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM},
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
 use psy_plonky2_basic_helpers::{
@@ -83,19 +83,19 @@ const SOURCE_DOMAIN: u64 = 0x3130_4543_5255_4f53;
 const ROTATION_ROUNDS: usize = 90;
 
 #[derive(Debug)]
-struct ConstantDivRemGenerator<F: RichField + Extendable<D>, const D: usize> {
+struct DivRemGenerator<F: RichField + Extendable<D>, const D: usize> {
     dividend: Target,
-    divisor: u64,
+    divisor: Target,
     quotient: Target,
     remainder: Target,
     _phantom: std::marker::PhantomData<F>,
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
-    for ConstantDivRemGenerator<F, D>
+    for DivRemGenerator<F, D>
 {
     fn dependencies(&self) -> Vec<Target> {
-        vec![self.dividend]
+        vec![self.dividend, self.divisor]
     }
 
     fn run_once(
@@ -104,38 +104,37 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer: &mut GeneratedValues<F>,
     ) -> anyhow::Result<()> {
         let dividend = witness.get_target(self.dividend).to_canonical_u64();
+        let divisor = witness.get_target(self.divisor).to_canonical_u64();
+        anyhow::ensure!(divisor > 0, "rotation divisor must be nonzero");
         out_buffer.set_target(
             self.quotient,
-            F::from_canonical_u64(dividend / self.divisor),
+            F::from_canonical_u64(dividend / divisor),
         )?;
         out_buffer.set_target(
             self.remainder,
-            F::from_canonical_u64(dividend % self.divisor),
+            F::from_canonical_u64(dividend % divisor),
         )
     }
 
     fn id(&self) -> String {
-        "RealmFinalizeConstantDivRemGenerator".to_string()
+        "RealmFinalizeDivRemGenerator".to_string()
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
         dst.write_target(self.dividend)?;
-        dst.extend_from_slice(&self.divisor.to_le_bytes());
+        dst.write_target(self.divisor)?;
         dst.write_target(self.quotient)?;
         dst.write_target(self.remainder)
     }
 
     fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
         let dividend = src.read_target()?;
-        let mut divisor_bytes = [0u8; 8];
-        for byte in &mut divisor_bytes {
-            *byte = src.read_u8()?;
-        }
+        let divisor = src.read_target()?;
         let quotient = src.read_target()?;
         let remainder = src.read_target()?;
         Ok(Self {
             dividend,
-            divisor: u64::from_le_bytes(divisor_bytes),
+            divisor,
             quotient,
             remainder,
             _phantom: std::marker::PhantomData,
@@ -216,6 +215,7 @@ where
     pub validator_node_id_hash_limbs: [Target; 4],
     pub validator_bls_hash_limbs: [Target; 4],
     pub validator_tree_proof: MerkleProofGadget,
+    pub validator_leaves: Vec<HashOutTarget>,
     pub validator_user_leaf: QEDUserLeafGadget,
     pub validator_user_tree_proof: MerkleProofGadget,
     pub current_validator_user_leaf: QEDUserLeafGadget,
@@ -256,24 +256,40 @@ where
         divisor: u64,
     ) -> (Target, Target) {
         assert!(divisor > 0, "strict constant divisor must be nonzero");
+        let divisor_target = builder.constant(C::F::from_canonical_u64(divisor));
+        Self::strict_div_rem(builder, dividend, dividend_bits, divisor_target, divisor)
+    }
+
+    // Integer reconstruction cannot wrap the field: quotient < 2^dividend_bits,
+    // divisor <= max_divisor and remainder < divisor. The bound below is strict.
+    fn strict_div_rem(
+        builder: &mut CircuitBuilder<C::F, D>,
+        dividend: Target,
+        dividend_bits: usize,
+        divisor: Target,
+        max_divisor: u64,
+    ) -> (Target, Target) {
+        assert!(dividend_bits < 64);
+        assert!((1u128 << dividend_bits) * (max_divisor as u128) < C::F::ORDER as u128);
         let quotient = builder.add_virtual_target();
         let remainder = builder.add_virtual_target();
-        builder.add_simple_generator(ConstantDivRemGenerator::<C::F, D> {
-            dividend,
-            divisor,
-            quotient,
-            remainder,
-            _phantom: std::marker::PhantomData,
+        builder.add_simple_generator(DivRemGenerator::<C::F, D> {
+            dividend, divisor, quotient, remainder, _phantom: std::marker::PhantomData,
         });
+        let divisor_bits = Self::nonzero_bit_width(max_divisor);
+        builder.range_check(divisor, divisor_bits);
+        let zero = builder.zero();
+        let nonzero = builder.is_equal(divisor, zero);
+        builder.assert_zero(nonzero.target);
+        let maximum = builder.constant(C::F::from_canonical_u64(max_divisor));
+        let in_range = builder.is_less_than_or_equal(divisor_bits, divisor, maximum);
+        builder.assert_one(in_range.target);
         builder.range_check(dividend, dividend_bits);
         builder.range_check(quotient, dividend_bits);
-        let divisor_target = builder.constant(C::F::from_canonical_u64(divisor));
-        let reconstructed = builder.mul_add(quotient, divisor_target, remainder);
+        let reconstructed = builder.mul_add(quotient, divisor, remainder);
         builder.connect(dividend, reconstructed);
-        let remainder_bits = Self::nonzero_bit_width(divisor - 1);
-        builder.range_check(remainder, remainder_bits);
-        let comparison_bits = Self::nonzero_bit_width(divisor);
-        let is_strict = builder.is_less_than(comparison_bits, remainder, divisor_target);
+        builder.range_check(remainder, Self::nonzero_bit_width(max_divisor - 1));
+        let is_strict = builder.is_less_than(divisor_bits, remainder, divisor);
         builder.assert_one(is_strict.target);
         (quotient, remainder)
     }
@@ -312,14 +328,27 @@ where
         realm_id: Target,
         realm_sub_id: Target,
         rotation_period_checkpoints: u64,
-        validator_sub_ids: &[u16],
+        validator_leaves: &[HashOutTarget],
         checkpoint_tree_height: usize,
         checkpoint_tree_root: HashOutTarget,
     ) -> (QEDCheckpointLeafGadget, MerkleProofGadget) {
         assert!(rotation_period_checkpoints > 0, "rotation period must be nonzero");
-        assert!(!validator_sub_ids.is_empty(), "rotation validators must be nonempty");
-        assert!(validator_sub_ids.len() <= 256, "rotation validators exceed 8-bit sub-ID space");
-        assert!(validator_sub_ids.iter().all(|&id| id <= u8::MAX as u16));
+        assert_eq!(validator_leaves.len(), 1 << psy_data::guta::realm_finalize::VALIDATOR_SUB_ID_BITS);
+        let empty = builder.constant_hash(<C::Hasher as MerkleZeroHasher<QHashOut<C::F>>>::get_zero_hash(0).0);
+        let occupied = validator_leaves.iter().map(|&leaf| {
+            let is_empty = builder.is_equal_hash(leaf, empty);
+            builder.not(is_empty)
+        }).collect::<Vec<_>>();
+        let validator_count_target = builder.add_many(occupied.iter().map(|bit| bit.target));
+        let count_bits = Self::nonzero_bit_width(MAX_VALIDATORS_PER_REALM as u64);
+        builder.range_check(validator_count_target, count_bits);
+        let maximum = builder.constant(C::F::from_canonical_usize(MAX_VALIDATORS_PER_REALM));
+        let in_range = builder.is_less_than_or_equal(count_bits, validator_count_target, maximum);
+        builder.assert_one(in_range.target);
+        assert!((1..=MAX_VALIDATORS_PER_REALM).contains(&MIN_VALIDATORS_PER_REALM));
+        let minimum = builder.constant(C::F::from_canonical_usize(MIN_VALIDATORS_PER_REALM));
+        let in_range = builder.is_less_than_or_equal(count_bits, minimum, validator_count_target);
+        builder.assert_one(in_range.target);
 
         let one = builder.one();
         let target_checkpoint_id = builder.add(checkpoint_id, one);
@@ -376,9 +405,7 @@ where
             anchor_seed.elements[3],
         ]);
 
-        let validator_count = validator_sub_ids.len() as u64;
-        let index_bits = Self::nonzero_bit_width(validator_count - 1);
-        let validator_count_target = builder.constant(C::F::from_canonical_u64(validator_count));
+        let index_bits = Self::nonzero_bit_width(MAX_VALIDATORS_PER_REALM as u64 - 1);
         let mut index = builder.zero();
         for round in 0..ROTATION_ROUNDS {
             let round_target = builder.constant(C::F::from_canonical_usize(round));
@@ -392,7 +419,7 @@ where
                 round_target,
             ]);
             let pivot_word = Self::canonical_goldilocks_word(builder, pivot_hash.elements[0]);
-            let (_, pivot) = Self::strict_div_rem_const(builder, pivot_word, 32, validator_count);
+            let (_, pivot) = Self::strict_div_rem(builder, pivot_word, 32, validator_count_target, MAX_VALIDATORS_PER_REALM as u64);
 
             let pivot_plus_n = builder.add(pivot, validator_count_target);
             let flip_sum = builder.sub(pivot_plus_n, index);
@@ -419,13 +446,36 @@ where
             index = builder.select(source_bit, flip, index);
         }
 
-        let validator_sub_id_targets = validator_sub_ids
-            .iter()
-            .map(|&id| builder.constant(C::F::from_canonical_u64(id as u64)))
-            .collect::<Vec<_>>();
-        let expected_sub_id = builder.select_in_array(&validator_sub_id_targets, index);
-        builder.connect(realm_sub_id, expected_sub_id);
+        let mut rank = builder.zero();
+        let mut selected = builder.zero();
+        let mut selected_count = builder.zero();
+        for (sub_id, active) in occupied.iter().enumerate() {
+            let at_index = builder.is_equal(rank, index);
+            let take = builder.and(*active, at_index);
+            let sub_id_target = builder.constant(C::F::from_canonical_usize(sub_id));
+            selected = builder.select(take, sub_id_target, selected);
+            selected_count = builder.add(selected_count, take.target);
+            rank = builder.add(rank, active.target);
+        }
+        builder.assert_one(selected_count);
+        builder.connect(realm_sub_id, selected);
         (anchor_checkpoint_leaf, anchor_checkpoint_tree_proof)
+    }
+
+    // Authenticate every slot, including empties, against the same proof-base
+    // root as the selected validator's identity. This proves set completeness.
+    fn enforce_validator_subtree(
+        builder: &mut CircuitBuilder<C::F, D>,
+        validator_leaves: &[HashOutTarget],
+        realm_id: Target,
+        siblings: &[HashOutTarget],
+        validator_tree_root: HashOutTarget,
+    ) {
+        let subtree_root = psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::hash_merkle_leaves::<C::F, D, C::Hasher>(
+            builder, validator_leaves);
+        let root = MerkleProofGadget::compute_root::<C::Hasher, C::F, D>(
+            builder, realm_id, subtree_root, siblings);
+        builder.connect_hashes(root, validator_tree_root);
     }
 
     /// Constrains `realm_sub_id` to the epoch-fixed scheduled proposer for
@@ -438,7 +488,7 @@ where
         realm_id: Target,
         realm_sub_id: Target,
         checkpoints_per_epoch: u64,
-        validator_sub_ids: &[u16],
+        validator_leaves: &[HashOutTarget],
         checkpoint_tree_height: usize,
         checkpoint_tree_root: HashOutTarget,
     ) -> (QEDCheckpointLeafGadget, MerkleProofGadget) {
@@ -448,7 +498,7 @@ where
             realm_id,
             realm_sub_id,
             checkpoints_per_epoch,
-            validator_sub_ids,
+            validator_leaves,
             checkpoint_tree_height,
             checkpoint_tree_root,
         )
@@ -465,7 +515,6 @@ where
         realm_global_user_tree_height: usize,
         chain_domain: QHashOut<C::F>,
         rotation_period_checkpoints: u64,
-        validator_sub_ids: Vec<u16>,
     ) -> Self {
         assert_eq!(
             validator_tree_height,
@@ -473,7 +522,7 @@ where
             "validator tree height must equal realm bits plus 8 sub-ID bits",
         );
         assert!(
-            rotation_period_checkpoints > 0 && !validator_sub_ids.is_empty(),
+            rotation_period_checkpoints > 0,
             "RealmFinalizeGUTA rotation must be configured",
         );
 
@@ -503,13 +552,15 @@ where
 
         let realm_sub_id = builder.add_virtual_target();
         builder.range_check(realm_sub_id, 8);
+        let validator_leaves = (0..1 << psy_data::guta::realm_finalize::VALIDATOR_SUB_ID_BITS)
+            .map(|_| builder.add_virtual_hash()).collect::<Vec<_>>();
         let (anchor_checkpoint_leaf, anchor_checkpoint_tree_proof) = Self::enforce_rotation(
             &mut builder,
             checkpoint_id,
             realm_id,
             realm_sub_id,
             rotation_period_checkpoints,
-            &validator_sub_ids,
+            &validator_leaves,
             checkpoint_tree_height,
             root_header.checkpoint_tree_root,
         );
@@ -577,6 +628,9 @@ where
         builder.connect(proof_realm_id, realm_id);
         builder.connect_hashes(validator_tree_proof.value, validator_leaf_hash);
         builder.connect_hashes(validator_tree_proof.root, checkpoint_validator_tree_root);
+        Self::enforce_validator_subtree(&mut builder, &validator_leaves, realm_id,
+            &validator_tree_proof.siblings[psy_data::guta::realm_finalize::VALIDATOR_SUB_ID_BITS as usize..],
+            checkpoint_validator_tree_root);
 
         let validator_user_leaf = QEDUserLeafGadget::create_virtual(&mut builder);
         builder.connect(validator_user_leaf.user_id, validator_user_id);
@@ -766,6 +820,7 @@ where
             validator_node_id_hash_limbs,
             validator_bls_hash_limbs,
             validator_tree_proof,
+            validator_leaves,
             validator_user_leaf,
             validator_user_tree_proof,
             current_validator_user_leaf,
@@ -790,7 +845,11 @@ where
         root_guta_reward_tag: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        anyhow::ensure!(input.validator_leaves.len() == self.validator_leaves.len(), "finalizer requires every validator subtree slot");
         let mut witness = PartialWitness::<C::F>::new();
+        for (target, leaf) in self.validator_leaves.iter().zip(&input.validator_leaves) {
+            witness.set_hash_target(*target, leaf.0)?;
+        }
         witness.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
         self.root_guta.set_witness(
             &mut witness,
@@ -984,7 +1043,7 @@ mod tests {
         utils::QPGenRandom,
     };
     use psy_data::v1::qdata::checkpoint::PQEDCheckpointLeaf;
-    use psy_data::p2p::DOMAIN_VALIDATOR_LEAF_FELT;
+    use psy_data::p2p::{DOMAIN_VALIDATOR_LEAF_FELT, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM};
     use plonky2::{
         field::{goldilocks_field::GoldilocksField, types::Field},
         hash::{hash_types::HashOutTarget, poseidon::PoseidonHash},
@@ -1244,6 +1303,42 @@ mod tests {
     }
 
 
+    #[test]
+    fn realm_finalize_dynamic_division_rejects_forged_integer_witnesses() -> anyhow::Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let dividend = builder.add_virtual_target();
+        let divisor = builder.add_virtual_target();
+        let (quotient, remainder) = super::RealmFinalizeGUTACircuit::<C, D>::strict_div_rem(
+            &mut builder, dividend, 32, divisor, 64);
+        let mut data = builder.build::<C>();
+        // Bypass the honest division generator: negatives must fail constraints,
+        // rather than merely conflict with its correctly generated quotient.
+        let mut next = 0;
+        let indexes = data.prover_only.generators.iter().map(|generator| {
+            if generator.0.id() == "RealmFinalizeDivRemGenerator" { None }
+            else { let index = next; next += 1; Some(index) }
+        }).collect::<Vec<_>>();
+        data.prover_only.generators.retain(|generator| generator.0.id() != "RealmFinalizeDivRemGenerator");
+        for watches in data.prover_only.generator_indices_by_watches.values_mut() {
+            *watches = watches.iter().filter_map(|&index| indexes[index]).collect();
+        }
+        for (n, q, r, valid) in [
+            (1, u32::MAX as u64, 0, true), (64, 67108863, 63, true),
+            (3, 1431655765, 0, true), (0, 0, 0, false), (65, 66076419, 60, false),
+            (64, 67108862, 127, false), (3, 0, u32::MAX as u64, false),
+            (1, (1u64 << 32) + u32::MAX as u64, 0, false),
+        ] {
+            let mut witness = PartialWitness::new();
+            witness.set_target(dividend, F::from_u64_value(u32::MAX as u64))?;
+            witness.set_target(divisor, F::from_u64_value(n))?;
+            witness.set_target(quotient, F::from_u64_value(q))?;
+            witness.set_target(remainder, F::from_u64_value(r))?;
+            let result = data.prove(witness).and_then(|proof| data.verify(proof));
+            assert_eq!(result.is_ok(), valid, "divisor={n} quotient={q} remainder={r}: {result:?}");
+        }
+        Ok(())
+    }
+
     fn prove_rotation(
         checkpoint_id: u64,
         realm_id: u32,
@@ -1251,6 +1346,19 @@ mod tests {
         realm_sub_id: u16,
         rotation_period_checkpoints: u64,
         validator_sub_ids: &[u16],
+    ) -> anyhow::Result<()> {
+        prove_rotation_with_subtree(checkpoint_id, realm_id, anchor_checkpoint_leaf, realm_sub_id,
+            rotation_period_checkpoints, validator_sub_ids, None)
+    }
+
+    fn prove_rotation_with_subtree(
+        checkpoint_id: u64,
+        realm_id: u32,
+        anchor_checkpoint_leaf: &PQEDCheckpointLeaf<F, Hash>,
+        realm_sub_id: u16,
+        rotation_period_checkpoints: u64,
+        validator_sub_ids: &[u16],
+        changed_slot: Option<u16>,
     ) -> anyhow::Result<()> {
         const CHECKPOINT_TREE_HEIGHT: usize = 8;
         let mut checkpoint_tree =
@@ -1274,6 +1382,7 @@ mod tests {
         let realm_sub_id_target = builder.add_virtual_target();
         builder.range_check(realm_sub_id_target, 8);
         let root_target = builder.constant_hash(anchor_proof.root.0);
+        let validator_leaves = (0..256).map(|_| builder.add_virtual_hash()).collect::<Vec<_>>();
         let (anchor_leaf_target, anchor_proof_target) =
             super::RealmFinalizeGUTACircuit::<C, D>::constrain_epoch_fixed_proposer_for_tests(
                 &mut builder,
@@ -1281,12 +1390,33 @@ mod tests {
                 realm_id_target,
                 realm_sub_id_target,
                 rotation_period_checkpoints,
-                validator_sub_ids,
+                &validator_leaves,
                 CHECKPOINT_TREE_HEIGHT,
                 root_target,
             );
+        let empty = <Hasher as parth_core::crypto::hash::traits::MerkleZeroHasher<Hash>>::get_zero_hash(0);
+        let mut validator_tree = SimpleMerkleTree::<Hasher, Hash>::new(20);
+        for &sub_id in validator_sub_ids {
+            validator_tree.set_leaf(((realm_id as u64) << 8) | sub_id as u64,
+                Hash::from_values(sub_id as u64 + 1, 2, 3, 4));
+        }
+        let validator_proof = validator_tree.get_leaf((realm_id as u64) << 8);
+        let siblings = validator_proof.siblings[8..].iter()
+            .map(|hash| builder.constant_hash(hash.0)).collect::<Vec<_>>();
+        let validator_root = builder.constant_hash(validator_proof.root.0);
+        super::RealmFinalizeGUTACircuit::<C, D>::enforce_validator_subtree(
+            &mut builder, &validator_leaves, realm_id_target, &siblings, validator_root);
         let data = builder.build::<C>();
         let mut witness = PartialWitness::new();
+        for (sub_id, target) in validator_leaves.iter().enumerate() {
+            let active = validator_sub_ids.contains(&(sub_id as u16)) ^ (changed_slot == Some(sub_id as u16));
+            let leaf = if active {
+                Hash::from_values(sub_id as u64 + 1, 2, 3, 4)
+            } else {
+                empty
+            };
+            witness.set_hash_target(*target, leaf.0)?;
+        }
         witness.set_target(checkpoint_id_target, F::from_u64_value(checkpoint_id))?;
         witness.set_target(realm_id_target, F::from_u64_value(realm_id as u64))?;
         witness.set_target(realm_sub_id_target, F::from_u64_value(realm_sub_id as u64))?;
@@ -1307,6 +1437,143 @@ mod tests {
     }
 
     const EPOCH_LEN: u64 = 32;
+
+    #[test]
+    fn realm_finalize_rotation_supports_bounded_sparse_membership() -> anyhow::Result<()> {
+        for count in [MIN_VALIDATORS_PER_REALM, 2, 3, 63, 64].into_iter().filter(|count| *count >= MIN_VALIDATORS_PER_REALM) {
+            let ids = (0..count).map(|i| (i * 4 + 3) as u16).collect::<Vec<_>>();
+            let leaf = rotation_leaf([7, 11, 13, 17]);
+            let rotation = RealmRotationConfig { checkpoints_per_epoch: EPOCH_LEN, validator_sub_ids: ids.clone() };
+            for checkpoint in [30, 31, 32] {
+                let expected = rotation.proposer_sub_id(42, checkpoint + 1, [7, 11, 13, 17])?.unwrap();
+                prove_rotation(checkpoint, 42, &leaf, expected, EPOCH_LEN, &ids)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realm_finalize_rotation_rejects_omitted_or_invented_members() -> anyhow::Result<()> {
+        let leaf = rotation_leaf([7, 11, 13, 17]);
+        let ids = [3, 91, 255];
+        let rotation = RealmRotationConfig { checkpoints_per_epoch: EPOCH_LEN, validator_sub_ids: ids.to_vec() };
+        let expected = rotation.proposer_sub_id(42, 33, [7, 11, 13, 17])?.unwrap();
+        for changed in [3, 91, 255, 0, 2, 254] {
+            assert!(prove_rotation_with_subtree(32, 42, &leaf, expected, EPOCH_LEN, &ids, Some(changed)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn realm_finalize_rotation_rejects_empty_and_over_capacity() {
+        let leaf = rotation_leaf([7, 11, 13, 17]);
+        let ids = (1..MIN_VALIDATORS_PER_REALM as u16).collect::<Vec<_>>();
+        assert!(prove_rotation(32, 42, &leaf, 0, EPOCH_LEN, &ids).is_err());
+        let ids = (1..=MAX_VALIDATORS_PER_REALM as u16 + 1).collect::<Vec<_>>();
+        assert!(prove_rotation(32, 42, &leaf, 1, EPOCH_LEN, &ids).is_err());
+    }
+
+    #[test]
+    fn realm_finalize_complete_proof_authenticates_membership() -> anyhow::Result<()> {
+        use parth_core::crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleZeroHasher};
+        use psy_data::{guta::realm_finalize::RealmFinalizeGUTAInput, v1::qdata::{
+            checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeafCompactWithStateRoots}, user::PQEDUserLeaf}};
+        use crate::guta::circuits::guta_no_change::GUTANoChangeCircuit;
+        let root = GUTANoChangeCircuit::<C, D>::new(8);
+        let mut whitelist = SimpleMerkleTree::<Hasher, Hash>::new(4);
+        whitelist.set_leaf(0, root.fingerprint);
+        let whitelist_proof = whitelist.get_leaf(0);
+        let mut user = PQEDUserLeaf::<F, Hash>::qp_rand_gen();
+        user.user_id = F::ONE;
+        user.balance = F::from_u64_value(100);
+        user.nonce = F::ZERO;
+        user.event_index = F::ZERO;
+        user.last_checkpoint_id = F::ZERO;
+        let mut users = SimpleMerkleTree::<Hasher, Hash>::new(4);
+        users.set_leaf(1, user.qfhash::<Hasher>());
+        let user_proof = users.get_leaf(1);
+        let mut validators = SimpleMerkleTree::<Hasher, Hash>::new(8);
+        validators.set_leaf(7, realm_validator_leaf_hash::<F, Hash, Hasher>(1, [1, 2, 3, 4], [5, 6, 7, 8]));
+        let validator_proof = validators.get_leaf(7);
+        let leaves = (0..256).map(|index| validators.get_leaf(index).value).collect::<Vec<_>>();
+        let zero = <Hasher as MerkleZeroHasher<Hash>>::get_zero_hash(0);
+        let roots = PQEDCheckpointGlobalStateRoots {
+            contract_tree_root: zero, deposit_tree_root: zero, withdrawal_tree_root: zero,
+            user_registration_tree_root: zero, user_tree_root: user_proof.root, validator_tree_root: validator_proof.root,
+        };
+        let mut leaf = rotation_leaf([7, 11, 13, 17]);
+        leaf.global_chain_root = roots.qfhash::<Hasher>();
+        let compact = PQEDCheckpointLeafCompactWithStateRoots {
+            checkpoint_leaf: leaf.to_compact::<Hasher>(), global_state_roots: roots,
+        };
+        let mut checkpoints = SimpleMerkleTree::<Hasher, Hash>::new(8);
+        checkpoints.set_leaf(0, leaf.qfhash::<Hasher>());
+        let checkpoint_proof = checkpoints.get_leaf(0);
+        let worker_tag = Hash::from_values(11, 12, 13, 14);
+        let root_proof = root.prove_base(worker_tag, whitelist_proof.root, &checkpoint_proof, &compact)?;
+        root.circuit_data.verify(root_proof.clone())?;
+        let header = GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: whitelist_proof.root, checkpoint_tree_root: checkpoint_proof.root,
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value: user_proof.root, new_node_value: user_proof.root,
+                node_index: F::ZERO, node_level: F::ZERO,
+            },
+            stats: GUTAStats { guta_fees_collected: F::ZERO, da_fees_collected: F::ZERO,
+                user_ops_processed: F::ZERO, total_transactions: F::ZERO, slots_modified: F::ZERO },
+            total_aggregation_proofs_generated: F::ONE,
+        };
+        let input = RealmFinalizeGUTAInput {
+            root_guta_header: header, root_guta_whitelist_proof: whitelist_proof.clone(),
+            checkpoint_id: F::ZERO, realm_sub_id: 7, anchor_checkpoint_leaf: leaf,
+            anchor_checkpoint_tree_proof: checkpoint_proof.clone(), checkpoint_tree_proof: checkpoint_proof,
+            checkpoint_leaf: compact,
+            old_realm_root_proof: parth_core::crypto::hash::merkle_proof::MerkleProofCore {
+                root: user_proof.root, value: user_proof.root, index: 0, siblings: vec![],
+            },
+            validator_user_id: F::ONE, validator_node_id_hash_limbs: [1, 2, 3, 4],
+            validator_bls_hash_limbs: [5, 6, 7, 8], validator_tree_proof: validator_proof,
+            validator_leaves: leaves, validator_user_leaf: user.clone(), validator_user_tree_proof: user_proof.clone(),
+            current_validator_user_leaf: user, current_validator_user_tree_proof: user_proof.clone(),
+            validator_fee_delta_proof: DeltaMerkleProofCore {
+                old_value: user_proof.value, new_value: user_proof.value,
+                old_root: user_proof.root, new_root: user_proof.root, index: 1, siblings: user_proof.siblings,
+            },
+        };
+        let circuit = super::RealmFinalizeGUTACircuit::<C, D>::new(
+            &root.circuit_data.common, root.circuit_data.verifier_only.constants_sigmas_cap.height(),
+            4, 8, 0, 8, 4, Hash::from_values(1, 2, 3, 4), EPOCH_LEN);
+        let root_reward = Hasher::q_two_to_one(Hasher::q_two_to_one(zero, zero), worker_tag);
+        let proof = circuit.prove_base(&input, &whitelist_proof, &root_proof,
+            &root.circuit_data.verifier_only, root_reward, worker_tag)?;
+        let expected = psy_data::guta::realm_finalize::finalize_public_input_hash::<F, Hash, Hasher>(
+            &circuit.expected_public_output(&input, root_reward), &worker_tag);
+        assert_eq!(proof.public_inputs.as_slice(), expected.0.elements.as_slice());
+        circuit.minifier.circuit_data.verify(proof)?;
+        let mut tampered = input;
+        tampered.validator_leaves[7] = zero;
+        assert!(circuit.prove_base(&tampered, &whitelist_proof, &root_proof,
+            &root.circuit_data.verifier_only, root_reward, worker_tag).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn realm_finalize_capacity_degree() {
+        use psy_core::{constants::chain_id::PsyChainNetworkType, network_config::get_circuit_config_for_network};
+        let network = PsyChainNetworkType::LocalDevnet;
+        let config = get_circuit_config_for_network(network);
+        let common = psy_plonky2_basic_helpers::lookalike::standard::get_guta_type_c_common_data::<C, D>();
+        let realm_bits = config.global_user_tree_height - config.global_user_tree_realm_height;
+        let circuit = super::RealmFinalizeGUTACircuit::<C, D>::new(
+            &common, common.config.fri_config.cap_height, config.guta_circuit_whitelist_tree_height,
+            config.checkpoint_tree_height, realm_bits, realm_bits + 8, config.global_user_tree_realm_height,
+            psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<F, Hash, Hasher>(network.get_chain_id()),
+            psy_config::CHECKPOINTS_PER_EPOCH);
+        println!("RealmFinalizeGUTA capacity=64 base_degree_bits={} base_rows={} minifier_degree_bits={} minifier_rows={}",
+            circuit.circuit_data.common.degree_bits(), circuit.circuit_data.common.degree(),
+            circuit.minifier.circuit_data.common.degree_bits(), circuit.minifier.circuit_data.common.degree());
+        assert_eq!(circuit.minifier.circuit_data.common, common);
+    }
+
 
     #[test]
     fn realm_finalize_rotation_matches_native_poseidon_shuffle() -> anyhow::Result<()> {

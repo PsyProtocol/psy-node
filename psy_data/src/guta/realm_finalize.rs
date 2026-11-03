@@ -393,6 +393,8 @@ pub struct RealmFinalizeGUTAInput<F, Hash> {
     pub validator_node_id_hash_limbs: [u64; 4],
     pub validator_bls_hash_limbs: [u64; 4],
     pub validator_tree_proof: MerkleProofCore<Hash>,
+    /// All 256 leaf hashes of the proof-base Realm subtree, including empty slots.
+    pub validator_leaves: Vec<Hash>,
     pub validator_user_leaf: PQEDUserLeaf<F, Hash>,
     pub validator_user_tree_proof: MerkleProofCore<Hash>,
     pub current_validator_user_leaf: PQEDUserLeaf<F, Hash>,
@@ -417,6 +419,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for RealmFinalizeGUTAInput<F
             validator_node_id_hash_limbs: rand::random(),
             validator_bls_hash_limbs: rand::random(),
             validator_tree_proof: MerkleProofCore::qp_rand_gen(),
+            validator_leaves: (0..1 << VALIDATOR_SUB_ID_BITS).map(|_| Hash::qp_rand_gen()).collect(),
             validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
             validator_user_tree_proof: MerkleProofCore::qp_rand_gen(),
             current_validator_user_leaf: PQEDUserLeaf::qp_rand_gen(),
@@ -445,6 +448,8 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             + 8 // validator_user_id
             + 64 // validator digest limbs (2 x 4 x u64)
             + self.validator_tree_proof.pio_serialized_size()
+            + 4 // Speedy-compatible validator leaf count
+            + self.validator_leaves.iter().map(PsyIOReadWrite::pio_serialized_size).sum::<usize>()
             + self.validator_user_leaf.pio_serialized_size()
             + self.validator_user_tree_proof.pio_serialized_size()
             + self.current_validator_user_leaf.pio_serialized_size()
@@ -470,6 +475,9 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             writer.psy_write_u64(limb)?;
         }
         self.validator_tree_proof.pio_write_to_io(writer)?;
+        anyhow::ensure!(self.validator_leaves.len() == 1 << VALIDATOR_SUB_ID_BITS, "finalizer requires every validator subtree slot");
+        writer.psy_write_u32(self.validator_leaves.len() as u32)?;
+        for leaf in &self.validator_leaves { leaf.pio_write_to_io(writer)?; }
         self.validator_user_leaf.pio_write_to_io(writer)?;
         self.validator_user_tree_proof.pio_write_to_io(writer)?;
         self.current_validator_user_leaf.pio_write_to_io(writer)?;
@@ -498,6 +506,9 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             *limb = reader.psy_read_u64()?;
         }
         let validator_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        anyhow::ensure!(reader.psy_read_u32()? == 1 << VALIDATOR_SUB_ID_BITS, "finalizer requires every validator subtree slot");
+        let validator_leaves = (0..1 << VALIDATOR_SUB_ID_BITS)
+            .map(|_| Hash::pio_read_from_io(reader)).collect::<anyhow::Result<Vec<_>>>()?;
         let validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
         let validator_user_tree_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let current_validator_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
@@ -517,6 +528,7 @@ impl<F: QFelt64, Hash: Q256BitHash + PsyIOReadWrite> FallbackPsySerializeCanonic
             validator_node_id_hash_limbs,
             validator_bls_hash_limbs,
             validator_tree_proof,
+            validator_leaves,
             validator_user_leaf,
             validator_user_tree_proof,
             current_validator_user_leaf,
