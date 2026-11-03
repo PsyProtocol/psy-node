@@ -187,6 +187,7 @@ impl<
             event = "worker_reputation",
             reason = "invalid_proof_not_charged",
             worker = %hex::encode(signer),
+            worker_label = %crate::worker_whitelist::worker_label_or_dash(signer),
             upid = unique_pending_id,
             job = ?job_id,
             "proof rejected: {:?}",
@@ -507,6 +508,7 @@ impl<
                 event = "worker_reputation",
                 reason = "stale_claim",
                 worker = %hex::encode(&signature.public_key),
+                worker_label = %crate::worker_whitelist::worker_label_or_dash(&signature.public_key),
                 upid = unique_pending_id,
                 job = ?job_id,
                 "stale submit rejected without penalty"

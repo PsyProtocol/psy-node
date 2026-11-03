@@ -36,6 +36,7 @@ fn log_change(
             realm = rid.realm_id,
             subrealm = rid.realm_sub_id,
             worker = %worker,
+            worker_label = %crate::worker_whitelist::worker_label_or_dash(public_key),
             upid = unique_pending_id,
             job,
             old = old.score,
@@ -51,6 +52,7 @@ fn log_change(
             realm = rid.realm_id,
             subrealm = rid.realm_sub_id,
             worker = %worker,
+            worker_label = %crate::worker_whitelist::worker_label_or_dash(public_key),
             upid = unique_pending_id,
             job,
             old = old.score,
@@ -131,6 +133,7 @@ pub trait WorkerReputationOps: QTempDBWorkerReputationStore + Sync {
                             realm = rid.realm_id,
                             subrealm = rid.realm_sub_id,
                             worker = %hex::encode(public_key),
+                            worker_label = %crate::worker_whitelist::worker_label_or_dash(public_key),
                             strikes = next.strikes,
                             "worker admitted on probation"
                         );

@@ -1,25 +1,59 @@
 //! Reloadable worker whitelist policy sourced from `psy-genesis/config.json`.
+//!
+//! The policy may carry an optional `labels` map from whitelisted public key to an operator name.
+//! Labels never affect admission; they only name workers in Edge logs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use parking_lot::RwLock;
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use serde::Deserialize;
 
 pub const RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+pub const MAX_LABEL_LEN: usize = 64;
 
-#[derive(Debug, Clone, Default)]
+type Labels = BTreeMap<[u8; 33], String>;
+
+/// Labels of every loaded whitelist, keyed by config path, so code without a handle on the cache
+/// (the reputation store) can still name a worker in its logs.
+static LABEL_REGISTRY: LazyLock<RwLock<BTreeMap<PathBuf, Arc<Labels>>>> = LazyLock::new(Default::default);
+
+/// Returns the operator label of `public_key` from any loaded whitelist.
+pub fn worker_label(public_key: &[u8; 33]) -> Option<String> {
+    LABEL_REGISTRY
+        .read()
+        .values()
+        .find_map(|labels| labels.get(public_key).cloned())
+}
+
+/// Log field value for a worker: its label, or `-` when it has none.
+pub fn worker_label_or_dash(public_key: &[u8; 33]) -> String {
+    worker_label(public_key).unwrap_or_else(|| "-".to_string())
+}
+
+fn publish_labels(config_path: &Path, labels: &Labels) {
+    LABEL_REGISTRY
+        .write()
+        .insert(config_path.to_path_buf(), Arc::new(labels.clone()));
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WhiteList {
     enabled: bool,
     keys: BTreeSet<[u8; 33]>,
+    labels: Labels,
 }
 
 impl WhiteList {
     pub fn is_allowed(&self, public_key: &[u8; 33]) -> bool {
         !self.enabled || self.keys.contains(public_key)
+    }
+
+    pub fn label(&self, public_key: &[u8; 33]) -> Option<&str> {
+        self.labels.get(public_key).map(String::as_str)
     }
 
     fn load_from_config(config_path: &Path, network: PsyChainNetworkType) -> anyhow::Result<Self> {
@@ -52,11 +86,37 @@ impl WhiteList {
         for value in &whitelist.secp256k1 {
             keys.insert(parse_compressed_key(value)?);
         }
+        let labels = parse_labels(&whitelist.labels, &keys)?;
         Ok(Self {
             enabled: true,
             keys,
+            labels,
         })
     }
+}
+
+fn parse_labels(raw: &BTreeMap<String, String>, keys: &BTreeSet<[u8; 33]>) -> anyhow::Result<Labels> {
+    let mut labels = Labels::new();
+    let mut names = BTreeSet::new();
+    for (key, label) in raw {
+        let public_key = parse_compressed_key(key)?;
+        if !keys.contains(&public_key) {
+            anyhow::bail!("worker label {label:?} names a key that is not whitelisted");
+        }
+        let valid = !label.is_empty()
+            && label.len() <= MAX_LABEL_LEN
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !valid {
+            anyhow::bail!("worker label {label:?} must be 1-{MAX_LABEL_LEN} characters of [A-Za-z0-9._-]");
+        }
+        if !names.insert(label.as_str()) {
+            anyhow::bail!("duplicate worker label {label:?}");
+        }
+        if labels.insert(public_key, label.clone()).is_some() {
+            anyhow::bail!("worker key labelled twice");
+        }
+    }
+    Ok(labels)
 }
 
 struct Inner {
@@ -75,6 +135,13 @@ impl WhiteListCache {
     pub fn new(config_path: impl AsRef<Path>, network: PsyChainNetworkType) -> anyhow::Result<Self> {
         let config_path = config_path.as_ref().to_path_buf();
         let snapshot = WhiteList::load_from_config(&config_path, network)?;
+        publish_labels(&config_path, &snapshot.labels);
+        tracing::info!(
+            enabled = snapshot.enabled,
+            keys = snapshot.keys.len(),
+            labels = snapshot.labels.len(),
+            "worker whitelist loaded"
+        );
         let inner = Arc::new(Inner {
             snapshot: RwLock::new(snapshot),
             config_path,
@@ -103,6 +170,10 @@ impl WhiteListCache {
         self.inner.snapshot.read().is_allowed(public_key)
     }
 
+    pub fn label(&self, public_key: &[u8; 33]) -> Option<String> {
+        self.inner.snapshot.read().label(public_key).map(str::to_string)
+    }
+
     pub fn ensure_allowed(&self, public_key: &[u8; 33]) -> anyhow::Result<()> {
         if !self.is_allowed(public_key) {
             anyhow::bail!("worker public key is not whitelisted");
@@ -118,7 +189,17 @@ impl WhiteListCache {
 fn reload_once(inner: &Inner) -> anyhow::Result<()> {
     match WhiteList::load_from_config(&inner.config_path, inner.network) {
         Ok(snapshot) => {
-            *inner.snapshot.write() = snapshot;
+            publish_labels(&inner.config_path, &snapshot.labels);
+            let mut current = inner.snapshot.write();
+            if *current != snapshot {
+                tracing::info!(
+                    enabled = snapshot.enabled,
+                    keys = snapshot.keys.len(),
+                    labels = snapshot.labels.len(),
+                    "worker whitelist reloaded with changes"
+                );
+                *current = snapshot;
+            }
             Ok(())
         }
         Err(error) => {
@@ -181,6 +262,8 @@ struct WhiteListConfig {
     enabled: bool,
     #[serde(default)]
     secp256k1: Vec<String>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -328,6 +411,82 @@ mod tests {
         clone.reload_once().unwrap();
         assert!(cache.ensure_allowed(&first).is_err());
         cache.ensure_allowed(&second).unwrap();
+    }
+
+    fn config_with_labels(keys: &[[u8; 33]], labels: serde_json::Value) -> serde_json::Value {
+        let mut config = config_with_policy("localhost", true, keys);
+        config["networks"]["localhost"]["whitelist"]["labels"] = labels;
+        config
+    }
+
+    #[tokio::test]
+    async fn labels_name_workers_without_changing_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (named, unnamed) = (key_from_seed(11), key_from_seed(12));
+        let labels = serde_json::json!({ format!("0x{}", hex::encode(named)): "c4d-coordinator" });
+        let path = write_config(&dir, config_with_labels(&[named, unnamed], labels));
+        let cache = WhiteListCache::new(&path, PsyChainNetworkType::LocalDevnet).unwrap();
+
+        cache.ensure_allowed(&named).unwrap();
+        cache.ensure_allowed(&unnamed).unwrap();
+        assert_eq!(cache.label(&named).as_deref(), Some("c4d-coordinator"));
+        assert_eq!(cache.label(&unnamed), None);
+        assert_eq!(worker_label(&named).as_deref(), Some("c4d-coordinator"));
+        assert_eq!(worker_label_or_dash(&unnamed), "-");
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_published_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key_from_seed(13);
+        let path = write_config(&dir, config_with_labels(&[key], serde_json::json!({ hex::encode(key): "old-name" })));
+        let cache = WhiteListCache::new(&path, PsyChainNetworkType::LocalDevnet).unwrap();
+        fs::write(&path, config_with_labels(&[key], serde_json::json!({ hex::encode(key): "new-name" })).to_string()).unwrap();
+
+        cache.reload_once().unwrap();
+        assert_eq!(cache.label(&key).as_deref(), Some("new-name"));
+        assert_eq!(worker_label(&key).as_deref(), Some("new-name"));
+
+        fs::write(&path, config_with_policy("localhost", true, &[key]).to_string()).unwrap();
+        cache.reload_once().unwrap();
+        assert_eq!(worker_label(&key), None);
+    }
+
+    #[test]
+    fn invalid_labels_fail_closed() {
+        let (member, outsider) = (key_from_seed(14), key_from_seed(15));
+        let other = key_from_seed(16);
+        let cases = [
+            serde_json::json!({ hex::encode(outsider): "outsider" }),
+            serde_json::json!({ hex::encode(member): "" }),
+            serde_json::json!({ hex::encode(member): "has space" }),
+            serde_json::json!({ hex::encode(member): "x".repeat(MAX_LABEL_LEN + 1) }),
+            serde_json::json!({ hex::encode(member): "same", hex::encode(other): "same" }),
+            serde_json::json!({ hex::encode(member): "a", format!("0x{}", hex::encode(member)): "b" }),
+            serde_json::json!({ "not-a-key": "name" }),
+        ];
+        for labels in cases {
+            let config = config_with_labels(&[member, other], labels.clone());
+            assert!(
+                WhiteList::from_json(&config.to_string(), PsyChainNetworkType::LocalDevnet).is_err(),
+                "labels must be rejected: {labels}"
+            );
+        }
+        let longest = config_with_labels(&[member], serde_json::json!({ hex::encode(member): "x".repeat(MAX_LABEL_LEN) }));
+        assert!(WhiteList::from_json(&longest.to_string(), PsyChainNetworkType::LocalDevnet).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_label_reload_retains_last_good_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key_from_seed(17);
+        let path = write_config(&dir, config_with_labels(&[key], serde_json::json!({ hex::encode(key): "kept" })));
+        let cache = WhiteListCache::new(&path, PsyChainNetworkType::LocalDevnet).unwrap();
+        fs::write(&path, config_with_labels(&[key], serde_json::json!({ hex::encode(key): "bad name" })).to_string()).unwrap();
+
+        assert!(cache.reload_once().is_err());
+        cache.ensure_allowed(&key).unwrap();
+        assert_eq!(worker_label(&key).as_deref(), Some("kept"));
     }
 
     #[tokio::test]
