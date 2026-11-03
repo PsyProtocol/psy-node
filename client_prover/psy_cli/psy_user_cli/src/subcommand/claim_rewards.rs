@@ -103,6 +103,13 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
                 Ok(material) => material,
                 Err(error) => { tracing::warn!(checkpoint_id = originals.source_checkpoint_id, %error, "reward historical material unavailable; whole selection remains pending"); deferred.push(originals.clone()); continue; }
             };
+            let completed = source.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
+            anyhow::ensure!(completed > 0 && !originals.jobs.is_empty() && originals.jobs.len() as u128 <= u128::from(completed), "reward job count exceeds completed jobs or is zero");
+            let fees = source.stats.guta_fees_collected.to_canonical_u64();
+            if originals.jobs.len() as u128 * u128::from(fees) / u128::from(completed) == 0 {
+                tracing::info!(checkpoint_id = originals.source_checkpoint_id, "skipping zero reward payout; original jobs file unchanged");
+                continue;
+            }
             let aggregate = load_or_prove_aggregate(&client, &circuits, &args, originals, &source)?;
             let root = client.prove_finalized_reward_root(&circuits.user_reward_root, &circuits.user_reward_leaf, &circuits.user_reward_aggregate, &aggregate, &anchor, recipient_limbs(&recipient))?;
             let pi: [u64; 23] = root.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("reward root statement width mismatch"))?;
