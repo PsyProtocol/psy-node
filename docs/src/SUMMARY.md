@@ -17,6 +17,8 @@
 - [Privacy Circuits](./protocol/PrivacyCircuits.md)
 - [Gadgets](./protocol/Gadgets.md)
 - [Proving Jobs](./protocol/ProvingJobs.md)
+- [Worker PoW 接入与信誉恢复设计](./protocol/WorkerAdmissionPoW.md)
+- [Worker PoW 任务交接](./protocol/WorkerAdmissionPoWHandoff.md)
 
 ---
 
