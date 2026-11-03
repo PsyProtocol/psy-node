@@ -108,13 +108,20 @@ pub struct MaintenanceReport {
     pub publish_failures: u32,
 }
 
-#[derive(Clone)]
 pub struct TaskFlow<Q, P> {
     leases: LeaseService,
     queue: Arc<Q>,
     pipeline: Arc<P>,
     config: FlowConfig,
     verifications: Arc<Semaphore>,
+}
+
+// Manual: the adapters are shared through Arc and need not be Clone themselves.
+impl<Q, P> Clone for TaskFlow<Q, P> {
+    fn clone(&self) -> Self {
+        Self { leases: self.leases.clone(), queue: self.queue.clone(), pipeline: self.pipeline.clone(),
+            config: self.config.clone(), verifications: self.verifications.clone() }
+    }
 }
 
 impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {

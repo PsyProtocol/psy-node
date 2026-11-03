@@ -196,3 +196,17 @@ async fn rpc_round_trip_signed_flow_and_no_public_revocation() {
     let result: std::result::Result<service::ChallengeResponse, _> = module.call("psy_worker_get_pow_challenge", rpc_params![bad]).await;
     assert!(result.unwrap_err().to_string().contains("INVALID_SIGNATURE"));
 }
+
+#[test]
+fn external_wallet_signatures_are_checked_before_use() {
+    use secp256k1::{Message, Secp256k1};
+    let signer = secret(1); let now = 1_000_000;
+    let mut request = auth(&signer, AdmissionMethod::GetStatus, 0, empty_payload(), now);
+    let expected = request.signature;
+    request.sign_with(|digest| Ok(Secp256k1::new().sign_ecdsa(Message::from_digest(digest.0), &signer).serialize_compact())).unwrap();
+    assert_eq!(request.signature, expected);
+    request.verify(&scope(), &AdmissionPolicy::for_base_bits(8), AdmissionMethod::GetStatus, empty_payload(), now).unwrap();
+    let other = secret(2);
+    assert_eq!(request.sign_with(|digest| Ok(Secp256k1::new().sign_ecdsa(Message::from_digest(digest.0), &other).serialize_compact())).unwrap_err(), AdmissionError::InvalidSignature);
+    assert_eq!(request.sign_with(|_| Err("wallet locked".into())).unwrap_err(), AdmissionError::InvalidSignature);
+}

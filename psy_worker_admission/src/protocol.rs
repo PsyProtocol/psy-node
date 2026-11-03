@@ -52,6 +52,28 @@ impl<'de, const N: usize> Deserialize<'de> for FixedBytes<N> {
     }
 }
 
+/// Variable-length bytes as lowercase hex, up to 16 MiB decoded.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HexBytes(pub Vec<u8>);
+
+impl fmt::Debug for HexBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{} bytes", self.0.len()) }
+}
+impl Serialize for HexBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(&self.0))
+    }
+}
+impl<'de> Deserialize<'de> for HexBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() > 32 << 20 || text.len() % 2 != 0 || text.bytes().any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b)) {
+            return Err(de::Error::custom("invalid hex bytes"));
+        }
+        hex::decode(text).map(Self).map_err(de::Error::custom)
+    }
+}
+
 pub type Hash32 = FixedBytes<32>;
 pub type WorkerKey = FixedBytes<33>;
 pub type RequestId = FixedBytes<16>;
@@ -324,6 +346,18 @@ impl RequestAuth {
         bytes.extend(self.expected_generation.to_le_bytes());
         bytes.extend(self.payload_hash.0);
         digest(&bytes)
+    }
+    /// Sign with an external wallet that signs a 32-byte prehash and returns
+    /// compact (r, s). The result is verified before it is accepted.
+    pub fn sign_with(&mut self, sign: impl FnOnce(Hash32) -> std::result::Result<[u8; 64], String>) -> Result<()> {
+        let digest = self.signing_hash();
+        let mut signature = Signature::from_compact(&sign(digest).map_err(|_| Error::InvalidSignature)?).map_err(|_| Error::InvalidSignature)?;
+        // Verifiers reject high-S; normalizing does not change which key signed.
+        signature.normalize_s();
+        let key = PublicKey::from_slice(&self.public_key.0).map_err(|_| Error::InvalidSignature)?;
+        Secp256k1::verification_only().verify_ecdsa(Message::from_digest(digest.0), &signature, &key).map_err(|_| Error::InvalidSignature)?;
+        self.signature = FixedBytes(signature.serialize_compact());
+        Ok(())
     }
     pub fn sign(&mut self, secret: &SecretKey) -> Result<()> {
         let secp = Secp256k1::new();
