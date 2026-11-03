@@ -59,6 +59,9 @@ pub enum AdmissionError {
     InflightLimit,
     #[error("JOB_ALREADY_ACCEPTED")]
     JobAlreadyAccepted,
+    /// Valid signature, but the edge's own access list does not admit this key.
+    #[error("WORKER_NOT_ALLOWED")]
+    NotAllowed,
     #[error("NO_WORK")]
     NoWork,
     /// Queue, input loading, verifier or proof storage failed. Never the worker's fault.

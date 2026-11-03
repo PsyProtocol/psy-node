@@ -34,25 +34,36 @@ pub struct RequestStatusResponse {
     pub current: AdmissionStatus,
 }
 
+/// An edge's own access list (for example a worker whitelist), applied to
+/// every signed request after its signature is verified.
+pub trait KeyGate: Send + Sync {
+    fn allowed(&self, key: &WorkerKey) -> bool;
+}
+
 #[derive(Clone)]
 pub struct AdmissionService {
     scope: AdmissionScope,
     policy: AdmissionPolicy,
     store: Arc<dyn AtomicAdmissionStore>,
+    gate: Option<Arc<dyn KeyGate>>,
 }
 
 impl AdmissionService {
     pub fn new(scope: AdmissionScope, policy: AdmissionPolicy, store: Arc<dyn AtomicAdmissionStore>) -> Result<Self> {
         scope.validate()?;
         policy.validate()?;
-        Ok(Self { scope, policy, store })
+        Ok(Self { scope, policy, store, gate: None })
     }
+    /// Refuse keys the gate does not admit, before they spend any per-key
+    /// budget, challenge capacity or task capacity.
+    pub fn with_gate(mut self, gate: Arc<dyn KeyGate>) -> Self { self.gate = Some(gate); self }
     pub fn scope(&self) -> &AdmissionScope { &self.scope }
     pub fn policy(&self) -> &AdmissionPolicy { &self.policy }
 
     pub(crate) async fn authenticate(&self, auth: &RequestAuth, method: AdmissionMethod, payload: Hash32) -> Result<()> {
         let now = self.store.request_budget(None).await?;
         auth.verify(&self.scope, &self.policy, method, payload, now)?;
+        if self.gate.as_ref().is_some_and(|gate| !gate.allowed(&auth.public_key)) { return Err(Error::NotAllowed); }
         self.store.request_budget(Some(auth.public_key)).await?;
         Ok(())
     }

@@ -360,6 +360,10 @@ impl LeaseService {
         Ok(Self { admission, store })
     }
     pub fn admission(&self) -> &AdmissionService { &self.admission }
+    pub fn with_gate(mut self, gate: Arc<dyn crate::service::KeyGate>) -> Self {
+        self.admission = self.admission.with_gate(gate);
+        self
+    }
     fn scope(&self) -> &AdmissionScope { self.admission.scope() }
     fn policy(&self) -> &AdmissionPolicy { self.admission.policy() }
 

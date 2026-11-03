@@ -94,6 +94,17 @@ impl AdmissionEnv {
             Ok("v2") => true,
             _ => return Err(Error::UnsupportedProtocol),
         };
+        let mut network_id: Hash32 = network_id;
+        if tasks_v2 {
+            // Validators of one realm run separate queues with the same realm ID;
+            // their leases must never share a scope.
+            let queue = value("PSY_WORKER_ADMISSION_QUEUE_ID")?;
+            if queue.is_empty() || queue.len() > 128 { return Err(Error::InvalidRequest); }
+            let mut bytes = b"psy-worker-admission-queue-v1\0".to_vec();
+            bytes.extend(network_id.0);
+            bytes.extend(queue.as_bytes());
+            network_id = digest(&bytes);
+        }
         let scope = AdmissionScope { network_id, admission_epoch, node_type, realm_id, realm_sub_id };
         scope.validate()?;
         Ok(Some(Self { scope, policy: AdmissionPolicy::for_base_bits(base_bits), redis_url: value("PSY_WORKER_ADMISSION_REDIS_URL")?, tasks_v2 }))
@@ -101,11 +112,13 @@ impl AdmissionEnv {
     pub async fn connect(&self) -> Result<RedisAdmissionStore> {
         RedisAdmissionStore::connect(&self.redis_url, &self.scope, &self.policy).await
     }
-    pub fn admission_rpc(&self, store: RedisAdmissionStore) -> Result<RpcModule<AdmissionRpc>> {
-        Ok(AdmissionRpc::new(AdmissionService::new(self.scope.clone(), self.policy.clone(), Arc::new(store))?).into_rpc())
+    pub fn admission_rpc(&self, store: RedisAdmissionStore, gate: Option<Arc<dyn KeyGate>>) -> Result<RpcModule<AdmissionRpc>> {
+        let service = AdmissionService::new(self.scope.clone(), self.policy.clone(), Arc::new(store))?;
+        Ok(AdmissionRpc::new(match gate { Some(gate) => service.with_gate(gate), None => service }).into_rpc())
     }
-    pub fn lease_service(&self, store: RedisAdmissionStore) -> Result<LeaseService> {
-        LeaseService::new(self.scope.clone(), self.policy.clone(), Arc::new(store))
+    pub fn lease_service(&self, store: RedisAdmissionStore, gate: Option<Arc<dyn KeyGate>>) -> Result<LeaseService> {
+        let service = LeaseService::new(self.scope.clone(), self.policy.clone(), Arc::new(store))?;
+        Ok(match gate { Some(gate) => service.with_gate(gate), None => service })
     }
 }
 
@@ -158,6 +171,7 @@ fn rpc_error(error: Error) -> ErrorObjectOwned {
         Error::JobAlreadyAccepted => -32117,
         Error::NoWork => -32118,
         Error::TaskInfrastructure => -32119,
+        Error::NotAllowed => -32120,
     };
     ErrorObjectOwned::owned(code, error.to_string(), Some(serde_json::json!({
         "category": error.to_string(), "retry_after_ms": retry_after_ms,
@@ -189,7 +203,7 @@ impl WorkerAdmissionRpcServer for AdmissionRpc {
 /// task lease/outbox implementation is validated. Both edge types call this helper.
 pub async fn observe_rpc_from_env(node_type: u8, realm_id: u32, realm_sub_id: u16) -> Result<Option<RpcModule<AdmissionRpc>>> {
     let Some(env) = AdmissionEnv::from_env(node_type, realm_id, realm_sub_id)? else { return Ok(None) };
-    Ok(Some(env.admission_rpc(env.connect().await?)?))
+    Ok(Some(env.admission_rpc(env.connect().await?, None)?))
 }
 
 pub fn validate_mode(mode: &str) -> Result<()> {

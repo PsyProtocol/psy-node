@@ -34,6 +34,9 @@ use crate::coordinator::{edge::handler::CoordinatorEdgeHandler, queue_key::Coord
 
 type Failure<T> = std::result::Result<T, TaskFailure>;
 
+const PREPARE_ATTEMPTS: usize = 4;
+const PREPARE_FAILURE_DELAY_MS: u64 = 30_000;
+
 pub struct CoordinatorTaskAdapter<N: QNetworkTypesConfig, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 where
     S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -133,7 +136,7 @@ where
     }
 
     /// Reward-tree value this lease's proof must commit to, with the lease's own tag.
-    async fn reward_value(&self, lease: &LeaseRecord, metadata: &PsyProvingJobMetadata<N::QHash, N::JobId>) -> Failure<(N::QHash, Vec<N::QHash>, N::QHash)> {
+    async fn reward_value(&self, lease: &LeaseRecord, _id: QProvingJobDataID, metadata: &PsyProvingJobMetadata<N::QHash, N::JobId>) -> Failure<(N::QHash, Vec<N::QHash>, N::QHash)> {
         let tag = N::QHash::from_ref_32bytes(&lease.reward_tag.0);
         let children = self.child_tag_values(lease.job.unique_pending_id, metadata).await?;
         let value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children)?;
@@ -157,31 +160,38 @@ where
 {
     async fn next(&self, claim: &ClaimContext) -> Failure<Option<TaskDelivery>> {
         let h = &self.handler;
-        let (unique_pending_id, unique_proc_id) = h.get_current_unique_pending_id_internal().await?;
-        let item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = h.get_proof_work_queue
-            .get_next_worker_queue_item_or_none(&self.queue_key(unique_proc_id), h.realm_id_u64, h.realm_sub_id_u64, unique_proc_id, 0)
-            .await?;
-        let Some(item) = item else { return Ok(None) };
-        let job = JobInstance { unique_pending_id, unique_proc_id, job_id: JobIdBytes(item.job_id.to_fixed_bytes().to_vec()) };
-        let output_id = item.job_id.get_output_id();
-        let metadata = item.metadata.clone();
-        let prepared = async {
-            h.temp_db.set_proving_job_metadata(&h.realm_identifier, unique_pending_id, output_id, &metadata).await?;
-            self.prepare(unique_pending_id, item).await
-        }.await;
-        match prepared {
-            Ok(payload) => Ok(Some(TaskDelivery {
-                binding: JobBinding { job, reward_tag: claim.reward_tag, task_digest: digest(&payload), lease_ms: self.lease_ms },
-                payload,
-            })),
-            Err(failure) => {
-                // The flow never saw this job; hand it straight back.
-                if let Err(release) = self.control(&job, WorkerJobControl::Release).await {
-                    tracing::warn!(failure = %release.0, "releasing an unprepared job failed");
+        let mut last_failure = None;
+        for _ in 0..PREPARE_ATTEMPTS {
+            let (unique_pending_id, unique_proc_id) = h.get_current_unique_pending_id_internal().await?;
+            let item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = h.get_proof_work_queue
+                .get_next_worker_queue_item_or_none(&self.queue_key(unique_proc_id), h.realm_id_u64, h.realm_sub_id_u64, unique_proc_id, 0)
+                .await?;
+            let Some(item) = item else { break };
+            let job = JobInstance { unique_pending_id, unique_proc_id, job_id: JobIdBytes(item.job_id.to_fixed_bytes().to_vec()) };
+            let output_id = item.job_id.get_output_id();
+            let metadata = item.metadata.clone();
+            let prepared = async {
+                h.temp_db.set_proving_job_metadata(&h.realm_identifier, unique_pending_id, output_id, &metadata).await?;
+                self.prepare(unique_pending_id, item).await
+            }.await;
+            match prepared {
+                Ok(payload) => return Ok(Some(TaskDelivery {
+                    binding: JobBinding { job, reward_tag: claim.reward_tag, task_digest: digest(&payload), lease_ms: self.lease_ms },
+                    payload,
+                })),
+                Err(failure) => {
+                    // Inputs not ready (or a transient store fault): park this job
+                    // as long as the legacy ack_wait would, and try the next one,
+                    // so one job cannot block the head of the queue.
+                    tracing::warn!(failure = %failure.0, "worker task inputs failed to load; delaying the job");
+                    if let Err(delay) = self.control(&job, WorkerJobControl::Delay(PREPARE_FAILURE_DELAY_MS)).await {
+                        tracing::warn!(failure = %delay.0, "delaying an unprepared job failed");
+                    }
+                    last_failure = Some(failure);
                 }
-                Err(failure)
             }
         }
+        match last_failure { Some(failure) => Err(failure), None => Ok(None) }
     }
 
     async fn reload(&self, lease: &LeaseRecord) -> Failure<Vec<u8>> {
@@ -227,7 +237,7 @@ where
     async fn verify(&self, lease: &LeaseRecord, proof: &[u8]) -> Failure<Verdict> {
         // Everything loaded from the edge's own stores is the edge's responsibility.
         let (id, metadata) = self.metadata(&lease.job).await?;
-        let (_, _, reward_value) = self.reward_value(lease, &metadata).await?;
+        let (_, _, reward_value) = self.reward_value(lease, id, &metadata).await?;
         let output_id = id.get_output_id();
         let expected = if output_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
             self.handler.get_root_state_transition_expected_public_inputs_hash_internal(output_id, lease.job.unique_pending_id, reward_value).await?
@@ -254,7 +264,7 @@ where
         let proof = self.staging.get_staged_proof(receipt.staged_proof).await.map_err(|e| TaskFailure(e.to_string()))?
             .ok_or_else(|| TaskFailure("staged proof missing".into()))?;
         let (id, metadata) = self.metadata(&lease.job).await?;
-        let (tag, children, reward_value) = self.reward_value(lease, &metadata).await?;
+        let (tag, children, reward_value) = self.reward_value(lease, id, &metadata).await?;
         let unique_pending_id = lease.job.unique_pending_id;
         let output_id = id.get_output_id();
         // Every write below is an overwrite with the same value: safe to repeat.

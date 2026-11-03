@@ -247,3 +247,22 @@ async fn revoked_between_reserve_and_attach_returns_the_capacity() {
     assert_eq!(held(&store, &signer), (0, 0, 0));
     assert!(service.lease_record(&job(1)).await.unwrap().is_none());
 }
+
+struct OnlyKey(WorkerKey);
+impl service::KeyGate for OnlyKey { fn allowed(&self, key: &WorkerKey) -> bool { *key == self.0 } }
+
+#[tokio::test]
+async fn the_edge_access_list_applies_to_every_signed_request() {
+    let store = MemoryStore::new();
+    let (listed, other) = (secret(1), secret(2));
+    let open = lease_service(store.clone(), policy());
+    activate(open.admission(), &other, 0, store.time()).await;
+    let service = open.with_gate(std::sync::Arc::new(OnlyKey(key(&listed))));
+    let now = store.time();
+    assert_eq!(service.admission().get_status(auth(&other, AdmissionMethod::GetStatus, 0, empty_payload(), now)).await.unwrap_err(), AdmissionError::NotAllowed);
+    assert_eq!(service.admission().get_challenge(auth(&other, AdmissionMethod::GetChallenge, 0, empty_payload(), now)).await.unwrap_err(), AdmissionError::NotAllowed);
+    assert_eq!(service.reserve_claim(claim_auth(&other, 0, now), digest(b"claim")).await.unwrap_err(), AdmissionError::NotAllowed);
+    assert_eq!(store.counter(StoreKey::TaskBudget), 0);
+    activate(service.admission(), &listed, 0, now).await;
+    service.reserve_claim(claim_auth(&listed, 0, now), digest(b"claim")).await.unwrap();
+}

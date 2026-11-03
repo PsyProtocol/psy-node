@@ -229,7 +229,9 @@ impl<Q: TaskQueue, P: ProofPipeline> TaskFlow<Q, P> {
                 return Ok(SubmitOutcome::Accepted { receipt, published });
             }
             SubmissionOutcome::TagMismatch(evidence) => {
-                return Ok(SubmitOutcome::Revoked(self.leases.apply_attributable_violation(&evidence).await?));
+                let receipt = self.leases.apply_attributable_violation(&evidence).await?;
+                if let Some(lease) = self.leases.lease_by_key(job_key).await? { self.queue_call(self.queue.release(&lease.job).await); }
+                return Ok(SubmitOutcome::Revoked(receipt));
             }
         };
         let lease = self.leases.lease_by_key(ticket.job_key).await?.ok_or(Error::StateCorrupt)?;

@@ -346,3 +346,26 @@ mod tests {
         assert!(WhiteListCache::new(path, PsyChainNetworkType::LocalDevnet).is_err());
     }
 }
+
+/// The edge whitelist as an admission gate: worker admission and the V2 task
+/// protocol refuse the same keys the legacy worker API refuses.
+pub struct AdmissionGate(pub WhiteListCache);
+
+impl psy_worker_admission::service::KeyGate for AdmissionGate {
+    fn allowed(&self, key: &psy_worker_admission::WorkerKey) -> bool { self.0.is_allowed(&key.0) }
+}
+
+static LEGACY_WORKER_API_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once by an edge that serves the V2 task protocol: a legacy claim or
+/// submission of a job held by a V2 lease would bypass the lease entirely.
+pub fn disable_legacy_worker_api() {
+    LEGACY_WORKER_API_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn ensure_legacy_worker_api_enabled() -> anyhow::Result<()> {
+    if LEGACY_WORKER_API_DISABLED.load(std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("legacy worker API disabled on this edge: use psy_worker_claim_task_v2 and psy_worker_submit_proof_v2");
+    }
+    Ok(())
+}

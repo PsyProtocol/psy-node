@@ -442,6 +442,9 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }

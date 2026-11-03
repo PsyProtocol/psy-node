@@ -67,7 +67,8 @@ pub async fn start_coordinator_edge_rpc_server<
     rpc_module.merge(CoordinatorEdgeRpcServer::into_rpc(handler.clone()))?;
     if let Some(admission) = psy_worker_admission::rpc::AdmissionEnv::from_env(2, realm_id.try_into()?, realm_sub_id.try_into()?)? {
         let store = admission.connect().await?;
-        rpc_module.merge(admission.admission_rpc(store.clone())?)?;
+        let gate: std::sync::Arc<dyn psy_worker_admission::service::KeyGate> = std::sync::Arc::new(crate::worker_whitelist::AdmissionGate(handler.worker_whitelist.clone()));
+        rpc_module.merge(admission.admission_rpc(store.clone(), Some(gate.clone()))?)?;
         if admission.tasks_v2 {
             // V2 tasks share the legacy queue. Enable only where every worker
             // speaks V2: a legacy claim of the same job is outside the lease.
@@ -78,11 +79,12 @@ pub async fn start_coordinator_edge_rpc_server<
                 staging_ttl_ms: admission.policy.receipt_retention_ms,
             });
             let flow = psy_worker_admission::flow::TaskFlow::new(
-                admission.lease_service(store)?, adapter.clone(), adapter, psy_worker_admission::flow::FlowConfig::default(),
+                admission.lease_service(store, Some(gate))?, adapter.clone(), adapter, psy_worker_admission::flow::FlowConfig::default(),
             );
             rpc_module.merge(psy_worker_admission::rpc::WorkerTaskRpcServer::into_rpc(psy_worker_admission::rpc::TaskRpc::new(flow.clone())))?;
             tokio::spawn(psy_worker_admission::rpc::run_maintenance(flow, std::time::Duration::from_secs(5)));
-            tracing::warn!("worker V2 task protocol enabled in observe mode");
+            crate::worker_whitelist::disable_legacy_worker_api();
+            tracing::warn!("worker V2 task protocol enabled; legacy worker claim and submit are refused on this edge");
         }
     }
     let handle = server.start(rpc_module);

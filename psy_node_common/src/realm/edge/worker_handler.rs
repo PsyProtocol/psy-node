@@ -61,7 +61,7 @@ impl<
     /// Output commitment `A` for the RealmFinalizeGUTA one-child reward mode,
     /// recomputed from the stored finalizer witness so the worker cannot forge
     /// the reward root. A wrong commitment fails proof-PI verification.
-    async fn finalize_output_commitment_a(
+    pub(crate) async fn finalize_output_commitment_a(
         &self,
         job_id: QProvingJobDataID,
         unique_pending_id: u64,
@@ -474,6 +474,9 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
