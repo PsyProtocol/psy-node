@@ -204,7 +204,36 @@ git diff --check
 
 已知限制：V2 与旧协议共用同一个队列，旧 worker 领取同一任务不受租约约束，因此只能在全部 worker 都使用 V2 的隔离环境开启；租约期限固定 300 秒；lease 记录尚无 GC；enforce 模式仍不可选。
 
-## 下一阶段任务租约闭环
+## 线上测试部署说明（2026 年 11 月 3 日）
+
+可部署分支：`feat/worker-admission-pow-sd192`，基于线上运行时 `release/testnet-sd192` @ `397b096e`。编译需要 `PSY_NETWORK=testnet`，并按 worker-labels 的做法把测试网 genesis 产物放进 `psy-genesis/`。**不设置下列环境变量时，edge 与 worker 的行为和 `397b096e` 相同。** 已通过：准入 crate 44 项测试（含 12 项真实 Redis）、`psy_node_common` 现有 54 项 worker 测试、`psy_node_cli` 与 `psy_worker_cli` 编译。尚未做过真实 proving 运行，线上测试即首次端到端验证。
+
+独立审查后修复的阻断问题：realm 的 UserEndCap 子证明按 goal_id 所在 checkpoint 读取；RealmFinalizeGUTA 的奖励值使用 `[c0, A]`。这两处是本运行时独有的 legacy 规则，V2 必须一致，否则 realm 会停住。
+
+Edge（每个要测试的 edge 进程）：
+
+| 变量 | 值 |
+| --- | --- |
+| `PSY_WORKER_ADMISSION_MODE` | `observe` |
+| `PSY_WORKER_ADMISSION_NETWORK_ID` | 64 位小写 hex，非零；同一测试的所有 edge 相同 |
+| `PSY_WORKER_ADMISSION_EPOCH` | 64 位小写 hex，非零；同一作用域的 edge 相同，正常重启不变 |
+| `PSY_WORKER_ADMISSION_BASE_BITS` | PoW 难度，测试可先用 20 左右；生产值未定 |
+| `PSY_WORKER_ADMISSION_REDIS_URL` | 例如线上 `redis://10.148.0.12:6379`；keys 在 `admission:{scope}` 下 |
+| `PSY_WORKER_ADMISSION_TASKS` | `v2` 才开放 V2 任务接口；不设只开放 PoW 接口 |
+| `PSY_WORKER_ADMISSION_QUEUE_ID` | 开启 V2 时必填：该 edge 的 `--db-namespace`，例如 `fresh20261030sd192_r0_v1` |
+
+Worker：`PSY_WORKER_TASK_PROTOCOL=v2`；可选 `PSY_WORKER_ADMISSION_MAX_BITS`（默认 30，超过就不求解）。Worker 公钥仍需在 edge 白名单里，V2 与 PoW 接口同样受白名单限制。
+
+注意事项：
+
+- 开启 V2 的 edge 会拒绝 legacy 的领取和提交。每个 realm 的 v1、v2、v3 验证者是各自独立的队列，必须用不同的 `QUEUE_ID`。worker 配置里列出的 edge 要么全部开启 V2，要么全部不开；混用会让旧 worker 在 V2 edge 上全部失败。
+- 建议先在一个验证者上测试，例如 realm-1-v1 edge，配一个只指向它的 V2 worker；另外两个验证者不动，作为对照组。
+- Redis 10.148.0.12 的持久化配置尚未检查。observe 测试可以接受；强制模式之前必须核实 AOF 和淘汰策略。
+- 验证失败默认不处罚（`attribute_invalid_proofs` 为 false），只退回任务。
+- 观测：edge 日志里的 `worker task maintenance`、`proof failed verification`、`worker task inputs failed to load`；Redis 里的 `admission:{scope}:tasks:total`、`:due`、`:outbox`。checkpoint 是否继续前进仍是最终判据。
+- 回滚：去掉上述环境变量后重启，或者换回 `397b096e` 的二进制。admission keys 可以留在原处。
+
+
 
 优先按以下顺序实现，保持 observe 和 enforce 的边界清楚。
 
