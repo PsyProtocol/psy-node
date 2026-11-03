@@ -863,9 +863,34 @@ impl LeaseService {
         Err(Error::RequestConflict)
     }
 
+    /// Leases still holding capacity, for queue keepalive. Oldest deadline first.
+    pub async fn live_leases(&self, limit: usize) -> Result<Vec<LeaseRecord>> {
+        let (members, _) = self.store.range(StoreIndex::Due, Some(u64::MAX), limit).await?;
+        let mut leases = Vec::new();
+        for member in members {
+            let StoreKey::Lease(job_key) = member else { continue };
+            let snapshot = self.store.load_many(&[member]).await?;
+            if let Some(lease) = self.lease(&snapshot.values[0], job_key)? {
+                if lease.state.holds_capacity() { leases.push(lease); }
+            }
+        }
+        Ok(leases)
+    }
+
     pub async fn lease_record(&self, job: &JobInstance) -> Result<Option<LeaseRecord>> {
-        let job_key = job.key(self.scope());
+        self.lease_by_key(job.key(self.scope())).await
+    }
+
+    /// The authoritative clock all deadlines are measured against.
+    pub async fn store_time(&self) -> Result<u64> { Ok(self.store.load_many(&[]).await?.now_ms) }
+
+    pub async fn lease_by_key(&self, job_key: Hash32) -> Result<Option<LeaseRecord>> {
         let snapshot = self.store.load_many(&[StoreKey::Lease(job_key)]).await?;
         self.lease(&snapshot.values[0], job_key)
+    }
+
+    pub async fn claim_record(&self, owner: WorkerKey, request_id: RequestId) -> Result<Option<ClaimRecord>> {
+        let snapshot = self.store.load_many(&[StoreKey::Claim(owner, request_id)]).await?;
+        self.claim(&snapshot.values[0], owner, request_id)
     }
 }

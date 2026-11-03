@@ -1,5 +1,6 @@
 //! Worker PoW admission. This first rollout exposes an explicitly observe-only
 //! protocol; it does not claim to enforce task leases or replace legacy scores.
+pub mod flow;
 pub mod lease;
 pub mod protocol;
 pub mod redis_store;
@@ -58,6 +59,11 @@ pub enum AdmissionError {
     InflightLimit,
     #[error("JOB_ALREADY_ACCEPTED")]
     JobAlreadyAccepted,
+    #[error("NO_WORK")]
+    NoWork,
+    /// Queue, input loading, verifier or proof storage failed. Never the worker's fault.
+    #[error("TASK_INFRASTRUCTURE")]
+    TaskInfrastructure,
 }
 
 pub type Result<T> = std::result::Result<T, AdmissionError>;

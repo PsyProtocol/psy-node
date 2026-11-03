@@ -62,6 +62,8 @@ fn rpc_error(error: Error) -> ErrorObjectOwned {
         Error::LeaseBusy => -32115,
         Error::InflightLimit => -32116,
         Error::JobAlreadyAccepted => -32117,
+        Error::NoWork => -32118,
+        Error::TaskInfrastructure => -32119,
     };
     ErrorObjectOwned::owned(code, error.to_string(), Some(serde_json::json!({
         "category": error.to_string(), "retry_after_ms": retry_after_ms,
