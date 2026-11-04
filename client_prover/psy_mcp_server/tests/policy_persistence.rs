@@ -319,3 +319,41 @@ fn a_paused_policy_cannot_be_handed_a_fresh_session_by_the_other_process() {
     assert!(err.to_string().contains("paus"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn explicit_digit_only_hex_recipient_scope_survives_reload_and_owner_update() {
+    let dir = tmpdir("recipient-scope");
+    let pid = {
+        let mut e = PolicyEngine::load_or_new(&dir);
+        let pid = e.create_policy("agent", Limits {
+            per_transaction: 100, per_day: 200, per_month: Some(300), total_budget: Some(400),
+        }, Some(vec!["0x1234".into(), "0xDeAdBeEf".into()]), vec!["private_transfer".into()]);
+        let (t, _) = e.issue_session(&pid, 60, None).unwrap();
+        assert!(e.authorize(&t, "1234", 20, "private_transfer").is_err());
+        e.authorize(&t, "0X1234", 20, "private_transfer").unwrap();
+        pid
+    };
+    let mut e = PolicyEngine::load_or_new(&dir);
+    let before = e.describe(&pid).unwrap();
+    assert_eq!((before.spent_today_nano, before.spent_this_month_nano, before.spent_total_nano), (20, 20, 20));
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
+    assert!(e.authorize(&t, "Psy-00001234", 1, "private_transfer").is_err());
+    assert!(e.authorize(&t, "deadbeef", 1, "private_transfer").is_ok(), "mixed-letter hex keeps its existing spelling equivalence");
+    let reviewed = Some(vec!["0x1234".into(), "Psy-00005678".into()]);
+    assert!(e.update_widens(&pid, None, None, None, None, &Some(reviewed.clone()), &[]).unwrap().is_some(), "adding the decimal payee requires the existing owner-review path");
+    e.update_policy(&pid, None, None, None, None, Some(reviewed), vec![]).unwrap();
+    let after = e.describe(&pid).unwrap();
+    assert_eq!((after.spent_today_nano, after.spent_this_month_nano, after.spent_total_nano), (21, 21, 21));
+    let budget = e.budget(&t).unwrap();
+    assert_eq!((budget.per_transaction, budget.remaining_day, budget.remaining_month, budget.remaining_total), (100, 179, Some(279), Some(379)));
+    assert!(e.authorize(&t, "1234", 1, "private_transfer").is_err());
+    assert!(e.authorize(&t, "5678", 1, "private_transfer").is_ok());
+    assert!(e.authorize(&t, "0x1234", 1, "private_transfer").is_ok());
+    drop(e);
+    let mut e = PolicyEngine::load_or_new(&dir);
+    assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 23);
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
+    assert!(e.authorize(&t, "1234", 1, "private_transfer").is_err());
+    assert!(e.authorize(&t, "0x1234", 1, "private_transfer").is_ok());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

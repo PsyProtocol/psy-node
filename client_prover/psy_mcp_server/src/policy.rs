@@ -20,8 +20,8 @@ use anyhow::anyhow;
 use rand::RngCore;
 use std::collections::{HashMap, VecDeque};
 
-/// Recipient sentinel for operations that move funds INTO this wallet (claims,
-/// deposits). They are gated for pause/method/cap purposes but are deliberately
+/// Recipient sentinel for fixed self-directed operations: inbound claims and
+/// deposits, delivery retries, and wallet/network fees. They remain method/cap gated but are deliberately
 /// exempt from the recipient allowlist: the allowlist answers "who may receive
 /// this agent's money", and the answer for a claim is "nobody — it is ours".
 /// Without this exemption, setting any allowlist would silently break claiming.
@@ -70,7 +70,8 @@ fn month_index() -> u64 {
 ///   * URL (an x402 seller)      → bare host, port kept (`localhost:8402` and
 ///     `localhost:9999` are different sellers)
 ///   * `Psy-00001234` / `01234`  → the decimal user id, `1234`
-///   * `0x<hex>` shielded address → the bare lowercase hex
+///   * `0x<hex>` shielded address → lowercase hex; keep `0x` for digit-only
+///     payloads so an address cannot authorize a decimal user id (or vice versa)
 ///   * anything else              → trimmed + lowercased
 pub fn normalize_recipient(raw: &str) -> String {
     let s = raw.trim().to_ascii_lowercase();
@@ -94,6 +95,9 @@ pub fn normalize_recipient(raw: &str) -> String {
     }
     if let Some(hex) = s.strip_prefix("0x") {
         if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if hex.chars().all(|c| c.is_ascii_digit()) {
+                return s;
+            }
             return hex.to_string();
         }
     }
@@ -118,28 +122,39 @@ fn fmt_psy(nano: u64) -> String {
 /// caller must have run `rollover` first. Checks run in a fixed order —
 /// paused, method, recipient, per-payment, daily, 30-day, total — and the cap
 /// keywords are load-bearing (callers/tests branch on them).
-fn denial_reason(policy: &Policy, recipients: &[&str], amount: u64, method: &str) -> Option<String> {
-    let primary = recipients.first().copied().unwrap_or("");
+fn denial_reason(policy: &Policy, recipients: Option<&[&str]>, amount: u64, method: &str) -> Option<String> {
+    let primary = recipients.and_then(|values| values.first().copied()).unwrap_or("");
     if !policy.active {
         return Some("policy paused by owner".to_string());
     }
     if !policy.allowed_methods.iter().any(|m| m == method) {
         return Some(format!("method `{method}` not allowed (allowed: {})", policy.allowed_methods.join(", ")));
     }
-    // `self` is not a payee (see SELF_RECIPIENT): claims and deposits move funds
-    // inward and are gated by the caps and the method list instead.
-    if let Some(allowed) = policy.allowed_recipients.as_ref() {
-        let inbound = recipients.iter().all(|r| *r == SELF_RECIPIENT);
-        if !inbound {
-            let permitted = recipients
-                .iter()
-                .map(|r| normalize_recipient(r))
-                .any(|r| allowed.iter().any(|a| *a == r));
-            if !permitted {
-                return Some(format!(
-                    "recipient `{primary}` is not on this policy's allowlist ({} approved recipient(s)); ask the owner to add it",
-                    allowed.len()
-                ));
+    // None is a capability-only check before a payee is known. Actual
+    // authorizations always supply Some and must name valid recipients.
+    if let Some(recipients) = recipients {
+        if recipients.is_empty() || recipients.iter().any(|recipient| normalize_recipient(recipient).is_empty()) {
+            return Some("a payment must name a non-empty recipient".to_string());
+        }
+        // Only fixed self-directed operations may use the sentinel. A spend
+        // cannot turn an agent-controlled address into an inbound exemption.
+        let inbound = matches!(method, "claim" | "private_claim" | "claim_deposit" | "deposit" | "retry_deposit_delivery" | "deploy_contract" | "call_contract")
+            && recipients.iter().all(|recipient| *recipient == SELF_RECIPIENT);
+        if !inbound && recipients.iter().any(|recipient| normalize_recipient(recipient) == SELF_RECIPIENT) {
+            return Some("the self recipient is only valid for self-directed operations".to_string());
+        }
+        if let Some(allowed) = policy.allowed_recipients.as_ref() {
+            if !inbound {
+                let permitted = recipients
+                    .iter()
+                    .map(|r| normalize_recipient(r))
+                    .any(|r| allowed.iter().any(|a| *a == r));
+                if !permitted {
+                    return Some(format!(
+                        "recipient `{primary}` is not on this policy's allowlist ({} approved recipient(s)); ask the owner to add it",
+                        allowed.len()
+                    ));
+                }
             }
         }
     }
@@ -431,6 +446,10 @@ pub struct Authorization {
     /// The spend-log rows this authorization created. `refund` uses these to
     /// mark exactly those rows, rather than guessing from an amount.
     pub spend_ids: Vec<u64>,
+    /// Buckets charged at authorization. A later refund must not credit a
+    /// different day or 30-day period after these counters have rolled over.
+    pub last_day: u64,
+    pub last_month: u64,
 }
 
 /// One authorized spend, as recorded at the moment of the decision.
@@ -784,9 +803,9 @@ impl PolicyEngine {
             .policies
             .get(&session.policy_id)
             .expect("resolve_session_or_record guarantees the policy exists");
-        // SELF_RECIPIENT keeps the allow-list out of it: this is a capability
-        // check, and the real recipient is decided by the 402 challenge later.
-        if let Some(reason) = denial_reason(policy, &[SELF_RECIPIENT], 0, method) {
+        // No recipient scope: the real payee is decided by the 402 challenge
+        // later and must pass a separate spend authorization.
+        if let Some(reason) = denial_reason(policy, None, 0, method) {
             let agent_id = policy.agent_id.clone();
             let policy_id = session.policy_id.clone();
             self.record_denial(&policy_id, &agent_id, "", 0, method, &reason);
@@ -1110,8 +1129,13 @@ impl PolicyEngine {
             s.session_spent = s.session_spent.saturating_sub(amount);
         }
         if let Some(policy) = self.policies.get_mut(&auth.policy_id) {
-            policy.spent_today = policy.spent_today.saturating_sub(amount);
-            policy.spent_this_month = policy.spent_this_month.saturating_sub(amount);
+            Self::rollover(policy);
+            if policy.last_day == auth.last_day {
+                policy.spent_today = policy.spent_today.saturating_sub(amount);
+            }
+            if policy.last_month == auth.last_month {
+                policy.spent_this_month = policy.spent_this_month.saturating_sub(amount);
+            }
             policy.spent_total = policy.spent_total.saturating_sub(amount);
             self.save();
         }
@@ -1747,7 +1771,7 @@ impl PolicyEngine {
         // caller receives is ALSO recorded as a blocked attempt the owner can
         // review. The reason strings and their order are unchanged, so callers
         // and tests that branch on the cap keywords still work.
-        if let Some(reason) = denial_reason(policy, recipients, amount, method) {
+        if let Some(reason) = denial_reason(policy, Some(recipients), amount, method) {
             self.record_denial(&policy_id, &agent_id, primary, amount, method, &reason);
             anyhow::bail!("{reason}");
         }
@@ -1790,6 +1814,8 @@ impl PolicyEngine {
             network: policy.bound_network.clone().or_else(|| self.current_network.clone()),
             user_id: self.current_user_id,
             spend_ids: Vec::new(),
+            last_day: policy.last_day,
+            last_month: policy.last_month,
         };
         let id = self.record_spend(&auth, primary, amount, method);
         auth.spend_ids.push(id);
@@ -1881,7 +1907,7 @@ impl PolicyEngine {
         }
         let mut denials: Vec<(usize, String, u64, String)> = Vec::new();
         for (i, (recipient, amount)) in legs.iter().enumerate() {
-            if let Some(reason) = denial_reason(&scratch, &[*recipient], *amount, method) {
+            if let Some(reason) = denial_reason(&scratch, Some(&[*recipient]), *amount, method) {
                 denials.push((i, (*recipient).to_string(), *amount, reason));
                 continue;
             }
@@ -1936,6 +1962,8 @@ impl PolicyEngine {
             network: scratch.bound_network.clone().or_else(|| self.current_network.clone()),
             user_id: self.current_user_id,
             spend_ids: Vec::new(),
+            last_day: scratch.last_day,
+            last_month: scratch.last_month,
         };
         for (recipient, amount) in legs {
             let id = self.record_spend(&auth, recipient, *amount, method);
@@ -2707,7 +2735,7 @@ mod tests {
         let default_id = e.create_policy("a", open_limits(), None, vec![]);
         let (tok, _) = e.issue_session(&default_id, 60, None).unwrap();
         let err = e
-            .authorize(&tok, "", 1_000_000_000, "deploy_contract")
+            .authorize(&tok, SELF_RECIPIENT, 1_000_000_000, "deploy_contract")
             .expect_err("deploy_contract must not be in the default method set");
         assert!(err.to_string().contains("not allowed"), "{err}");
 
@@ -2717,7 +2745,7 @@ mod tests {
         let id = e2.create_policy("a", open_limits(), None, vec!["deploy_contract".into()]);
         let (tok, _) = e2.issue_session(&id, 60, None).unwrap();
         let _auth = e2
-            .authorize(&tok, "", 1_000_000_000, "deploy_contract")
+            .authorize(&tok, SELF_RECIPIENT, 1_000_000_000, "deploy_contract")
             .expect("allowed method + within caps must pass");
         // authorize already recorded the fee as a spend (same as transfer).
         let d = e2.describe(&id).unwrap();
