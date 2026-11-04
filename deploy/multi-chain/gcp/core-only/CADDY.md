@@ -1,10 +1,15 @@
 # Caddy maintenance routing
 
 `caddy_ingress.py` fences and reopens public ingress on the Caddy host. The hosts and
-the tag come from `ingress` in the release lock: `fenced_hosts`, `faucet_hosts` and
-`maintenance_tag`. L1 RPC routes, Nostr and every host not listed are never touched.
-The tool changes no upstream, header, log setting or TLS setting, and never restarts
-Caddy or its container.
+the tag come from `ingress` in the release lock: `fenced_hosts`, `faucet_hosts`,
+`retired_hosts` and `maintenance_tag`. L1 RPC routes, Nostr and every host not listed
+are never touched. The tool changes no upstream, header, log setting or TLS setting,
+and never restarts Caddy or its container.
+
+`retired_hosts` lists public names that no longer have a backend: the Envio GraphQL
+sites `indexer` and `indexer-stg`, retired with Hasura. Every phase removes their site
+blocks and refuses a candidate in which a retired host still has a route, for example
+inside a shared multi-host site block; remove such a block by hand.
 
 ## Phases
 

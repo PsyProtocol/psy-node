@@ -25,7 +25,7 @@ def release_checks(release):
                 "faucet_operator_count": 100, "genesis_spec_version": 2,
                 "account_identity_mode": "fresh-faucet-and-relayer",
                 "native_deposits_allowed": False, "public_deposits_after_deploy": False,
-                "bridge_reader_included": False, "deposit_tokens": {"PSY": 0, "pUSDT": 4},
+                "bridge_reader_included": True, "deposit_tokens": {"PSY": 0, "pUSDT": 4},
                 "withdrawal_append_supported_batch_sizes": [1, 2, 5], "withdrawal_append_max_batch_size": 5}
     for key, value in expected.items():
         if type(release.get(key)) is not type(value) or release[key] != value:

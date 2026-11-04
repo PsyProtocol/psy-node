@@ -1,8 +1,9 @@
 # Independent Envio Preparation
 
-`prepare_envio.py` prepares inputs locally from the Node runtime commit in the
-release lock (`sources.runtime`). Every name, port, image, hash and path comes from
-the lock (`envio`, `paths.envio`, `units.envio`); nothing is a module constant.
+`prepare_envio.py` prepares inputs locally from the Bridge Reader commit in the
+release lock (`sources.bridge_reader`), whose schema the Bridge Reader reads. Every
+name, port, hash and path comes from the lock (`envio`, `paths.envio`, `units.envio`);
+nothing is a module constant. Envio runs with `ENVIO_HASURA=false`; there is no Hasura.
 It reads Git objects, not the
 working tree, replacement refs, old deployment artifacts or live release.
 Inherited `GIT_*` overrides are removed. It never runs APT,
@@ -31,10 +32,10 @@ The spec has these exact top-level fields:
   integrity verification or a successful frozen build. Do not take an old
   generated workspace lock without comparison.
 - `placement`: `null` while pending, otherwise exactly `postgres_host`,
-  `postgres_port`, `postgres_user`, `hasura_bind`, `hasura_port`, `indexer_port`.
+  `postgres_port`, `postgres_user`, `indexer_port`.
   Hosts must be RFC1918 IPv4 literals supplied privately. Require a dedicated
-  non-superuser role, distinct ports and unused listeners; old Hasura/Envio
-  ports are rejected. Availability is a later read-only host gate, not a
+  non-superuser role, distinct ports and unused listeners; `indexer_port` must
+  equal `envio.indexer_port`. Availability is a later read-only host gate, not a
   conclusion from local validation.
 - `rpc_routes`: `{}` while pending, otherwise exactly `sepolia`, `bscTestnet`,
   `baseSepolia`. Each has `urls` (1-3 ordered, private, credential-free HTTP(S)
@@ -52,9 +53,8 @@ The spec has these exact top-level fields:
   Start block is the earlier creation block. Do not supply proposed addresses.
   These checks bind the supplied bytes; on-chain readback remains a gate.
 
-No DB password or Hasura secret belongs in this spec. Later credential wiring
-must provide `ENVIO_PG_PASSWORD`, its percent-encoded equivalent
-`ENVIO_POSTGRES_PASSWORD_ENCODED`, and `HASURA_GRAPHQL_ADMIN_SECRET` privately.
+No DB password belongs in this spec. Later credential wiring must provide
+`ENVIO_PG_PASSWORD` privately.
 They must not fall back to upstream development passwords or enter argv/logs.
 
 ## Prepare
@@ -72,21 +72,24 @@ python3 -B -m unittest discover \
 
 The output includes the seven pinned source files, five unchanged tools and
 `manifest.json`. A supplied lock is copied as `pnpm-lock.yaml`. Complete
-placement adds `compose.hasura.json` and non-secret `runtime-env.json`.
+placement adds the non-secret `runtime-env.json` (`ENVIO_HASURA=false`, no `HASURA_*` key).
 Complete L1 documents plus RPC routes add `config.yaml` and pinned document
 copies. Missing L1 documents never produce a runnable config. Handler, schema
 and event declarations stay together: in particular do not rename the
 template's `WithdrawalClaimed` field from `nullifier` independently of its
 handler. Do not copy old timestamp handlers or timestamp migrations.
 
-The only database name is `envio.database` of the lock, schema `envio`.
-The Compose project is `envio.project`; it contains Hasura only, no PG
-service, no PG volume and no auto-restart. The Hasura image is `envio.image`,
-pinned by digest. Both Hasura data and metadata URLs
-are constructed with that new database name, not an overridable database URL.
-The release directory is `paths.envio.release` and the unit is `units.envio`.
-No old `current` symlink is changed. Hasura keeps bounded logs
-(`100m`, `100`, compression) and nofile 65536/524288.
+The only database name is `envio.database` of the lock, schema `envio`; `envio.project`
+names the generated Envio config. The release directory is `paths.envio.release` and
+the unit is `units.envio`. No old `current` symlink is changed.
+
+Envio 2.32.10 reads `ENVIO_HASURA` with a default of true
+(`generated/src/Env.res:150`). When it is false, `makeStorage` installs no Hasura
+`onInitialize` or `onNewTables` hook (`generated/src/Generated.res:188-248`), and the
+Hasura endpoint, role and secret fall back to development values that nothing calls
+(`Env.res:157-168`; `rescript-envsafe` `EnvSafe.res:217-219` uses them because
+`NODE_ENV` is not `production`). Table DDL differs only for numeric array columns
+(`node_modules/envio/src/PgStorage.res:114`), and the schema has none.
 
 ## Remaining Gates
 
@@ -118,15 +121,15 @@ failover. Do not run `envio dev`: it owns Docker/schema lifecycle.
 
 Before any remote installation/activation, separately verify unused database,
 role, release, project, container, unit and ports; exact existing PG identity;
-private routing; and Hasura image provenance. Fresh bridge deployment already
+and private routing. Fresh bridge deployment already
 authorizes creation/install/start of the new isolated database and services;
 the main thread performs remote operations, not this local preparation branch.
 Do not restart/recreate existing PG: its runtime
 shared memory is currently 2 GiB while its Docker configuration is 64 MiB.
 Do not run the old `install-envio.sh`, its bundle installer or its cleanup.
 
-Credential wiring must keep Hasura and Envio on the same new database and
-metadata endpoint; Services must use that Hasura's `/v1/graphql`. Envio's
+Services never reads Envio directly: it reads the Bridge Reader (step 88), which
+reads the new database through its read-only role. Envio's
 `ENVIO_INDEXER_PORT` does not establish a private bind in 2.32.10; verify host
 firewall/private reachability separately before startup. No unit is generated
 until the built runtime and its protected writable paths are reviewed.
@@ -134,8 +137,8 @@ until the built runtime and its protected writable paths are reviewed.
 After the new schema exists, use the retained Deposit index tool in
 plan/apply/verify modes against **only the new database**, after checking
 `current_database()`. Before enabling consumers verify all three indexes,
-all three `envio_chains.max_reorg_depth` values, metadata permissions, all
-three indexed heads and chain-specific reads. No BridgeReader is involved.
+all three `envio_chains.max_reorg_depth` values, all three indexed heads and chain-specific reads. Step 88 then grants the Bridge Reader
+role (`psy_bridge_reader_api/sql/reader-role.sql` of `sources.bridge_reader`).
 Until these gates pass, `deployment_ready` and `release_approved` remain false.
 
 ## Install-Only Tool
@@ -163,8 +166,7 @@ The private installer spec has exactly these fields:
 ```
 
 Spec and credentials must be root-owned 0600 for host operations. Credentials
-contain only `postgres_password` and `hasura_admin_secret`; each is a 24-256
-character string from letters, digits, underscore, plus, slash, equals and
+contain only `postgres_password`, a 24-256 character string from letters, digits, underscore, plus, slash, equals and
 hyphen. Values are never printed, placed in argv or copied into the package.
 Use the dedicated PG role's password, not an old application role.
 
@@ -190,15 +192,15 @@ python3 -B -m unittest discover \
 
 `check-host` only reads: exact host/IP and PG container identity/running state,
 new DB absence, role attributes, root-owned staged inputs, new destinations,
-new project/ports/unit absence, cached Hasura image and Compose presence. It
+new port and unit absence. It
 neither creates resources nor changes PG configuration or shared memory.
 
 `install --apply` copies and rechecks the inventory under the new release;
 creates dedicated writable state and root-only environment files; creates only
 the new empty database with the dedicated owner and revokes PUBLIC CONNECT to
 that database; writes the new unit; and runs daemon-reload. It never starts or
-enables services or runs Compose. No existing release, unit, DB, role, PG
-container or Hasura container is overwritten or removed. Partial failure is
+enables services. No existing release, unit, DB, role or PG container is
+overwritten or removed. Partial failure is
 retained; rerunning against existing output refuses.
 
 The unit runs bundled Node/ts-node directly, not `envio dev` or global pnpm.
@@ -208,14 +210,7 @@ user; only dedicated state is writable. MemoryMax is 1 GiB and IP policy allows
 only private ranges/loopback. Host memory fit, IP-filter support, credential
 validity and startup acceptance remain to be measured.
 
-`activate --apply` is the activation: it starts this release's Hasura project (its
-own compose file, `--pull never`, the root-only `hasura.env`), waits for Hasura
-health, enables and starts the Envio unit, waits until `envio.envio_chains` shows a
-source block for all three chains, and builds the Deposit query indexes with the
-pinned `deposit-indexes.py`. Without `--apply` it only reports. The text below is
-the manual form of the same sequence. The independent Hasura command must use this project,
-this compose file, `--pull never` and the new root-only `hasura.env`; do not use
-the generated default compose (it includes PG). Start only the new indexer unit
-after Hasura is healthy, then apply/check Deposit indexes against the new DB
-and verify metadata permissions/three-chain heads before consumers. Neither
-tool executes activation commands.
+`activate --apply` is the activation: it enables and starts the Envio unit, waits
+until `envio.envio_chains` shows a source block for all three chains, and builds the
+Deposit query indexes with the pinned `deposit-indexes.py`. Without `--apply` it
+only reports. Do not use the generated default compose (it includes PG and Hasura).

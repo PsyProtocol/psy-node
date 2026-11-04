@@ -53,7 +53,8 @@ certify either live Redis policy or existing JetStream consumer configuration.
 `release.json` records testnet magic `0x1337CF514544CF69`, Plonky2, epoch 32,
 192 calldata words, 64 introspectable transactions, 100 Faucet operators,
 two Realms with three validators each, and the three existing Guardians.
-Bridge Reader is excluded. Only PSY (L2 contract 0) and pUSDT (contract 4)
+The Bridge Reader is included: it is the only Envio read path of Services, and
+there is no Hasura and no public indexer route. Only PSY (L2 contract 0) and pUSDT (contract 4)
 may be admitted; native deposits and initial public deposits stay disabled.
 Host roles are preparation inputs, not fresh SSH or resource measurements.
 
@@ -131,7 +132,7 @@ renamed inputs or replace only their version strings. Likewise, the historical
 The PostgreSQL installer now fixes 2 GiB Docker shared memory and compressed
 `100m`/100-file logs, checking actual container policy before readiness. It is
 a fresh installer that replaces a container, not a live database maintenance
-command. Hasura's existing bounded logging remains unchanged.
+command.
 
 ## Fresh Faucet And Relayer Generation
 
@@ -278,7 +279,7 @@ never committed). Every file named there is hash-checked against the lock or
 | Section | Names | Meaning |
 | --- | --- | --- |
 | `build` | `source`, `builder_image`, `caches` (`cargo`, `target`, `go`, `go_build`), `output_root`, `jobs` | Inputs of the pinned Node build. All paths absolute. |
-| `files` | `config`, `canonical_config`, `genesis`, `genesis_contracts`, `compiler_stamp`, `groth16_setup_manifest`, `gnark_groth16_verifier`, `deposit_batch_verifier`, `withdrawal_claim_verifier`, `psy_services`, `psy_indexer`, `l1_bundle_manifest`, `l1_policy` | Frozen release inputs. `l1_bundle_manifest` is the `manifest.json` at the root of the L1 bundle directory. |
+| `files` | `config`, `canonical_config`, `genesis`, `genesis_contracts`, `compiler_stamp`, `groth16_setup_manifest`, `gnark_groth16_verifier`, `deposit_batch_verifier`, `withdrawal_claim_verifier`, `psy_services`, `psy_indexer`, `psy_bridge_reader`, `l1_bundle_manifest`, `l1_policy` | Frozen release inputs. `psy_bridge_reader` is built by `core-only/build_bridge_reader.sh` from a clean psy-node checkout at `sources.bridge_reader` and must match `binaries.psy-bridge-reader`. `l1_bundle_manifest` is the `manifest.json` at the root of the L1 bundle directory. |
 | `databases` | `postgres_password_file` | Absolute path of a file whose single line is the PostgreSQL superuser password for the rebuilt database host (step `rebuild_databases`). The controller sends it on stdin; the installer exports it and `docker` takes it from the environment, so it is in no command line. |
 | `notifier` | `checkout` | Local checkout of the Psy Notifier repository used by step 85 (absolute path). Step 55 checks it; once `sources.notifier` in the lock is set (Task C1, together with `EXPECTED_PSY_NOTIFIER_COMMIT` in `source-versions.env`) it must be at that commit and clean. |
 | `packages.core` | `registration_keys`, `faucet_operators`, `p2p_keys`, `output` | Inputs of the core host packages; `output` must not exist before the first run. All absolute. |
@@ -315,7 +316,7 @@ The release check (`check_hosts`, step 55) and `stop_services` both run the whol
 `--apply` (unprivileged on operator hosts) and fail on any refusal.
 | `packages.worker` | `output` | Output directory of the Worker package (must not exist before the first run). Absolute. |
 
-Bridge package steps (54, 70, 72, 73) read three more sections. All paths are absolute and no value is a secret.
+Bridge package steps (54, 70, 72, 88, 73) read three more sections. All paths are absolute and no value is a secret.
 
 | Section | Names | Meaning |
 | --- | --- | --- |
@@ -324,7 +325,18 @@ Bridge package steps (54, 70, 72, 73) read three more sections. All paths are ab
 | `packages.envio` | `patches_dir`, `dependency_lock`, `build_script` | The five pinned patch files, the reviewed pnpm v9 lock and an executable that builds Envio. Step 70 runs `build_script <source package dir> <output dir>`; the output must be a finished build whose `build.json` carries the verified flags, the lock's Node hash and the exact file inventory (`install_envio.inventory`). `core-only/build_envio.py` is that executable: it needs `PSY_ENVIO_NODE` (the pinned Node), `PSY_ENVIO_PNPM_STORE` (a populated pnpm store) and `PSY_ENVIO_WORKSPACE_LOCK` (the reviewed lock that includes the generated workspace) in the environment, and runs offline. |
 | `databases` | `postgres_password_file` | The file the database host is rebuilt from. Step 72 uses the same value as the login of the Envio and Services roles, so it must hold 24 to 256 of letters, digits, underscore, plus, slash, equals and hyphen. |
 
-Step 72 and 73 write the generated Hasura admin value and the indexer JWT value once to `<state>/service-credentials.json` (mode 0600) and reuse them on reruns.
+Steps 88 and 73 write the generated indexer JWT value and the Bridge Reader database login and bearer token once to `<state>/service-credentials.json` (mode 0600) and reuse them on reruns.
+
+The `build.source` checkout must also hold commit `sources.bridge_reader`: step 70 builds Envio from its schema and
+handlers, and step 88 reads `psy_bridge_reader_api/sql/reader-role.sql` from it.
+
+Step 88 runs after Envio (72) and before Services (73). It creates the read-only role `bridge_reader.database_role`
+(connection limit 8, read-only transactions), grants it SELECT on the Reader's six Envio tables, installs the Reader
+on the Services host on `bridge_reader.listen` (loopback only) and waits until `/v1/status` lists all three Envio
+chains as ready. The Reader token is written twice, mode 0600: to `bridge_reader.config` for the Reader and to
+`bridge_reader.client_token_file` for the Services account. Services then runs with `PSY_ENVIO_READ_PATH=reader`;
+`services.env` holds only `DATABASE_URL` and `PSY_JWT_SECRET`. A crash inside the Reader install leaves a partial
+install that the next run refuses by path; remove the named paths of this release and rerun.
 
 Build attempts live in `<output_root>/<release id>-<first 12 of the runtime commit>-build-<n>`.
 A completed attempt of the same commit is verified and reused; a failed attempt
@@ -396,5 +408,5 @@ After a tool-only change of the lock, recorded state can move to the new lock wi
 `python3 core-only/rebind_lock_state.py --release-dir <dir> --private-dir <private> --previous-lock <old release-lock.json>`
 (dry run; add `--apply`). It refuses when the two locks differ in anything but `tool_sha256`. Lock-bound packages of step
 53 are removed and rebuilt by the step itself when the lock or an installer changed. A Caddyfile that holds a
-maintenance block of another tag inside a listed site is refused by name; the indexer upstream follows
-`envio.hasura_port` in `fence`.
+maintenance block of another tag inside a listed site is refused by name; every phase removes the site blocks of
+`ingress.retired_hosts` (the retired `indexer` and `indexer-stg` GraphQL sites).

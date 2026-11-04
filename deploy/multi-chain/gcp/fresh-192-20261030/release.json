@@ -38,7 +38,7 @@
   "deposit_tokens": {"PSY": 0, "pUSDT": 4},
   "native_deposits_allowed": false,
   "public_deposits_after_deploy": false,
-  "bridge_reader_included": false,
+  "bridge_reader_included": true,
   "core_placement": {
     "coordinator": "gcp-cp-ce",
     "realm_processors": ["gcp-realm-processor", "realm-processors-b", "realm-processors-c"],

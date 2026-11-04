@@ -18,7 +18,7 @@
 69	py-cutover:deploy_l1	Deploy the three L1 chains
 70	py-cutover:prepare_bridge_packages	Package the bridge components with the real L1 documents
 71	py-cutover:start_guardians	Start the three Guardians
-72	py-cutover:start_envio	Start Envio and Hasura
+72	py-cutover:start_envio	Start Envio (no Hasura)
 # 88 runs between 72 and 73 on purpose: Services reads the Bridge Reader, which reads the Envio database.
 88	py-cutover:start_bridge_reader	Grant the Reader role on the Envio database and start the Bridge Reader
 73	py-cutover:start_services	Start Services and the indexers

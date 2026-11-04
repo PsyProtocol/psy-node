@@ -36,7 +36,7 @@ class Fresh192PreflightTests(unittest.TestCase):
         for key, expected in {"sd_key_max_calldata_words": 192, "max_introspectable_transactions": 64,
                               "checkpoints_per_epoch": 32, "faucet_operator_count": 100,
                               "native_deposits_allowed": False, "public_deposits_after_deploy": False,
-                              "bridge_reader_included": False}.items():
+                              "bridge_reader_included": True}.items():
             self.assertEqual(self.release[key], expected)
         self.assertEqual(self.release["deposit_tokens"], {"PSY": 0, "pUSDT": 4})
         self.assertEqual(self.release["withdrawal_append_supported_batch_sizes"], [1, 2, 5])
