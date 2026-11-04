@@ -30,7 +30,7 @@ TOPOLOGY = {
         {"registration_id": 4, "validator_user_id": 9, "processor_host": "gcp-realm-processor", "edge_host": "gcp-edge-1",
          "http_port": 15381}]}],
 }
-LOCK_HOSTS = {"gcp-faucet": "10.148.0.33", "gcp-coordinator-worker": "10.148.0.31", "gcp-psy-service": "10.148.0.38",
+LOCK_HOSTS = {"gcp-faucet": "10.148.0.33", "gcp-coordinator-worker": "10.148.0.31", "gcp-psy-service": "10.148.0.38", "gcp-postgres": "10.148.0.24",
               "arc99x1": "10.250.0.13", "arc99x3": "10.250.0.12"}
 OLD_EXPECTED = "".join(f'[[collectors.expected]]\nid = "{host}"\nenvironment = "staging"\nheartbeat_timeout = "60s"\n\n'
                        for host in ("gcp-cp-ce", "gcp-faucet", "arc99x4"))
@@ -103,6 +103,20 @@ unit = "wg-quick@wg0.service"
 id = "prove-ingress"
 unit = "parth-offsite-prove-ingress.service"
 """
+POSTGRES_BASE = """[[targets]]
+id = "postgres-stack"
+kind = "infrastructure"
+
+[[targets.probes]]
+id = "postgres-tcp"
+kind = "tcp"
+url = "127.0.0.1:5432"
+
+[[targets.probes]]
+id = "hasura-health"
+kind = "http"
+url = "http://127.0.0.1:8080/healthz"
+"""
 
 
 def controller_text(warning=None):
@@ -170,6 +184,7 @@ class Fixture(unittest.TestCase):
         (collectors / "arc99x3.toml").write_text(ARC_BASE)
         (collectors / "gcp-cp-ce.toml").write_text(CP_BASE)
         (collectors / "gcp-faucet.toml").write_text(GATEWAY_BASE)
+        (collectors / "gcp-postgres.toml").write_text(POSTGRES_BASE)
         (self.private_dir / "local-inputs.json").write_text(json.dumps({"notifier": {"checkout": str(self.notifier)}}))
 
     def context(self, remote):
@@ -268,6 +283,12 @@ class CollectorTests(Fixture):
         self.assertEqual([service["unit"] for service in wireguard["services"]], ["wg-quick@wg0.service"])
         cp, _ = self.collector("gcp-cp-ce")
         self.assertEqual(cp["filters"]["immediate_patterns"][0]["name"], "psy-services-nostr-unavailable")
+
+    def test_the_retired_hasura_probe_is_dropped(self):
+        document, text = self.collector("gcp-postgres")
+        stack = next(target for target in document["targets"] if target["id"] == "postgres-stack")
+        self.assertEqual([probe["id"] for probe in stack["probes"]], ["postgres-tcp"])
+        self.assertNotIn("8080", text)
 
     def test_services_unit_gets_the_nostr_filter_and_a_matching_service_id(self):
         unit = self.lock["units"]["services"]

@@ -181,10 +181,16 @@ def split_targets(text):
     return blocks[0], blocks[1:]
 
 
+# Probes of components this release no longer runs (Hasura is retired; Envio runs without it).
+RETIRED_PROBES = ("hasura-health",)
+
+
 def drop_retired_services(block):
     head, *parts = re.split(r"(?m)^(?=\[\[targets\.(?:services|probes)\]\]$)", block)
     kept = [part for part in parts
-            if not (part.startswith("[[targets.services]]") and re.search(r'(?m)^unit = "parth-', part))]
+            if not (part.startswith("[[targets.services]]") and re.search(r'(?m)^unit = "parth-', part))
+            and not (part.startswith("[[targets.probes]]")
+                     and any(re.search(rf'(?m)^id = "{probe}"$', part) for probe in RETIRED_PROBES))]
     return head + "".join(kept)
 
 
