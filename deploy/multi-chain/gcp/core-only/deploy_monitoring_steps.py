@@ -31,13 +31,12 @@ ADAPTER_TIMEOUT_SECONDS = 3 * 3600
 STATUS_POLL_SECONDS = 10
 STATUS_TIMEOUT_SECONDS = 300
 DISCOVERY_TIMEOUT_SECONDS = 60
-# Finalize gas used on R3 peaked at 381k (BSC), 338k (Base) and 677k (Sepolia), rounded up. Cadence is
-# 240 finalizes a day, the busiest sustained R3 day (228) rounded up; a burst like 644 in 20 hours spends
-# 3x faster and is covered by the actual-spend l1-runway-low rule. Priced at 1 Gwei, the BSC floor: an
-# upper bound for Base (about 0.006 Gwei) and Sepolia (base fee about 15 wei, tips to 1.5 Gwei).
-FINALIZE_GAS = {"sepolia": 700_000, "bscTestnet": 400_000, "baseSepolia": 400_000}
-FINALIZES_PER_DAY = 240
-PRICE_WEI = 1_000_000_000
+# Relayer gas per day. BSC is measured whole-relayer use on SD192 (finalize, batchAppend ~3.4M and
+# batchClaimWithdrawal ~1.6M: ~315M/day, 2026-11-02..04) rounded up for load growth. Sepolia and Base
+# keep 240 finalizes a day at R3 peaks (700k, 400k); their 1 Gwei price already bounds them from above.
+DAILY_GAS = {"sepolia": 168_000_000, "bscTestnet": 400_000_000, "baseSepolia": 96_000_000}
+# BSC base fee is 0 and the relayer pays its 0.1 Gwei tip floor.
+PRICE_WEI = {"sepolia": 1_000_000_000, "bscTestnet": 100_000_000, "baseSepolia": 1_000_000_000}
 WARNING_DAYS = 7
 CRITICAL_DAYS = 2
 HOST_PROBE_INTERVAL = "5s"
@@ -77,7 +76,7 @@ def release_chains(release_dir):
     chains = release_lock.read_document(release_dir / "release.json")["chains"]
     require(sorted(chain["index"] for chain in chains) == list(range(len(chains))) and chains,
             "release chains need contiguous indexes")
-    require(all(chain["name"] in FINALIZE_GAS for chain in chains), "release chain without a gas basis")
+    require(all(chain["name"] in DAILY_GAS for chain in chains), "release chain without a gas basis")
     return chains
 
 
@@ -235,7 +234,7 @@ def render_collector(lock, host, zone, base_text, core_blocks, units):
 
 
 def threshold_floors(chain_name):
-    per_day = FINALIZE_GAS[chain_name] * PRICE_WEI * FINALIZES_PER_DAY
+    per_day = DAILY_GAS[chain_name] * PRICE_WEI[chain_name]
     return WARNING_DAYS * per_day, CRITICAL_DAYS * per_day
 
 
@@ -247,7 +246,7 @@ def check_thresholds(controller, chains):
         warning_floor, critical_floor = threshold_floors(chain["name"])
         require(int(monitor["balance_warning_wei"]) >= warning_floor
                 and int(monitor["balance_critical_wei"]) >= critical_floor,
-                f"balance thresholds of chain index {chain['index']} cover less than the finalize runway")
+                f"balance thresholds of chain index {chain['index']} cover less than the gas runway")
 
 
 EXPECTED_BLOCK = re.compile(r"(?m)^\[\[collectors\.expected\]\]\n(?:^(?!\[).*\n?)*")

@@ -22,9 +22,10 @@ no host list lives in `deploy-monitoring.sh` or in this document.
   Its config is the Notifier staging file with the lock `l1.signer` as the balance address
   and one `[[settlement]]` probe per release chain index (StateManager read from the
   deployed documents on the Relayer host).
-- Alerts: `l1-low-balance` per chain (warning at 7 days of finalize gas, critical at 2 days, at
-  240 finalizes per day priced at 1 Gwei, the BSC floor; 400k gas on BSC and Base, 700k on Sepolia.
-  1 Gwei is an upper bound for Base, about 0.006 Gwei, and Sepolia, base fee about 15 wei) and
+- Alerts: `l1-low-balance` per chain (warning at 7 days of relayer gas, critical at 2 days. BSC:
+  400M gas per day, the measured whole-relayer use of about 315M rounded up, at its 0.1 Gwei tip
+  floor, so 0.28 / 0.08 tBNB. Sepolia and Base: 240 finalizes per day of 700k / 400k gas at 1 Gwei,
+  an upper bound for Base, about 0.006 Gwei, and Sepolia, base fee about 15 wei) and
   `settlement-stalled` per chain index (no `lastFinalizedCheckpointId` advance for 30 minutes).
   The shared finalize round freezes all three cursors when one chain is starved, so all three alert.
   A burst such as 644 finalizes in 20 hours spends 3x faster; `l1-runway-low` measures actual spend.

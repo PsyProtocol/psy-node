@@ -312,15 +312,19 @@ class ControllerTests(Fixture):
         with self.assertRaises(ValueError):
             self.render(FakeRemote(state_manager="0x" + "0" * 40))
 
-    def test_thresholds_below_the_finalize_runway_are_refused(self):
+    def test_thresholds_below_the_gas_runway_are_refused(self):
         (self.notifier / steps.CONTROLLER_CONFIG).write_text(controller_text(warning=50_000_000_000_000_000))
         with self.assertRaises(ValueError):
             self.render()
 
-    def test_bsc_threshold_covers_seven_days_at_one_gwei(self):
+    def test_bsc_threshold_covers_seven_days_of_measured_spend_at_the_tip_floor(self):
         warning, critical = steps.threshold_floors("bscTestnet")
-        self.assertGreaterEqual(warning, 7 * 240 * 360_000 * 10**9)
-        self.assertEqual(critical * 7, warning * 2)
+        self.assertGreaterEqual(warning, 7 * 315_000_000 * 10**8)
+        self.assertEqual((warning, critical), (280_000_000_000_000_000, 80_000_000_000_000_000))
+
+    def test_sepolia_and_base_floors_are_unchanged(self):
+        self.assertEqual(steps.threshold_floors("sepolia"), (1_176_000_000_000_000_000, 336_000_000_000_000_000))
+        self.assertEqual(steps.threshold_floors("baseSepolia"), (672_000_000_000_000_000, 192_000_000_000_000_000))
 
     @unittest.skipUnless(NOTIFIER and (NOTIFIER / steps.CONTROLLER_CONFIG).is_file(), "needs PSY_NOTIFIER_DIR")
     def test_committed_notifier_config_meets_the_floors(self):
