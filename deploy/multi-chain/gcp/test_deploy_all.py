@@ -43,14 +43,14 @@ CONFIRMS = {
 
 EXPECTED_PAIRS = (
     ("50", "py:verify_release"), ("51", "py:rebuild_binaries"), ("52", "py:verify_artifacts"),
-    ("53", "py:prepare_packages"), ("54", "py:plan_bridge_packages"), ("55", "py:check_hosts"),
+    ("53", "py:prepare_packages"), ("54", "py:plan_bridge_packages"), ("55", "py:check_hosts"), ("56", "py:ensure_l1_rpc_routing"),
     ("60", "py-cutover:fence_ingress"), ("61", "py-cutover:stop_services"),
     ("62", "py-cutover:stop_operator_hosts"), ("63", "py-cutover:clear_node_state"),
     ("64", "py-cutover:rebuild_databases"), ("65", "py-cutover:start_core"),
     ("66", "py-cutover:start_workers"), ("67", "py-cutover:gate_l2_stability"),
     ("68", "py-cutover:start_proxies"), ("69", "py-cutover:deploy_l1"),
     ("70", "py-cutover:prepare_bridge_packages"), ("71", "py-cutover:start_guardians"),
-    ("72", "py-cutover:start_envio"), ("73", "py-cutover:start_services"),
+    ("72", "py-cutover:start_envio"), ("88", "py-cutover:start_bridge_reader"), ("73", "py-cutover:start_services"),
     ("74", "py-cutover:start_relayer"), ("75", "py-cutover:open_ingress"),
     ("76", "py-cutover:start_faucet"), ("77", "py:publish_trust_setup"), ("78", "py:publish_public_config"),
     ("79", "py:publish_frontends"), ("80", "py:accept_entrypoints"),
@@ -409,7 +409,7 @@ class Sd192StepTableTests(unittest.TestCase):
         rows = [line.split("\t")[:2] for line in SD192_STEPS.read_text().splitlines()
                 if line and line[0].isdigit()]
         self.assertEqual(rows, [list(p) for p in EXPECTED_PAIRS])
-        self.assertEqual(len(rows), 34)
+        self.assertEqual(len(rows), 36)
 
     def test_plan_with_the_real_table_needs_no_private_inputs(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("DEPLOY_", "GCP_"))}

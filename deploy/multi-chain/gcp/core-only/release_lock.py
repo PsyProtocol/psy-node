@@ -15,16 +15,18 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 MAX_BYTES = 4 * 1024 * 1024
 TOP_LEVEL = ("schema_version", "release_id", "network", "network_magic", "inputs", "sources", "binaries", "paths",
-             "units", "hosts", "services", "envio", "faucet", "images", "nostr", "groth16", "l1", "ingress", "gates",
-             "tool_sha256")
+             "units", "hosts", "services", "envio", "bridge_reader", "faucet", "images", "nostr", "groth16", "l1", "ingress",
+             "gates", "tool_sha256")
 INPUTS = ("release_profile", "topology", "artifacts", "runtime_config", "canonical_config", "genesis",
           "worker_whitelist", "risk_acceptance", "retired_state", "retained_paths")
 SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "services", "indexer", "notifier", "bridge_reader")
 CLI_BINARIES = ("psy_dev_cli", "psy_node_cli", "psy_relayer_cli", "psy_user_cli", "psy_worker_cli")
 SERVICE_BINARIES = ("psy-services", "psy-indexer")
+READER_BINARY = "psy-bridge-reader"
+BRIDGE_READER = ("database_role", "listen", "release", "config", "client_token_file")
 PATH_ROLES = ("core", "guardian", "relayer", "worker", "proxy", "faucet", "services", "envio")
 UNITS = ("core_prefix", "core_namespace_prefix", "guardian_prefix", "relayer", "worker_prefix", "proxy_prefix", "faucet", "services",
-         "indexer_prefix", "envio")
+         "indexer_prefix", "envio", "bridge_reader")
 IMAGES = ("scylla", "valkey", "nats", "postgres", "nostr")
 CHAINS = ("sepolia", "bscTestnet", "baseSepolia")
 ENVIO_PATCHES = ("history.py", "polling.py", "ordered.py", "reorg.py", "deposit-indexes.py")
@@ -32,7 +34,7 @@ GROTH16_VERIFIERS = ("gnark_groth16_verifier", "deposit_batch_verifier", "withdr
 # Every file that is loaded or executed on a remote host, keyed by file name in this directory.
 TOOL_NAMES = ("activate_bridge.py", "activate_host.py", "activate_services.py", "admin_pause.py", "caddy_ingress.py",
               "clear_host_state.py",
-              "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_envio.py",
+              "fresh_l1.cjs", "fresh_l1.py", "guardian_exec.py", "indexer_backup_mirror.py", "install_bridge_reader.py", "install_envio.py",
               "install_guardian.py", "install_host.py", "install_relayer.py", "install_services.py",
               "prepare_bridge_forwarders.py", "prepare_faucet.py", "prepare_proxies.py",
               "prepare_relayer_credential.py", "prepare_workers.py", "probe_databases.py", "relayer_exec.py")
@@ -208,6 +210,12 @@ def check_names(lock, release, topology):
         for name in ("release", "state"):
             require(release["release_id"] in group[name] or namespace in group[name],
                     f"path must carry the release id or namespace: {role}.{name}")
+    reader = lock["bridge_reader"]
+    for name in ("release", "config"):
+        require(release["release_id"] in reader[name] or namespace in reader[name],
+                f"path must carry the release id or namespace: bridge_reader.{name}")
+    for name in ("client_token_file", "database_role"):
+        require(namespace in reader[name], f"bridge_reader.{name} must carry the namespace")
     for alias, address in lock["hosts"].items():
         require(alias not in topology["hosts"], f"host duplicates the topology: {alias}")
         require(ipaddress.ip_address(address).is_private, f"host address must be internal: {alias}")
@@ -222,8 +230,9 @@ def check_shape(lock, walk):
         walk.digest(fields(lock["inputs"], INPUTS, "inputs")[name], "inputs." + name)
     for name in SOURCES:
         walk.commit(fields(lock["sources"], SOURCES, "sources")[name], "sources." + name)
-    for name in CLI_BINARIES + SERVICE_BINARIES:
-        walk.digest(fields(lock["binaries"], CLI_BINARIES + SERVICE_BINARIES, "binaries")[name], "binaries." + name)
+    binaries = CLI_BINARIES + SERVICE_BINARIES + (READER_BINARY,)
+    for name in binaries:
+        walk.digest(fields(lock["binaries"], binaries, "binaries")[name], "binaries." + name)
     fields(lock["paths"], PATH_ROLES, "paths")
     for role in PATH_ROLES:
         for name in ("release", "config", "state"):
@@ -254,6 +263,13 @@ def check_services(lock, walk):
     routes = fields(envio["rpc_routes"], CHAINS, "envio.rpc_routes")
     for chain, url in routes.items():
         require(isinstance(url, str) and re.fullmatch(r"http://[0-9.]+:[0-9]+", url), f"envio.rpc_routes.{chain} url")
+    reader = fields(lock["bridge_reader"], BRIDGE_READER, "bridge_reader")
+    require(isinstance(reader["database_role"], str) and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", reader["database_role"]),
+            "bridge_reader.database_role must be a plain lowercase identifier")
+    require(isinstance(reader["listen"], str) and re.fullmatch(r"127\.0\.0\.1:[0-9]{4,5}", reader["listen"])
+            and 1024 <= int(reader["listen"].rpartition(":")[2]) <= 65535, "bridge_reader.listen must be a loopback port")
+    for name in ("release", "config", "client_token_file"):
+        walk.absolute(reader[name], "bridge_reader." + name)
     faucet = fields(lock["faucet"], ("account", "listen_port", "operators_sha256"), "faucet")
     walk.text(faucet["account"], "faucet.account")
     walk.number(faucet["listen_port"], "faucet.listen_port", 1, 65535)

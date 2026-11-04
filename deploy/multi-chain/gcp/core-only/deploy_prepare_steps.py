@@ -270,6 +270,7 @@ def artifact_pins(ctx):
             ("genesis_contracts", artifacts.get("genesis_contracts_sha256")),
             ("compiler_stamp", artifacts.get("compiler_stamp_sha256")),
             ("psy_services", lock["binaries"]["psy-services"]), ("psy_indexer", lock["binaries"]["psy-indexer"]),
+            ("psy_bridge_reader", lock["binaries"][release_lock.READER_BINARY]),
             ("groth16_setup_manifest", groth16["setup_manifest_sha256"]),
             *[(name, groth16["verifiers"][name]) for name in release_lock.GROTH16_VERIFIERS],
             ("l1_bundle_manifest", lock["l1"]["bundle_sha256"]), ("l1_policy", lock["l1"]["policy_sha256"])]

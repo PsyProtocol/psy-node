@@ -19,6 +19,8 @@
 70	py-cutover:prepare_bridge_packages	Package the bridge components with the real L1 documents
 71	py-cutover:start_guardians	Start the three Guardians
 72	py-cutover:start_envio	Start Envio and Hasura
+# 88 runs between 72 and 73 on purpose: Services reads the Bridge Reader, which reads the Envio database.
+88	py-cutover:start_bridge_reader	Grant the Reader role on the Envio database and start the Bridge Reader
 73	py-cutover:start_services	Start Services and the indexers
 74	py-cutover:start_relayer	Start the Relayer and wait for the first settlement
 75	py-cutover:open_ingress	Remove the L2, Proxy and Services maintenance routes and check each route; Faucet stays 503

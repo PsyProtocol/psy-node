@@ -324,6 +324,7 @@ class VerifyArtifactsTests(PrepareTestCase):
             "withdrawal_claim_verifier": lambda h: lock["groth16"]["verifiers"].update(withdrawal_claim_verifier=h),
             "psy_services": lambda h: lock["binaries"].update({"psy-services": h}),
             "psy_indexer": lambda h: lock["binaries"].update({"psy-indexer": h}),
+            "psy_bridge_reader": lambda h: lock["binaries"].update({"psy-bridge-reader": h}),
             "l1_bundle_manifest": lambda h: lock["l1"].update(bundle_sha256=h),
             "l1_policy": lambda h: lock["l1"].update(policy_sha256=h),
         }
@@ -373,6 +374,11 @@ class VerifyArtifactsTests(PrepareTestCase):
     def test_services_binary_hash_mismatch_is_rejected_by_name(self):
         self.paths["psy_services"].write_bytes(b"swapped")
         with self.assertRaisesRegex(ValueError, "psy_services hash differs from the lock"):
+            run_all(steps.PREPARE_STEPS["verify_artifacts"], self.ws.context())
+
+    def test_reader_binary_hash_mismatch_is_rejected_by_name(self):
+        self.paths["psy_bridge_reader"].write_bytes(b"swapped")
+        with self.assertRaisesRegex(ValueError, "psy_bridge_reader hash differs from the lock"):
             run_all(steps.PREPARE_STEPS["verify_artifacts"], self.ws.context())
 
     def test_groth16_verifier_mismatch_is_rejected_by_name(self):

@@ -128,6 +128,8 @@ def protected_lock_paths(lock):
     for group in lock["paths"].values():
         found += [group["release"], group["config"], group["state"]]
     found += [lock["services"]["backups"], lock["services"]["mirror"], lock["l1"]["output_root"]]
+    reader = lock["bridge_reader"]
+    found += [reader["release"], reader["config"], str(Path(reader["client_token_file"]).parent)]
     return found
 
 

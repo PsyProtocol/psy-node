@@ -33,7 +33,8 @@
     "psy_user_cli": "1525aac9c73d0900736e6ea90c0c61b5bf1308c3e1993f1bd4de4fe7f0762027",
     "psy_worker_cli": "c8f6c522ca459e744a69cf57dcaf3d002b4315c88dc789f10453f24d5122240e",
     "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
-    "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a"
+    "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a",
+    "psy-bridge-reader": "7eb9db1aa4677f7f418ed885fa442dbe4bf85e7a2a19c7969f7adeda5ef6b6b2"
   },
   "paths": {
     "core": {
@@ -87,7 +88,8 @@
     "faucet": "psy-faucet-fresh20261030sd192.service",
     "services": "psy-services-fresh20261030sd192.service",
     "indexer_prefix": "psy-indexer-fresh20261030sd192-",
-    "envio": "psy-envio-fresh20261030sd192.service"
+    "envio": "psy-envio-fresh20261030sd192.service",
+    "bridge_reader": "psy-bridge-reader-fresh20261030sd192.service"
   },
   "hosts": {
     "gcp-psy-service": "10.148.0.38",
@@ -134,6 +136,13 @@
       "reorg.py": "8739c575630a57d831cd4063f48033ffc7c8c27dde62ace310ec22e5f0e1bebf",
       "deposit-indexes.py": "c2fcf5d23d3568706f2fc5b263b92dc52821dba96e30effbb232cf723d634711"
     }
+  },
+  "bridge_reader": {
+    "database_role": "bridge_reader_fresh20261030sd192",
+    "listen": "127.0.0.1:8740",
+    "release": "/opt/psy-bridge-reader/releases/core-testnet-20261030-sd192",
+    "config": "/etc/psy-bridge-reader/core-testnet-20261030-sd192",
+    "client_token_file": "/etc/psy-services-reader-fresh20261030sd192/token"
   },
   "faucet": {
     "account": "psy-faucet-r2",
@@ -203,11 +212,12 @@
     "activate_services.py": "d1654378c69760188c4c1b21028baf91d90ebf534b3d240c4d5e18c4d9ab8b74",
     "admin_pause.py": "458b17f2f2278298650ba264b6e33fd0f5ba4459a68ece6cf0e777d2f524d30f",
     "caddy_ingress.py": "3243caf141032673485139017afd95079947065d2b86a63d099e98ff6582818c",
-    "clear_host_state.py": "5cf1e6a3322a444bf01b41789e2577ceca17e8d43463646501f4e7258b0115a0",
+    "clear_host_state.py": "121782e230504e9282fad1dea2875db9b42a3a6d1cec255a1a573dd5b9f2f1db",
     "fresh_l1.cjs": "5a70cbc8b729b017d7dccc2deaded5a2fc8e6e027ccba55e03d8b49bd0647e47",
     "fresh_l1.py": "80c05afbc1691a4fe7c1a62640e48cc6220e3dca8013aa01c10bee21cc405204",
     "guardian_exec.py": "965c325ef2e0d4477beb73a2f9415a0952e214cadd4e31d098198e7fd5489762",
     "indexer_backup_mirror.py": "4e5ce785f72a470fffe4f63540ff0573485cb912e6f24979548d5d837c2dc427",
+    "install_bridge_reader.py": "537ab76ef20e4e3cd2873ef272455f53aa504cc77f181111ca7a41dc1895b4d4",
     "install_envio.py": "720a52ba3350083e7e6b0565789ba71b5cac15afa8465176c457080e6e6f634e",
     "install_guardian.py": "b12f963e776078142dd08a77e894ed54d3f0add0f6e1b54093d3de4b0ddb7b96",
     "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",

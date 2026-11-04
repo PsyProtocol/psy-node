@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Steps 54, 70, 72 and 73: plan and prepare the bridge packages, start Envio, start Services and the indexers.
+"""Steps 54, 70, 72, 88 and 73: plan and prepare the bridge packages, start Envio, the Bridge Reader, Services and the indexers.
 
-Step 54 runs with no L1 documents and changes nothing on a host. Steps 70, 72 and 73 are cutover steps. Every apply
+Step 54 runs with no L1 documents and changes nothing on a host. Steps 70, 72, 88 and 73 are cutover steps. Every apply
 looks at the host first: an installed unit is not installed again and a running unit is left alone, so a rerun after a
 failure or after later steps repeats nothing that already holds. Credentials travel on stdin and are never in a
 command line or a result; the generated values are kept once in the operator state directory.
@@ -28,6 +28,9 @@ STAGE_ROOT = "/var/tmp"
 POSTGRES_ALIAS = "gcp-postgres"
 POSTGRES_CONTAINER = "parth-postgres"
 ENVIO_ACCOUNT = "psy-envio-fresh"
+READER_ACCOUNT = "psy-bridge-reader"
+READER_ROLE_SQL = "psy_bridge_reader_api/sql/reader-role.sql"
+READER_CONNECTION_LIMIT = 8
 LOGIN_PATTERN = re.compile(r"[A-Za-z0-9_+/=-]{24,256}")
 ROLE_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 SHORT_SECONDS = 120
@@ -38,7 +41,7 @@ READY_SECONDS = 600
 SYNC_SECONDS = 180
 POLL_SECONDS = 10
 UNIT_PROPERTIES = "LoadState,ActiveState,UnitFileState,MainPID,NRestarts"
-BRIDGE_TOOLS = ("install_envio.py", "install_services.py", "activate_services.py", "indexer_backup_mirror.py",
+BRIDGE_TOOLS = ("install_envio.py", "install_bridge_reader.py", "install_services.py", "activate_services.py", "indexer_backup_mirror.py",
                 "install_guardian.py", "guardian_exec.py", "activate_bridge.py", "install_relayer.py", "relayer_exec.py")
 REALM_STALL_MESSAGE = ("the Realm indexer watermark is not advancing; the committed-realm backup parser (CGB2) was only "
                        "tested on derived fixtures, so read the Realm indexer log for a parser error before anything else")
@@ -203,15 +206,20 @@ def service_values(ctx):
     """Generated once, kept in the operator state directory, shared by Envio, Services and the indexers."""
     path = ctx.state_dir / "service-credentials.json"
     if not path.exists():
-        values = {"hasura_admin_secret": secrets.token_urlsafe(32), "jwt_secret": secrets.token_hex(32)}
+        values = {"hasura_admin_secret": secrets.token_urlsafe(32), "jwt_secret": secrets.token_hex(32),
+                  "bridge_reader_login": secrets.token_urlsafe(48), "bridge_reader_token": secrets.token_hex(32)}
         bridge.write_new(path, bridge.encode(values))
     values = release_lock.read_document(path)
-    prepare.require(set(values) == {"hasura_admin_secret", "jwt_secret"}, "recorded service values differ in shape")
+    prepare.require(set(values) == {"hasura_admin_secret", "jwt_secret", "bridge_reader_login", "bridge_reader_token"},
+                    "recorded service values differ in shape")
+    prepare.require(LOGIN_PATTERN.fullmatch(values["bridge_reader_login"]) is not None
+                    and re.fullmatch(r"[0-9a-f]{64}", values["bridge_reader_token"]) is not None,
+                    "recorded Bridge Reader credentials differ in shape")
     return values
 
 
-def postgres_script(ctx, sql, timeout=SHORT_SECONDS):
-    script = (f"docker exec -i --user postgres {POSTGRES_CONTAINER} psql -XqAt -v ON_ERROR_STOP=1 -U postgres -d postgres "
+def postgres_script(ctx, sql, timeout=SHORT_SECONDS, database="postgres"):
+    script = (f"docker exec -i --user postgres {POSTGRES_CONTAINER} psql -XqAt -v ON_ERROR_STOP=1 -U postgres -d {quote_word(database)} "
               f"<<'PSY_SQL_END'\n{sql}PSY_SQL_END\n")
     return root_script(ctx, POSTGRES_ALIAS, script, timeout)
 
@@ -369,6 +377,118 @@ def envio_verify(ctx):
 
     wait_until(advanced, lambda: None, POLL_SECONDS, READY_SECONDS, "Envio polling on three chains")
     return {"unit": envio_unit(ctx), "restarts": 0, "chains": sorted(first)}
+
+
+# ---- step 88: Bridge Reader ----------------------------------------------------------------------------------------
+
+def reader_unit(ctx):
+    return ctx.lock["units"]["bridge_reader"]
+
+
+def reader_alias(ctx):
+    return services_alias(read_placement(ctx))
+
+
+def reader_stage(ctx):
+    return f"{STAGE_ROOT}/psy-bridge-reader-{namespace(ctx)}-stage"
+
+
+def reader_binary(ctx):
+    path = prepare.local_path(ctx, "files", "psy_bridge_reader")
+    prepare.require(prepare.file_sha256(path) == ctx.lock["binaries"][release_lock.READER_BINARY], "the Reader binary differs from the lock")
+    return path
+
+
+def reader_role_sql(ctx):
+    """The grant script of the pinned Reader source; it grants SELECT on the Reader's six tables and nothing else."""
+    repo = prepare.local_path(ctx, "build", "source")
+    result = prepare.run_local(["git", "--no-replace-objects", "-C", str(repo), "show",
+                                f"{ctx.lock['sources']['bridge_reader']}:{READER_ROLE_SQL}"], SHORT_SECONDS)
+    prepare.require(result.returncode == 0 and "GRANT SELECT" in result.stdout,
+                    "the Reader grant script is missing from the build source at sources.bridge_reader")
+    return result.stdout
+
+
+def reader_role(ctx):
+    role = ctx.lock["bridge_reader"]["database_role"]
+    prepare.require(ROLE_PATTERN.fullmatch(role) is not None, "database role names must be plain lowercase identifiers")
+    return role
+
+
+def ensure_reader_role(ctx):
+    """A read-only login role of its own, so the Reader never holds the Envio owner's login."""
+    role, login = reader_role(ctx), service_values(ctx)["bridge_reader_login"]
+    postgres_script(ctx, f"SELECT 'CREATE ROLE \"{role}\" LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{role}') \\gexec\n"
+                         f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{login}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION "
+                         f"NOBYPASSRLS CONNECTION LIMIT {READER_CONNECTION_LIMIT};\n"
+                         f"ALTER ROLE \"{role}\" SET default_transaction_read_only = on;\n")
+
+
+def grant_reader(ctx):
+    """Re-applied on every run, since an Envio schema re-initialisation drops the grants; PUBLIC also loses CREATE on public."""
+    role, database = reader_role(ctx), ctx.lock["envio"]["database"]
+    sql = (f"\\set reader_role {role}\n\\set envio_schema envio\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n"
+           f"GRANT CONNECT ON DATABASE \"{database}\" TO \"{role}\";\n" + reader_role_sql(ctx))
+    postgres_script(ctx, sql, database=database)
+
+
+def run_reader_tool(ctx, alias, directory, mode, extra=(), stdin_text=None, timeout=INSTALL_SECONDS):
+    argv = [PYTHON, "-I", "-B", f"{directory}/install_bridge_reader.py", mode, "--release-lock", f"{directory}/release-lock.json",
+            "--release-lock-sha256", ctx.lock_sha256, *extra]
+    return ctx.remote.run_root_text(alias, argv, timeout, stdin_text=stdin_text, show_stderr=True)
+
+
+def reader_report(ctx, alias):
+    """The installed tool's status report; it carries readiness only, never the token."""
+    output = run_reader_tool(ctx, alias, ctx.lock["bridge_reader"]["release"], "status", timeout=SHORT_SECONDS)
+    return json.loads(output.strip().splitlines()[-1])
+
+
+def reader_check(ctx):
+    prepare.check_tool_hash(ctx, "install_bridge_reader.py")
+    reader_binary(ctx)
+    reader_role_sql(ctx)
+    prepare.require(envio_rows_ready(ctx), "Envio is not polling all three chains; start Envio first")
+
+
+def install_reader(ctx, alias, binary):
+    stage = reader_stage(ctx)
+    values = service_values(ctx)
+    secrets_raw = bridge.encode({"postgres_password": values["bridge_reader_login"], "token": values["bridge_reader_token"]})
+    try:
+        root_script(ctx, alias, f"rm -rf -- {quote_word(stage)}\ninstall -d -m 0755 -o \"$SUDO_USER\" -- {quote_word(stage)}\n")
+        ctx.remote.copy_files(alias, [binary, prepare.TOOLS_DIR / "install_bridge_reader.py", ctx.release_dir / "release-lock.json"],
+                              stage + "/", timeout_seconds=UPLOAD_SECONDS)
+        root_script(ctx, alias, f"chown -R root:root -- {quote_word(stage)}\nchmod -R go-w -- {quote_word(stage)}\n")
+        extra = ["--binary", f"{stage}/{binary.name}"]
+        run_reader_tool(ctx, alias, stage, "check-host", extra)
+        run_reader_tool(ctx, alias, stage, "install", [*extra, "--apply"], stdin_text=secrets_raw.decode())
+    finally:
+        root_script(ctx, alias, f"rm -rf -- {quote_word(stage)}\n")
+
+
+def reader_apply(ctx):
+    alias, binary = reader_alias(ctx), reader_binary(ctx)
+    state = unit_state(ctx, alias, reader_unit(ctx))
+    ensure_reader_role(ctx)
+    grant_reader(ctx)
+    if is_running(state) and reader_report(ctx, alias)["reader_ready"]:
+        return
+    root_script(ctx, alias, f"id {READER_ACCOUNT} >/dev/null 2>&1 || useradd --system --user-group --no-create-home "
+                            f"--home-dir /nonexistent --shell /usr/sbin/nologin {READER_ACCOUNT}\n")
+    if state.get("LoadState") != "loaded":
+        install_reader(ctx, alias, binary)
+    run_reader_tool(ctx, alias, ctx.lock["bridge_reader"]["release"], "activate", ["--apply"], timeout=ACTIVATE_SECONDS)
+
+
+def reader_verify(ctx):
+    alias = reader_alias(ctx)
+    state = unit_state(ctx, alias, reader_unit(ctx))
+    prepare.require(is_running(state) and state.get("NRestarts") == "0", "the Bridge Reader is not running without restarts")
+    report = reader_report(ctx, alias)
+    prepare.require(report["reader_ready"], "the Bridge Reader is not ready on all three chains")
+    return {"unit": reader_unit(ctx), "restarts": 0, "envio_chain_ids": report["envio_chain_ids"],
+            "deposits": {str(row["chain_index"]): row["deposit_count"] for row in report["chains"]}}
 
 
 # ---- step 73: Services and indexers --------------------------------------------------------------------------------
@@ -667,5 +787,6 @@ SERVICES_STEPS = {
     "plan_bridge_packages": Step("plan_bridge_packages", package_check, plan_apply, plan_verify),
     "prepare_bridge_packages": Step("prepare_bridge_packages", prepare_check, prepare_apply, prepare_verify, cutover=True),
     "start_envio": Step("start_envio", envio_check, envio_apply, envio_verify, cutover=True),
+    "start_bridge_reader": Step("start_bridge_reader", reader_check, reader_apply, reader_verify, cutover=True),
     "start_services": Step("start_services", services_check, services_apply, services_verify, cutover=True),
 }

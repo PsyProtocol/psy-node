@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -18,6 +19,7 @@ from test_services_packages import ServicesWorld, sha
 
 
 REAL_READ_CURSOR = steps.read_cursor
+REAL_READER_ROLE_SQL = steps.reader_role_sql
 
 
 class BridgeWorld(ServicesWorld):
@@ -410,12 +412,126 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertGreaterEqual(len(first["hasura_admin_secret"]), 32)
         self.assertRegex(first["jwt_secret"], r"[0-9a-f]{64}")
+        self.assertRegex(first["bridge_reader_token"], r"^[0-9a-f]{64}$")
+        self.assertRegex(first["bridge_reader_login"], r"^[A-Za-z0-9_-]{64}$")
+        self.assertNotEqual(first["bridge_reader_login"], steps.database_login(self.ctx))
+        path.write_text(json.dumps(dict(first, bridge_reader_login="quote'" + "a" * 30)))
+        with self.assertRaisesRegex(ValueError, "Bridge Reader credentials"):
+            steps.service_values(self.ctx)
 
     def test_steps_are_registered_with_the_right_cutover_flags(self):
         self.assertEqual({name: step.cutover for name, step in steps.SERVICES_STEPS.items()},
-                         {"plan_bridge_packages": False, "prepare_bridge_packages": True, "start_envio": True, "start_services": True})
+                         {"plan_bridge_packages": False, "prepare_bridge_packages": True, "start_envio": True,
+                          "start_bridge_reader": True, "start_services": True})
         for name, step in steps.SERVICES_STEPS.items():
             self.assertEqual(step.name, name)
+
+
+
+class ReaderStepTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.world = BridgeWorld(self.temp.name)
+        self.binary = self.world.root / "psy-bridge-reader"
+        self.binary.write_bytes(b"\x7fELF reader")
+        self.world.lock["binaries"]["psy-bridge-reader"] = sha(self.binary.read_bytes())
+        local = json.loads((self.world.private_dir / "local-inputs.json").read_bytes())
+        local["files"]["psy_bridge_reader"] = str(self.binary)
+        (self.world.private_dir / "local-inputs.json").write_text(json.dumps(local))
+        self.world.rewrite_lock()
+        self.remote = SimpleNamespace(copies=[], tools=[])
+        self.remote.copy_files = lambda host, sources, destination, timeout_seconds=0: self.remote.copies.append((host, sources, destination))
+        self.remote.run_root_text = self.run_root_text
+        self.ctx = SimpleNamespace(**{**vars(self.world.ctx()), "remote": self.remote})
+        self.report = {"reader_ready": True, "envio_chain_ids": [97, 84532, 11155111], "chains": []}
+        self.sql = []
+        self.scripts = []
+        for name, replacement in (
+                ("reader_role_sql", lambda ctx: "GRANT SELECT ON :\"envio_schema\".\"Deposit\" TO :\"reader_role\";\n"),
+                ("postgres_script", lambda ctx, sql, timeout=0, database="postgres": self.sql.append((database, sql))),
+                ("root_script", lambda ctx, host, script, timeout=0: self.scripts.append((host, script)) or "")):
+            patcher = patch.object(steps, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_root_text(self, host, argv, timeout, stdin_text=None, show_stderr=True):
+        self.remote.tools.append((host, argv, stdin_text))
+        return json.dumps(self.report) + "\n"
+
+    def test_apply_creates_the_role_grants_installs_and_activates(self):
+        with patch.object(steps, "unit_state", return_value={"LoadState": "not-found"}):
+            steps.reader_apply(self.ctx)
+        role, database = self.world.lock["bridge_reader"]["database_role"], self.world.lock["envio"]["database"]
+        values = steps.service_values(self.ctx)
+        (_, role_sql), (grant_database, grant_sql) = self.sql
+        self.assertIn(f'ALTER ROLE "{role}" LOGIN PASSWORD \'{values["bridge_reader_login"]}\'', role_sql)
+        self.assertIn("CONNECTION LIMIT 8", role_sql)
+        self.assertIn("default_transaction_read_only = on", role_sql)
+        self.assertEqual(grant_database, database)
+        self.assertTrue(grant_sql.startswith(f"\\set reader_role {role}\n\\set envio_schema envio\n"))
+        self.assertIn(f'GRANT CONNECT ON DATABASE "{database}" TO "{role}";', grant_sql)
+        self.assertNotIn("INSERT", grant_sql.upper().replace("GRANT SELECT", ""))
+        modes = [argv[4] for _, argv, _ in self.remote.tools]
+        self.assertEqual(modes, ["check-host", "install", "activate"])
+        stage = steps.reader_stage(self.ctx)
+        self.assertEqual(self.remote.copies[0][1][0], self.binary)
+        _, install_argv, stdin = self.remote.tools[1]
+        self.assertEqual(install_argv[install_argv.index("--binary") + 1], f"{stage}/psy-bridge-reader")
+        self.assertEqual(json.loads(stdin), {"postgres_password": values["bridge_reader_login"], "token": values["bridge_reader_token"]})
+        self.assertFalse(any(values["bridge_reader_token"] in " ".join(argv) for _, argv, _ in self.remote.tools))
+        activate = self.remote.tools[2][1]
+        self.assertEqual(activate[3], self.world.lock["bridge_reader"]["release"] + "/install_bridge_reader.py")
+        self.assertIn("--apply", activate)
+        self.assertIn(f"rm -rf -- {stage}\n", [script for _, script in self.scripts][-1])
+
+    def test_apply_on_a_running_ready_reader_only_reapplies_the_grants(self):
+        running = {"LoadState": "loaded", "ActiveState": "active", "UnitFileState": "enabled", "MainPID": "9", "NRestarts": "0"}
+        with patch.object(steps, "unit_state", return_value=running):
+            steps.reader_apply(self.ctx)
+        self.assertEqual([argv[4] for _, argv, _ in self.remote.tools], ["status"])
+        self.assertEqual(len(self.sql), 2)
+
+    def test_apply_on_an_installed_stopped_reader_activates_without_reinstalling(self):
+        with patch.object(steps, "unit_state", return_value={"LoadState": "loaded", "ActiveState": "inactive"}):
+            steps.reader_apply(self.ctx)
+        self.assertEqual([argv[4] for _, argv, _ in self.remote.tools], ["activate"])
+        self.assertEqual(self.remote.copies, [])
+
+    def test_verify_needs_a_running_ready_reader(self):
+        running = {"LoadState": "loaded", "ActiveState": "active", "UnitFileState": "enabled", "MainPID": "9", "NRestarts": "0"}
+        with patch.object(steps, "unit_state", return_value=running):
+            self.assertEqual(steps.reader_verify(self.ctx)["unit"], self.world.lock["units"]["bridge_reader"])
+            self.report = dict(self.report, reader_ready=False)
+            with self.assertRaisesRegex(ValueError, "not ready"):
+                steps.reader_verify(self.ctx)
+        with patch.object(steps, "unit_state", return_value=dict(running, NRestarts="1")):
+            with self.assertRaisesRegex(ValueError, "without restarts"):
+                steps.reader_verify(self.ctx)
+
+    def test_grant_script_is_read_from_the_pinned_reader_commit(self):
+        repo = self.world.root / "node"
+        sql = repo / "psy_bridge_reader_api/sql/reader-role.sql"
+        sql.parent.mkdir(parents=True)
+        git = lambda *args: subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q")
+        sql.write_text("GRANT SELECT ON pinned TO reader;\n")
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pinned")
+        pinned = git("rev-parse", "HEAD")
+        sql.write_text("GRANT ALL ON later TO reader;\n")
+        self.world.lock["sources"]["bridge_reader"] = pinned
+        self.assertEqual(REAL_READER_ROLE_SQL(self.ctx), "GRANT SELECT ON pinned TO reader;\n")
+        self.world.lock["sources"]["bridge_reader"] = "0" * 40
+        with self.assertRaisesRegex(ValueError, "grant script is missing"):
+            REAL_READER_ROLE_SQL(self.ctx)
+
+    def test_check_refuses_a_binary_that_differs_from_the_lock(self):
+        with patch.object(steps, "envio_rows_ready", return_value=True), patch.object(steps.prepare, "check_tool_hash"):
+            steps.reader_check(self.ctx)
+            self.binary.write_bytes(b"other")
+            with self.assertRaisesRegex(ValueError, "Reader binary differs"):
+                steps.reader_check(self.ctx)
 
 
 if __name__ == "__main__":

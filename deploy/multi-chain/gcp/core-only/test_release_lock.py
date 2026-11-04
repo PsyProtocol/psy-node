@@ -78,14 +78,15 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
         "sources": {"runtime": "1" * 40, "guardian_key": "4" * 40, "compiler": "2" * 40, "genesis": "3" * 40,
                     "contracts": "5" * 40, "services": "6" * 40, "indexer": "7" * 40,
                     "notifier": "8" * 40, "bridge_reader": "9" * 40},
-        "binaries": {**binaries, "psy-services": digest("psy-services"), "psy-indexer": digest("psy-indexer")},
+        "binaries": {**binaries, "psy-services": digest("psy-services"), "psy-indexer": digest("psy-indexer"),
+                     "psy-bridge-reader": digest("psy-bridge-reader")},
         "paths": paths,
         "units": {"core_prefix": f"psy-core-{namespace}-", "core_namespace_prefix": namespace,
                   "guardian_prefix": f"psy-guardian-{namespace}-",
                   "relayer": f"psy-core-relayer-{namespace}.service", "worker_prefix": f"psy-core-worker-{namespace}-",
                   "proxy_prefix": f"psy-core-prove-proxy-{namespace}-", "faucet": f"psy-faucet-{namespace}.service",
                   "services": f"psy-services-{namespace}.service", "indexer_prefix": f"psy-indexer-{namespace}-",
-                  "envio": f"psy-envio-{namespace}.service"},
+                  "envio": f"psy-envio-{namespace}.service", "bridge_reader": f"psy-bridge-reader-{namespace}.service"},
         "hosts": {"gcp-test-services": "10.0.0.38"},
         "services": {"database": "services_db", "owner": "services_owner", "redis_db": 14,
                      "key_prefix": "svc:", "listen": "10.0.0.38:3001", "backups": f"/var/lib/psy-core/{rid}/checkpoints",
@@ -94,6 +95,9 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
                   "rpc_routes": {chain: f"http://10.0.0.32:{18545 + index}" for index, chain in enumerate(CHAINS)},
                   "node_sha256": digest("envio-node"),
                   "patch_sha256": {name: digest("patch" + name) for name in lock_module.ENVIO_PATCHES}},
+        "bridge_reader": {"database_role": f"bridge_reader_{namespace}", "listen": "127.0.0.1:8740",
+                          "release": f"/opt/psy-bridge-reader/releases/{rid}", "config": f"/etc/psy-bridge-reader/{rid}",
+                          "client_token_file": f"/etc/psy-services-reader-{namespace}/token"},
         "faucet": {"account": "faucet-account", "listen_port": 29998, "operators_sha256": digest("operators")},
         "images": {"scylla": "scylladb/scylla@sha256:" + "b" * 64, "valkey": "valkey/valkey@sha256:" + "c" * 64,
                    "nats": "nats@sha256:" + "d" * 64, "postgres": "postgres@sha256:" + "e" * 64,
@@ -152,6 +156,24 @@ class ReleaseLockTests(unittest.TestCase):
         lock = copy.deepcopy(self.lock)
         lock["sources"]["bridge_reader"] = "6792483a"
         with self.assertRaisesRegex(ValueError, "sources.bridge_reader must be a commit"):
+            self.validate(lock)
+
+    def test_bridge_reader_is_loopback_named_and_pinned(self):
+        for key, value, message in (("listen", "0.0.0.0:8740", "loopback"), ("listen", "127.0.0.1:80", "loopback"),
+                                    ("database_role", "Reader-Role", "identifier"), ("release", "opt/x", "absolute"),
+                                    ("client_token_file", "/etc/psy-services-reader/token", "namespace"),
+                                    ("config", "/etc/psy-bridge-reader", "release id or namespace")):
+            lock = copy.deepcopy(self.lock)
+            lock["bridge_reader"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, message):
+                self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        del lock["binaries"]["psy-bridge-reader"]
+        with self.assertRaisesRegex(ValueError, "binaries fields"):
+            self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        del lock["units"]["bridge_reader"]
+        with self.assertRaisesRegex(ValueError, "units fields"):
             self.validate(lock)
 
     def test_signer_host_must_be_a_known_alias(self):

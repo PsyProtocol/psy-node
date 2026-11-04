@@ -185,6 +185,14 @@ class ClearHostStateTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertTrue(any("new release" in reason for reason in report["refused"]), report)
 
+    def test_clear_refuses_the_bridge_reader_paths_of_the_new_release(self):
+        reader = self.lock["bridge_reader"]
+        for path in (reader["release"], reader["config"], str(Path(reader["client_token_file"]).parent), "/opt/psy-bridge-reader"):
+            with self.subTest(path=path), patch.object(tool, "CLEARABLE", [re.compile(".*")]):
+                code, report = self.run_tool([path], secret=[])
+                self.assertEqual(code, 2)
+                self.assertTrue(any("new release" in reason for reason in report["refused"]), report)
+
     def test_scan_refuses_the_whole_host_on_a_nested_operators_file(self):
         first = self.make("old/a/plain.txt").parent
         second = self.make("old/b/deep/er/operators.json", b"private").parent.parent.parent
