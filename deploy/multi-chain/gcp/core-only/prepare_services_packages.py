@@ -36,8 +36,7 @@ def service_config(topology, lock, documents):
         if documents:
             chains.append({"name": name, "chain_id": chain_id, "chain_index": index,
                            "eth_rpc_url": lock["envio"]["rpc_routes"][name],
-                           "state_manager": json.loads(documents[name])["core"]["StateManager"],
-                           "graphql_url": topology["hasura_url"]})
+                           "state_manager": json.loads(documents[name])["core"]["StateManager"]})
     realm_ids = sorted(int(role[len("realm"):]) for role in topology["indexers"] if role.startswith("realm"))
     endpoints = [{"role": {"type": "Coordinator", "id": 0}, "url": topology["indexers"]["coordinator"]["edge_url"]}]
     endpoints += [{"role": {"type": "Realm", "id": realm_id}, "url": topology["indexers"][f"realm{realm_id}"]["edge_url"]}
@@ -62,8 +61,11 @@ def unit(topology, lock, lock_sha256, user, role):
     name = installer.unit_name(lock, role)
     guard = (f"ExecStartPre=/usr/bin/python3 -I -B {release}/install_services.py guard --package {release} --role {role} "
              f"--release-lock {release}/release-lock.json --release-lock-sha256 {lock_sha256}\n")
-    extra = ""
+    extra, after = "", "network-online.target"
     if role == "services":
+        after += " " + topology["bridge_reader_unit"]
+        extra = (f"Environment=PSY_ENVIO_READ_PATH=reader\nEnvironment=PSY_BRIDGE_READER_URL={topology['bridge_reader_url']}\n"
+                 f"Environment=PSY_BRIDGE_READER_TOKEN_FILE={topology['bridge_reader_token_file']}\n")
         command = (f"{release}/psy-services --config {release}/services.json --network-type psy-public-testnet "
                    f"--genesis-path {release}/genesis.json.zst --run-migrations=true --migrations-path {release}/migrations")
         state = Path(topology["nostr_state"]).name
@@ -84,7 +86,7 @@ def unit(topology, lock, lock_sha256, user, role):
             extra = (f"EnvironmentFile=-{env_file}\nExecStartPre=+/usr/bin/bash -c 'if [ -e {cursor} ]; then : > {env_file}; "
                      f"else echo PSY_INDEXER_START_CHECKPOINT=0 > {env_file}; fi'\n")
     credentials = topology["credentials"] + ("/services.env" if role == "services" else "/indexer.env")
-    return (f"[Unit]\nDescription=Fresh testnet {role}\nWants=network-online.target\nAfter=network-online.target\n\n"
+    return (f"[Unit]\nDescription=Fresh testnet {role}\nWants=network-online.target\nAfter={after}\n\n"
             f"[Service]\nType=simple\nUser={user}\nGroup={user}\nWorkingDirectory={release}\n"
             f"EnvironmentFile={credentials}\nEnvironment=PSY_NETWORK_TYPE=psy-public-testnet\nEnvironment=RUST_LOG=info\n"
             f"{extra}{guard}ExecStart={command}\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\nPrivateTmp=true\n"

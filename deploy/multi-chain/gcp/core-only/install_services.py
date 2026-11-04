@@ -40,7 +40,7 @@ def unit_name(lock, role):
 
 def placement(lock, release_topology):
     """The Services and indexer placement, derived only from the release lock and the release topology."""
-    services, envio = lock["services"], lock["envio"]
+    services, envio, reader = lock["services"], lock["envio"], lock["bridge_reader"]
     addresses = {**release_topology["hosts"], **lock["hosts"]}
     postgres_host = addresses[POSTGRES_ALIAS]
     listen_host, _, listen_port = services["listen"].rpartition(":")
@@ -83,7 +83,8 @@ def placement(lock, release_topology):
             "redis_prefix": services["key_prefix"], "backup_dir": backups, "cursor_dir": backups + "/indexer_state",
             "mirror_dir": mirror, "nostr_state": lock["paths"]["services"]["state"],
             "services_url": "http://" + services["listen"], "services_host": listen_host, "services_port": int(listen_port),
-            "hasura_url": f"http://{postgres_host}:{envio['hasura_port']}/v1/graphql", "envio_database": envio["database"],
+            "bridge_reader_url": "http://" + reader["listen"], "bridge_reader_token_file": reader["client_token_file"],
+            "bridge_reader_unit": lock["units"]["bridge_reader"], "envio_database": envio["database"],
             "groups": groups, "indexers": indexers, "realm_sources": sources, "mirror_sources": mirror_sources}
 
 
@@ -205,15 +206,25 @@ def validate_environment(env, role, topology):
                 and db.port == 5432 and db.username == topology["database_owner"]
                 and db.path == "/" + topology["database"] and bool(db.password)
                 and not db.query and not db.fragment, "fresh database URL required")
-        require(env.get("INDEXER_GRAPHQL_URL") == topology["hasura_url"], "Hasura URL differs from frozen topology")
-        graphql = urlsplit(env.get("INDEXER_GRAPHQL_URL", ""))
-        require(graphql.scheme == "http" and graphql.hostname == topology["postgres_host"]
-                and graphql.port is not None and 1024 < graphql.port < 65536
-                and graphql.port not in (8080, 18080, 9898)
-                and graphql.path == "/v1/graphql" and not graphql.username
-                and not graphql.query and not graphql.fragment, "fresh private Hasura URL required")
-        require(len(env.get("HASURA_GRAPHQL_ADMIN_SECRET", "")) >= 32,
-                "fresh Hasura secret required")
+
+
+def validate_read_path(env, topology):
+    """Services reads Envio only through the Bridge Reader; no GraphQL endpoint or secret may reach it."""
+    require(env.get("PSY_ENVIO_READ_PATH") == "reader", "Services must read Envio through the Bridge Reader")
+    require(env.get("PSY_BRIDGE_READER_URL") == topology["bridge_reader_url"]
+            and env.get("PSY_BRIDGE_READER_TOKEN_FILE") == topology["bridge_reader_token_file"],
+            "Bridge Reader endpoint differs from frozen topology")
+    require(not any(key in env for key in ("INDEXER_GRAPHQL_URL", "ENVIO_GRAPHQL_URL", "HASURA_GRAPHQL_ADMIN_SECRET")),
+            "a GraphQL endpoint or Hasura secret reaches Services")
+
+
+def check_reader_token(topology, account):
+    path = Path(topology["bridge_reader_token_file"])
+    trusted_parents(path)
+    require(path.exists(), "the Bridge Reader token is missing; install the Reader first")
+    st = path.lstat()
+    require(stat.S_ISREG(st.st_mode) and st.st_uid == account.pw_uid and stat.S_IMODE(st.st_mode) == 0o600,
+            "the Bridge Reader token must be a mode 0600 file of the Services account; install the Reader first")
 
 
 def read_credentials(path, role, topology):
@@ -223,7 +234,7 @@ def read_credentials(path, role, topology):
             "credentials must be root-owned regular mode 0600")
     allowed = {"PSY_JWT_SECRET"}
     if role == "services":
-        allowed |= {"DATABASE_URL", "INDEXER_GRAPHQL_URL", "HASURA_GRAPHQL_ADMIN_SECRET"}
+        allowed |= {"DATABASE_URL"}
     values = {}
     for line in path.read_text().splitlines():
         key, sep, value = line.partition("=")
@@ -267,6 +278,7 @@ def check_host(root, manifest, topology, lock):
             require((backup / item["backup_subdir"]).is_dir(), "fresh backup subtree missing")
             subprocess.run(["systemctl", "is-active", "--quiet", item["core_unit"]], check=True)
     if "services" in group["roles"]:
+        check_reader_token(topology, account)
         require(not os.path.lexists(topology["nostr_state"]), "fresh Nostr state already exists")
         with socket.socket() as sock:
             sock.bind((topology["services_host"], topology["services_port"]))
@@ -335,6 +347,8 @@ def main():
         require(manifest["l1_ready"], "fresh L1 documents missing")
         require(args.role in topology["groups"][manifest["group"]]["roles"], "role mismatch")
         validate_environment(os.environ, args.role, topology)
+        if args.role == "services":
+            validate_read_path(os.environ, topology)
     elif args.mode in ("check-host", "install"):
         account = check_host(args.package, manifest, topology, lock)
         if args.mode == "install":

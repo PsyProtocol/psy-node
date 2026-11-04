@@ -209,7 +209,7 @@
   "tool_sha256": {
     "activate_bridge.py": "d4100211b1b736bf159eec67c6093dd41de245a3374c9ae7156eac2d5edbb642",
     "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
-    "activate_services.py": "d1654378c69760188c4c1b21028baf91d90ebf534b3d240c4d5e18c4d9ab8b74",
+    "activate_services.py": "db8c576586ac361ad650da5a3d4e1aa02ba0e33108731db11ca2122d5870e31b",
     "admin_pause.py": "458b17f2f2278298650ba264b6e33fd0f5ba4459a68ece6cf0e777d2f524d30f",
     "caddy_ingress.py": "3243caf141032673485139017afd95079947065d2b86a63d099e98ff6582818c",
     "clear_host_state.py": "121782e230504e9282fad1dea2875db9b42a3a6d1cec255a1a573dd5b9f2f1db",
@@ -222,7 +222,7 @@
     "install_guardian.py": "b12f963e776078142dd08a77e894ed54d3f0add0f6e1b54093d3de4b0ddb7b96",
     "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
     "install_relayer.py": "5e15d87644ec078eb40f4f62b69c34da4a1b02770888d9c63b5b6b7a8319e184",
-    "install_services.py": "56b4be1afc66fde56f6e0a461b3a9350d419e4a38aecc982127db1f78748e3df",
+    "install_services.py": "bcd644c1a92cfbaba9ba7d5b16f3313d650a7296302ae81dc6a77ee92ba5e8bc",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
     "prepare_faucet.py": "4d219b12c569f4ace495ea03e9a26436be91d48a100575980babdcdd505eb697",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",

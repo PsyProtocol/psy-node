@@ -203,14 +203,14 @@ def database_login(ctx):
 
 
 def service_values(ctx):
-    """Generated once, kept in the operator state directory, shared by Envio, Services and the indexers."""
+    """Generated once, kept in the operator state directory, shared by the Bridge Reader, Services and the indexers."""
     path = ctx.state_dir / "service-credentials.json"
     if not path.exists():
-        values = {"hasura_admin_secret": secrets.token_urlsafe(32), "jwt_secret": secrets.token_hex(32),
-                  "bridge_reader_login": secrets.token_urlsafe(48), "bridge_reader_token": secrets.token_hex(32)}
+        values = {"jwt_secret": secrets.token_hex(32), "bridge_reader_login": secrets.token_urlsafe(48),
+                  "bridge_reader_token": secrets.token_hex(32)}
         bridge.write_new(path, bridge.encode(values))
     values = release_lock.read_document(path)
-    prepare.require(set(values) == {"hasura_admin_secret", "jwt_secret", "bridge_reader_login", "bridge_reader_token"},
+    prepare.require(set(values) == {"jwt_secret", "bridge_reader_login", "bridge_reader_token"},
                     "recorded service values differ in shape")
     prepare.require(LOGIN_PATTERN.fullmatch(values["bridge_reader_login"]) is not None
                     and re.fullmatch(r"[0-9a-f]{64}", values["bridge_reader_token"]) is not None,
@@ -532,7 +532,8 @@ def services_check(ctx):
                     "local-inputs packages.services.mirror_host_keys must hold a host key for every mirror source")
     mirror_sources(sources, keys)
     database_login(ctx)
-    prepare.require(envio_rows_ready(ctx), "Envio is not polling all three chains; start Envio first")
+    prepare.require(reader_report(ctx, services_alias(read_placement(ctx)))["reader_ready"],
+                    "the Bridge Reader is not ready; start it first")
 
 
 def write_env_file(ctx, host, path, lines):
@@ -553,8 +554,7 @@ def write_credentials(ctx, placement):
     for alias, group in placement["groups"].items():
         if "services" in group["roles"]:
             write_env_file(ctx, alias, placement["credentials"] + "/services.env",
-                           [f"DATABASE_URL={url}", f"INDEXER_GRAPHQL_URL={placement['hasura_url']}",
-                            f"HASURA_GRAPHQL_ADMIN_SECRET={values['hasura_admin_secret']}", f"PSY_JWT_SECRET={values['jwt_secret']}"])
+                           [f"DATABASE_URL={url}", f"PSY_JWT_SECRET={values['jwt_secret']}"])
         else:
             write_env_file(ctx, alias, placement["credentials"] + "/indexer.env", [f"PSY_JWT_SECRET={values['jwt_secret']}"])
 
@@ -748,17 +748,14 @@ def watermark_advancing(ctx, placement, role, message):
     return read_cursor(ctx, placement, role)
 
 
-def deposit_root_rows(ctx):
-    """A well-formed answer from Hasura for the deposit root of each chain; no rows is the fresh state."""
-    host, port = ctx.lock["hosts"][POSTGRES_ALIAS], ctx.lock["envio"]["hasura_port"]
-    script = ("python3 -I - <<'PSY_QUERY_END'\nimport json, urllib.request\nout = {}\nfor index in (0, 1, 2):\n"
-              "    body = json.dumps({'query': 'query { DepositTreeMeta(where: {chain_index: {_eq: %%d}}) { chain_index last_count } }' %% index}).encode()\n"
-              "    request = urllib.request.Request('http://%s:%d/v1/graphql', data=body, headers={'Content-Type': 'application/json'})\n"
-              "    try:\n        answer = json.loads(urllib.request.urlopen(request, timeout=15).read())\n"
-              "        rows = answer.get('data', {}).get('DepositTreeMeta')\n"
-              "        out[str(index)] = len(rows) if isinstance(rows, list) and not answer.get('errors') else None\n"
-              "    except Exception:\n        out[str(index)] = None\nprint(json.dumps(out))\nPSY_QUERY_END\n") % (host, port)
-    return json.loads(ctx.remote.run_script(POSTGRES_ALIAS, script, SHORT_SECONDS).strip().splitlines()[-1])
+def services_reader_state(ctx, placement):
+    """details.bridge_reader of Services' /health/ready: whether Services itself reaches a ready Bridge Reader."""
+    script = ("python3 -I - <<'PSY_HTTP_END'\nimport json, urllib.request\ntry:\n"
+              "    body = json.loads(urllib.request.urlopen(%r, timeout=10).read())\n"
+              "    print(json.dumps(body.get('details', {}).get('bridge_reader', {}).get('ready') is True))\n"
+              "except Exception:\n    print('false')\nPSY_HTTP_END\n") % (placement["services_url"] + "/health/ready")
+    output = ctx.remote.run_script(services_alias(placement), script, SHORT_SECONDS).strip().splitlines()
+    return bool(output) and output[-1] == "true"
 
 
 def services_verify(ctx):
@@ -776,11 +773,11 @@ def services_verify(ctx):
                                                        "the Coordinator indexer watermark is not advancing")}
     realm = sorted(role for role in placement["indexers"] if role.startswith("realm"))[0]
     watermarks[realm] = watermark_advancing(ctx, placement, realm, REALM_STALL_MESSAGE)
-    rows = deposit_root_rows(ctx)
-    prepare.require(set(rows) == {"0", "1", "2"} and all(value is not None for value in rows.values()),
-                    "the deposit root query failed on at least one chain")
-    return {"services_ready": True, "units": sorted(units), "watermarks": watermarks, "deposit_root_rows": rows,
-            "services_host": alias}
+    prepare.require(services_reader_state(ctx, placement), "Services does not report a ready Bridge Reader")
+    report = reader_report(ctx, alias)
+    prepare.require(report["reader_ready"], "the Bridge Reader is not ready on all three chains")
+    return {"services_ready": True, "units": sorted(units), "watermarks": watermarks, "reader_ready": True,
+            "deposits": {str(row["chain_index"]): row["deposit_count"] for row in report["chains"]}, "services_host": alias}
 
 
 SERVICES_STEPS = {

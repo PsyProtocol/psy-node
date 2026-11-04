@@ -20,6 +20,7 @@ from test_services_packages import ServicesWorld, sha
 
 REAL_READ_CURSOR = steps.read_cursor
 REAL_READER_ROLE_SQL = steps.reader_role_sql
+REAL_SERVICES_READER_STATE = steps.services_reader_state
 
 
 class BridgeWorld(ServicesWorld):
@@ -298,14 +299,16 @@ class VerifyTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.cursors = {"coordinator": [10, 12], "realm0": [4, 6]}
-        self.rows = {"0": 0, "1": 0, "2": 0}
+        self.reader = {"reader_ready": True, "envio_chain_ids": [97, 84532, 11155111], "chains": []}
+        self.services_reader = True
         self.status = 200
         for name, replacement in (
                 ("unit_state", lambda ctx, host, unit: {"LoadState": "loaded", "ActiveState": "active", "UnitFileState": "enabled",
                                                         "MainPID": "9", "NRestarts": "0"}),
                 ("http_status", lambda ctx, host, url: self.status),
                 ("read_cursor", self.read_cursor),
-                ("deposit_root_rows", lambda ctx: dict(self.rows))):
+                ("reader_report", lambda ctx, alias: dict(self.reader)),
+                ("services_reader_state", lambda ctx, placement: self.services_reader)):
             patcher = patch.object(steps, name, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -349,16 +352,39 @@ class VerifyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "without restarts"):
                 steps.services_verify(self.ctx)
 
-    def test_verify_requires_empty_deposit_root_query_on_three_chains(self):
-        self.assertEqual(steps.services_verify(self.ctx)["deposit_root_rows"], {"0": 0, "1": 0, "2": 0})
-        for bad in ({"0": 0, "1": None, "2": 0}, {"0": 0, "1": 0}):
-            self.cursors = {"coordinator": [10, 12], "realm0": [4, 6]}
-            self.rows = bad
-            with self.subTest(rows=bad), self.assertRaisesRegex(ValueError, "deposit root query"):
-                steps.services_verify(self.ctx)
+    def test_verify_reads_deposits_through_services_and_the_reader_not_hasura(self):
+        self.assertEqual(steps.services_verify(self.ctx)["deposits"], {})
         self.cursors = {"coordinator": [10, 12], "realm0": [4, 6]}
-        self.rows = {"0": 0, "1": 0, "2": 3}
-        self.assertEqual(steps.services_verify(self.ctx)["deposit_root_rows"]["2"], 3)
+        self.reader["chains"] = [{"chain_index": 2, "deposit_count": 3}]
+        self.assertEqual(steps.services_verify(self.ctx)["deposits"], {"2": 3})
+        self.cursors = {"coordinator": [10, 12], "realm0": [4, 6]}
+        self.services_reader = False
+        with self.assertRaisesRegex(ValueError, "Services does not report a ready Bridge Reader"):
+            steps.services_verify(self.ctx)
+        self.cursors = {"coordinator": [10, 12], "realm0": [4, 6]}
+        self.services_reader, self.reader["reader_ready"] = True, False
+        with self.assertRaisesRegex(ValueError, "not ready on all three chains"):
+            steps.services_verify(self.ctx)
+
+    def test_services_reader_state_reads_the_health_details(self):
+        placement = steps.read_placement(self.ctx)
+        for output, expected in (("true\n", True), ("false\n", False), ("", False)):
+            remote = SimpleNamespace(run_script=lambda host, script, timeout: output)
+            with self.subTest(output=output):
+                self.assertIs(REAL_SERVICES_READER_STATE(SimpleNamespace(**{**vars(self.ctx), "remote": remote}), placement), expected)
+
+    def test_services_check_needs_a_ready_reader(self):
+        with patch.object(steps, "bridge_state", return_value={"services": {"gcp-svc": {}}}), \
+                patch.object(steps.prepare, "check_tool_hash"), patch.object(steps, "mirror_sources"), \
+                patch.object(steps, "database_login"), \
+                patch.object(steps.prepare, "local_value", return_value={"mirror_host_keys": {"10.0.0.25": "k", "10.0.0.42": "k",
+                                                                                              "10.0.0.43": "k"}}), \
+                patch.object(steps, "read_placement", return_value={"groups": {"gcp-svc": {"roles": ["services"]}},
+                                                                    "mirror_sources": {}}):
+            steps.services_check(self.ctx)
+            self.reader["reader_ready"] = False
+            with self.assertRaisesRegex(ValueError, "Bridge Reader is not ready"):
+                steps.services_check(self.ctx)
 
     def test_envio_verify_needs_polling_that_advances_on_all_three_chains(self):
         chains = prepare_envio.CHAINS
@@ -410,7 +436,6 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(steps.service_values(self.ctx), first)
         path = self.world.state_dir / "service-credentials.json"
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertGreaterEqual(len(first["hasura_admin_secret"]), 32)
         self.assertRegex(first["jwt_secret"], r"[0-9a-f]{64}")
         self.assertRegex(first["bridge_reader_token"], r"^[0-9a-f]{64}$")
         self.assertRegex(first["bridge_reader_login"], r"^[A-Za-z0-9_-]{64}$")

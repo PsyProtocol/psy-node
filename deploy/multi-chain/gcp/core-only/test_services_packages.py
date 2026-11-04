@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -116,6 +117,88 @@ class ServicesPackageTests(unittest.TestCase):
         unit = (output / "gcp-svc/units" / self.lock["units"]["services"]).read_text()
         self.assertIn("--release-lock-sha256 " + self.world.lock_sha256, unit)
         self.assertNotIn("20261026", unit)
+
+    def test_services_reads_envio_only_through_the_bridge_reader(self):
+        output, _ = self.world.build("final", self.world.summaries())
+        placement = self.world.placement()
+        reader = self.lock["bridge_reader"]
+        self.assertEqual((placement["bridge_reader_url"], placement["bridge_reader_token_file"]),
+                         ("http://" + reader["listen"], reader["client_token_file"]))
+        self.assertNotIn("hasura_url", placement)
+        unit = (output / "gcp-svc/units" / self.lock["units"]["services"]).read_text()
+        self.assertIn("Environment=PSY_ENVIO_READ_PATH=reader\n", unit)
+        self.assertIn(f"Environment=PSY_BRIDGE_READER_URL=http://{reader['listen']}\n", unit)
+        self.assertIn(f"Environment=PSY_BRIDGE_READER_TOKEN_FILE={reader['client_token_file']}\n", unit)
+        self.assertIn(f"After=network-online.target {self.lock['units']['bridge_reader']}\n", unit)
+        self.assertNotIn("GRAPHQL", unit.upper())
+        indexer = (output / "gcp-cp/units" / installer.unit_name(self.lock, "coordinator")).read_text()
+        self.assertNotIn("PSY_BRIDGE_READER", indexer)
+        config = json.loads((output / "gcp-svc/services.json").read_bytes())
+        self.assertTrue(config["l1_chains"] and all("graphql_url" not in row for row in config["l1_chains"]))
+
+    def test_guard_requires_the_reader_path_and_refuses_graphql(self):
+        placement = self.world.placement()
+        env = {"PSY_ENVIO_READ_PATH": "reader", "PSY_BRIDGE_READER_URL": placement["bridge_reader_url"],
+               "PSY_BRIDGE_READER_TOKEN_FILE": placement["bridge_reader_token_file"]}
+        installer.validate_read_path(env, placement)
+        for change in ({"PSY_ENVIO_READ_PATH": "pg"}, {"PSY_ENVIO_READ_PATH": "graphql"},
+                       {"PSY_BRIDGE_READER_URL": "http://10.0.0.38:8740"}, {"PSY_BRIDGE_READER_TOKEN_FILE": "/tmp/token"},
+                       {"INDEXER_GRAPHQL_URL": "http://10.0.0.24:38081/v1/graphql"}, {"HASURA_GRAPHQL_ADMIN_SECRET": "x" * 32}):
+            with self.subTest(change=change), self.assertRaises(installer.ValidationError):
+                installer.validate_read_path({**env, **change}, placement)
+
+    def test_services_credentials_hold_only_the_database_url_and_jwt(self):
+        placement = self.world.placement()
+        directory = Path(self.temp.name) / "credentials"
+        directory.mkdir()
+        path = directory / "services.env"
+        url = f"postgresql://{placement['database_owner']}:pw@{placement['postgres_host']}:5432/{placement['database']}"
+        path.write_text(f"DATABASE_URL={url}\nPSY_JWT_SECRET={'a' * 64}\n")
+        path.chmod(0o600)
+        with patch.object(installer, "trusted_parents"), \
+                patch.object(installer.Path, "stat", return_value=SimpleNamespace(st_mode=0o100600, st_uid=0)):
+            self.assertEqual(set(installer.read_credentials(path, "services", placement)), {"DATABASE_URL", "PSY_JWT_SECRET"})
+            path.write_text(path.read_text() + "INDEXER_GRAPHQL_URL=http://10.0.0.24:38081/v1/graphql\n")
+            with self.assertRaises(installer.ValidationError):
+                installer.read_credentials(path, "services", placement)
+
+    def test_reader_token_must_belong_to_the_services_account(self):
+        placement = dict(self.world.placement(), bridge_reader_token_file=str(Path(self.temp.name) / "client/token"))
+        token = Path(placement["bridge_reader_token_file"])
+        token.parent.mkdir()
+        token.write_text("b" * 64 + "\n")
+        token.chmod(0o600)
+        account = SimpleNamespace(pw_uid=os.getuid())
+        with patch.object(installer, "trusted_parents"):
+            installer.check_reader_token(placement, account)
+            token.chmod(0o640)
+            with self.assertRaisesRegex(installer.ValidationError, "install the Reader first"):
+                installer.check_reader_token(placement, account)
+            token.chmod(0o600)
+            with self.assertRaisesRegex(installer.ValidationError, "install the Reader first"):
+                installer.check_reader_token(placement, SimpleNamespace(pw_uid=os.getuid() + 1))
+            token.unlink()
+            with self.assertRaisesRegex(installer.ValidationError, "install the Reader first"):
+                installer.check_reader_token(placement, account)
+
+    def test_services_activation_checks_the_reader_not_hasura(self):
+        placement = self.world.placement()
+        root = Path(self.temp.name) / "release"
+        calls = []
+        helper = SimpleNamespace(require=lambda ok, message: None, trusted_parents=lambda path: None, no_links=lambda path: None,
+                                 unit_name=installer.unit_name, fence_services=lambda names: None,
+                                 read_credentials=lambda path, role, topology: calls.append(("credentials", role)),
+                                 check_reader_token=lambda topology, account: calls.append(("token", account.pw_name)),
+                                 unit_status=lambda name: {"ActiveState": "active", "FragmentPath": "/etc/systemd/system/" + name})
+        topology = dict(placement, release=str(root), groups={"gcp-svc": dict(placement["groups"]["gcp-svc"], host="10.0.0.38")})
+        with patch.object(activate_services.subprocess, "check_output", return_value="10.0.0.38"), \
+                patch.object(activate_services.pwd, "getpwnam", return_value=SimpleNamespace(pw_name="parth")), \
+                patch.object(activate_services, "http_health", side_effect=lambda url: calls.append(("health", url))), \
+                patch.object(activate_services.Path, "read_bytes", return_value=b""):
+            activate_services.preflight(helper, root, {"l1_ready": True, "group": "gcp-svc"}, topology, self.lock)
+        self.assertIn(("token", "parth"), calls)
+        self.assertIn(("health", placement["bridge_reader_url"] + "/health/ready"), calls)
+        self.assertFalse(any("38081" in str(call) or "graphql" in str(call) for call in calls))
 
     def test_core_unit_names_use_lock_prefix(self):
         placement = self.world.placement()

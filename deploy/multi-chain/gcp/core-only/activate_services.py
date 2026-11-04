@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import stat
 import subprocess
 import time
@@ -67,7 +68,8 @@ def preflight(helper, root, manifest, topology, lock):
         if value["ActiveState"] == "inactive":
             helper.require(value.get("MainPID") == "0", "inactive unit still has PID")
     if role == "services":
-        http_health(topology["hasura_url"].replace("/v1/graphql", "/healthz"))
+        helper.check_reader_token(topology, pwd.getpwnam(group["user"]))
+        http_health(topology["bridge_reader_url"] + "/health/ready")
     else:
         http_health(topology["services_url"] + "/health")
         for name in group["roles"]:
