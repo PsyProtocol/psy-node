@@ -109,15 +109,21 @@ impl PsyWalletServer {
         let relays = match a.relay.as_deref() {
             Some(explicit) => match guard_outbound_url(explicit) {
                 Ok(()) => vec![explicit.to_string()],
-                Err(e) => return err_json(e, json!({ "gate": "url" })),
+                Err(e) => {
+                    self.policy.lock().unwrap().refund(&auth, charge);
+                    return err_json(e, json!({ "gate": "url" }));
+                }
             },
             None => {
                 match state.wallet.nostr_relay(&network) {
                     Some(configured) => vec![configured],
-                    None => return err_json(
-                        format!("network `{network}` has no non-empty `nostr_relay_url` in config.json"),
-                        json!({ "gate": "config", "field": "nostr_relay_url" }),
-                    ),
+                    None => {
+                        self.policy.lock().unwrap().refund(&auth, charge);
+                        return err_json(
+                            format!("network `{network}` has no non-empty `nostr_relay_url` in config.json"),
+                            json!({ "gate": "config", "field": "nostr_relay_url" }),
+                        );
+                    }
                 }
             }
         };
@@ -250,5 +256,87 @@ impl PsyWalletServer {
                     "relays": relays,
                     "note": "The funds are debited and the recovery material is safe on the server host (owner-side; path in the server log)." }),
         )
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn relay_preflight_refunds(relay: Option<&str>, configured: &str, gate: &str) {
+        let wallet = crate::wallet::private_transfer_fixture::wallet(configured);
+        let mut policy = PolicyEngine::new();
+        policy.set_current_wallet("relay-test", 42);
+        let policy_id = policy.create_policy("relay-test", policy::Limits {
+            per_transaction: 1_000,
+            per_day: 1_000,
+            per_month: Some(2_000),
+            total_budget: Some(3_000),
+        }, None, vec!["private_transfer".to_string()]);
+        let (session, _) = policy.issue_session(&policy_id, 60, Some(100)).unwrap();
+        // Keep a real prior authorization: a failed request must refund only
+        // its own row, never erase another payment's counters or log status.
+        let prior = policy.authorize_for("relay-test", Some(42), &session, "prior-recipient", 25, "private_transfer").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let server = PsyWalletServer {
+            state: Arc::new(ServerState { wallet }),
+            consumed_payments: Arc::new(x402_state::ConsumedPayments::load(dir.path())),
+            policy: Arc::new(std::sync::Mutex::new(policy)),
+            pending_transactions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tool_router: PsyWalletServer::private_tools_router(),
+        };
+        for attempt in 1..=2 {
+            let result = server.private_transfer(Parameters(PrivateTransferArgs {
+                network: Some("relay-test".to_string()),
+                session: session.clone(),
+                to_shielded_address: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                recipient_npub: "unused-before-settlement".to_string(),
+                amount_nano: 75,
+                token: "PSY".to_string(),
+                relay: relay.map(str::to_string),
+                dry_run: false,
+            })).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(body["gate"], gate, "must reach the relay preflight after authorization");
+            if gate == "config" {
+                assert_eq!(body["field"], "nostr_relay_url");
+            }
+            let mut policy = server.policy.lock().unwrap();
+            let budget = policy.budget(&session).unwrap();
+            assert_eq!((budget.spent_today, budget.spent_this_month, budget.spent_total), (25, 25, 25));
+            assert_eq!((budget.remaining_day, budget.remaining_month, budget.remaining_total), (975, Some(1_975), Some(2_975)));
+            let log = policy.spend_log(10, Some(&policy_id));
+            assert_eq!(log.len(), attempt + 1, "each failed attempt must retain its authorization row");
+            for record in &log {
+                assert_eq!(record.refunded, !prior.spend_ids.contains(&record.id));
+            }
+            assert_eq!(log[0].amount_nano, 75);
+            assert_eq!(log[0].method, "private_transfer");
+            assert_eq!(log[0].network.as_deref(), Some("relay-test"));
+        }
+        // The policy caps still allow this amount even if the session leaked;
+        // succeeding proves that both failed requests restored the session cap.
+        let mut policy = server.policy.lock().unwrap();
+        let next = policy.authorize_for("relay-test", Some(42), &session, "next-recipient", 75, "private_transfer").unwrap();
+        assert!(policy.authorize_for("relay-test", Some(42), &session, "next-recipient", 1, "private_transfer").is_err());
+        assert!(!policy.spend_log(1, Some(&policy_id))[0].refunded);
+        policy.refund(&next, 75);
+        assert_eq!(policy.budget(&session).unwrap().spent_total, 25);
+    }
+
+    #[tokio::test]
+    async fn private_transfer_invalid_relay_refunds_policy_and_session() {
+        for relay in ["not a url", "http://127.0.0.1:1337", "http://169.254.169.254/latest/meta-data/", "file:///etc/passwd"] {
+            relay_preflight_refunds(Some(relay), "wss://1.1.1.1", "url").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn private_transfer_empty_configured_relay_refunds_policy_and_session() {
+        for configured in ["", "   "] {
+            relay_preflight_refunds(None, configured, "config").await;
+        }
     }
 }

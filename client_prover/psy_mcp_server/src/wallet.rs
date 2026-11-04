@@ -3627,3 +3627,61 @@ mod withdraw_nonce_reservation_tests {
     }
 
 }
+
+
+#[cfg(test)]
+pub(crate) mod private_transfer_fixture {
+    use super::*;
+
+    /// Only preflight is exercised: no RPC client, circuit manager, or prover
+    /// may run before an invalid relay returns its tool error.
+    pub(crate) fn wallet(nostr_relay_url: &str) -> WalletManager {
+        let network = NetworkId::new("relay-test").unwrap();
+        let config = psy_config::PsyConfigGoldilocks::from_json(&serde_json::json!({
+            "defaultNetwork": network.as_str(),
+            "networks": {
+                "relay-test": {
+                    "magic": format!("0x{:016x}", psy_config::PSY_NETWORK_MAGIC),
+                    "users_per_realm": 1_048_576,
+                    "global_user_tree_height": 32,
+                    "realm_user_tree_height": 20,
+                    "group_realm_height": 12,
+                    "realm_configs": [{ "id": 0, "rpc_url": ["http://127.0.0.1:1"] }],
+                    "p2p": { "checkpoints_per_epoch": 1 },
+                    "coordinator_configs": [{ "id": 0, "rpc_url": ["http://127.0.0.1:1"] }],
+                    "prove_proxy_url": [],
+                    "faucet_rpc_url": [],
+                    "nostr_relay_url": nostr_relay_url,
+                    "native_currency": "PSY",
+                    "native_currency_decimal": 9,
+                    "native_currency_name": "PSY",
+                    "fees": { "register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0 }
+                }
+            }
+        }).to_string()).unwrap();
+        let session = WalletSession {
+            wallet: psy_prover::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new()),
+            circuit_info: psy_client_data::qstore::controllers::session_info::SessionCircuitInfoStore::new(),
+            st_provider: psy_provider::provider::RpcProvider::new_with_config(config.get_current_network().unwrap()).unwrap(),
+            local_proving_job_manager: psy_prover::trace::proof_schedule::JobManager::empty(),
+            user_session_mgrs: Default::default(),
+            sign_while_finalizing: false,
+        };
+        let mut state = NetworkWallet { session, users: HashMap::new(), active_user: None };
+        state.activate(LoadedUser {
+            name: "relay-test".to_string(),
+            pk_hash: QHashOut::from_values(1, 2, 3, 4),
+            user_id: 42,
+            fingerprint: QHashOut::ZERO,
+            sign_type: "zk".to_string(),
+            mandate: None,
+            private_key: QHashOut::ZERO,
+        });
+        WalletManager {
+            config,
+            mcp_networks: HashMap::from([(network.clone(), McpNetworkConfig::default())]),
+            default_network: network.clone(),
+            networks: RwLock::new(HashMap::from([(network, Arc::new(Mutex::new(state)))])),
+        }
+    }
+}
