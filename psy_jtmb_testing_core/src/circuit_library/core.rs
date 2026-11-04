@@ -21,6 +21,7 @@ pub fn get_jtmb_circuit_library_and_prover_for_network<C: JTMBCircuitConfig>(
 ) -> anyhow::Result<(JTMBGenericCircuitVerifier<C>, QEDCoordinatorCircuitManager<C>)> {
     let circuit_config = get_circuit_config_for_network(network);
     let authority_key = get_test_circuit_authority_key(network);
+    let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
 
     let mut verifier = JTMBGenericCircuitVerifier::<C>::new();
 
@@ -45,6 +46,8 @@ pub fn get_jtmb_circuit_library_and_prover_for_network<C: JTMBCircuitConfig>(
         circuit_config.global_contract_tree_height,
         circuit_config.batch_deploy_contract_sub_tree_height,
         circuit_config.max_contract_state_tree_height,
+        psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<C::F, C::Hash, C::Hasher>(network.get_chain_id()),
+        rotation,
     );
 
     manager.register_library(&mut verifier.library);

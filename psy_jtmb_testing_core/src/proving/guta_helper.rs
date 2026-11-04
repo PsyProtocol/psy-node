@@ -1,3 +1,4 @@
+use parth_common::realm_rotation::RealmRotationConfig;
 use parth_common::{memory_stores::simple_merkle_tree::SimpleMerkleTree, secp256k1::MemorySecp256K1SinglePrivateKeyWallet};
 use parth_core::
     crypto::hash::merkle_proof::MerkleProofCore
@@ -13,6 +14,7 @@ use crate::{
     proving::circuits::{
         dummy_end_cap::DummyUPSStandardEndCapCircuit,
         guta::{
+            realm_finalize_guta::RealmFinalizeGUTACircuit,
             guta_no_change::GUTANoChangeCircuit, verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::GUTAVerifyTwoGUTALinearCircuit, verify_guta_to_cap::GUTAVerifyGUTAToCapCircuit, verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_linear_transition_upgrade_checkpoint::GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2
         },
     },
@@ -36,6 +38,7 @@ pub struct QEDGUTACircuitManager<C: JTMBCircuitConfig> {
     pub verify_guta_to_cap_upgrade_checkpoint: GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C>,
     pub verify_guta_left_linear_right_leaf_upgrade_checkpoint: GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit<C>,
     pub no_change: GUTANoChangeCircuit<C>,
+    pub realm_finalize_guta: RealmFinalizeGUTACircuit<C>,
 
     // Whitelist Config
     pub guta_circuit_whitelist_root: C::Hash,
@@ -52,6 +55,7 @@ pub struct QEDGUTACircuitManager<C: JTMBCircuitConfig> {
     pub verify_guta_to_cap_upgrade_checkpoint_whitelist_proof: MerkleProofCore<C::Hash>,
     pub verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof: MerkleProofCore<C::Hash>,
     pub no_change_whitelist_proof: MerkleProofCore<C::Hash>,
+    pub realm_finalize_guta_whitelist_proof: MerkleProofCore<C::Hash>,
 }
 
 impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
@@ -62,6 +66,8 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
         max_guta_nca_merkle_proof_height: usize,
+        chain_domain: C::Hash,
+        rotation: RealmRotationConfig,
     ) -> Self {
         // Instantiate a dummy end cap to get its fingerprint
         let end_cap_circuit = DummyUPSStandardEndCapCircuit::<C>::new(private_key);
@@ -117,6 +123,8 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
                 max_guta_nca_merkle_proof_height,
         );
         let no_change = GUTANoChangeCircuit::new(private_key, checkpoint_tree_height);
+        let realm_finalize_guta = RealmFinalizeGUTACircuit::new(private_key, global_user_tree_height,
+            global_user_tree_realm_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height, chain_domain, rotation);
 
         // 2. Generate Whitelist Merkle Tree
         let mut guta_circuit_whitelist_proofs = SimpleMerkleTree::<C::Hasher, C::Hash>::gen_fast_tree_inclusion_proofs(
@@ -133,6 +141,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
                 verify_guta_to_cap_upgrade_checkpoint.get_fingerprint(),
                 verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_fingerprint(),
                 no_change.get_fingerprint(),
+                realm_finalize_guta.get_fingerprint(),
             ],
         )
         .expect("Failed to generate GUTA whitelist");
@@ -151,6 +160,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
         let verify_guta_to_cap_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let no_change_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
+        let realm_finalize_guta_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
 
         Self {
             verify_single_end_cap,
@@ -164,6 +174,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
             verify_guta_to_cap_upgrade_checkpoint,
             verify_guta_left_linear_right_leaf_upgrade_checkpoint,
             no_change,
+            realm_finalize_guta,
 
             guta_circuit_whitelist_root,
 
@@ -178,6 +189,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
             verify_guta_to_cap_upgrade_checkpoint_whitelist_proof,
             verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof,
             no_change_whitelist_proof,
+            realm_finalize_guta_whitelist_proof,
         }
     }
 
@@ -194,6 +206,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
             &self.verify_guta_to_cap_upgrade_checkpoint,
             &self.verify_guta_left_linear_right_leaf_upgrade_checkpoint,
             &self.no_change,
+            &self.realm_finalize_guta,
         ];
 
         for c in circuits {
@@ -212,6 +225,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
             ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
             ProvingJobCircuitType::GUTANoChange,
+            ProvingJobCircuitType::RealmFinalizeGUTA,
         ];
 
         library.add_inclusion_proof(
@@ -265,6 +279,7 @@ impl<C: JTMBCircuitConfig> QEDGUTACircuitManager<C> {
             self.verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof.clone(),
         );
         library.add_inclusion_proof(&all_group, ProvingJobCircuitType::GUTANoChange, self.no_change_whitelist_proof.clone());
+        library.add_inclusion_proof(&all_group, ProvingJobCircuitType::RealmFinalizeGUTA, self.realm_finalize_guta_whitelist_proof.clone());
     }
 }
 
@@ -281,7 +296,8 @@ impl<C: JTMBCircuitConfig> QNextGenWorkerGenericInfo<QProvingJobDataID> for QEDG
             | ProvingJobCircuitType::GUTANoChange
             | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
-            | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint => true,
+            | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
+            | ProvingJobCircuitType::RealmFinalizeGUTA => true,
             _ => false,
         }
     }
@@ -341,6 +357,8 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> PsyWorkerGener
                 .jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?,
             ProvingJobCircuitType::GUTANoChange => self
                 .no_change
+                .jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?,
+            ProvingJobCircuitType::RealmFinalizeGUTA => self.realm_finalize_guta
                 .jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?,
             _ => anyhow::bail!("Unsupported GUTA circuit type: {:?}", input.base.job.job_id.circuit_type),
         };

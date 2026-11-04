@@ -61,6 +61,8 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         global_contract_tree_height: usize,
         batch_deploy_contract_sub_tree_height: usize,
         max_contract_state_tree_height: usize,
+        chain_domain: C::Hash,
+        rotation: parth_common::realm_rotation::RealmRotationConfig,
     ) -> Self {
         let max_guta_nca_merkle_proof_height = (global_user_tree_height - global_user_tree_realm_height).max(global_user_tree_realm_height);
 
@@ -71,6 +73,8 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
             max_guta_nca_merkle_proof_height,
+            chain_domain,
+            rotation,
         );
 
         let append_user_registration_tree = BatchAppendUserRegistrationTreeCircuit::new(
