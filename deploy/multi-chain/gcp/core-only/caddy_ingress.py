@@ -3,7 +3,8 @@
 
 Hosts and the maintenance tag come from the release lock. Stage renders a candidate
 Caddyfile and checks its native adaptation; check validates it and with --apply writes
-the source and bind files, then reloads Caddy. Only listed hosts change. No restart.
+the source and bind files, then reloads Caddy. Only listed hosts change: fenced and
+Faucet hosts get or lose the 503 route, retired hosts lose their site block. No restart.
 The bind-write transaction is adapted from the reviewed R2 Caddy apply helper.
 """
 import argparse
@@ -51,9 +52,7 @@ def read_release_lock(encoded_lock, expected_sha256):
 
 def read_ingress(lock):
     ingress = dict(lock['ingress'])
-    if 'envio' in lock and 'gcp-postgres' in lock.get('hosts', {}):
-        ingress['indexer_upstream'] = f"{lock['hosts']['gcp-postgres']}:{lock['envio']['hasura_port']}"
-    hosts = ingress['fenced_hosts'] + ingress['faucet_hosts']
+    hosts = ingress['fenced_hosts'] + ingress['faucet_hosts'] + ingress['retired_hosts']
     require(all(isinstance(host, str) and re.fullmatch(r'[a-z0-9.-]+', host) for host in hosts) and len(set(hosts)) == len(hosts),
             'ingress hosts must be distinct DNS names')
     require(isinstance(ingress['maintenance_tag'], str) and re.fullmatch(r'[a-z0-9-]+', ingress['maintenance_tag']),
@@ -152,11 +151,10 @@ def has_gate(route):
 
 
 def masked(config, hosts):
-    config = copy.deepcopy(normalized(config))
-    for route in routes(config):
-        if route.get('match') in [[{'host': [host]}] for host in hosts]:
-            route.clear()
-    return config
+    config = copy.deepcopy(config)
+    table = routes(config)
+    table[:] = [route for route in table if route.get('match') not in [[{'host': [host]}] for host in hosts]]
+    return normalized(config)
 
 
 def fence_text(marker):
@@ -199,19 +197,18 @@ def refuse_foreign_blocks(text, ingress):
                     f'foreign maintenance block {found.group(1)} in {host}; remove it by hand or give it this release tag')
 
 
-def align_indexer_upstream(text, ingress):
-    """The indexer sites must proxy to the Hasura port of this release; other upstream hosts stay as they are."""
-    upstream = ingress.get('indexer_upstream')
-    if not upstream:
+def remove_site(text, host):
+    """Drop a retired host's site block; an absent block is already the target state."""
+    openings = list(re.finditer('(?m)^' + re.escape(host) + r' \{\n', text))
+    if not openings:
         return text
-    address = upstream.rsplit(':', 1)[0]
-    for host in ingress['fenced_hosts']:
-        if host.split('.')[0].startswith('indexer'):
-            start, end = block_span(text, host)
-            block = re.sub(r'(?m)^(\s*reverse_proxy\s+)' + re.escape(address) + r':\d+(?=\s|$)',
-                           lambda found: found.group(1) + upstream, text[start:end])
-            text = text[:start] + block + text[end:]
-    return text
+    start, end = block_span(text, host)
+    tail = end + 1 + (text[end + 1:end + 3] == '\n\n') + (text[end + 1:end + 2] == '\n')
+    return text[:openings[0].start()] + text[tail:]
+
+
+def hosts_in(config):
+    return {host for route in routes(config) for match in route.get('match', []) for host in match.get('host', [])}
 
 
 def render(raw, current, phase, ingress):
@@ -221,14 +218,16 @@ def render(raw, current, phase, ingress):
     require(baseline == normalized(current), 'runtime config differs from the Caddyfile source')
     refuse_foreign_blocks(text, ingress)
     fenced_hosts_in(text, ingress)
-    if phase == 'fence':
-        text = align_indexer_upstream(text, ingress)
+    for host in ingress['retired_hosts']:
+        text = remove_site(text, host)
     for host in targets:
         text = set_fence(text, host, marker_of(ingress, host), ingress['maintenance_tag'], phase == 'fence')
     fenced_hosts_in(text, ingress)
     candidate = text.encode()
     adapted = adapt(candidate)
-    require(masked(adapted, targets) == masked(baseline, targets), 'candidate changes a route outside the target hosts')
+    changed = targets + ingress['retired_hosts']
+    require(masked(adapted, changed) == masked(baseline, changed), 'candidate changes a route outside the target hosts')
+    require(not hosts_in(adapted) & set(ingress['retired_hosts']), 'a retired host still has a route; remove it by hand')
     gated = [host for host in targets if (has_gate if phase == 'fence' else contains_gate)(route_of(adapted, host))]
     require(gated == (targets if phase == 'fence' else []), 'candidate maintenance routes differ from the phase')
     return candidate, adapted

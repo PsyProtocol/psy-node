@@ -251,15 +251,13 @@ def check_services(lock, walk):
     walk.number(services["redis_db"], "services.redis_db", 0, 15)
     walk.absolute(services["backups"], "services.backups")
     walk.absolute(services["mirror"], "services.mirror")
-    envio = fields(lock["envio"], ("database", "project", "hasura_port", "indexer_port", "rpc_routes",
-                                   "node_sha256", "patch_sha256"), "envio")
+    envio = fields(lock["envio"], ("database", "project", "indexer_port", "rpc_routes", "node_sha256", "patch_sha256"), "envio")
     walk.digest(envio["node_sha256"], "envio.node_sha256")
     for name in ENVIO_PATCHES:
         walk.digest(fields(envio["patch_sha256"], ENVIO_PATCHES, "envio.patch_sha256")[name], "envio.patch_sha256." + name)
     for name in ("database", "project"):
         walk.text(envio[name], "envio." + name)
-    for name in ("hasura_port", "indexer_port"):
-        walk.number(envio[name], "envio." + name, 1, 65535)
+    walk.number(envio["indexer_port"], "envio.indexer_port", 1, 65535)
     routes = fields(envio["rpc_routes"], CHAINS, "envio.rpc_routes")
     for chain, url in routes.items():
         require(isinstance(url, str) and re.fullmatch(r"http://[0-9.]+:[0-9]+", url), f"envio.rpc_routes.{chain} url")
@@ -297,10 +295,13 @@ def check_chain_values(lock, walk):
     for chain in CHAINS:
         walk.digest(fields(l1["gas_budget_sha256"], CHAINS, "l1.gas_budget_sha256")[chain],
                     "l1.gas_budget_sha256." + chain)
-    ingress = fields(lock["ingress"], ("fenced_hosts", "faucet_hosts", "maintenance_tag", "forwarder_topology_sha256"), "ingress")
-    for name in ("fenced_hosts", "faucet_hosts"):
+    ingress = fields(lock["ingress"], ("fenced_hosts", "faucet_hosts", "retired_hosts", "maintenance_tag",
+                                       "forwarder_topology_sha256"), "ingress")
+    for name in ("fenced_hosts", "faucet_hosts", "retired_hosts"):
         require(isinstance(ingress[name], list) and ingress[name] and all(
             isinstance(host, str) and host for host in ingress[name]), f"ingress.{name} must list hosts")
+    require(not set(ingress["retired_hosts"]) & set(ingress["fenced_hosts"] + ingress["faucet_hosts"]),
+            "a retired host cannot also be fenced or opened")
     walk.text(ingress["maintenance_tag"], "ingress.maintenance_tag")
     walk.digest(ingress["forwarder_topology_sha256"], "ingress.forwarder_topology_sha256")
     gates = fields(lock["gates"], ("l2_stability_checkpoint_count", "worker_queue_ack_wait_ms"), "gates")

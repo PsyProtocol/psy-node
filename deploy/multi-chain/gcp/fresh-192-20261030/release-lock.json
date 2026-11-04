@@ -122,7 +122,6 @@
     "database": "envio_bridge_fresh20261030sd192",
     "project": "psy-envio-fresh20261030sd192",
     "indexer_port": 29899,
-    "hasura_port": 38081,
     "rpc_routes": {
       "sepolia": "http://10.148.0.32:18545",
       "bscTestnet": "http://10.148.0.32:18645",
@@ -191,13 +190,15 @@
       "prove.psy-protocol.xyz",
       "prove-stg.psy-protocol.xyz",
       "services.psy-protocol.xyz",
-      "services-stg.psy-protocol.xyz",
-      "indexer.psy-protocol.xyz",
-      "indexer-stg.psy-protocol.xyz"
+      "services-stg.psy-protocol.xyz"
     ],
     "faucet_hosts": [
       "faucet.psy-protocol.xyz",
       "faucet-stg.psy-protocol.xyz"
+    ],
+    "retired_hosts": [
+      "indexer.psy-protocol.xyz",
+      "indexer-stg.psy-protocol.xyz"
     ],
     "maintenance_tag": "psy-sd192-maintenance",
     "forwarder_topology_sha256": "acfef0dfc3ac9eeb0b7752cc84c8081496545a203f2eff1a6ccbb38b0de4b04d"
@@ -211,7 +212,7 @@
     "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
     "activate_services.py": "db8c576586ac361ad650da5a3d4e1aa02ba0e33108731db11ca2122d5870e31b",
     "admin_pause.py": "458b17f2f2278298650ba264b6e33fd0f5ba4459a68ece6cf0e777d2f524d30f",
-    "caddy_ingress.py": "3243caf141032673485139017afd95079947065d2b86a63d099e98ff6582818c",
+    "caddy_ingress.py": "ade51e9c41422cb5653d578a2c7ec76287f7e7f57535c56ada1c81f5686d6745",
     "clear_host_state.py": "121782e230504e9282fad1dea2875db9b42a3a6d1cec255a1a573dd5b9f2f1db",
     "fresh_l1.cjs": "5a70cbc8b729b017d7dccc2deaded5a2fc8e6e027ccba55e03d8b49bd0647e47",
     "fresh_l1.py": "80c05afbc1691a4fe7c1a62640e48cc6220e3dca8013aa01c10bee21cc405204",

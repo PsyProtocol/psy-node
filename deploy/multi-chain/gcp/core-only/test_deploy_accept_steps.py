@@ -97,8 +97,7 @@ class EntrypointTests(World):
     PUBLIC = {"chains": {chain: {"rpc_url": f"https://rpc-{chain}.example/"} for chain in CHAINS},
               "trust_setup": {"base_url": "https://nostr.example/trust-setup", "archive": "a.tar.gz"},
               "services": {"coordinator_rpc": "https://c.example", "realm_rpcs": ["https://r0.example", "https://r1.example"],
-                           "prove_proxy": "https://p.example", "faucet_rpc": "https://f.example", "psy_services": "https://s.example",
-                           "indexer_graphql": "https://i.example/v1/graphql"},
+                           "prove_proxy": "https://p.example", "faucet_rpc": "https://f.example", "psy_services": "https://s.example"},
               "frontends": {"app": "https://app.example/"}}
 
     def test_entrypoint_deferred_items_are_listed_in_the_result(self):
@@ -112,6 +111,7 @@ class EntrypointTests(World):
         self.assertEqual(env["PUBLIC_TRUST_SETUP_PATH"], "/trust-setup")
         self.assertEqual({row["name"] for row in json.loads(env["PUBLIC_L1_RPC_ROUTES_JSON"])}, {"sepolia", "bsc", "base"})
         self.assertIsNone(find_secret({"env": {k: v for k, v in env.items() if k.startswith("PUBLIC_")}}))
+        self.assertNotIn("PUBLIC_INDEXER_DOMAIN", env)
 
     def test_a_stale_public_route_fails_with_its_age(self):
         now = 10_000

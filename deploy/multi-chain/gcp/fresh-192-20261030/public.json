@@ -12,8 +12,7 @@
     "realm_rpcs": ["https://realm0-stg.psy-protocol.xyz", "https://realm1-stg.psy-protocol.xyz"],
     "prove_proxy": "https://prove-stg.psy-protocol.xyz",
     "faucet_rpc": "https://faucet-stg.psy-protocol.xyz",
-    "psy_services": "https://services-stg.psy-protocol.xyz",
-    "indexer_graphql": "https://indexer-stg.psy-protocol.xyz/v1/graphql"
+    "psy_services": "https://services-stg.psy-protocol.xyz"
   },
   "frontends": {
     "app": "https://app-stg.psy-protocol.xyz/",

@@ -138,7 +138,7 @@ def entrypoint_env(ctx, public, trust_published):
             "PUBLIC_PROVE_PROXY_DOMAIN": host_of(public["services"]["prove_proxy"]),
             "PUBLIC_FAUCET_DOMAIN": host_of(public["services"]["faucet_rpc"]),
             "PUBLIC_PSY_SERVICES_DOMAIN": host_of(public["services"]["psy_services"]),
-            "PUBLIC_INDEXER_DOMAIN": host_of(public["services"]["indexer_graphql"]), "PUBLIC_RPC_DOMAIN": "",
+            "PUBLIC_RPC_DOMAIN": "",
             "PUBLIC_L1_RPC_ROUTES_JSON": json.dumps(routes), "CORS_ORIGIN": public["frontends"]["app"].rstrip("/")}
 
 

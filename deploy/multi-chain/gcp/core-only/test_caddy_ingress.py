@@ -16,7 +16,8 @@ import caddy_ingress as c
 
 WRITABLE_BIND = c.writable_bind
 LOCK_INGRESS = {'fenced_hosts': ['coordinator.example.test', 'services.example.test'],
-                'faucet_hosts': ['faucet.example.test'], 'maintenance_tag': 'maintenance-test'}
+                'faucet_hosts': ['faucet.example.test'], 'retired_hosts': ['indexer.example.test'],
+                'maintenance_tag': 'maintenance-test'}
 INGRESS = LOCK_INGRESS
 OTHER_HOSTS = ('rpc-eth.example.test', 'nostr.example.test')
 
@@ -209,26 +210,40 @@ class RenderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'differ from the phase'):
                 self.render(fenced, 'open')
 
-    def test_fence_moves_the_indexer_upstream_to_the_locked_hasura_port(self):
-        ingress = dict(INGRESS, fenced_hosts=[*INGRESS['fenced_hosts'], 'indexer.example.test'], indexer_upstream='10.0.0.24:38081')
-        raw = fixture_text() + site_text('indexer.example.test', '10.0.0.24:28081').encode()
+    def test_every_phase_removes_the_retired_indexer_site_and_nothing_else(self):
+        raw = fixture_text() + site_text('indexer.example.test', '10.0.0.24:38081').encode()
         raw += site_text('other-indexer.example.test', '10.0.0.24:28081').encode()
-        candidate, config = c.render(raw, adapt_text(raw), 'fence', ingress)
-        self.assertIn('reverse_proxy 10.0.0.24:38081 {', self.block(candidate, 'indexer.example.test'))
-        self.assertIn('reverse_proxy 10.0.0.24:28081 {', self.block(candidate, 'other-indexer.example.test'))
-        again, _ = c.render(candidate, config, 'fence', ingress)
-        self.assertEqual(again, candidate)
-        opened, _ = c.render(candidate, config, 'open', ingress)
-        self.assertIn('reverse_proxy 10.0.0.24:38081 {', self.block(opened, 'indexer.example.test'))
+        for phase in ('fence', 'open', 'open-faucet'):
+            with self.subTest(phase=phase):
+                candidate, config = c.render(raw, adapt_text(raw), phase, INGRESS)
+                self.assertNotIn(b'indexer.example.test {', candidate.replace(b'other-indexer.example.test {', b''))
+                self.assertIn('reverse_proxy 10.0.0.24:28081 {', self.block(candidate, 'other-indexer.example.test'))
+                self.assertNotIn('indexer.example.test', c.hosts_in(config))
+                self.assertEqual(c.hosts_in(config), c.hosts_in(adapt_text(raw)) - {'indexer.example.test'})
+        fenced, config = c.render(raw, adapt_text(raw), 'fence', INGRESS)
+        again, _ = c.render(fenced, config, 'fence', INGRESS)
+        self.assertEqual(again, fenced)
+        opened, _ = c.render(fenced, config, 'open', INGRESS)
+        self.assertNotIn(b'\nindexer.example.test {', b'\n' + opened)
 
-    def test_already_fenced_indexer_with_a_stale_upstream_is_realigned(self):
-        ingress = dict(INGRESS, fenced_hosts=[*INGRESS['fenced_hosts'], 'indexer.example.test'], indexer_upstream='10.0.0.24:38081')
-        raw = fixture_text() + site_text('indexer.example.test', '10.0.0.24:28081').encode()
-        fenced, config = c.render(raw, adapt_text(raw), 'fence', INGRESS | {'fenced_hosts': ingress['fenced_hosts']})
-        stale, stale_config = fenced, adapt_text(fenced)
-        candidate, _ = c.render(stale, stale_config, 'fence', ingress)
-        self.assertNotEqual(candidate, stale)
-        self.assertIn('10.0.0.24:38081', self.block(candidate, 'indexer.example.test'))
+    def test_group_labels_of_a_removed_retired_route_do_not_shift_the_others(self):
+        def route(host, group):
+            return {'match': [{'host': [host]}], 'handle': [{'handler': 'subroute', 'routes': [{'group': group, 'handle': []}]}]}
+        baseline = {'apps': {'http': {'servers': {'srv0': {'routes': [route('indexer.example.test', 'group0'),
+                                                                      route('a.example.test', 'group1')]}}}}}
+        candidate = {'apps': {'http': {'servers': {'srv0': {'routes': [route('a.example.test', 'group0')]}}}}}
+        self.assertEqual(c.masked(baseline, ['indexer.example.test']), c.masked(candidate, ['indexer.example.test']))
+        changed = {'apps': {'http': {'servers': {'srv0': {'routes': [route('b.example.test', 'group0')]}}}}}
+        self.assertNotEqual(c.masked(baseline, ['indexer.example.test']), c.masked(changed, ['indexer.example.test']))
+
+    def test_a_retired_host_inside_a_shared_site_block_is_refused(self):
+        raw = fixture_text() + b'indexer.example.test, indexer-stg.example.test {\n    reverse_proxy 10.0.0.24:38081 {\n    }\n}\n'
+        shared = adapt_text(raw)
+        shared['apps']['http']['servers']['srv0']['routes'].append({'match': [{'host': ['indexer.example.test']}], 'terminal': True,
+                                                                     'handle': []})
+        with patch.object(c, 'adapt', side_effect=[shared, shared]):
+            with self.assertRaisesRegex(ValueError, 'retired host still has a route'):
+                c.render(raw, shared, 'fence', INGRESS)
 
     def test_a_foreign_maintenance_block_is_refused_by_name(self):
         foreign = self.raw.replace(b'coordinator.example.test {\n', b'coordinator.example.test {\n    # BEGIN other-team-maintenance\n'
@@ -242,13 +257,12 @@ class RenderTests(unittest.TestCase):
             raw = json.dumps({'ingress': LOCK_INGRESS}).encode()
             encoded_lock = base64.b64encode(raw).decode()
             self.assertEqual(c.read_ingress(c.read_release_lock(encoded_lock, c.sha(raw))), LOCK_INGRESS)
-            with_envio = json.dumps({'ingress': LOCK_INGRESS, 'hosts': {'gcp-postgres': '10.0.0.24'}, 'envio': {'hasura_port': 38081}}).encode()
-            self.assertEqual(c.read_ingress(c.read_release_lock(base64.b64encode(with_envio).decode(), c.sha(with_envio)))
-                             ['indexer_upstream'], '10.0.0.24:38081')
+            with_envio = json.dumps({'ingress': LOCK_INGRESS, 'hosts': {'gcp-postgres': '10.0.0.24'}, 'envio': {'indexer_port': 29899}}).encode()
+            self.assertEqual(c.read_ingress(c.read_release_lock(base64.b64encode(with_envio).decode(), c.sha(with_envio))), LOCK_INGRESS)
             with self.assertRaisesRegex(ValueError, 'hash mismatch'):
                 c.read_release_lock(encoded_lock, c.sha(raw + b' '))
         for bad in (dict(LOCK_INGRESS, maintenance_tag='Bad Tag'), dict(LOCK_INGRESS, faucet_hosts=['coordinator.example.test']),
-                    dict(LOCK_INGRESS, fenced_hosts=['a b'])):
+                    dict(LOCK_INGRESS, fenced_hosts=['a b']), dict(LOCK_INGRESS, retired_hosts=['coordinator.example.test'])):
             with self.assertRaises(ValueError):
                 c.read_ingress({'ingress': bad})
 

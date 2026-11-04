@@ -6,6 +6,7 @@ if [ "${CHECK_PUBLIC_STANDALONE:-0}" = "1" ]; then
   # The release orchestrator passes every domain; no deployment config is read.
   : "${PUBLIC_NOSTR_DOMAIN:?}" "${CORS_ORIGIN:?}"
   PUBLIC_RPC_DOMAIN="${PUBLIC_RPC_DOMAIN:-}"
+  PUBLIC_INDEXER_DOMAIN="${PUBLIC_INDEXER_DOMAIN:-}"
   PUBLIC_L1_RPC_ROUTES_JSON="${PUBLIC_L1_RPC_ROUTES_JSON:-}"
   : "${PUBLIC_TRUST_SETUP_DOMAIN:=${PUBLIC_NOSTR_DOMAIN}}"
   : "${PUBLIC_TRUST_SETUP_PATH:=/trust-setup}"
@@ -259,9 +260,13 @@ main() {
   for domain in ${PUBLIC_PSY_SERVICES_ALIAS_DOMAINS:-}; do
     check_services_domain "psy-services alias ${domain}" "$domain"
   done
-  curl_expect_status "indexer Hasura health" 200 "https://${PUBLIC_INDEXER_DOMAIN}/healthz"
-  graphql_expect_result "indexer Hasura" "https://${PUBLIC_INDEXER_DOMAIN}/v1/graphql" \
-    Deposit DepositTreeMeta WithdrawalClaim FinalizedBatch
+  if [ -n "$PUBLIC_INDEXER_DOMAIN" ]; then
+    curl_expect_status "indexer Hasura health" 200 "https://${PUBLIC_INDEXER_DOMAIN}/healthz"
+    graphql_expect_result "indexer Hasura" "https://${PUBLIC_INDEXER_DOMAIN}/v1/graphql" \
+      Deposit DepositTreeMeta WithdrawalClaim FinalizedBatch
+  else
+    pass "public indexer skipped"
+  fi
   for domain in ${PUBLIC_INDEXER_ALIAS_DOMAINS:-}; do
     check_indexer_domain "indexer alias ${domain}" "$domain"
   done
@@ -280,7 +285,9 @@ main() {
     cors_preflight "public L1 RPC" "https://${PUBLIC_RPC_DOMAIN}/"
   fi
   cors_preflight "psy-services" "https://${PUBLIC_PSY_SERVICES_DOMAIN}/health"
-  cors_preflight "indexer Hasura" "https://${PUBLIC_INDEXER_DOMAIN}/v1/graphql"
+  if [ -n "$PUBLIC_INDEXER_DOMAIN" ]; then
+    cors_preflight "indexer Hasura" "https://${PUBLIC_INDEXER_DOMAIN}/v1/graphql"
+  fi
 }
 
 main "$@"

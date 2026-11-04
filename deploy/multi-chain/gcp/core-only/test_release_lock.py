@@ -91,7 +91,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
         "services": {"database": "services_db", "owner": "services_owner", "redis_db": 14,
                      "key_prefix": "svc:", "listen": "10.0.0.38:3001", "backups": f"/var/lib/psy-core/{rid}/checkpoints",
                      "mirror": "/var/lib/psy-indexer-mirror"},
-        "envio": {"database": "envio_db", "project": "envio-project", "indexer_port": 29899, "hasura_port": 38081,
+        "envio": {"database": "envio_db", "project": "envio-project", "indexer_port": 29899,
                   "rpc_routes": {chain: f"http://10.0.0.32:{18545 + index}" for index, chain in enumerate(CHAINS)},
                   "node_sha256": digest("envio-node"),
                   "patch_sha256": {name: digest("patch" + name) for name in lock_module.ENVIO_PATCHES}},
@@ -109,6 +109,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
                "bundle_sha256": digest("bundle"), "policy_sha256": digest("policy"),
                "gas_budget_sha256": {chain: digest("gas" + chain) for chain in CHAINS}},
         "ingress": {"fenced_hosts": ["fenced.example.test"], "faucet_hosts": ["faucet.example.test"],
+                    "retired_hosts": ["indexer.example.test"],
                     "maintenance_tag": "maintenance-test", "forwarder_topology_sha256": digest("forwarders")},
         "gates": {"l2_stability_checkpoint_count": 100, "worker_queue_ack_wait_ms": 30000},
         "tool_sha256": {name: digest(name) for name in lock_module.TOOL_NAMES},
@@ -144,7 +145,7 @@ class ReleaseLockTests(unittest.TestCase):
             self.validate(lock)
 
     def test_envio_has_no_hasura_image_or_graphql_port_and_the_reader_source_is_pinned(self):
-        for extra in ({"image": "hasura/graphql-engine@sha256:" + "a" * 64}, {"graphql_port": 29899}):
+        for extra in ({"image": "hasura/graphql-engine@sha256:" + "a" * 64}, {"graphql_port": 29899}, {"hasura_port": 38081}):
             lock = copy.deepcopy(self.lock)
             lock["envio"].update(extra)
             with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "envio fields"):
@@ -174,6 +175,15 @@ class ReleaseLockTests(unittest.TestCase):
         lock = copy.deepcopy(self.lock)
         del lock["units"]["bridge_reader"]
         with self.assertRaisesRegex(ValueError, "units fields"):
+            self.validate(lock)
+
+    def test_retired_hosts_are_listed_and_disjoint_from_fenced_hosts(self):
+        lock = copy.deepcopy(self.lock)
+        lock["ingress"]["retired_hosts"] = ["fenced.example.test"]
+        with self.assertRaisesRegex(ValueError, "retired host"):
+            self.validate(lock)
+        lock["ingress"]["retired_hosts"] = []
+        with self.assertRaisesRegex(ValueError, "retired_hosts must list hosts"):
             self.validate(lock)
 
     def test_signer_host_must_be_a_known_alias(self):
@@ -406,6 +416,13 @@ class CommittedLockTests(unittest.TestCase):
         for name in ("contracts", "services", "indexer", "notifier", "bridge_reader"):
             self.assertRegex(self.lock["sources"][name], "^[0-9a-f]{40}$")
         self.assertEqual(self.lock["sources"]["guardian_key"], "de539f565ec1a92f91bb4e9686e1442e89ba8639")
+
+    def test_committed_release_has_no_public_indexer(self):
+        indexers = {"indexer.psy-protocol.xyz", "indexer-stg.psy-protocol.xyz"}
+        self.assertEqual(set(self.lock["ingress"]["retired_hosts"]), indexers)
+        self.assertFalse(indexers & set(self.lock["ingress"]["fenced_hosts"]))
+        public = json.loads((RELEASE_DIR / "public.json").read_bytes())
+        self.assertFalse(any("indexer" in key or "graphql" in str(value) for key, value in public["services"].items()))
 
     def test_committed_lock_matches_current_tools(self):
         lock_module.check_tool_hashes(self.lock, HERE)
