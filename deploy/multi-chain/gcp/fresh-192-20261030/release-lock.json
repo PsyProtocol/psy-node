@@ -21,7 +21,7 @@
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
     "contracts": "b18aa6cfe1d8aa57ba15969a805637408a880188",
-    "services": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
+    "services": "45c2c23a8d141845ce6b1cc35f9291f6b894c1d9",
     "indexer": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
     "notifier": "d80a89f390623f59d7bad0750a485793aee31358",
     "bridge_reader": "6792483adfd5fa1425dc08ab4157bcc370c89ba8"
@@ -32,7 +32,7 @@
     "psy_relayer_cli": "4a0d2104e937c81c354d9321257a3435971d37e93df420f629e3b399c508728d",
     "psy_user_cli": "1525aac9c73d0900736e6ea90c0c61b5bf1308c3e1993f1bd4de4fe7f0762027",
     "psy_worker_cli": "c8f6c522ca459e744a69cf57dcaf3d002b4315c88dc789f10453f24d5122240e",
-    "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
+    "psy-services": "abd44f22acc99089b89976e8668476c52f6be9b01f2979e9b7029b05aecb65e2",
     "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a",
     "psy-bridge-reader": "7eb9db1aa4677f7f418ed885fa442dbe4bf85e7a2a19c7969f7adeda5ef6b6b2"
   },
