@@ -67,6 +67,7 @@ import {
     resolveBoundDevnetNames,
     commitDevnetNamespaceBinding,
     selectedUiDependencies,
+    requiresBridgeCustody,
     ensurePsyContractsDependencies,
     runFrozenEnvioCodegen,
     frozenEnvioStartCommand,
@@ -2190,6 +2191,16 @@ describe("frozen dependency startup selection", () => {
         for (const ui of ["psyPrivacyBridge", "ide", "explorer", "modeAWebWalletBridge"] as const) {
             expect(selectedUiDependencies(false, { [ui]: true })).toBe(true);
         }
+    });
+
+    it("requires bridge custody only for full startup and Groth16-wrapping consumers", () => {
+        expect(requiresBridgeCustody(true, {})).toBe(true);
+        expect(requiresBridgeCustody(false, {})).toBe(false);
+        expect(requiresBridgeCustody(false, { relayer: true })).toBe(true);
+        expect(requiresBridgeCustody(false, { bridgeProposerDaemon: true })).toBe(true);
+        expect(requiresBridgeCustody(false, { proveProxyCount: 1 })).toBe(true);
+        expect(requiresBridgeCustody(false, { proveProxyCount: 0 })).toBe(false);
+        expect(requiresBridgeCustody(false, { proveProxyCount: undefined })).toBe(false);
     });
 
     it("refuses missing contracts dependencies instead of installing in frozen mode", async () => {

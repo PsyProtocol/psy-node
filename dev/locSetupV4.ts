@@ -3325,6 +3325,11 @@ export function selectedUiDependencies(startAll: boolean, options: { psyPrivacyB
     return startAll || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
 }
 
+/** Component selection contract: only full startup and Groth16-wrapping consumers read bridge trust setup. */
+export function requiresBridgeCustody(startAll: boolean, options: { relayer?: boolean; bridgeProposerDaemon?: boolean; proveProxyCount?: number }): boolean {
+    return startAll || !!options.relayer || !!options.bridgeProposerDaemon || (options.proveProxyCount ?? 0) > 0;
+}
+
 async function ensureDevEnvironment(
     cwd: string,
     opts?: {
@@ -8263,11 +8268,13 @@ Usage: bun run dev/locSetupV4.ts [options]
     process.on('SIGTERM', () => void shutdown());
     try {
     if (!teardown && !retained.resume) {
+        const startAll = !hasOnlyOptions || !!values.all;
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
             selectedUi: selectedUiDependencies(!hasOnlyOptions, { psyPrivacyBridge, ide, explorer, modeAWebWalletBridge }),
+            skipBridgeCustody: !requiresBridgeCustody(startAll, { relayer, bridgeProposerDaemon, proveProxyCount }),
             env: envVars,
         });
     }
