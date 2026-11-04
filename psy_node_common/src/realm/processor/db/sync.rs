@@ -5,6 +5,7 @@ use parth_core::{
         merkle_proof::MerkleProofCore,
         traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash},
     },
+    data::hash::checkpointed_merkle_node::CheckpointedMerkleHash,
     protocol::core_types::QNetworkTypesConfig,
 };
 use psy_data::{
@@ -23,7 +24,38 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::realm::processor::{db::PsyRealmDatabaseProcessor, guta_resend::REALM_GUTA_RESEND_MIN_CHECKPOINTS};
+use crate::{
+    p2p::realm_coordinator::CoordinatorRpcUnavailable,
+    realm::processor::{db::PsyRealmDatabaseProcessor, guta_resend::REALM_GUTA_RESEND_MIN_CHECKPOINTS},
+};
+
+const COORDINATOR_UNAVAILABLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT: u32 = 300;
+
+/// Pauses and returns Ok while the Coordinator is unavailable, up to the consecutive limit; any other error is returned.
+async fn pause_after_coordinator_unavailable(
+    error: anyhow::Error,
+    realm_id: u64,
+    waited_realm_root: &str,
+    consecutive_unavailable_count: &mut u32,
+) -> anyhow::Result<()> {
+    if !CoordinatorRpcUnavailable::is_cause_of(&error) {
+        return Err(error);
+    }
+    *consecutive_unavailable_count += 1;
+    if *consecutive_unavailable_count > MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT {
+        return Err(error.context(format!(
+            "Coordinator unavailable {} consecutive times while waiting for realm root {}",
+            MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT, waited_realm_root
+        )));
+    }
+    tracing::warn!(
+        "Realm {} Coordinator unavailable while waiting for realm root {} (attempt {}); retrying: {:#}",
+        realm_id, waited_realm_root, consecutive_unavailable_count, error
+    );
+    tokio::time::sleep(COORDINATOR_UNAVAILABLE_RETRY_DELAY).await;
+    Ok(())
+}
 
 fn require_checkpoint_metadata<F, Hash, H>(
     checkpoint_id: u64,
@@ -296,11 +328,15 @@ where
         let start_wait_checkpoint = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         // Checkpoint the latest submission attempt is measured from. Taking the larger of the
         // coordinator's answer and the local head can only delay a resend.
-        let mut resend_baseline_checkpoint = self
-            .coordinator_client
-            .rc_get_latest_checkpoint_id()
-            .await?
-            .max(start_wait_checkpoint);
+        let waited_realm_root = format!("{:?}", new_realm_root);
+        let mut consecutive_unavailable_count = 0u32;
+        let mut resend_baseline_checkpoint = match self.coordinator_client.rc_get_latest_checkpoint_id().await {
+            Result::Ok(coordinator_head) => coordinator_head.max(start_wait_checkpoint),
+            Err(error) => {
+                pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                start_wait_checkpoint
+            }
+        };
         let mut resend_attempts: u64 = 0;
         let mut metadata_checkpoint_id = self.state.last_committed_checkpoint_id;
 
@@ -310,18 +346,14 @@ where
         );
 
         loop {
-            // 1. Sync Checkpoint Tree to get latest proofs locally
-            self.checkpoint_tree_backup_manager
-                .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
-                .await?;
-
-            let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
-
-            // 2. Query Coordinator for the Realm's state at the absolute Tip
-            // We use `latest_synced_checkpoint_id` to get the latest state available to us.
-            let realm_state = self.coordinator_client
-                .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
-                .await?;
+            let (latest_synced_checkpoint_id, realm_state) = match self.read_synced_realm_root().await {
+                Result::Ok(observed) => observed,
+                Err(error) => {
+                    pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                    continue;
+                }
+            };
+            consecutive_unavailable_count = 0;
             tracing::info!("realm state {}", serde_json::to_string_pretty(&realm_state)?);
 
             // 3. Evaluate State
@@ -432,15 +464,18 @@ where
                             err
                         );
                     }
-                    resend_baseline_checkpoint = self
-                        .coordinator_client
-                        .rc_get_latest_checkpoint_id()
-                        .await?
-                        .max(latest_synced_checkpoint_id);
+                    resend_baseline_checkpoint = match self.coordinator_client.rc_get_latest_checkpoint_id().await {
+                        Result::Ok(coordinator_head) => coordinator_head.max(latest_synced_checkpoint_id),
+                        Err(error) => {
+                            pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                            latest_synced_checkpoint_id
+                        }
+                    };
                 }
 
-                // Sleep via client wait
-                self.coordinator_client.rc_wait_for_next_checkpoint().await?;
+                if let Err(error) = self.coordinator_client.rc_wait_for_next_checkpoint().await {
+                    pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                }
                 
             } else {
                 // Case: The root changed to something else entirely.
@@ -451,6 +486,43 @@ where
                     old_realm_root, new_realm_root, realm_state.value, realm_state.checkpoint_id
                 );
             }
+        }
+    }
+
+    async fn read_synced_realm_root(&mut self) -> anyhow::Result<(u64, CheckpointedMerkleHash<N::QHash>)> {
+        self.checkpoint_tree_backup_manager
+            .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
+            .await?;
+        let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        let realm_state = self
+            .coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
+            .await?;
+        Result::Ok((latest_synced_checkpoint_id, realm_state))
+    }
+
+    /// Submits a GUTA proof before the inclusion wait. An unavailable Coordinator may still have
+    /// received it, so that case returns Ok and leaves delivery to the wait's resend.
+    pub async fn submit_guta_proof(
+        &self,
+        submission_header: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        submission_proof: Vec<u8>,
+        submission_proposal: Option<Vec<u8>>,
+        submission_certificate: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .coordinator_client
+            .rc_submit_guta_proof(submission_header, submission_proof, self.state.realm_id_u64, submission_proposal, submission_certificate)
+            .await;
+        match result {
+            Err(error) if CoordinatorRpcUnavailable::is_cause_of(&error) => {
+                tracing::warn!(
+                    "Realm {} GUTA proof delivery is uncertain; waiting for inclusion and resending if it is not included: {:#}",
+                    self.state.realm_id_u64, error
+                );
+                Result::Ok(())
+            }
+            result => result,
         }
     }
 
@@ -1354,6 +1426,102 @@ mod sync_tests {
         assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
         assert_eq!(env.processor.state.last_committed_checkpoint_id, 3);
         assert_eq!(env.processor.state.last_committed_realm_end_root, new_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_retries_while_the_coordinator_is_unavailable() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        let new_root = zh(77);
+        env.stage_checkpoint_chain(2);
+        env.coordinator.seed_realm_root(2, new_root);
+        env.coordinator.set_unavailable_realm_root_queries(2);
+
+        let sync_info = env
+            .processor.wait_for_realm_update_sync_with_coordinator(new_root, header, &proof, TEST_RESEND_AFTER_CHECKPOINTS, None, None)
+            .await?;
+
+        assert_eq!(*env.coordinator.unavailable_realm_root_queries.lock().unwrap(), 0);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 2);
+        assert_eq!(env.processor.state.last_committed_realm_end_root, new_root);
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_still_fails_on_a_diverged_root_after_unavailability() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(1);
+        env.coordinator.seed_realm_root(1, zh(88));
+        env.coordinator.set_unavailable_realm_root_queries(1);
+
+        let err = wait_error(&mut env, zh(78), header, &proof, TEST_RESEND_AFTER_CHECKPOINTS).await;
+
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(*env.coordinator.unavailable_realm_root_queries.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coordinator_unavailable_pause_stops_at_the_consecutive_limit() {
+        let unavailable = || anyhow::Error::new(crate::p2p::realm_coordinator::CoordinatorRpcUnavailable {
+            message: "connection refused".to_string(),
+        });
+        let mut count = super::MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT;
+        let err = super::pause_after_coordinator_unavailable(unavailable(), TEST_REALM_ID, "root", &mut count).await.unwrap_err();
+        assert!(format!("{err:#}").contains("consecutive times"), "unexpected error: {err:#}");
+
+        let mut count = 0;
+        let err = super::pause_after_coordinator_unavailable(anyhow::anyhow!("proof mismatch"), TEST_REALM_ID, "root", &mut count)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "proof mismatch");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_retries_an_unavailable_first_head_read() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        let new_root = zh(79);
+        env.stage_checkpoint_chain(1);
+        env.coordinator.seed_realm_root(1, new_root);
+        env.coordinator.set_unavailable_latest_checkpoint_reads(1);
+
+        let sync_info = env
+            .processor.wait_for_realm_update_sync_with_coordinator(new_root, header, &proof, TEST_RESEND_AFTER_CHECKPOINTS, None, None)
+            .await?;
+
+        assert_eq!(*env.coordinator.unavailable_latest_checkpoint_reads.lock().unwrap(), 0);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_proof_leaves_an_unavailable_coordinator_to_the_resend() -> anyhow::Result<()> {
+        let env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.coordinator.set_unavailable_guta_submissions(1);
+
+        env.processor.submit_guta_proof(header, proof, None, None).await?;
+
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
+        assert!(env.coordinator.submitted_gutas.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_proof_returns_a_rejection() -> anyhow::Result<()> {
+        let env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.coordinator.set_fail_guta_submissions(true);
+
+        let err = env.processor.submit_guta_proof(header, proof, None, None).await.unwrap_err();
+
+        assert!(err.to_string().contains("injected GUTA submission failure"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
         Ok(())
     }
 

@@ -71,6 +71,7 @@ Realm commit            durable mappings, FFS rows, then set_latest_checkpoint_i
 | Include | Coordinator | The checkpoint tree now carries this realm root. Noun: **inclusion**. | Local durable writes. Function names that apply FFS. |
 | Apply | Realm (or gatherer FastForward) | Execute the FFS / tree transition. Pair of **unapplied**. | The checkpoint marker write. |
 | Commit | Local processor | `commit_state` writes records and the marker. Adjective: **last_committed_**. | Coordinator inclusion. A proposal that is only certified. |
+| Unavailable | Realm Coordinator client | `CoordinatorRpcUnavailable`: the Coordinator Edge was unreachable or timed out (transport, restart, request timeout), so a request's outcome is unknown. | A Coordinator rejection, which carries a `GutaSubmitError` or another answer. |
 
 `included` is the coordinator checkpoint that already carries the transition
 (`first_root_change` returns it with the `RealmTransition`). It is not a good

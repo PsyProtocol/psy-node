@@ -133,7 +133,7 @@ where
                             }
                         } else {
                             tracing::error!(
-                                "[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; aborting gatherer and re-entering init catch-up",
+                                "[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; re-entering init catch-up",
                                 e,
                                 duration_ms,
                                 current_slot
@@ -381,11 +381,10 @@ mod runner_tests {
         let handle = tokio::task::spawn_local(run_realm_processor_loop(env.processor));
         assert!(poll_until(5_000, || status.state() == ProcessorState::Running).await);
 
-        assert!(
-            poll_until(10_000, || original_gatherer.is_finished()
-                && env.db_env.guta_queue.ensured_consumer_count() > consumers_before).await,
-            "block failure must abort the old gatherer and bootstrap a replacement"
-        );
+        // At least one 4.5 s block slot fails and re-enters catch-up with the gathering start root still committed.
+        let is_gatherer_replaced = poll_until(7_000, || original_gatherer.is_finished()
+            || env.db_env.guta_queue.ensured_consumer_count() > consumers_before).await;
+        assert!(!is_gatherer_replaced, "a block failure that leaves the gathering start root committed must keep the gatherer");
         assert_eq!(status.state(), ProcessorState::Running);
         assert!(status.error().is_none());
         assert!(!handle.is_finished());
