@@ -1278,7 +1278,7 @@ function l1StartedDetector(line: string): boolean {
 
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
-export const REALM_P2P_SUB_IDS = [1, 2] as const;
+export const REALM_P2P_SUB_IDS = [1, 2, 3] as const;
 /** Local-devnet genesis pre-places ZK validators only for realms `[0, count)`. */
 export const LOCAL_DEVNET_VALIDATOR_REALM_COUNT = 2;
 export const LOCAL_DEVNET_VALIDATORS_PER_REALM = REALM_P2P_SUB_IDS.length;
@@ -1303,7 +1303,7 @@ export function realmValidatorUserId(realmId: number, subId: number, height: num
 /**
  * Dense Strategy5 registration reserved for a local-devnet validator.
  * Registration 2 is reserved for the bridge relayer (user_id 524288), so
- * validators use: (0,1)->0, (1,1)->1, (1,2)->3, (0,2)->4.
+ * validators use: (0,1)->0, (1,1)->1, (1,2)->3, (0,2)->4, (1,3)->5, (0,3)->6.
  */
 export function reservedValidatorRegistrationId(realmId: number, subId: number): number {
     if (!Number.isInteger(realmId) || realmId < 0 || realmId >= LOCAL_DEVNET_VALIDATOR_REALM_COUNT) {
@@ -1315,7 +1315,7 @@ export function reservedValidatorRegistrationId(realmId: number, subId: number):
         throw new Error(`Validator sub id must be in 1..${LOCAL_DEVNET_VALIDATORS_PER_REALM}, got ${subId}`);
     }
     if (subId === 1) return realmId;
-    return 4 - realmId;
+    return 2 * subId - realmId;
 }
 
 /** Strategy5 user id for a local-devnet registration id. */

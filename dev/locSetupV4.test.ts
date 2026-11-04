@@ -914,8 +914,8 @@ describe("planPsyDappNestedSubmodulesFromDisk", () => {
 });
 
 describe("realm P2P HTTP ports", () => {
-    it("uses subs 1 and 2 only", () => {
-        expect([...REALM_P2P_SUB_IDS]).toEqual([1, 2]);
+    it("uses three validator positions per Realm", () => {
+        expect([...REALM_P2P_SUB_IDS]).toEqual([1, 2, 3]);
     });
 
     it("matches psy-genesis localhost realm RPC URLs at default edge count", () => {
@@ -981,7 +981,7 @@ describe("realm P2P launch planning", () => {
             addresses: [`/ip4/192.0.2.8/tcp/${realmP2pEdgePort(0, subId, edgeIndex, edges)}/p2p/edge-peer-${subId}-${edgeIndex}`],
         })),
     });
-    const realm0ValidatorIds = [reservedValidatorUserId(0, 1), reservedValidatorUserId(0, 2)];
+    const realm0ValidatorIds = REALM_P2P_SUB_IDS.map((subId) => reservedValidatorUserId(0, subId));
     const config = (edges: number) => ({
         defaultNetwork: "localhost",
         genesisConfigHash,
@@ -996,6 +996,7 @@ describe("realm P2P launch planning", () => {
                     validators: [
                         validator(realm0ValidatorIds[0], 1, edges),
                         validator(realm0ValidatorIds[1], 2, edges),
+                        validator(realm0ValidatorIds[2], 3, edges),
                     ],
                 }],
             },
@@ -1010,7 +1011,7 @@ describe("realm P2P launch planning", () => {
         const runtime = config(2);
         const source = structuredClone(runtime);
         const genesis = {
-            users: Array.from({ length: 5 }, () => ({ public_key_info: { fingerprint: LOCAL_DEVNET_ZK_FINGERPRINT } })),
+            users: Array.from({ length: 7 }, () => ({ public_key_info: { fingerprint: LOCAL_DEVNET_ZK_FINGERPRINT } })),
             validators: existing ? runtime.networks.localhost.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
                 realm_id: realm.id, validator_user_id: validator.validator_user_id,
                 node_id: validator.processor_node_id, bls_public_key: validator.bls_public_key,
@@ -1126,7 +1127,7 @@ describe("realm P2P launch planning", () => {
     it(`generates only fresh ${directory} state and binds reserved ZK keys once`, async () => {
         const f = await fixture(false);
         if (directory === "absent") await rm(f.runtimeDir, { recursive: true });
-        const privateKeys = Array.from({ length: 5 }, (_, index) => (index + 1).toString(16).repeat(64));
+        const privateKeys = Array.from({ length: 7 }, (_, index) => (index + 1).toString(16).repeat(64));
         await writeFile(path.join(f.cwd, "private_keys.json"), JSON.stringify(privateKeys));
         const spawn = spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => {
             mkdirSync(f.runtimeDir, { recursive: true });
@@ -1139,7 +1140,7 @@ describe("realm P2P launch planning", () => {
             expect(spawn).toHaveBeenCalledTimes(1);
             expect(spawn.mock.calls[0][0]).toContain("init-realm-p2p-keys");
             await injectGenesisValidators(path.join(f.cwd, "genesis.json"), result);
-            expect(JSON.parse(readFileSync(path.join(f.cwd, "genesis.json"), "utf8")).validators).toHaveLength(2);
+            expect(JSON.parse(readFileSync(path.join(f.cwd, "genesis.json"), "utf8")).validators).toHaveLength(3);
             for (const subId of REALM_P2P_SUB_IDS) {
                 expect(readFileSync(path.join(f.runtimeDir, `realm_0_sub_${subId}_zk.key`), "utf8")).toBe(privateKeys[reservedValidatorRegistrationId(0, subId)]);
             }
@@ -1216,7 +1217,7 @@ describe("realm P2P launch planning", () => {
     });
 
     it("pins generator network selection and edge count", () => {
-        const placeholderIds = [3 * (1 << 20), 3 * (1 << 20) + 1, 4 * (1 << 20), 4 * (1 << 20) + 1];
+        const placeholderIds = [3, 4].flatMap((realm) => REALM_P2P_SUB_IDS.map((sub) => realm * (1 << 20) + sub - 1));
         const plan = planRealmP2pConfig(null, [3, 4], 3, "devnet.example", placeholderIds, genesisConfigHash);
         expect(plan.env).toEqual({ PSY_CONFIG_PATH: "psy-genesis/config.json", PSY_NETWORK: "localhost", PSY_REALM_P2P_PUBLIC_HOST: "devnet.example" });
         expect(plan.args).toContain("--edges-per-validator");
@@ -1233,6 +1234,11 @@ describe("realm P2P launch planning", () => {
             "./local_checkpoints/realm_p2p/realm_0_sub_2_zk.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_identity.key",
             "./local_checkpoints/realm_p2p/realm_0_sub_2_edge_1_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_3_processor_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_3_bls.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_3_zk.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_3_edge_identity.key",
+            "./local_checkpoints/realm_p2p/realm_0_sub_3_edge_1_identity.key",
         ]);
     });
 
@@ -1266,6 +1272,10 @@ describe("realm P2P launch planning", () => {
         expect(reservedValidatorRegistrationId(1, 1)).toBe(1);
         expect(reservedValidatorRegistrationId(0, 2)).toBe(4);
         expect(reservedValidatorRegistrationId(1, 2)).toBe(3);
+        expect(reservedValidatorRegistrationId(0, 3)).toBe(6);
+        expect(reservedValidatorRegistrationId(1, 3)).toBe(5);
+        expect(reservedValidatorUserId(0, 3)).toBe(786432);
+        expect(reservedValidatorUserId(1, 3)).toBe(1310720);
         expect(reservedValidatorUserId(0, 1)).toBe(0);
         expect(reservedValidatorUserId(1, 1)).toBe(1 << 20);
         expect(reservedValidatorUserId(0, 2)).toBe(1 << 18);
@@ -3110,7 +3120,7 @@ describe("retained devnet pre-spawn gate", () => {
     const realmConfigs = realmIds.map((realmId) => ({
         id: realmId,
         rpc_url: [],
-        validators: [validator(realmId, 1), validator(realmId, 2)],
+        validators: REALM_P2P_SUB_IDS.map((subId) => validator(realmId, subId)),
     }));
     const genesisText = JSON.stringify({
         checkpoint_stats: { block_time: 1764248609 },

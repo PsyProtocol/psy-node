@@ -41,7 +41,7 @@ type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
 const DEFAULT_SD_KEY_FINGERPRINT: &str = "9faca812159aeeca40980d2483315265c69249ee4537f1d962457f16f3fe527a";
-const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
+const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4", "1,3,5", "0,3,6"];
 
 
 #[derive(Clone, Debug)]

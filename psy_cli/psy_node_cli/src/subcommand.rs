@@ -200,7 +200,7 @@ pub enum Commands {
         #[arg(long = "realm-ids", value_delimiter = ',', help = "Comma-separated realm ids to generate keys for (e.g. 0,1,2).")]
         realm_ids: Vec<u64>,
 
-        #[arg(long = "validators-per-realm", default_value_t = 2, help = "Number of ordered validators to generate per Realm.")]
+        #[arg(long = "validators-per-realm", default_value_t = 3, help = "Number of ordered validators to generate per Realm.")]
         validators_per_realm: u16,
 
         #[arg(long = "edges-per-validator", default_value_t = 1, help = "Number of distinct public edge identities to generate for each validator.")]
