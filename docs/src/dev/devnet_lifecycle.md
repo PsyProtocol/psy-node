@@ -614,6 +614,62 @@ core, and `--psy-privacy-bridge` does not select Nostr (`dev/locSetupV4.ts:3950-
 Core-only component selection also skips bridge custody setup (trust setup and bridge-relayer keystore checks): only full startup, relayer selection, and prove proxies
 consume those files (`dev/locSetupV4.ts:3328-3330,3387,8277`).
 
+### 10.4 Isolated JTMB core tests
+
+JTMB is test-only. Use a dedicated checkout, a `jtmb-` namespace, and separate
+runtime storage. These targets do not run `make run-all`, Layer 1, guardians,
+relayers, frontends, or proof proxies. They are not rollback or Plonky2 acceptance
+evidence. Existing verified `genesis.json`, matching P2P identities (when Genesis
+already contains validator bindings), sibling/nested contracts protocol config,
+and current release binaries from the preflight in section 2 are prerequisites.
+The targets never regenerate Genesis, replace missing identities, or purge state.
+
+```bash
+# Terminal 1: the existing foreground supervisor, two Realms and three validators each.
+make jtmb-start JTMB_NAMESPACE=jtmb-test
+
+# Terminal 2: inspect the running backend and all seven RPC state roots.
+make jtmb-status
+
+# Register new ordinary accounts, then prepare and deploy one compiled contract to L2.
+make jtmb-register JTMB_REGISTER_COUNT=10
+make jtmb-deploy JTMB_CONTRACT=psy-genesis/token.json
+
+# 20 distinct ordinary accounts x 5 confirmed rounds = 100 simulated EndCaps.
+make jtmb-batch JTMB_USERS=20 JTMB_ROUNDS=5 JTMB_CONCURRENCY=10
+
+# Run registration, L2 deployment, then EndCaps sequentially on an already-running stack.
+make jtmb-test JTMB_REGISTER_COUNT=10 JTMB_USERS=20 JTMB_ROUNDS=5
+
+# Non-purge shutdown through the existing lifecycle command.
+make jtmb-stop
+```
+
+`dev/jtmbTest.ts` reuses the launcher's Strategy5 mapping and Realm HTTP-port
+calculation. It selects distinct registered ordinary accounts, excluding user 0,
+all validators and the reserved relayer. `JTMB_USERS` counts selected accounts;
+it does not assume their physical user IDs are contiguous. `JTMB_TIMEOUT` defaults
+to 180 seconds for confirmation. Each round requires nonce +1 for every selected
+account, identical user leaves on all three Realm replicas, and matching global
+state roots at one common checkpoint across all seven RPC endpoints. Any failed
+client or confirmation check fails the Make target.
+
+Registration is confirmed against registration-tree leaf values, not submission
+responses alone. The L2 deployment test prepares the existing compiled artifact
+through `psy_user_cli`, submits it directly to the coordinator core RPC, and checks
+the included contract leaf and code. It does not exercise the optional services
+ABI-upload path or deploy anything to L1. By default it uses a key from the most
+recent successful `jtmb-register` run; an already-registered `PRIVATE_KEY` may be
+supplied through the environment. Keys are never passed in argv. Public results
+and client logs are under `local_checkpoints/jtmb_tests/<run>/`; new registration
+keys remain in that run's private, mode-0600 `private_keys.json` inside a mode-0700
+directory. Do not share that key file with test evidence.
+
+`jtmb-start` is a fresh core-component launch: the existing launcher refuses
+occupied infrastructure/storage rather than adopting it. `jtmb-stop` preserves
+storage; it is not a reset/restart shortcut. Use the lifecycle procedures above
+for any later state-preserving operation or separately authorized cleanup.
+
 ## 11. CLI Option Reference
 
 Numeric strings are parsed with `parseInt(..., 10)`, so malformed suffixes can still be accepted. Core startup additionally validates the parsed Realm start identifier, Realm count, edge count, and every requested Realm port before setup (`dev/locSetupV4.ts:1107-1121,5482-5487`). Worker and Coordinator counts do not receive that Realm-topology validation.

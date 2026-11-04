@@ -31,6 +31,8 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 jsonrpsee = { workspace = true }
+plonky2 = { workspace = true }
+psy_plonky2_circuits = { path = "../psy_plonky2_circuits", default-features = false, features = ["std"] }
 # start local packages
 cf_utils = { workspace = true }
 parth_core = { workspace = true }
