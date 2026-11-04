@@ -376,7 +376,7 @@ class VerifyTests(unittest.TestCase):
     def test_services_check_needs_a_ready_reader(self):
         with patch.object(steps, "bridge_state", return_value={"services": {"gcp-svc": {}}}), \
                 patch.object(steps.prepare, "check_tool_hash"), patch.object(steps, "mirror_sources"), \
-                patch.object(steps, "database_login"), \
+                patch.object(steps, "database_login"), patch.object(steps, "fallback_sql"), \
                 patch.object(steps.prepare, "local_value", return_value={"mirror_host_keys": {"10.0.0.25": "k", "10.0.0.42": "k",
                                                                                               "10.0.0.43": "k"}}), \
                 patch.object(steps, "read_placement", return_value={"groups": {"gcp-svc": {"roles": ["services"]}},
@@ -439,6 +439,8 @@ class VerifyTests(unittest.TestCase):
         self.assertRegex(first["jwt_secret"], r"[0-9a-f]{64}")
         self.assertRegex(first["bridge_reader_token"], r"^[0-9a-f]{64}$")
         self.assertRegex(first["bridge_reader_login"], r"^[A-Za-z0-9_-]{64}$")
+        for name, _ in steps.FALLBACK_ROLES.values():
+            self.assertRegex(first[name], r"^[A-Za-z0-9_-]{64}$")
         self.assertNotEqual(first["bridge_reader_login"], steps.database_login(self.ctx))
         path.write_text(json.dumps(dict(first, bridge_reader_login="quote'" + "a" * 30)))
         with self.assertRaisesRegex(ValueError, "Bridge Reader credentials"):
@@ -557,6 +559,96 @@ class ReaderStepTests(unittest.TestCase):
             self.binary.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "Reader binary differs"):
                 steps.reader_check(self.ctx)
+
+
+
+class FallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.world = BridgeWorld(self.temp.name)
+        self.ctx = self.world.ctx()
+        self.scripts = []
+        self.exists = "no"
+
+        def root_script(ctx, host, script, timeout=0, show_stderr=True):
+            self.scripts.append((host, script))
+            return self.exists if script.startswith("test -e") else ""
+        patcher = patch.object(steps, "root_script", side_effect=root_script)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_roles_are_created_through_stdin_with_limits_and_cleanup(self):
+        roles = "SELECT 1; -- envio_background_reader\n"
+        with patch.object(steps, "fallback_sql", return_value=(roles, "GRANT SELECT ON x TO y;\n")):
+            steps.ensure_fallback_roles(self.ctx)
+        (host, script), = self.scripts
+        values = steps.service_values(self.ctx)
+        self.assertEqual(host, "gcp-postgres")
+        for role, (name, limit) in steps.FALLBACK_ROLES.items():
+            self.assertIn(f"\\set {steps.FALLBACK_PASSWORD_VARIABLES[role]} '{values[name]}'\n", script)
+            self.assertIn(f"ALTER ROLE {role} CONNECTION LIMIT {limit};", script)
+            password_line = next(line for line in script.splitlines() if values[name] in line)
+            self.assertTrue(password_line.startswith("\\set "), "a fallback password may only travel in the psql stdin")
+        directory = f"/tmp/psy-envio-fallback-{self.world.lock['units']['core_namespace_prefix']}"
+        self.assertIn(f"\\set fallback_role_sql {directory}/grants.sql\n", script)
+        self.assertIn(f"\\i {directory}/roles.sql\n", script)
+        self.assertIn(f"-d {self.world.lock['envio']['database']} <<'PSY_SQL_END'", script)
+        self.assertIn(f"rm -rf {directory}\" EXIT", script)
+
+    def test_the_generated_script_runs_every_command_under_bash_stdin(self):
+        with patch.object(steps, "fallback_sql", return_value=("-- envio_background_reader roles\n", "GRANT SELECT ON x TO y;\n")):
+            steps.ensure_fallback_roles(self.ctx)
+        script = self.scripts[0][1]
+        bin_dir = self.world.root / "stub-bin"
+        bin_dir.mkdir()
+        log = self.world.root / "docker.log"
+        (bin_dir / "docker").write_text(f"#!/usr/bin/env bash\necho \"$*\" >> {log}\n"
+                                        "if [ \"$2\" = -i ]; then cat > /dev/null; fi\n")
+        (bin_dir / "docker").chmod(0o755)
+        result = subprocess.run(["bash", "-s"], input="set -euo pipefail\n" + script, text=True, capture_output=True,
+                                env={"PATH": f"{bin_dir}:/usr/bin:/bin"}, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual(len(calls), 5, calls)
+        self.assertIn("psql", calls[3])
+        self.assertTrue(calls[4].endswith(f"rm -rf /tmp/psy-envio-fallback-{self.world.lock['units']['core_namespace_prefix']}"))
+
+    def test_read_path_file_is_written_once_with_reader_and_the_fallback_urls(self):
+        placement = steps.read_placement(self.ctx)
+        written = []
+        with patch.object(steps, "write_env_file", side_effect=lambda ctx, host, path, lines: written.append((path, lines))):
+            steps.write_read_path(self.ctx, "gcp-svc", placement)
+            self.exists = "yes"
+            steps.write_read_path(self.ctx, "gcp-svc", placement)
+        (path, lines), = written
+        self.assertEqual(path, placement["read_path_file"])
+        values = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(values["PSY_ENVIO_READ_PATH"], "reader")
+        installer = steps.install_services
+        installer.validate_read_path({**values, "PSY_BRIDGE_READER_URL": placement["bridge_reader_url"],
+                                      "PSY_BRIDGE_READER_TOKEN_FILE": placement["bridge_reader_token_file"]}, placement)
+        self.assertEqual(set(values), installer.READ_PATH_KEYS)
+
+    def test_fallback_sql_comes_from_the_pinned_services_and_reader_commits(self):
+        def repo(name, path, text):
+            root = self.world.root / name
+            root.mkdir(exist_ok=True)
+            git = lambda *args: subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q")
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+            git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pin")
+            return root, git("rev-parse", "HEAD")
+        services, services_commit = repo("services-src", steps.FALLBACK_ROLES_SQL, "-- envio_background_reader\n")
+        node, node_commit = repo("node", steps.FALLBACK_GRANTS_SQL, "GRANT SELECT ON t TO r;\n")
+        self.world.lock["sources"].update(services=services_commit, bridge_reader=node_commit)
+        with patch.object(steps.bridge, "services_inputs", return_value={"services_source": str(services)}):
+            self.assertEqual(steps.fallback_sql(self.ctx), ("-- envio_background_reader\n", "GRANT SELECT ON t TO r;\n"))
+            self.world.lock["sources"]["services"] = "0" * 40
+            with self.assertRaisesRegex(ValueError, "fallback role script"):
+                steps.fallback_sql(self.ctx)
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ def unit(topology, lock, lock_sha256, user, role):
     extra, after = "", "network-online.target"
     if role == "services":
         after += " " + topology["bridge_reader_unit"]
-        extra = (f"Environment=PSY_ENVIO_READ_PATH=reader\nEnvironment=PSY_BRIDGE_READER_URL={topology['bridge_reader_url']}\n"
+        extra = (f"EnvironmentFile={topology['read_path_file']}\nEnvironment=PSY_BRIDGE_READER_URL={topology['bridge_reader_url']}\n"
                  f"Environment=PSY_BRIDGE_READER_TOKEN_FILE={topology['bridge_reader_token_file']}\n")
         command = (f"{release}/psy-services --config {release}/services.json --network-type psy-public-testnet "
                    f"--genesis-path {release}/genesis.json.zst --run-migrations=true --migrations-path {release}/migrations")

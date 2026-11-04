@@ -31,6 +31,13 @@ ENVIO_ACCOUNT = "psy-envio-fresh"
 READER_ACCOUNT = "psy-bridge-reader"
 READER_ROLE_SQL = "psy_bridge_reader_api/sql/reader-role.sql"
 READER_CONNECTION_LIMIT = 8
+FALLBACK_ROLES_SQL = "scripts/envio-reader-roles.sql"
+FALLBACK_GRANTS_SQL = "psy_bridge_reader_api/sql/fallback-role.sql"
+# Class role -> (generated value, connection limit); the limits cover the Services pool sizes 8+6, 16 and 4 with headroom.
+FALLBACK_ROLES = {"envio_bridge_reader": ("fallback_bridge_login", 16), "envio_interactive_reader": ("fallback_interactive_login", 20),
+                  "envio_background_reader": ("fallback_background_login", 8)}
+FALLBACK_PASSWORD_VARIABLES = {"envio_bridge_reader": "bridge_password", "envio_interactive_reader": "interactive_password",
+                               "envio_background_reader": "background_password"}
 LOGIN_PATTERN = re.compile(r"[A-Za-z0-9_+/=-]{24,256}")
 ROLE_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 SHORT_SECONDS = 120
@@ -51,8 +58,9 @@ def quote_word(value):
     return shlex.quote(str(value))
 
 
-def root_script(ctx, host, script, timeout=SHORT_SECONDS):
-    return ctx.remote.run_root_text(host, ["/usr/bin/bash", "-s"], timeout, stdin_text="set -euo pipefail\n" + script)
+def root_script(ctx, host, script, timeout=SHORT_SECONDS, show_stderr=True):
+    return ctx.remote.run_root_text(host, ["/usr/bin/bash", "-s"], timeout, stdin_text="set -euo pipefail\n" + script,
+                                    show_stderr=show_stderr)
 
 
 def unit_state(ctx, host, unit):
@@ -208,11 +216,12 @@ def service_values(ctx):
     if not path.exists():
         values = {"jwt_secret": secrets.token_hex(32), "bridge_reader_login": secrets.token_urlsafe(48),
                   "bridge_reader_token": secrets.token_hex(32)}
+        values.update({name: secrets.token_urlsafe(48) for name, _ in FALLBACK_ROLES.values()})
         bridge.write_new(path, bridge.encode(values))
     values = release_lock.read_document(path)
-    prepare.require(set(values) == {"jwt_secret", "bridge_reader_login", "bridge_reader_token"},
-                    "recorded service values differ in shape")
-    prepare.require(LOGIN_PATTERN.fullmatch(values["bridge_reader_login"]) is not None
+    logins = ["bridge_reader_login", *(name for name, _ in FALLBACK_ROLES.values())]
+    prepare.require(set(values) == {"jwt_secret", "bridge_reader_token", *logins}, "recorded service values differ in shape")
+    prepare.require(all(LOGIN_PATTERN.fullmatch(values[name]) is not None for name in logins)
                     and re.fullmatch(r"[0-9a-f]{64}", values["bridge_reader_token"]) is not None,
                     "recorded Bridge Reader credentials differ in shape")
     return values
@@ -532,6 +541,7 @@ def services_check(ctx):
                     "local-inputs packages.services.mirror_host_keys must hold a host key for every mirror source")
     mirror_sources(sources, keys)
     database_login(ctx)
+    fallback_sql(ctx)
     prepare.require(reader_report(ctx, services_alias(read_placement(ctx)))["reader_ready"],
                     "the Bridge Reader is not ready; start it first")
 
@@ -546,6 +556,57 @@ def write_env_file(ctx, host, path, lines):
     root_script(ctx, host, script)
 
 
+def pinned_text(ctx, repo, commit, path, label):
+    result = prepare.run_local(["git", "--no-replace-objects", "-C", str(repo), "show", f"{commit}:{path}"], SHORT_SECONDS)
+    prepare.require(result.returncode == 0 and result.stdout, f"{label} is missing from its pinned checkout")
+    return result.stdout
+
+
+def fallback_sql(ctx):
+    """The Services role script at sources.services and the grant script it applies at sources.bridge_reader."""
+    roles = pinned_text(ctx, Path(bridge.services_inputs(ctx)["services_source"]), ctx.lock["sources"]["services"],
+                        FALLBACK_ROLES_SQL, "the Services fallback role script (sources.services)")
+    grants = pinned_text(ctx, prepare.local_path(ctx, "build", "source"), ctx.lock["sources"]["bridge_reader"],
+                         FALLBACK_GRANTS_SQL, "the fallback grant script (sources.bridge_reader)")
+    prepare.require("GRANT SELECT" in grants and "envio_background_reader" in roles, "the fallback SQL has an unexpected shape")
+    return roles, grants
+
+
+def ensure_fallback_roles(ctx):
+    """The read-only class roles of the pg fallback, provisioned ahead so an operator switch needs no role work."""
+    roles_sql, grants_sql = fallback_sql(ctx)
+    values, database = service_values(ctx), ctx.lock["envio"]["database"]
+    directory = f"/tmp/psy-envio-fallback-{namespace(ctx)}"
+    # Only the commands that read a here-document get -i; any other would swallow the rest of the bash -s script.
+    plain, container = (f"docker exec --user postgres {POSTGRES_CONTAINER}", f"docker exec -i --user postgres {POSTGRES_CONTAINER}")
+    passwords = "".join(f"\\set {FALLBACK_PASSWORD_VARIABLES[role]} '{values[name]}'\n" for role, (name, _) in FALLBACK_ROLES.items())
+    limits = "".join(f"ALTER ROLE {role} CONNECTION LIMIT {limit};\n" for role, (_, limit) in FALLBACK_ROLES.items())
+    script = (f"{plain} sh -c 'rm -rf {directory} && mkdir -m 0755 {directory}'\n"
+              f"{container} sh -c 'cat > {directory}/roles.sql' <<'PSY_ROLES_END'\n{roles_sql}\nPSY_ROLES_END\n"
+              f"{container} sh -c 'cat > {directory}/grants.sql' <<'PSY_GRANTS_END'\n{grants_sql}\nPSY_GRANTS_END\n"
+              f"trap \"{plain} rm -rf {directory}\" EXIT\n"
+              f"{container} psql -XqAt -v ON_ERROR_STOP=1 -U postgres -d {quote_word(database)} <<'PSY_SQL_END'\n"
+              f"\\set db {database}\n\\set schema envio\n\\set fallback_role_sql {directory}/grants.sql\n{passwords}"
+              f"\\i {directory}/roles.sql\n{limits}PSY_SQL_END\n")
+    root_script(ctx, POSTGRES_ALIAS, script, show_stderr=False)
+
+
+def fallback_urls(ctx, placement):
+    values = service_values(ctx)
+    url = lambda role: (f"postgresql://{role}:{quote(values[FALLBACK_ROLES[role][0]], safe='')}@{placement['postgres_host']}:"
+                        f"{bridge.POSTGRES_PORT}/{placement['envio_database']}")
+    return {key: url(role) for key, role in install_services.FALLBACK_URLS.items()}
+
+
+def write_read_path(ctx, alias, placement):
+    """Written once: a rerun must not undo an operator's switch to pg."""
+    lines = ["PSY_ENVIO_READ_PATH=reader", f"PSY_ENVIO_DB_SCHEMA={install_services.ENVIO_SCHEMA}",
+             *(f"{key}={value}" for key, value in fallback_urls(ctx, placement).items())]
+    path = placement["read_path_file"]
+    if root_script(ctx, alias, f"test -e {quote_word(path)} && echo yes || echo no\n").strip() != "yes":
+        write_env_file(ctx, alias, path, lines)
+
+
 def write_credentials(ctx, placement):
     values = service_values(ctx)
     login = quote(database_login(ctx), safe="")
@@ -555,6 +616,7 @@ def write_credentials(ctx, placement):
         if "services" in group["roles"]:
             write_env_file(ctx, alias, placement["credentials"] + "/services.env",
                            [f"DATABASE_URL={url}", f"PSY_JWT_SECRET={values['jwt_secret']}"])
+            write_read_path(ctx, alias, placement)
         else:
             write_env_file(ctx, alias, placement["credentials"] + "/indexer.env", [f"PSY_JWT_SECRET={values['jwt_secret']}"])
 
@@ -700,6 +762,7 @@ def services_apply(ctx):
     state, placement = bridge_state(ctx), read_placement(ctx)
     ensure_roles(ctx)
     ensure_services_database(ctx)
+    ensure_fallback_roles(ctx)
     write_credentials(ctx, placement)
     alias = services_alias(placement)
     install_package(ctx, alias, state["services"][alias])

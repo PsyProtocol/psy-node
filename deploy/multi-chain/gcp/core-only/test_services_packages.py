@@ -95,6 +95,12 @@ class ServicesWorld:
         return installer.placement(self.lock, TOPOLOGY)
 
 
+def fallback_env(placement):
+    url = lambda role: f"postgresql://{role}:pw-{role}@{placement['postgres_host']}:5432/{placement['envio_database']}"
+    return {"PSY_ENVIO_READ_PATH": "reader", "PSY_ENVIO_DB_SCHEMA": "envio",
+            **{key: url(role) for key, role in installer.FALLBACK_URLS.items()}}
+
+
 class ServicesPackageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -126,7 +132,8 @@ class ServicesPackageTests(unittest.TestCase):
                          ("http://" + reader["listen"], reader["client_token_file"]))
         self.assertNotIn("hasura_url", placement)
         unit = (output / "gcp-svc/units" / self.lock["units"]["services"]).read_text()
-        self.assertIn("Environment=PSY_ENVIO_READ_PATH=reader\n", unit)
+        self.assertIn(f"EnvironmentFile={self.lock['paths']['services']['config']}/envio-read-path.env\n", unit)
+        self.assertNotIn("PSY_ENVIO_READ_PATH", unit)
         self.assertIn(f"Environment=PSY_BRIDGE_READER_URL=http://{reader['listen']}\n", unit)
         self.assertIn(f"Environment=PSY_BRIDGE_READER_TOKEN_FILE={reader['client_token_file']}\n", unit)
         self.assertIn(f"After=network-online.target {self.lock['units']['bridge_reader']}\n", unit)
@@ -138,10 +145,14 @@ class ServicesPackageTests(unittest.TestCase):
 
     def test_guard_requires_the_reader_path_and_refuses_graphql(self):
         placement = self.world.placement()
-        env = {"PSY_ENVIO_READ_PATH": "reader", "PSY_BRIDGE_READER_URL": placement["bridge_reader_url"],
+        env = {**fallback_env(placement), "PSY_BRIDGE_READER_URL": placement["bridge_reader_url"],
                "PSY_BRIDGE_READER_TOKEN_FILE": placement["bridge_reader_token_file"]}
         installer.validate_read_path(env, placement)
-        for change in ({"PSY_ENVIO_READ_PATH": "pg"}, {"PSY_ENVIO_READ_PATH": "graphql"},
+        installer.validate_read_path({**env, "PSY_ENVIO_READ_PATH": "pg"}, placement)
+        owner = f"postgresql://{placement['database_owner']}:pw@{placement['postgres_host']}:5432/{placement['envio_database']}"
+        for change in ({"PSY_ENVIO_READ_PATH": "graphql"}, {"PSY_ENVIO_READ_PATH": "Reader"}, {"PSY_ENVIO_DB_SCHEMA": "public"},
+                       {"ENVIO_DATABASE_URL": owner}, {"ENVIO_DATABASE_URL_BACKGROUND": env["ENVIO_DATABASE_URL"]},
+                       {"ENVIO_DATABASE_URL_INTERACTIVE": env["ENVIO_DATABASE_URL_INTERACTIVE"].replace(":5432/", ":5432/other")},
                        {"PSY_BRIDGE_READER_URL": "http://10.0.0.38:8740"}, {"PSY_BRIDGE_READER_TOKEN_FILE": "/tmp/token"},
                        {"INDEXER_GRAPHQL_URL": "http://10.0.0.24:38081/v1/graphql"}, {"HASURA_GRAPHQL_ADMIN_SECRET": "x" * 32}):
             with self.subTest(change=change), self.assertRaises(installer.ValidationError):
@@ -161,6 +172,25 @@ class ServicesPackageTests(unittest.TestCase):
             path.write_text(path.read_text() + "INDEXER_GRAPHQL_URL=http://10.0.0.24:38081/v1/graphql\n")
             with self.assertRaises(installer.ValidationError):
                 installer.read_credentials(path, "services", placement)
+
+    def test_read_path_file_holds_exact_keys_and_accepts_the_operator_switch(self):
+        placement = dict(self.world.placement(), read_path_file=str(Path(self.temp.name) / "envio-read-path.env"))
+        path = Path(placement["read_path_file"])
+        env = fallback_env(placement)
+        write = lambda values: path.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+        with patch.object(installer, "trusted_parents"), \
+                patch.object(installer.Path, "stat", return_value=SimpleNamespace(st_mode=0o100600, st_uid=0)):
+            write(env)
+            self.assertEqual(installer.read_read_path(placement), env)
+            write({**env, "PSY_ENVIO_READ_PATH": "pg"})
+            self.assertEqual(installer.read_read_path(placement)["PSY_ENVIO_READ_PATH"], "pg")
+            for extra in ({"INDEXER_GRAPHQL_URL": "http://10.0.0.24:38081/v1/graphql"}, {"PSY_BRIDGE_READER_URL": "http://x:1"}):
+                write({**env, **extra})
+                with self.subTest(extra=extra), self.assertRaises(installer.ValidationError):
+                    installer.read_read_path(placement)
+            write({key: value for key, value in env.items() if key != "ENVIO_DATABASE_URL_BACKGROUND"})
+            with self.assertRaises(installer.ValidationError):
+                installer.read_read_path(placement)
 
     def test_reader_token_must_belong_to_the_services_account(self):
         placement = dict(self.world.placement(), bridge_reader_token_file=str(Path(self.temp.name) / "client/token"))
@@ -189,6 +219,7 @@ class ServicesPackageTests(unittest.TestCase):
                                  unit_name=installer.unit_name, fence_services=lambda names: None,
                                  read_credentials=lambda path, role, topology: calls.append(("credentials", role)),
                                  check_reader_token=lambda topology, account: calls.append(("token", account.pw_name)),
+                                 read_read_path=lambda topology: calls.append(("read_path", topology["read_path_file"])),
                                  unit_status=lambda name: {"ActiveState": "active", "FragmentPath": "/etc/systemd/system/" + name})
         topology = dict(placement, release=str(root), groups={"gcp-svc": dict(placement["groups"]["gcp-svc"], host="10.0.0.38")})
         with patch.object(activate_services.subprocess, "check_output", return_value="10.0.0.38"), \
@@ -197,6 +228,7 @@ class ServicesPackageTests(unittest.TestCase):
                 patch.object(activate_services.Path, "read_bytes", return_value=b""):
             activate_services.preflight(helper, root, {"l1_ready": True, "group": "gcp-svc"}, topology, self.lock)
         self.assertIn(("token", "parth"), calls)
+        self.assertIn(("read_path", placement["read_path_file"]), calls)
         self.assertIn(("health", placement["bridge_reader_url"] + "/health/ready"), calls)
         self.assertFalse(any("38081" in str(call) or "graphql" in str(call) for call in calls))
 

@@ -69,6 +69,7 @@ def preflight(helper, root, manifest, topology, lock):
             helper.require(value.get("MainPID") == "0", "inactive unit still has PID")
     if role == "services":
         helper.check_reader_token(topology, pwd.getpwnam(group["user"]))
+        helper.read_read_path(topology)
         http_health(topology["bridge_reader_url"] + "/health/ready")
     else:
         http_health(topology["services_url"] + "/health")

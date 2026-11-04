@@ -16,6 +16,11 @@ import tempfile
 from urllib.parse import urlsplit
 
 POSTGRES_ALIAS = "gcp-postgres"
+# The class roles scripts/envio-reader-roles.sql of psy-services creates for the pg fallback, keyed by the URL that names each.
+FALLBACK_URLS = {"ENVIO_DATABASE_URL": "envio_bridge_reader", "ENVIO_DATABASE_URL_INTERACTIVE": "envio_interactive_reader",
+                 "ENVIO_DATABASE_URL_BACKGROUND": "envio_background_reader"}
+READ_PATH_KEYS = {"PSY_ENVIO_READ_PATH", "PSY_ENVIO_DB_SCHEMA", *FALLBACK_URLS}
+ENVIO_SCHEMA = "envio"
 SERVICE_PATTERNS = ("psy-services-fresh*", "psy-indexer-fresh*", "parth-psy-services.service", "parth-psy-indexer@*")
 
 
@@ -85,6 +90,7 @@ def placement(lock, release_topology):
             "services_url": "http://" + services["listen"], "services_host": listen_host, "services_port": int(listen_port),
             "bridge_reader_url": "http://" + reader["listen"], "bridge_reader_token_file": reader["client_token_file"],
             "bridge_reader_unit": lock["units"]["bridge_reader"], "envio_database": envio["database"],
+            "read_path_file": lock["paths"]["services"]["config"] + "/envio-read-path.env",
             "groups": groups, "indexers": indexers, "realm_sources": sources, "mirror_sources": mirror_sources}
 
 
@@ -209,8 +215,14 @@ def validate_environment(env, role, topology):
 
 
 def validate_read_path(env, topology):
-    """Services reads Envio only through the Bridge Reader; no GraphQL endpoint or secret may reach it."""
-    require(env.get("PSY_ENVIO_READ_PATH") == "reader", "Services must read Envio through the Bridge Reader")
+    """Services reads Envio through the Bridge Reader or, after an operator switch, the read-only pg fallback; never GraphQL."""
+    require(env.get("PSY_ENVIO_READ_PATH") in ("reader", "pg"), "PSY_ENVIO_READ_PATH must be reader or pg")
+    require(env.get("PSY_ENVIO_DB_SCHEMA") == ENVIO_SCHEMA, "the pg fallback must read the Envio schema")
+    for key, role in FALLBACK_URLS.items():
+        url = urlsplit(env.get(key, ""))
+        require(url.scheme == "postgresql" and url.hostname == topology["postgres_host"] and url.port == 5432
+                and url.username == role and bool(url.password) and url.path == "/" + topology["envio_database"]
+                and not url.query and not url.fragment, f"{key} must name the read-only fallback role on the Envio database")
     require(env.get("PSY_BRIDGE_READER_URL") == topology["bridge_reader_url"]
             and env.get("PSY_BRIDGE_READER_TOKEN_FILE") == topology["bridge_reader_token_file"],
             "Bridge Reader endpoint differs from frozen topology")
@@ -227,14 +239,11 @@ def check_reader_token(topology, account):
             "the Bridge Reader token must be a mode 0600 file of the Services account; install the Reader first")
 
 
-def read_credentials(path, role, topology):
+def read_env_file(path, allowed):
     trusted_parents(path)
     st = path.stat()
     require(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o600,
             "credentials must be root-owned regular mode 0600")
-    allowed = {"PSY_JWT_SECRET"}
-    if role == "services":
-        allowed |= {"DATABASE_URL"}
     values = {}
     for line in path.read_text().splitlines():
         key, sep, value = line.partition("=")
@@ -243,7 +252,20 @@ def read_credentials(path, role, topology):
                 "credentials require only exact unquoted environment keys and URL-safe values")
         values[key] = value
     require(set(values) == allowed, "credential keys missing")
+    return values
+
+
+def read_credentials(path, role, topology):
+    values = read_env_file(path, {"PSY_JWT_SECRET", "DATABASE_URL"} if role == "services" else {"PSY_JWT_SECRET"})
     validate_environment(values, role, topology)
+    return values
+
+
+def read_read_path(topology):
+    """The operator-switchable file: PSY_ENVIO_READ_PATH plus the pre-provisioned fallback URLs, nothing else."""
+    values = read_env_file(Path(topology["read_path_file"]), READ_PATH_KEYS)
+    validate_read_path({**values, "PSY_BRIDGE_READER_URL": topology["bridge_reader_url"],
+                        "PSY_BRIDGE_READER_TOKEN_FILE": topology["bridge_reader_token_file"]}, topology)
     return values
 
 
@@ -279,6 +301,7 @@ def check_host(root, manifest, topology, lock):
             subprocess.run(["systemctl", "is-active", "--quiet", item["core_unit"]], check=True)
     if "services" in group["roles"]:
         check_reader_token(topology, account)
+        read_read_path(topology)
         require(not os.path.lexists(topology["nostr_state"]), "fresh Nostr state already exists")
         with socket.socket() as sock:
             sock.bind((topology["services_host"], topology["services_port"]))
