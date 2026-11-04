@@ -19,7 +19,7 @@ TOP_LEVEL = ("schema_version", "release_id", "network", "network_magic", "inputs
              "tool_sha256")
 INPUTS = ("release_profile", "topology", "artifacts", "runtime_config", "canonical_config", "genesis",
           "worker_whitelist", "risk_acceptance", "retired_state", "retained_paths")
-SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "services", "indexer", "notifier")
+SOURCES = ("runtime", "guardian_key", "compiler", "genesis", "contracts", "services", "indexer", "notifier", "bridge_reader")
 CLI_BINARIES = ("psy_dev_cli", "psy_node_cli", "psy_relayer_cli", "psy_user_cli", "psy_worker_cli")
 SERVICE_BINARIES = ("psy-services", "psy-indexer")
 PATH_ROLES = ("core", "guardian", "relayer", "worker", "proxy", "faucet", "services", "envio")
@@ -242,15 +242,14 @@ def check_services(lock, walk):
     walk.number(services["redis_db"], "services.redis_db", 0, 15)
     walk.absolute(services["backups"], "services.backups")
     walk.absolute(services["mirror"], "services.mirror")
-    envio = fields(lock["envio"], ("database", "project", "image", "graphql_port", "hasura_port", "rpc_routes",
+    envio = fields(lock["envio"], ("database", "project", "hasura_port", "indexer_port", "rpc_routes",
                                    "node_sha256", "patch_sha256"), "envio")
     walk.digest(envio["node_sha256"], "envio.node_sha256")
     for name in ENVIO_PATCHES:
         walk.digest(fields(envio["patch_sha256"], ENVIO_PATCHES, "envio.patch_sha256")[name], "envio.patch_sha256." + name)
     for name in ("database", "project"):
         walk.text(envio[name], "envio." + name)
-    walk.image(envio["image"], "envio")
-    for name in ("graphql_port", "hasura_port"):
+    for name in ("hasura_port", "indexer_port"):
         walk.number(envio[name], "envio." + name, 1, 65535)
     routes = fields(envio["rpc_routes"], CHAINS, "envio.rpc_routes")
     for chain, url in routes.items():

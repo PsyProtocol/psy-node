@@ -86,15 +86,12 @@ def port(value):
 
 
 def validate_placement(value, lock):
-    require(set(value) == {"postgres_host", "postgres_port", "postgres_user", "hasura_bind",
-                           "hasura_port", "indexer_port"}, "placement fields mismatch")
+    require(set(value) == {"postgres_host", "postgres_port", "postgres_user", "indexer_port"}, "placement fields mismatch")
     private_ip(value["postgres_host"])
-    private_ip(value["hasura_bind"])
-    for key in ("postgres_port", "hasura_port", "indexer_port"):
+    for key in ("postgres_port", "indexer_port"):
         port(value[key])
-    require(len({value[key] for key in ("postgres_port", "hasura_port", "indexer_port")}) == 3
-            and value["hasura_port"] == lock["envio"]["hasura_port"]
-            and value["indexer_port"] == lock["envio"]["graphql_port"], "release ports required")
+    require(value["postgres_port"] != value["indexer_port"] and value["indexer_port"] == lock["envio"]["indexer_port"],
+            "release ports required")
     require(isinstance(value["postgres_user"], str)
             and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value["postgres_user"])
             and value["postgres_user"] != "postgres", "dedicated database role required")
@@ -189,27 +186,10 @@ def config_bytes(template, networks, routes, project):
     return yaml.safe_dump(config, sort_keys=False).encode()
 
 
-def compose(value, lock):
-    database = lock["envio"]["database"]
-    database_url = (f'postgresql://{value["postgres_user"]}:'
-                    '${ENVIO_POSTGRES_PASSWORD_ENCODED:?URL-encoded private password required}'
-                    f'@{value["postgres_host"]}:{value["postgres_port"]}/{database}')
-    return {"name": lock["envio"]["project"], "services": {"graphql-engine": {
-        "image": lock["envio"]["image"], "user": "1001:1001", "restart": "no",
-        "ports": [{"target": 8080, "published": str(value["hasura_port"]), "host_ip": value["hasura_bind"], "protocol": "tcp"}],
-        "ulimits": {"nofile": {"soft": 65536, "hard": 524288}},
-        "logging": {"driver": "json-file", "options": {"max-size": "100m", "max-file": "100", "compress": "true"}},
-        "environment": {"HASURA_GRAPHQL_DATABASE_URL": database_url,
-                        "HASURA_GRAPHQL_METADATA_DATABASE_URL": database_url,
-                        "HASURA_GRAPHQL_ADMIN_SECRET": "${HASURA_GRAPHQL_ADMIN_SECRET:?private secret required}",
-                        "HASURA_GRAPHQL_ENABLE_CONSOLE": "false", "HASURA_GRAPHQL_STRINGIFY_NUMERIC_TYPES": "true",
-                        "HASURA_GRAPHQL_UNAUTHORIZED_ROLE": "public", "HASURA_GRAPHQL_NO_OF_RETRIES": "10"}}}}
-
-
 def build_files(spec, repo, lock):
     require(set(spec) == {"version", "patches", "dependency_lock", "placement", "rpc_routes", "l1_documents"}
             and type(spec["version"]) is int and spec["version"] == 1, "operator spec fields mismatch")
-    files = source_files(repo, lock["sources"]["runtime"])
+    files = source_files(repo, lock["sources"]["bridge_reader"])
     source_hashes = {name: digest(raw) for name, raw in files.items()}
     patch_pins = lock["envio"]["patch_sha256"]
     require(set(spec["patches"]) == set(patch_pins), "all five pinned patch inputs required")
@@ -232,13 +212,11 @@ def build_files(spec, repo, lock):
     if spec["placement"] is not None:
         value = spec["placement"]
         validate_placement(value, lock)
-        files["compose.hasura.json"] = encode(compose(value, lock))
         environment = {
             "ENVIO_PG_HOST": value["postgres_host"], "ENVIO_PG_PORT": str(value["postgres_port"]),
             "ENVIO_PG_USER": value["postgres_user"], "ENVIO_PG_DATABASE": lock["envio"]["database"],
-            "ENVIO_PG_PUBLIC_SCHEMA": "envio", "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "true",
+            "ENVIO_PG_PUBLIC_SCHEMA": "envio", "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "false",
             "ENVIO_INDEXER_PORT": str(value["indexer_port"]), "TUI_OFF": "true",
-            "HASURA_GRAPHQL_ENDPOINT": f'http://{value["hasura_bind"]}:{value["hasura_port"]}/v1/metadata',
             "ENVIO_RPC_POLLING_INTERVAL_MILLIS": "12000", "PSY_ENVIO_FRESH_REORG_PARENT": "1"}
         if spec["rpc_routes"]:
             environment["PSY_ENVIO_ORDERED_FAILOVER"] = "1" if any(len(r["urls"]) > 1 for r in spec["rpc_routes"].values()) else "0"
@@ -249,9 +227,9 @@ def build_files(spec, repo, lock):
         files.update(documents)
         files["config.yaml"] = config_bytes(files["config.template.yaml"], networks, spec["rpc_routes"],
                                             lock["envio"]["project"])
-    report = {"source_commit": lock["sources"]["runtime"], "source_files": source_hashes,
+    report = {"source_commit": lock["sources"]["bridge_reader"], "source_files": source_hashes,
               "database": lock["envio"]["database"], "rpc_policy": "protected-alchemy-only-no-fallback",
-              "compose_project": lock["envio"]["project"], "release_path": lock["paths"]["envio"]["release"],
+              "project": lock["envio"]["project"], "release_path": lock["paths"]["envio"]["release"],
               "unit_name": lock["units"]["envio"],
               "l1_documents_pending": not bool(spec["l1_documents"]),
               "placement_pending": spec["placement"] is None, "rpc_routes_pending": not bool(spec["rpc_routes"]),

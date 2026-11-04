@@ -233,18 +233,24 @@ class PackageSetTests(unittest.TestCase):
         self.assertEqual(spec["placement"]["postgres_host"], lock["hosts"]["gcp-postgres"])
         self.assertEqual([route["urls"] for route in spec["rpc_routes"].values()], [[url] for url in lock["envio"]["rpc_routes"].values()])
         self.assertEqual(spec["l1_documents"], {})
+        self.assertEqual(spec["placement"], {"postgres_host": lock["hosts"]["gcp-postgres"], "postgres_port": 5432,
+                                             "postgres_user": lock["envio"]["database"], "indexer_port": lock["envio"]["indexer_port"]})
 
     def test_envio_build_must_carry_verified_evidence(self):
         built = self.world.root / "built"
         built.mkdir()
         (built / "node").write_bytes(b"node")
-        evidence = {"source_commit": self.world.lock["sources"]["runtime"], "node_sha256": self.world.lock["envio"]["node_sha256"],
+        evidence = {"source_commit": self.world.lock["sources"]["bridge_reader"], "node_sha256": self.world.lock["envio"]["node_sha256"],
                     "frozen_install_verified": True, "patches_verified": True, "native_help_verified": True,
                     "generated_config_verified": True}
         import install_envio
         evidence["files"] = install_envio.inventory(built)
         (built / "build.json").write_text(json.dumps(evidence))
         self.assertEqual(bridge.check_envio_build(built, self.world.lock), sha((built / "build.json").read_bytes()))
+        runtime_build = dict(evidence, source_commit=self.world.lock["sources"]["runtime"])
+        (built / "build.json").write_text(json.dumps(runtime_build))
+        with self.assertRaisesRegex(ValueError, "not verified"):
+            bridge.check_envio_build(built, self.world.lock)
         for key in ("frozen_install_verified", "patches_verified", "native_help_verified", "generated_config_verified"):
             broken = copy.deepcopy(evidence)
             broken[key] = False
@@ -356,19 +362,37 @@ class VerifyTests(unittest.TestCase):
         chains = prepare_envio.CHAINS
         depths = {chain_id: depth for _, chain_id, depth in chains.values()}
         sequences = [{chain: (100 + 5 * step, depth) for chain, depth in depths.items()} for step in range(3)]
-        with patch.object(steps, "envio_rows", side_effect=sequences), patch.object(steps, "hasura_status", return_value=200):
-            self.assertEqual(steps.envio_verify(self.ctx)["chains"], sorted(depths))
+        with patch.object(steps, "envio_rows", side_effect=sequences):
+            self.assertEqual(steps.envio_verify(self.ctx), {"unit": self.world.lock["units"]["envio"], "restarts": 0,
+                                                            "chains": sorted(depths)})
         stuck = {chain: (100, depth) for chain, depth in depths.items()}
-        with patch.object(steps, "envio_rows", return_value=stuck), patch.object(steps, "hasura_status", return_value=200):
+        with patch.object(steps, "envio_rows", return_value=stuck):
             with self.assertRaises(TimeoutError):
                 steps.envio_verify(self.ctx)
         wrong_depth = {chain: (100, 1) for chain in depths}
-        with patch.object(steps, "envio_rows", return_value=wrong_depth), patch.object(steps, "hasura_status", return_value=200):
+        with patch.object(steps, "envio_rows", return_value=wrong_depth):
             with self.assertRaisesRegex(ValueError, "reorg window"):
                 steps.envio_verify(self.ctx)
-        with patch.object(steps, "envio_rows", return_value={}), patch.object(steps, "hasura_status", return_value=503):
-            with self.assertRaisesRegex(ValueError, "Hasura is not healthy"):
+        with patch.object(steps, "envio_rows", return_value={}):
+            with self.assertRaisesRegex(ValueError, "all three chains"):
                 steps.envio_verify(self.ctx)
+
+    def test_envio_apply_sends_only_the_database_login(self):
+        recorded = {}
+
+        def stage(ctx, summary, secrets_raw):
+            recorded["secrets"] = json.loads(secrets_raw)
+            return "f" * 64
+        scripts = []
+        with patch.object(steps, "read_envio_summary", return_value={"built": "/x", "build_sha256": "a" * 64}), \
+                patch.object(steps, "unit_state", return_value={"LoadState": "not-found"}), \
+                patch.object(steps, "root_script", side_effect=lambda ctx, host, script, timeout=0: scripts.append(script) or ""), \
+                patch.object(steps, "postgres_script"), patch.object(steps, "stage_envio", side_effect=stage), \
+                patch.object(steps, "run_envio_tool", return_value="") as tool:
+            steps.envio_apply(self.ctx)
+        self.assertEqual(recorded["secrets"], {"postgres_password": steps.database_login(self.ctx)})
+        self.assertEqual([call.args[1] for call in tool.call_args_list], ["check-host", "install", "activate"])
+        self.assertFalse(any("docker pull" in script or "graphql-engine" in script for script in scripts))
 
     def test_database_login_must_have_the_installer_shape(self):
         self.assertTrue(steps.database_login(self.ctx).startswith("fixture-login-"))

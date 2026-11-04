@@ -51,9 +51,7 @@ class PrepareEnvioTests(unittest.TestCase):
     def complete(self):
         address = str(ipaddress.IPv4Address(0xAC100102))
         self.spec["placement"] = {"postgres_host": address, "postgres_port": 5432,
-                                  "postgres_user": "envio_fresh", "hasura_bind": address,
-                                  "hasura_port": self.lock["envio"]["hasura_port"],
-                                  "indexer_port": self.lock["envio"]["graphql_port"]}
+                                  "postgres_user": "envio_fresh", "indexer_port": self.lock["envio"]["indexer_port"]}
         for name, (index, chain_id, depth) in envio.CHAINS.items():
             self.spec["rpc_routes"][name] = {"urls": [self.lock["envio"]["rpc_routes"][name]],
                                              "confirmed_block_threshold": depth}
@@ -100,25 +98,19 @@ class PrepareEnvioTests(unittest.TestCase):
         self.assertEqual([n["confirmed_block_threshold"] for n in config["networks"]], [8, 200, 64])
         self.assertFalse(report["l1_documents_pending"] or report["deployment_ready"])
 
-    def test_hasura_is_separate_private_and_cannot_target_old_database(self):
+    def test_envio_runs_without_hasura_on_the_new_database(self):
         self.complete()
-        files, _ = self.build()
-        compose = json.loads(files["compose.hasura.json"])
-        self.assertEqual(compose["name"], self.lock["envio"]["project"])
-        self.assertEqual(compose["services"]["graphql-engine"]["image"], self.lock["envio"]["image"])
-        self.assertEqual(set(compose["services"]), {"graphql-engine"})
-        self.assertNotIn("volumes", compose)
-        service = compose["services"]["graphql-engine"]
-        self.assertEqual(service["restart"], "no")
-        self.assertEqual(service["ports"][0]["host_ip"], self.spec["placement"]["hasura_bind"])
-        for key in ("HASURA_GRAPHQL_DATABASE_URL", "HASURA_GRAPHQL_METADATA_DATABASE_URL"):
-            self.assertTrue(service["environment"][key].endswith("/" + self.lock["envio"]["database"]))
-            self.assertNotIn("${ENVIO_DATABASE_URL", service["environment"][key])
+        files, report = self.build()
+        self.assertFalse(any("hasura" in name for name in files))
         runtime = json.loads(files["runtime-env.json"])
+        self.assertEqual(runtime["ENVIO_HASURA"], "false")
+        self.assertFalse(any(key.startswith("HASURA_") for key in runtime))
         self.assertEqual(runtime["ENVIO_PG_DATABASE"], self.lock["envio"]["database"])
+        self.assertEqual(runtime["ENVIO_INDEXER_PORT"], str(self.lock["envio"]["indexer_port"]))
         self.assertEqual(runtime["ENVIO_RPC_POLLING_INTERVAL_MILLIS"], "12000")
-        self.assertEqual(runtime["HASURA_GRAPHQL_ENDPOINT"],
-                         f'http://{self.spec["placement"]["hasura_bind"]}:{self.lock["envio"]["hasura_port"]}/v1/metadata')
+        self.assertEqual(report["source_commit"], self.lock["sources"]["bridge_reader"])
+        self.assertEqual(report["project"], self.lock["envio"]["project"])
+        envio.source_files.assert_called_with(self.root, self.lock["sources"]["bridge_reader"])
 
     def test_own_node_or_additional_fallback_is_rejected(self):
         self.complete()
@@ -158,8 +150,8 @@ class PrepareEnvioTests(unittest.TestCase):
     def test_public_hosts_old_ports_superuser_and_small_windows_rejected(self):
         self.complete()
         original = copy.deepcopy(self.spec)
-        changes = [("postgres_host", "8.8.8.8"), ("hasura_bind", "0.0.0.0"),
-                   ("hasura_port", 18080), ("indexer_port", 9898), ("postgres_user", "postgres")]
+        changes = [("postgres_host", "8.8.8.8"), ("hasura_bind", "10.0.0.24"), ("indexer_port", 9898),
+                   ("indexer_port", 5432), ("postgres_user", "postgres")]
         for key, value in changes:
             self.spec = copy.deepcopy(original)
             self.spec["placement"][key] = value

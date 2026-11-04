@@ -305,9 +305,7 @@ def run_envio_tool(ctx, mode, spec_sha, apply, timeout):
 def prepare_envio_host(ctx):
     root_script(ctx, POSTGRES_ALIAS,
                 f"id {ENVIO_ACCOUNT} >/dev/null 2>&1 || useradd --system --user-group --no-create-home --home-dir /nonexistent "
-                f"--shell /usr/sbin/nologin {ENVIO_ACCOUNT}\n"
-                f"docker image inspect {quote_word(ctx.lock['envio']['image'])} >/dev/null 2>&1 || "
-                f"docker pull {quote_word(ctx.lock['envio']['image'])} >/dev/null\n", INSTALL_SECONDS)
+                f"--shell /usr/sbin/nologin {ENVIO_ACCOUNT}\n", INSTALL_SECONDS)
 
 
 def envio_apply(ctx):
@@ -317,8 +315,7 @@ def envio_apply(ctx):
     ensure_roles(ctx)
     if is_running(state) and envio_rows_ready(ctx):
         return
-    values = service_values(ctx)
-    secrets_raw = bridge.encode({"postgres_password": database_login(ctx), "hasura_admin_secret": values["hasura_admin_secret"]})
+    secrets_raw = bridge.encode({"postgres_password": database_login(ctx)})
     try:
         spec_sha = stage_envio(ctx, summary, secrets_raw)
         if state.get("LoadState") != "loaded":
@@ -351,11 +348,6 @@ def envio_rows_ready(ctx):
     return set(rows) == set(expected_chains()) and all(block > 0 for block, _ in rows.values())
 
 
-def hasura_status(ctx):
-    host, port = ctx.lock["hosts"][POSTGRES_ALIAS], ctx.lock["envio"]["hasura_port"]
-    return http_status(ctx, POSTGRES_ALIAS, f"http://{host}:{port}/healthz")
-
-
 def http_status(ctx, host, url):
     script = ("python3 -I - <<'PSY_HTTP_END'\nimport urllib.request\ntry:\n    print(urllib.request.urlopen(%r, timeout=10).status)\n"
               "except Exception:\n    print(0)\nPSY_HTTP_END\n") % url
@@ -366,7 +358,6 @@ def http_status(ctx, host, url):
 def envio_verify(ctx):
     state = unit_state(ctx, POSTGRES_ALIAS, envio_unit(ctx))
     prepare.require(is_running(state) and state.get("NRestarts") == "0", "Envio is not running without restarts")
-    prepare.require(hasura_status(ctx) == 200, "Hasura is not healthy")
     first = envio_rows(ctx)
     prepare.require(set(first) == set(expected_chains()), "Envio does not report all three chains")
     for chain_id, depth in expected_chains().items():
@@ -377,7 +368,7 @@ def envio_verify(ctx):
         return set(rows) == set(first) and all(rows[chain][0] > first[chain][0] > 0 for chain in first)
 
     wait_until(advanced, lambda: None, POLL_SECONDS, READY_SECONDS, "Envio polling on three chains")
-    return {"unit": envio_unit(ctx), "restarts": 0, "chains": sorted(first), "hasura_healthy": True}
+    return {"unit": envio_unit(ctx), "restarts": 0, "chains": sorted(first)}
 
 
 # ---- step 73: Services and indexers --------------------------------------------------------------------------------
@@ -421,7 +412,7 @@ def services_check(ctx):
                     "local-inputs packages.services.mirror_host_keys must hold a host key for every mirror source")
     mirror_sources(sources, keys)
     database_login(ctx)
-    prepare.require(hasura_status(ctx) == 200, "Hasura is not healthy; start Envio first")
+    prepare.require(envio_rows_ready(ctx), "Envio is not polling all three chains; start Envio first")
 
 
 def write_env_file(ctx, host, path, lines):

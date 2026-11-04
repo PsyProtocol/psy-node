@@ -77,7 +77,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
                    "retained_paths": sha256(private["retained-paths.json"].encode())},
         "sources": {"runtime": "1" * 40, "guardian_key": "4" * 40, "compiler": "2" * 40, "genesis": "3" * 40,
                     "contracts": "5" * 40, "services": "6" * 40, "indexer": "7" * 40,
-                    "notifier": "8" * 40},
+                    "notifier": "8" * 40, "bridge_reader": "9" * 40},
         "binaries": {**binaries, "psy-services": digest("psy-services"), "psy-indexer": digest("psy-indexer")},
         "paths": paths,
         "units": {"core_prefix": f"psy-core-{namespace}-", "core_namespace_prefix": namespace,
@@ -90,8 +90,7 @@ def build_test_lock(release_dir=None, private_dir=None, *, topology_text=None, r
         "services": {"database": "services_db", "owner": "services_owner", "redis_db": 14,
                      "key_prefix": "svc:", "listen": "10.0.0.38:3001", "backups": f"/var/lib/psy-core/{rid}/checkpoints",
                      "mirror": "/var/lib/psy-indexer-mirror"},
-        "envio": {"database": "envio_db", "project": "envio-project",
-                  "image": "hasura/graphql-engine@sha256:" + "a" * 64, "graphql_port": 29899, "hasura_port": 38081,
+        "envio": {"database": "envio_db", "project": "envio-project", "indexer_port": 29899, "hasura_port": 38081,
                   "rpc_routes": {chain: f"http://10.0.0.32:{18545 + index}" for index, chain in enumerate(CHAINS)},
                   "node_sha256": digest("envio-node"),
                   "patch_sha256": {name: digest("patch" + name) for name in lock_module.ENVIO_PATCHES}},
@@ -138,6 +137,21 @@ class ReleaseLockTests(unittest.TestCase):
         lock = copy.deepcopy(self.lock)
         del lock["ingress"]["forwarder_topology_sha256"]
         with self.assertRaisesRegex(ValueError, "ingress fields"):
+            self.validate(lock)
+
+    def test_envio_has_no_hasura_image_or_graphql_port_and_the_reader_source_is_pinned(self):
+        for extra in ({"image": "hasura/graphql-engine@sha256:" + "a" * 64}, {"graphql_port": 29899}):
+            lock = copy.deepcopy(self.lock)
+            lock["envio"].update(extra)
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "envio fields"):
+                self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        del lock["sources"]["bridge_reader"]
+        with self.assertRaisesRegex(ValueError, "sources fields"):
+            self.validate(lock)
+        lock = copy.deepcopy(self.lock)
+        lock["sources"]["bridge_reader"] = "6792483a"
+        with self.assertRaisesRegex(ValueError, "sources.bridge_reader must be a commit"):
             self.validate(lock)
 
     def test_signer_host_must_be_a_known_alias(self):
@@ -367,7 +381,7 @@ class CommittedLockTests(unittest.TestCase):
         lock_module.validate_release_lock(self.lock, RELEASE_DIR, False)
 
     def test_committed_lock_pins_published_sources_and_a_known_key_source(self):
-        for name in ("contracts", "services", "indexer", "notifier"):
+        for name in ("contracts", "services", "indexer", "notifier", "bridge_reader"):
             self.assertRegex(self.lock["sources"][name], "^[0-9a-f]{40}$")
         self.assertEqual(self.lock["sources"]["guardian_key"], "de539f565ec1a92f91bb4e9686e1442e89ba8639")
 

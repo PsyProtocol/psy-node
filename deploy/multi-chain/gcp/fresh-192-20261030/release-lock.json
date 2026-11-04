@@ -23,7 +23,8 @@
     "contracts": "b18aa6cfe1d8aa57ba15969a805637408a880188",
     "services": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
     "indexer": "458e139d881f2ce3f10fd09694bf412b60f24ca7",
-    "notifier": "d80a89f390623f59d7bad0750a485793aee31358"
+    "notifier": "d80a89f390623f59d7bad0750a485793aee31358",
+    "bridge_reader": "6792483adfd5fa1425dc08ab4157bcc370c89ba8"
   },
   "binaries": {
     "psy_dev_cli": "82d201552d236cf9b4afe8a21188888411216a4946095e6a8b44188e4194536f",
@@ -118,8 +119,7 @@
   "envio": {
     "database": "envio_bridge_fresh20261030sd192",
     "project": "psy-envio-fresh20261030sd192",
-    "image": "hasura/graphql-engine@sha256:13bb9088f5b011b15af117fd1b175360f5205946bee1a78d9e0c846e5a38551c",
-    "graphql_port": 29899,
+    "indexer_port": 29899,
     "hasura_port": 38081,
     "rpc_routes": {
       "sepolia": "http://10.148.0.32:18545",
@@ -208,7 +208,7 @@
     "fresh_l1.py": "80c05afbc1691a4fe7c1a62640e48cc6220e3dca8013aa01c10bee21cc405204",
     "guardian_exec.py": "965c325ef2e0d4477beb73a2f9415a0952e214cadd4e31d098198e7fd5489762",
     "indexer_backup_mirror.py": "4e5ce785f72a470fffe4f63540ff0573485cb912e6f24979548d5d837c2dc427",
-    "install_envio.py": "691edba90ab96718346d9bf27808e70c786fe32827b8d4d640882e2e1fe9f27b",
+    "install_envio.py": "720a52ba3350083e7e6b0565789ba71b5cac15afa8465176c457080e6e6f634e",
     "install_guardian.py": "b12f963e776078142dd08a77e894ed54d3f0add0f6e1b54093d3de4b0ddb7b96",
     "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
     "install_relayer.py": "5e15d87644ec078eb40f4f62b69c34da4a1b02770888d9c63b5b6b7a8319e184",

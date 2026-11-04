@@ -232,7 +232,7 @@ def envio_spec(ctx, documents):
         patches[name] = {"path": str(path), "sha256": prepare.file_sha256(path)}
     address = ctx.lock["hosts"][POSTGRES_ALIAS]
     placement = {"postgres_host": address, "postgres_port": POSTGRES_PORT, "postgres_user": lock["envio"]["database"],
-                 "hasura_bind": address, "hasura_port": lock["envio"]["hasura_port"], "indexer_port": lock["envio"]["graphql_port"]}
+                 "indexer_port": lock["envio"]["indexer_port"]}
     routes = {name: {"urls": [lock["envio"]["rpc_routes"][name]], "confirmed_block_threshold": depth}
               for name, (_, _, depth) in prepare_envio.CHAINS.items()}
     dependency_lock = Path(values["dependency_lock"])
@@ -246,7 +246,7 @@ def check_envio_build(built, lock):
     prepare.require(build_path.is_file(), "the Envio build produced no build.json")
     build = release_lock.parse(build_path.read_bytes())  # lists every file, so it exceeds the document size cap
     flags = ("frozen_install_verified", "patches_verified", "native_help_verified", "generated_config_verified")
-    prepare.require(build.get("source_commit") == lock["sources"]["runtime"] and build.get("node_sha256") == lock["envio"]["node_sha256"]
+    prepare.require(build.get("source_commit") == lock["sources"]["bridge_reader"] and build.get("node_sha256") == lock["envio"]["node_sha256"]
                     and all(build.get(flag) is True for flag in flags), "the Envio build is not verified against the lock")
     prepare.require(install_envio.inventory(built) == build["files"], "the Envio build inventory differs from build.json")
     return prepare.file_sha256(build_path)

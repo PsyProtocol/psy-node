@@ -30,17 +30,12 @@ class InstallEnvioTests(unittest.TestCase):
                                            state=self.root / "state", config=self.root / "config",
                                            unit=self.root / "new.service")
         database = self.release.database
-        self.placement = {"postgres_host": self.address, "postgres_port": 5432, "postgres_user": database,
-                          "hasura_bind": self.address, "hasura_port": self.release.hasura_port,
-                          "indexer_port": self.release.indexer_port}
         self.runtime = {"ENVIO_PG_HOST": self.address, "ENVIO_PG_PORT": "5432", "ENVIO_PG_USER": database,
                         "ENVIO_PG_DATABASE": database, "ENVIO_PG_PUBLIC_SCHEMA": "envio",
-                        "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "true", "ENVIO_INDEXER_PORT": str(self.release.indexer_port),
-                        "TUI_OFF": "true", "HASURA_GRAPHQL_ENDPOINT": f"http://{self.address}:{self.release.hasura_port}/v1/metadata",
-                        "ENVIO_RPC_POLLING_INTERVAL_MILLIS": "12000", "PSY_ENVIO_FRESH_REORG_PARENT": "1",
+                        "ENVIO_PG_SSL_MODE": "false", "ENVIO_HASURA": "false", "ENVIO_INDEXER_PORT": str(self.release.indexer_port),
+                        "TUI_OFF": "true", "ENVIO_RPC_POLLING_INTERVAL_MILLIS": "12000", "PSY_ENVIO_FRESH_REORG_PARENT": "1",
                         "PSY_ENVIO_ORDERED_FAILOVER": "0"}
         self.write(self.package / "runtime-env.json", self.runtime)
-        self.write(self.package / "compose.hasura.json", prepare.compose(self.placement, self.lock))
         self.write(self.package / "node/bin/node", self.node, 0o755)
         self.write(self.package / "generated/fixture.js", b"compiled fixture")
         (self.package / "generated/alias.js").symlink_to("fixture.js")
@@ -48,8 +43,7 @@ class InstallEnvioTests(unittest.TestCase):
                       "frozen_install_verified": True, "patches_verified": True, "native_help_verified": True,
                       "generated_config_verified": True}
         self.secret_path = self.root / "secrets.json"
-        self.write(self.secret_path, {"postgres_password": "fixture-password-" + "a" * 32,
-                                     "hasura_admin_secret": "fixture-admin-" + "b" * 32})
+        self.write(self.secret_path, {"postgres_password": "fixture-password-" + "a" * 32})
         self.spec = {"version": 1, "hostname": "fixture.example.invalid", "address": self.address,
                      "postgres_container_id": "a" * 64, "package": str(self.package), "build_sha256": "",
                      "secrets": {"path": str(self.secret_path), "sha256": installer.sha(self.secret_path.read_bytes())}}
@@ -102,19 +96,23 @@ class InstallEnvioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             installer.inventory(self.package)
 
-    def test_wrong_database_and_extra_compose_capability_rejected(self):
-        original = prepare.compose(self.placement, self.lock)
-        for key in ("HASURA_GRAPHQL_DATABASE_URL", "HASURA_GRAPHQL_METADATA_DATABASE_URL", "volumes"):
-            compose = copy.deepcopy(original)
-            service = compose["services"]["graphql-engine"]
-            if key == "volumes":
-                service[key] = ["/:/host"]
-            else:
-                service["environment"][key] = "postgres://example.invalid/old_database"
-            self.write(self.package / "compose.hasura.json", compose)
+    def test_hasura_runtime_or_secret_is_rejected(self):
+        original = copy.deepcopy(self.runtime)
+        for key, value in (("ENVIO_HASURA", "true"), ("HASURA_GRAPHQL_ENDPOINT", f"http://{self.address}:38081/v1/metadata")):
+            self.runtime = dict(original, **{key: value})
+            self.write(self.package / "runtime-env.json", self.runtime)
             self.freeze()
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.plan()
+        self.runtime = original
+        self.write(self.package / "runtime-env.json", self.runtime)
+        self.freeze()
+        self.plan()
+        self.write(self.secret_path, {"postgres_password": "fixture-password-" + "a" * 32, "hasura_admin_secret": "b" * 32})
+        self.spec["secrets"]["sha256"] = installer.sha(self.secret_path.read_bytes())
+        self.freeze()
+        with self.assertRaises(ValueError):
+            self.plan()
 
     def test_runtime_database_url_override_is_rejected(self):
         self.runtime["DATABASE_URL"] = "postgres://example.invalid/old_database"
@@ -151,6 +149,9 @@ class InstallEnvioTests(unittest.TestCase):
             self.assertEqual(installer.inventory(release), self.build["files"])
             self.assertEqual(stat.S_IMODE(release.stat().st_mode), 0o750)
             self.assertEqual(stat.S_IMODE((config / "runtime.env").stat().st_mode), 0o600)
+            self.assertEqual(sorted(path.name for path in config.iterdir()), ["runtime.env"])
+            self.assertIn('ENVIO_HASURA="false"', (config / "runtime.env").read_text())
+            self.assertNotIn("HASURA_GRAPHQL", (config / "runtime.env").read_text())
             self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o700)
             self.assertIn("runUpMigrations(true,false)", unit.read_text())
             self.assertNotIn("runDown", unit.read_text())
@@ -164,8 +165,6 @@ class InstallEnvioTests(unittest.TestCase):
         def command(args, input=None):
             if args[:2] == ["ip", "-j"]:
                 return json.dumps([{"addr_info": [{"local": self.address}]}])
-            if args[:3] == ["docker", "ps", "-aq"]:
-                return ""
             if args[:2] == ["docker", "inspect"]:
                 return json.dumps("a" * 64) if ".Id" in args[3] else "true"
             if args[0] == "ss":
@@ -186,24 +185,21 @@ class InstallEnvioTests(unittest.TestCase):
             self.assertIn("default_transaction_read_only=on", sql)
             self.assertNotIn("CREATE", sql)
             self.assertFalse(any("restart" in c.args[0] or "start" in c.args[0] for c in run.call_args_list))
+            self.assertFalse(any(c.args[0][:2] in (["docker", "compose"], ["docker", "image"]) for c in run.call_args_list))
             pg.return_value = "1\n1\n0"
             with self.assertRaises(ValueError):
                 installer.host_checks(plan, self.release)
 
     def test_envio_constants_come_from_lock(self):
         release = installer.load_release(self.lock)
-        self.assertEqual((release.source, release.node_sha256), (self.lock["sources"]["runtime"], installer.sha(self.node)))
-        self.assertEqual((release.database, release.project, release.image),
-                         (self.lock["envio"]["database"], self.lock["envio"]["project"], self.lock["envio"]["image"]))
+        self.assertEqual((release.source, release.node_sha256), (self.lock["sources"]["bridge_reader"], installer.sha(self.node)))
+        self.assertEqual(release.database, self.lock["envio"]["database"])
         self.assertEqual((str(release.release), str(release.state), str(release.config)),
                          tuple(self.lock["paths"]["envio"][name] for name in ("release", "state", "config")))
         self.assertEqual(release.unit.name, self.lock["units"]["envio"])
-        self.assertEqual((release.hasura_port, release.indexer_port), (self.lock["envio"]["hasura_port"], self.lock["envio"]["graphql_port"]))
+        self.assertEqual(release.indexer_port, self.lock["envio"]["indexer_port"])
         for name in ("SOURCE", "NODE_HASH", "DATABASE", "PROJECT", "RELEASE", "STATE", "CONFIG", "UNIT"):
             self.assertFalse(hasattr(installer, name), name)
-        compose = prepare.compose(self.placement, self.lock)
-        self.assertEqual(compose["name"], release.project)
-        self.assertEqual(compose["services"]["graphql-engine"]["image"], release.image)
         wrong = dataclasses.replace(release, database="other_database")
         with self.assertRaises(ValueError):
             installer.load_plan(self.spec_path, installer.sha(self.spec_path.read_bytes()), wrong)
@@ -222,30 +218,25 @@ class InstallEnvioTests(unittest.TestCase):
         properties = [{"ActiveState": "inactive", "MainPID": "0"}] + [{"ActiveState": "active", "MainPID": "55", "NRestarts": "0"}] * 8
         rows = iter([{}, {chain: {"source_block": 0, "max_reorg_depth": 8} for chain in installer.CHAIN_IDS}] +
                     [{chain: {"source_block": 9, "max_reorg_depth": 8} for chain in installer.CHAIN_IDS}] * 3)
-        with patch.object(installer, "check_installed"), patch.object(installer, "hasura_container_ids", return_value=[]), \
+        with patch.object(installer, "check_installed"), \
                 patch.object(installer, "run", side_effect=lambda args, input=None, timeout=120: commands.append([str(a) for a in args]) or ""), \
-                patch.object(installer, "hasura_is_healthy", return_value=True), \
                 patch.object(installer, "unit_properties", side_effect=lambda release: properties.pop(0) if len(properties) > 1 else properties[0]), \
                 patch.object(installer, "chain_rows", side_effect=lambda plan, release: next(rows)), \
                 patch.object(installer, "apply_indexes") as indexes, patch.object(installer.time, "sleep") as sleep:
             result = installer.activate(plan, self.release, True)
         self.assertTrue(result["polling_live"] and result["unit_active"])
-        self.assertEqual(commands[0][:6], ["docker", "compose", "--project-name", self.release.project, "--file", str(self.release.release / "compose.hasura.json")])
-        self.assertIn("--pull", commands[0])
-        self.assertEqual(commands[1], ["systemctl", "enable", "--now", self.release.unit.name])
+        self.assertEqual(commands, [["systemctl", "enable", "--now", self.release.unit.name]])
         self.assertGreaterEqual(sleep.call_count, 2)
         indexes.assert_called_once()
         with patch.object(installer, "check_installed"), patch.object(installer, "run") as run, \
-                patch.object(installer, "unit_properties", return_value={"ActiveState": "inactive", "MainPID": "0"}), \
-                patch.object(installer, "hasura_is_healthy", return_value=False):
+                patch.object(installer, "unit_properties", return_value={"ActiveState": "inactive", "MainPID": "0"}):
             report = installer.activate(plan, self.release, False)
         run.assert_not_called()
         self.assertFalse(report["polling_live"])
 
     def test_envio_activate_stops_waiting_when_the_unit_fails(self):
         plan = self.plan()
-        with patch.object(installer, "check_installed"), patch.object(installer, "hasura_container_ids", return_value=["x"]), \
-                patch.object(installer, "run", return_value=""), patch.object(installer, "hasura_is_healthy", return_value=True), \
+        with patch.object(installer, "check_installed"), patch.object(installer, "run", return_value=""), \
                 patch.object(installer, "unit_properties", return_value={"ActiveState": "failed", "MainPID": "0"}), \
                 patch.object(installer.time, "sleep"):
             with self.assertRaises(ValueError):
