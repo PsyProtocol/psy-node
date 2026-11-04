@@ -5,10 +5,8 @@
 //! here plays the agent and tries to move money the owner did not sanction.
 //!
 //! A PASSING test named `attack_*` or `*_is_denied` means the attack is BLOCKED.
-//! A test named `FINDING_*` documents an attack that SUCCEEDS today: it asserts
-//! the SECURE behaviour, is `#[ignore]`d so the suite stays green, and fails
-//! when run with `cargo test -- --ignored`. Each has a sibling `documents_*`
-//! test that pins the current (vulnerable) behaviour so a fix visibly flips it.
+//! Tests named `finding_*` retain captured policy defects as active regressions.
+//! Their companion tests cover the repaired authorization and accounting paths.
 //!
 //! The crate has no `[lib]` target, so the module under test is included by
 //! path. That is deliberate: these tests exercise the REAL `policy.rs`, not a
@@ -153,17 +151,16 @@ fn attack_a_thousand_refunded_attempts_do_not_drift_the_counter() {
     assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 0);
 }
 
-/// FINDING (LOW) — a refund issued after the daily window rolled over subtracts
-/// from the NEW day's counter, handing back budget that was never spent today.
-/// Reachable when a tool call straddles the UTC-midnight boundary: proving and
-/// settlement take minutes, and the failure path refunds long after the gate ran.
+/// A call can fail after UTC midnight; its refund must not reduce spending
+/// already recorded in the new daily bucket.
 #[test]
-#[ignore = "FINDING: refund after rollover credits the new day's counter"]
 fn finding_a_refund_across_the_day_boundary_must_not_credit_the_new_day() {
     let limits = Limits { per_transaction: 100, per_day: 100, ..open_limits() };
     let (mut e, pid, t) = engine_with(limits, None);
 
-    let yesterday = e.authorize(&t, "9999", 100, "transfer").unwrap(); // day D
+    let mut yesterday = e.authorize(&t, "9999", 100, "transfer").unwrap(); // day D
+    // The helper backdates the policy bucket; backdate its captured receipt too.
+    yesterday.last_day = yesterday.last_day.saturating_sub(1);
     e.force_day_rollover_for_test(); // wall clock crosses midnight
     e.authorize(&t, "9999", 100, "transfer").unwrap(); // day D+1, budget now spent
     e.refund(&yesterday, 100); // day D's call finally fails
@@ -177,17 +174,45 @@ fn finding_a_refund_across_the_day_boundary_must_not_credit_the_new_day() {
 }
 
 #[test]
-fn documents_the_cross_day_refund_credit() {
-    let limits = Limits { per_transaction: 100, per_day: 100, ..open_limits() };
-    let (mut e, pid, t) = engine_with(limits, None);
-    let yesterday = e.authorize(&t, "9999", 100, "transfer").unwrap();
+fn refund_across_period_preserves_new_buckets_session_and_batch_log() {
+    let limits = Limits { per_transaction: 100, per_day: 200, per_month: Some(200), total_budget: Some(500) };
+    let mut e = PolicyEngine::new();
+    let pid = e.create_policy("agent", limits, None, vec![]);
+    let (t, _) = e.issue_session(&pid, 60, Some(160)).unwrap();
+    let mut previous = e.authorize_batch(&t, &[("111", 40), ("222", 60)], "transfer").unwrap();
+    previous.last_day = previous.last_day.saturating_sub(1);
+    previous.last_month = previous.last_month.saturating_sub(1);
+    e.force_period_rollover_for_test();
+    let current = e.authorize(&t, "9999", 60, "transfer").unwrap();
+    e.refund(&previous, 100);
+    e.refund(&previous, 100); // Idempotency applies across buckets too.
+    let budget = e.budget(&t).unwrap();
+    assert_eq!((budget.spent_today, budget.spent_this_month, budget.spent_total), (60, 60, 60));
+    let rows = e.spend_log(10, Some(&pid));
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row.refunded, previous.spend_ids.contains(&row.id));
+        if current.spend_ids.contains(&row.id) { assert!(!row.refunded); }
+    }
+    // This fits the current day/month and succeeds only if the session refund
+    // also happened: without it the 160 session budget is already exhausted.
+    assert!(e.authorize(&t, "9999", 40, "transfer").is_ok());
+    assert_eq!(e.budget(&t).unwrap().spent_today, 100);
+    assert!(e.authorize(&t, "9999", 61, "transfer").is_err(), "the restored session cap remains enforced");
+}
+
+#[test]
+fn refund_after_day_rollover_preserves_today_but_restores_same_month() {
+    let (mut e, pid, t) = engine_with(open_limits(), None);
+    let mut previous = e.authorize(&t, "9999", 100, "transfer").unwrap();
+    previous.last_day = previous.last_day.saturating_sub(1);
     e.force_day_rollover_for_test();
-    e.authorize(&t, "9999", 100, "transfer").unwrap();
-    e.refund(&yesterday, 100);
-    // CURRENT behaviour: today's 100 was silently un-spent, so a second 100
-    // goes through — 200 Nano moved on a 100/day policy.
-    assert_eq!(spent_today(&mut e, &pid), 0, "current (vulnerable) behaviour");
-    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok(), "second 100 on a 100/day cap");
+    e.authorize(&t, "9999", 60, "transfer").unwrap();
+    e.refund(&previous, 100);
+    let description = e.describe(&pid).unwrap();
+    assert_eq!(description.spent_today_nano, 60);
+    assert_eq!(description.spent_this_month_nano, 60);
+    assert_eq!(description.spent_total_nano, 60);
 }
 
 /// Regression for the overflow attack: the cap comparisons now use
@@ -348,12 +373,8 @@ fn attack_x402_aliases_cannot_smuggle_an_unapproved_seller() {
     );
 }
 
-/// FINDING (LOW, latent) — `recipients.iter().all(..)` is vacuously TRUE for an
-/// empty slice, so `authorize_aliases(token, &[], ..)` skips the recipient
-/// allowlist entirely. No caller passes an empty slice today; this is a trap
-/// for the next one.
+/// Missing aliases must fail closed rather than satisfy an inbound all() check.
 #[test]
-#[ignore = "FINDING: an empty alias list is treated as an inbound (self) operation"]
 fn finding_an_empty_alias_list_must_not_bypass_the_allowlist() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
     assert!(
@@ -363,21 +384,18 @@ fn finding_an_empty_alias_list_must_not_bypass_the_allowlist() {
 }
 
 #[test]
-fn documents_the_empty_alias_list_bypass() {
+fn empty_or_blank_aliases_are_denied_without_spend() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
-    assert!(
-        e.authorize_aliases(&t, &[], 1_000, "transfer").is_ok(),
-        "current (vulnerable) behaviour: vacuous all() ⇒ inbound ⇒ allowlist skipped"
-    );
+    for aliases in [&[][..], &[""][..], &["   "][..], &["1234", ""][..]] {
+        assert!(e.authorize_aliases(&t, aliases, 1_000, "transfer").is_err());
+    }
+    assert_eq!(e.spend_log_len(), 0);
+    assert_eq!(e.denied_log_len(), 4);
+    assert!(e.check_can_act(&t, "x402_fetch").is_ok(), "a capability check does not invent a payee");
 }
 
-/// FINDING (LOW) — `0x`-prefixed hex and bare decimal share one namespace after
-/// normalization, so approving public user id `1234` also approves the shielded
-/// address `0x1234` and the L1 address `0x1234`. Practical impact is capped by
-/// the fact that a short address like that is not an address anyone owns, so
-/// this is fund-destruction/griefing rather than theft.
+/// Approving a decimal user id must not approve an explicitly hexadecimal address.
 #[test]
-#[ignore = "FINDING: hex and decimal identifiers collide after normalization"]
 fn finding_a_hex_address_must_not_collide_with_a_decimal_user_id() {
     assert_ne!(
         normalize_recipient("0x1234"),
@@ -387,32 +405,24 @@ fn finding_a_hex_address_must_not_collide_with_a_decimal_user_id() {
 }
 
 #[test]
-fn documents_the_hex_decimal_collision() {
-    assert_eq!(normalize_recipient("0x1234"), "1234", "current behaviour");
+fn decimal_user_allowlist_does_not_grant_hex_address_permission() {
+    assert_eq!(normalize_recipient("0x1234"), "0x1234");
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
-    // Owner approved public user id 1234; the agent gets a PRIVATE transfer to
-    // shielded address 0x1234 past the gate on the strength of that.
-    assert!(e.authorize(&t, "0x1234", 1_000, "private_transfer").is_ok());
-    assert!(e.authorize(&t, "0x1234", 1_000, "withdraw").is_ok(), "and an L1 withdrawal too");
-    // Addresses that are not all decimal digits do NOT collide, which is why
-    // this is narrow.
+    assert!(e.authorize(&t, "0x1234", 1_000, "private_transfer").is_err());
+    assert!(e.authorize(&t, "0x1234", 1_000, "withdraw").is_err());
+    assert!(e.authorize(&t, "Psy-00001234", 1_000, "transfer").is_ok());
     assert!(e.authorize(&t, "0x12ab", 1_000, "private_transfer").is_err());
 }
 
-/// An empty string in the allowlist must not act as a wildcard for degenerate
-/// recipients. (It does match other degenerate inputs — recorded here so the
-/// blast radius is known.)
+/// An empty allowlist entry cannot authorize a real or missing payee.
 #[test]
 fn attack_a_blank_allowlist_entry_is_not_a_wildcard_for_real_payees() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["".into()]));
     for real in ["1234", "0xdeadbeef", "https://evil.com/x", "evil.com"] {
         assert!(e.authorize(&t, real, 1, "transfer").is_err(), "`{real}` must not match a blank entry");
     }
-    // Degenerate inputs DO match it — they normalize to "" as well. They are
-    // not payable identifiers, so nothing can be sent to them, but a blank
-    // entry is still a configuration smell worth rejecting at create time.
-    assert!(e.authorize(&t, "", 1, "transfer").is_ok(), "documented: blank matches blank");
-    assert!(e.authorize(&t, "   ", 1, "transfer").is_ok());
+    assert!(e.authorize(&t, "", 1, "transfer").is_err());
+    assert!(e.authorize(&t, "   ", 1, "transfer").is_err());
 }
 
 #[test]
@@ -473,15 +483,9 @@ fn attack_x402_and_transfer_are_not_interchangeable() {
     assert!(e.authorize(&t2, "1", 1, "transfer").is_err(), "and so are direct transfers");
 }
 
-/// FINDING (MEDIUM, defence-in-depth) — the inbound exemption tests the RAW
-/// recipient string against the literal "self". Two tools pass an
-/// agent-controlled string into that position (`withdraw.l1_recipient` and
-/// `private_transfer.to_shielded_address`), so the agent can name any spend
-/// "self" and skip the recipient allowlist entirely. Today the downstream
-/// address parsers reject "self", so no funds move — the gate is what fails,
-/// not the wallet, and a future lenient parser turns this into theft.
+/// An agent-controlled outbound recipient must not claim the self exemption;
+/// the policy gate must reject it before downstream address validation.
 #[test]
-#[ignore = "FINDING: the literal \"self\" bypasses the recipient allowlist on spend methods"]
 fn finding_the_self_sentinel_must_not_exempt_a_spend_method() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
     for method in ["withdraw", "private_transfer", "transfer", "x402_fetch"] {
@@ -493,20 +497,18 @@ fn finding_the_self_sentinel_must_not_exempt_a_spend_method() {
 }
 
 #[test]
-fn documents_the_self_sentinel_bypass() {
+fn self_sentinel_is_denied_for_outbound_methods_and_aliases() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
-    // Current behaviour: the allowlist is skipped for ANY method when the
-    // recipient string is exactly "self".
-    assert!(e.authorize(&t, SELF_RECIPIENT, 1_000_000, "withdraw").is_ok());
-    assert!(e.authorize(&t, SELF_RECIPIENT, 1_000_000, "private_transfer").is_ok());
-    // The hole is exact-match only — case and whitespace variants are denied.
+    assert!(e.authorize(&t, SELF_RECIPIENT, 1_000_000, "withdraw").is_err());
+    assert!(e.authorize(&t, SELF_RECIPIENT, 1_000_000, "private_transfer").is_err());
+    // Case and whitespace variants cannot turn the sentinel into a payee.
     for variant in ["SELF", "Self", " self", "self ", "self\0", "sel f", "0xself"] {
         assert!(e.authorize(&t, variant, 1, "withdraw").is_err(), "`{variant}` must not be the sentinel");
     }
-    // And a mixed alias list is not vacuous, so it is still checked.
+    // Mixing the sentinel with a real alias never grants an exemption.
     assert!(
         e.authorize_aliases(&t, &[SELF_RECIPIENT, "evil.com"], 1, "x402_fetch").is_err(),
-        "one real recipient among the aliases restores the allowlist check"
+        "the sentinel is never an outbound alias"
     );
 }
 
@@ -794,14 +796,9 @@ fn attack_a_corrupt_store_fails_closed_for_spending() {
     }
 }
 
-/// FINDING (LOW) — a corrupt store is indistinguishable from a first run: the
-/// engine logs a warning, starts empty, and the next `save()` OVERWRITES the
-/// damaged file. Every spent counter (including the lifetime one) and every
-/// pause is lost silently. If the operator can then re-create a policy — which
-/// they can, and in owner-token-less dev mode so can the AGENT — a corrupted
-/// file is a budget reset.
+/// Quarantine must retain the exact corrupt bytes under the current randomized
+/// filename and keep the owner-review gate closed.
 #[test]
-#[ignore = "FINDING: a corrupt policies.json is silently discarded and then overwritten"]
 fn finding_a_corrupt_store_must_be_quarantined_not_overwritten() {
     let dir = temp_dir("clobber");
     std::fs::create_dir_all(&dir).unwrap();
@@ -811,24 +808,31 @@ fn finding_a_corrupt_store_must_be_quarantined_not_overwritten() {
     let mut e = PolicyEngine::load_or_new(&dir);
     e.create_policy("fresh", open_limits(), None, vec![]);
 
-    let on_disk = std::fs::read_to_string(dir.join("policies.json")).unwrap();
-    assert!(
-        on_disk.contains("deadbeef") || dir.join("policies.json.corrupt").exists(),
-        "the unreadable prior state must be preserved or moved aside, not clobbered"
-    );
+    let copies: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("policies.corrupt-"))
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), damaged);
+    assert!(e.lost_policies(), "quarantine must retain the owner-review gate");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn documents_the_corrupt_store_clobber() {
+fn quarantined_store_bytes_survive_creation_of_a_new_policy() {
     let dir = temp_dir("clobber-doc");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("policies.json"), r#"{"deadbeef": {"agent_id":"a","limi"#).unwrap();
     let mut e = PolicyEngine::load_or_new(&dir);
     e.create_policy("fresh", open_limits(), None, vec![]);
     let on_disk = std::fs::read_to_string(dir.join("policies.json")).unwrap();
-    assert!(!on_disk.contains("deadbeef"), "current behaviour: prior state is gone");
-    assert!(!dir.join("policies.json.corrupt").exists(), "and nothing was quarantined");
+    assert!(!on_disk.contains("deadbeef"), "the active store contains the new policy");
+    let copies: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("policies.corrupt-"))
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), r#"{"deadbeef": {"agent_id":"a","limi"#);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -966,4 +970,43 @@ fn attack_describe_does_not_leak_the_allowlist_contents() {
     for s in &secrets {
         assert!(!err.contains(s.trim_start_matches("https://")), "denial leaked `{s}`: {err}");
     }
+}
+
+#[test]
+fn outbound_self_and_missing_aliases_are_denied_even_without_an_allowlist() {
+    let (mut e, pid, t) = engine_with(open_limits(), None);
+    for method in ["transfer", "private_transfer", "withdraw", "x402_fetch"] {
+        assert!(e.authorize(&t, SELF_RECIPIENT, 1, method).is_err());
+        assert!(e.authorize_aliases(&t, &[], 0, method).is_err());
+        assert!(e.authorize_aliases(&t, &["9999", SELF_RECIPIENT], 1, method).is_err());
+    }
+    assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 0);
+    assert_eq!(e.spend_log_len(), 0);
+}
+
+#[test]
+fn fixed_self_directed_operations_preserve_owner_method_and_budget_gates() {
+    let mut e = PolicyEngine::new();
+    let methods = ["claim", "private_claim", "claim_deposit", "deposit", "retry_deposit_delivery", "deploy_contract", "call_contract"];
+    let pid = e.create_policy("agent", Limits { per_transaction: 1, per_day: 7, ..open_limits() }, Some(vec![]), methods.iter().map(|method| method.to_string()).collect());
+    let (t, _) = e.issue_session(&pid, 60, None).unwrap();
+    for method in methods {
+        assert!(e.authorize(&t, SELF_RECIPIENT, 1, method).is_ok(), "self-directed {method} must remain available when owner-approved");
+    }
+    assert_eq!(e.describe(&pid).unwrap().spent_today_nano, 7);
+    assert!(e.authorize(&t, SELF_RECIPIENT, 1, "call_contract").is_err());
+    assert!(e.check_can_act(&t, "x402_fetch").is_err(), "capability checks retain the method gate");
+}
+
+#[test]
+fn refund_rolls_over_expired_buckets_without_a_subsequent_spend() {
+    let (mut e, pid, t) = engine_with(open_limits(), None);
+    let mut previous = e.authorize(&t, "9999", 100, "transfer").unwrap();
+    previous.last_day = previous.last_day.saturating_sub(1);
+    previous.last_month = previous.last_month.saturating_sub(1);
+    e.force_period_rollover_for_test();
+    e.refund(&previous, 100);
+    let d = e.describe(&pid).unwrap();
+    assert_eq!((d.spent_today_nano, d.spent_this_month_nano, d.spent_total_nano), (0, 0, 0));
+    assert!(e.spend_log(1, Some(&pid))[0].refunded);
 }
