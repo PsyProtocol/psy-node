@@ -243,6 +243,24 @@ impl<F: RichField + Extendable<D>, const D: usize> GateSerializer<F, D> for Rewa
     }
 }
 
+fn reward_claim_progress(stage: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_namespace = console, js_name = info)]
+            fn reward_claim_log(message: &str);
+        }
+        let memory = wasm_bindgen::memory();
+        let bytes = js_sys::Reflect::get(&memory, &wasm_bindgen::JsValue::from_str("buffer"))
+            .and_then(|buffer| js_sys::Reflect::get(&buffer, &wasm_bindgen::JsValue::from_str("byteLength")))
+            .ok().and_then(|value| value.as_f64()).unwrap_or(0.0);
+        reward_claim_log(&format!("[reward-claim][wasm] stage={} timestampMs={} wasmMemoryBytes={}", stage, js_sys::Date::now(), bytes));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    tracing::info!(stage, "reward claim progress");
+}
+
 pub struct UserRewardCircuits {
     pub user_reward_leaf: UserRewardLeafCircuit,
     pub user_reward_aggregate: UserRewardAggregateCircuit,
@@ -250,9 +268,15 @@ pub struct UserRewardCircuits {
 }
 impl UserRewardCircuits {
     pub fn build() -> Result<Self> {
+        reward_claim_progress("build Leaf started");
         let user_reward_leaf = UserRewardLeafCircuit::new();
+        reward_claim_progress("build Leaf finished");
+        reward_claim_progress("build Aggregate started");
         let user_reward_aggregate = UserRewardAggregateCircuit::new(&user_reward_leaf);
+        reward_claim_progress("build Aggregate finished");
+        reward_claim_progress("build Root started");
         let user_reward_root = UserRewardRootCircuit::new(&user_reward_aggregate);
+        reward_claim_progress("build Root finished");
         anyhow::ensure!(user_reward_leaf.circuit_data.common.num_public_inputs == USER_REWARD_LEAF_PUBLIC_INPUT_COUNT, "reward leaf width differs from 15");
         anyhow::ensure!(user_reward_aggregate.circuit_data.common.num_public_inputs == USER_REWARD_AGGREGATE_PUBLIC_INPUT_COUNT + USER_REWARD_AGGREGATE_RECURSIVE_PUBLIC_INPUT_COUNT, "reward aggregate width differs from 83");
         anyhow::ensure!(user_reward_root.circuit_data.common.num_public_inputs == USER_REWARD_ROOT_PUBLIC_INPUT_COUNT, "reward root width differs from 23");
@@ -510,7 +534,9 @@ fn prove_job_leaves(leaf: &UserRewardLeafCircuit, aggregate: &UserRewardAggregat
             user_id, old_nullifier_root: update.old_nullifier_root, job: job.clone(),
             checkpoint_leaf: source_leaf.clone(), nullifier_siblings: update.nullifier_siblings,
         };
+        reward_claim_progress("prove Leaf started");
         let proved = leaf.prove(&input)?;
+        reward_claim_progress("prove Leaf finished");
         anyhow::ensure!(proved.public_inputs.len() == USER_REWARD_LEAF_PUBLIC_INPUT_COUNT, "reward leaf statement width mismatch");
         let statement = &proved.public_inputs;
         anyhow::ensure!(statement[0].to_canonical_u64() == u64::from(user_id), "reward leaf user mismatch");
@@ -518,7 +544,9 @@ fn prove_job_leaves(leaf: &UserRewardLeafCircuit, aggregate: &UserRewardAggregat
         anyhow::ensure!(read_hash(statement, 2) == source_hash, "reward leaf source hash mismatch");
         anyhow::ensure!(read_hash(statement, 6) == input.old_nullifier_root && read_hash(statement, 10) == update.new_nullifier_root, "reward leaf nullifier transition mismatch");
         anyhow::ensure!(statement[14].to_canonical_u64() == 1, "reward leaf count is not one");
+        reward_claim_progress("prove Aggregate Leaf started");
         proofs.push(aggregate.prove(&UserRewardAggregateWitness::Leaf { leaf: proved })?);
+        reward_claim_progress("prove Aggregate Leaf finished");
     }
     Ok(proofs)
 }
@@ -529,7 +557,12 @@ fn reduce_job_proofs(aggregate: &UserRewardAggregateCircuit, mut proofs: Vec<Use
         let mut round = proofs.into_iter();
         while let Some(left) = round.next() {
             reduced.push(match round.next() {
-                Some(right) => aggregate.prove(&UserRewardAggregateWitness::Pair { left, right })?,
+                Some(right) => {
+                    reward_claim_progress("prove Aggregate Pair started");
+                    let proof = aggregate.prove(&UserRewardAggregateWitness::Pair { left, right })?;
+                    reward_claim_progress("prove Aggregate Pair finished");
+                    proof
+                },
                 None => left,
             });
         }
@@ -1206,7 +1239,9 @@ impl RewardClient {
         let mut payable = Vec::new();
         let mut caches = Vec::new();
         let mut kept = Vec::new();
+        reward_claim_progress("build CheckpointAggregate started");
         let checkpoint_circuit = UserRewardCheckpointAggregateCircuit::new(&circuits.user_reward_root);
+        reward_claim_progress("build CheckpointAggregate finished");
         let mut proofs = Vec::new();
         let mut claims = Vec::new();
         for originals in selected {
@@ -1224,12 +1259,17 @@ impl RewardClient {
                     continue;
                 }
             };
+            reward_claim_progress("prove job aggregate started");
             let (aggregate, cache) = self.reuse_or_record(circuits, &request.aggregate_caches, originals, &source)?;
+            reward_claim_progress("prove job aggregate finished; prove Root started");
             let root = self.prove_finalized_reward_root(&circuits.user_reward_root, &circuits.user_reward_leaf, &circuits.user_reward_aggregate, &aggregate, &anchor, recipient_limbs(&recipient))?;
+            reward_claim_progress("prove Root finished");
             caches.push(cache);
             let pi: [u64; 23] = root.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("reward root statement width mismatch"))?;
             claims.push(RewardClaim::from_public_inputs(&pi)?);
+            reward_claim_progress("prove checkpoint Root started");
             proofs.push(checkpoint_circuit.prove(&UserRewardCheckpointAggregateWitness::Root { root })?);
+            reward_claim_progress("prove checkpoint Root finished");
             payable.push(aggregate.get_reward_job_originals());
         }
         if payable.is_empty() {
@@ -1256,7 +1296,12 @@ impl RewardClient {
             let mut reduced = Vec::new();
             while let Some(left) = round.next() {
                 reduced.push(match round.next() {
-                    Some(right) => checkpoint_circuit.prove(&UserRewardCheckpointAggregateWitness::Pair { left, right })?,
+                    Some(right) => {
+                        reward_claim_progress("prove CheckpointAggregate Pair started");
+                        let proof = checkpoint_circuit.prove(&UserRewardCheckpointAggregateWitness::Pair { left, right })?;
+                        reward_claim_progress("prove CheckpointAggregate Pair finished");
+                        proof
+                    },
                     None => left,
                 });
             }
@@ -1265,9 +1310,13 @@ impl RewardClient {
         let proof = proofs.pop().context("no eligible checkpoint proof")?;
         let statement = bind_reward_checkpoint_statement(&proof.public_inputs, request.user_id, &recipient, &root_word, &claims)?;
         let anchor = self.load_finalized_reward_anchor(anchor_id, root_word, payable.first().context("reward claim has no payable group")?).await?;
+        reward_claim_progress("prove RewardClaimWrap started");
         let wrapped = signer.prove_reward_claim(self, &checkpoint_circuit, &proof, &anchor, deployment.token, deployment.state_manager).await?;
+        reward_claim_progress("prove RewardClaimWrap finished");
         let request_proof = RewardClaimWrapProofInput { reward_claim_wrap_proof_hex: hex::encode(bincode::serialize(&wrapped)?) };
+        reward_claim_progress("Groth16 RPC started");
         let wrap = self.prove_reward_claim_groth16(&request.prove_proxy_url, request.prove_proxy_token.as_deref(), &request_proof).await?;
+        reward_claim_progress("Groth16 RPC finished");
         let data = encode_reward_claim_calldata(&wrap.solidity_proof, request.user_id, recipient, &statement)?;
         let fresh = self.read_l1_block(&request.l1_rpc_url).await?;
         if !self.read_reward_root_recognized(&request.l1_rpc_url, &fresh, &state_manager, statement.checkpoint_tree_root).await? {
