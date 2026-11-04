@@ -334,9 +334,32 @@ Step 88 runs after Envio (72) and before Services (73). It creates the read-only
 (connection limit 8, read-only transactions), grants it SELECT on the Reader's six Envio tables, installs the Reader
 on the Services host on `bridge_reader.listen` (loopback only) and waits until `/v1/status` lists all three Envio
 chains as ready. The Reader token is written twice, mode 0600: to `bridge_reader.config` for the Reader and to
-`bridge_reader.client_token_file` for the Services account. Services then runs with `PSY_ENVIO_READ_PATH=reader`;
-`services.env` holds only `DATABASE_URL` and `PSY_JWT_SECRET`. A crash inside the Reader install leaves a partial
-install that the next run refuses by path; remove the named paths of this release and rerun.
+`bridge_reader.client_token_file` for the Services account. Services then runs on the Reader; `services.env` holds only
+`DATABASE_URL` and `PSY_JWT_SECRET`. A crash inside the Reader install leaves a partial install that the next run
+refuses by path; remove the named paths of this release and rerun.
+
+Step 73 also provisions the emergency `pg` path ahead of time. It applies psy-services `scripts/envio-reader-roles.sql`
+(at `sources.services`, so `packages.services.services_source` must hold that commit) with psy-node
+`psy_bridge_reader_api/sql/fallback-role.sql` (at `sources.bridge_reader`) on the Envio database: three read-only class
+roles, `envio_bridge_reader`, `envio_interactive_reader` and `envio_background_reader`, with connection limits 16, 20 and
+8. Their generated logins join `service-credentials.json`. Step 73 writes `<paths.services.config>/envio-read-path.env`
+(root, mode 0600) once and never rewrites it. It holds `PSY_ENVIO_READ_PATH=reader`, `PSY_ENVIO_DB_SCHEMA=envio`,
+`ENVIO_DATABASE_URL` (bridge role) and `ENVIO_DATABASE_URL_INTERACTIVE` / `_BACKGROUND`. The Services unit reads it as an
+`EnvironmentFile`; check-host and activation accept only these keys, and they and the start guard accept only
+lowercase `reader` or `pg` and URLs that name the fallback roles
+on the Envio database. The Reader URL and token stay set on both paths. The file is separate from `services.env` so the
+switch edits one line and leaves the database and JWT credentials alone.
+
+Switch to `pg` on the Services host (one restart; `:3001` is down while Services restarts):
+
+```sh
+sudo sed -i 's/^PSY_ENVIO_READ_PATH=reader$/PSY_ENVIO_READ_PATH=pg/' <paths.services.config>/envio-read-path.env
+sudo systemctl restart <units.services>
+```
+
+`/health/ready` then reports `details.envio_store` (the schema guard) instead of a Reader in use. Switch back by
+setting the line to `reader` again and restarting. After any Envio schema re-initialisation, rerun step 88 and 73 so
+both role sets get their grants back.
 
 Build attempts live in `<output_root>/<release id>-<first 12 of the runtime commit>-build-<n>`.
 A completed attempt of the same commit is verified and reused; a failed attempt

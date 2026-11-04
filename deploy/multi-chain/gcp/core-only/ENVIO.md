@@ -128,8 +128,10 @@ Do not restart/recreate existing PG: its runtime
 shared memory is currently 2 GiB while its Docker configuration is 64 MiB.
 Do not run the old `install-envio.sh`, its bundle installer or its cleanup.
 
-Services never reads Envio directly: it reads the Bridge Reader (step 88), which
-reads the new database through its read-only role. Envio's
+Services normally reads the Bridge Reader (step 88), which reads the new database
+through its read-only role. Its emergency `pg` path reads the database directly
+through three read-only class roles that step 73 provisions; the release README
+describes the switch. Envio's
 `ENVIO_INDEXER_PORT` does not establish a private bind in 2.32.10; verify host
 firewall/private reachability separately before startup. No unit is generated
 until the built runtime and its protected writable paths are reviewed.
