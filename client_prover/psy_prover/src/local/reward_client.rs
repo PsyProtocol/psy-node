@@ -780,7 +780,7 @@ pub fn chain_id_word(value: [u8; 32]) -> Result<u64> {
 }
 
 fn lowercase_address(value: &str) -> Result<[u8; 20]> {
-    anyhow::ensure!(value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "recipient must be 0x plus 40 lowercase hex characters");
+    anyhow::ensure!(value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit()), "reward address must be 0x plus 40 hex characters");
     let address = decode_address(value)?;
     anyhow::ensure!(address != [0; 20], "reward recipient must be nonzero");
     Ok(address)
@@ -961,11 +961,24 @@ impl RewardClient {
     }
 
     async fn eth_rpc(&self, url: &str, method: &str, params: Value) -> Result<Value> {
-        let response = self.http.post(url).json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await?.json::<Value>().await?;
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("reward L1 {method} failed: {error}");
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let response = self.http.post(url).json(&request).send().await?.json::<Value>().await?;
+            if let Some(error) = response.get("error") {
+                let missing_block = error.get("message").and_then(Value::as_str)
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("block not found"));
+                if matches!(method, "eth_getCode" | "eth_call") && missing_block && attempt < 6 {
+                    let delay_secs = 1u64 << (attempt - 1);
+                    tracing::warn!(method, attempt, delay_secs, %error, "reward L1 block unavailable; retrying the same snapshot");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    continue;
+                }
+                anyhow::bail!("reward L1 {method} failed after {attempt} attempt(s): {error}");
+            }
+            return Ok(response["result"].clone());
         }
-        Ok(response["result"].clone())
     }
 
     async fn observed_reward_chain_id(&self, url: &str) -> Result<u64> {
@@ -1496,6 +1509,64 @@ pub async fn load_coordinator_reward_proofs(
 
 #[cfg(test)]
 mod status_tests {
+    #[tokio::test]
+    async fn reward_l1_rpc_retries_missing_blocks_without_changing_snapshot() {
+        use std::io::{BufRead, Read, Write};
+        for (method, message, attempts, succeeds) in [
+            ("eth_getCode", "block not found: hash 0xab", 3, true),
+            ("eth_call", "block not found: hash 0xab", 6, false),
+            ("eth_call", "execution reverted", 1, false),
+            ("eth_sendRawTransaction", "block not found", 1, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let params = serde_json::json!(["0x1234", {"blockHash":"0xab", "requireCanonical":true}]);
+            let expected = params.clone();
+            let thread = std::thread::spawn(move || {
+                for attempt in 1..=attempts {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    let mut length = None;
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" { break; }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>().unwrap()); }
+                        }
+                    }
+                    let mut body = vec![0; length.unwrap()];
+                    reader.read_exact(&mut body).unwrap();
+                    drop(reader);
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(request["method"], method);
+                    assert_eq!(request["params"], expected);
+                    let response = if succeeds && attempt == attempts {
+                        serde_json::json!({"jsonrpc":"2.0", "id":1, "result":"0x60"})
+                    } else {
+                        serde_json::json!({"jsonrpc":"2.0", "id":1, "error":{"code":-32001, "message":message}})
+                    }.to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                }
+            });
+            let provider = psy_provider::provider::RpcProvider {
+                client: std::sync::Arc::new(reqwest::Client::new()), endpoint_clients: None,
+                realm_configs: std::collections::HashMap::new(), coordinator_configs: std::collections::HashMap::new(),
+                users_per_realm: 1, current_user_id: 0,
+            };
+            let client = super::RewardClient::new(provider);
+            let result = client.eth_rpc(&url, method, params).await;
+            if succeeds { assert_eq!(result.unwrap(), "0x60"); }
+            else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(message), "{error}");
+                assert!(error.contains(&format!("after {attempts} attempt(s)")), "{error}");
+            }
+            thread.join().unwrap();
+        }
+    }
+
     use super::*;
 
 
@@ -1672,6 +1743,16 @@ mod status_tests {
         assert_eq!(address_word(&word).unwrap(), [3; 20]);
         assert!(lowercase_address("0x111111111111111111111111111111111111111").is_err());
         assert!(lowercase_address("0xGG11111111111111111111111111111111111111").is_err());
+        for value in [
+            "0x78Cc5853f613961c9dd5e20Cf9Ba7e6ec82Fc934",
+            "0x700e814e63c473771A634678FE6d7A6Cc1E0E243",
+        ] {
+            assert_eq!(lowercase_address(value).unwrap(), lowercase_address(&value.to_ascii_lowercase()).unwrap());
+            assert_eq!(lowercase_address(value).unwrap(), lowercase_address(&format!("0x{}", value[2..].to_ascii_uppercase())).unwrap());
+        }
+        assert!(lowercase_address("0x0000000000000000000000000000000000000000").is_err());
+        assert!(lowercase_address("0x111111111111111111111111111111111111111111").is_err());
+        assert!(lowercase_address("700e814e63c473771a634678fe6d7a6cc1e0e243").is_err());
     }
 
     #[test]
