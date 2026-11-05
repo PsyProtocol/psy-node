@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use alloy_primitives::{keccak256, U256};
+use alloy_primitives::{keccak256, B256, U256};
 use alloy_rpc_types_eth::Log;
 use alloy_sol_types::SolEvent;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use plonky2::field::{goldilocks_field::GoldilocksField as F, types::Field};
 use psy_client_data::config::store_config::PsyHasher;
 use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::DepositLeafData;
@@ -356,34 +357,42 @@ fn append_verified_deposit_leaf(frontier: &mut [Hash4;32], occupied_partial_page
 }
 
 
+const DEPOSIT_RPC_CONCURRENCY: usize = 8;
+
+struct DepositLogEvidence {
+    index: u32,
+    block_number: u64,
+    block_hash: B256,
+    transaction: B256,
+    log_json: Value,
+    token: Hex20,
+    contract_id: u32,
+    leaf_hash: B256,
+    words: Vec<u32>,
+    record: DepositLeafData,
+}
+
 async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, router: Hex20, anchor: &DepositAnchor, from_count: u32, mut event_block: u64, pinned: &Value) -> Result<(BTreeMap<u32,(Hash4,DepositLeafData)>,u64)> {
     if anchor.block_number < chain.deployment_block || event_block < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
-    let mut events = BTreeMap::new();
+    let bridge = configured_bridge(chain);
+    let mut deposits = BTreeMap::new();
     let mut start=event_block;
     while start <= anchor.block_number {
         let end = start.saturating_add(4999).min(anchor.block_number);
-        let bridge = configured_bridge(chain);
         let logs = rpc.call("eth_getLogs", json!([{"address": bridge, "fromBlock": block_id(start), "toBlock": block_id(end), "topics": [format!("{:#x}", DepositRecorded::SIGNATURE_HASH)]}])).await?;
         let logs: Vec<Log> = serde_json::from_value(logs).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
         for log in logs {
             let decoded = log.log_decode::<DepositRecorded>().map_err(|_|GuardianSignError::L1ResponseMismatch)?;
             let event = decoded.data();
             if event.index < from_count || event.index >= anchor.new_count { continue; }
-            if log.address().as_slice() != bridge.0 || log.removed || events.contains_key(&event.index) || log.log_index.is_none() { return Err(GuardianSignError::DepositMismatch.into()); }
+            if log.address().as_slice() != bridge.0 || log.removed || deposits.contains_key(&event.index) || log.log_index.is_none() { return Err(GuardianSignError::DepositMismatch.into()); }
             let number = log.block_number.ok_or(GuardianSignError::DepositMismatch)?;
-            event_block=event_block.max(number);
-            let hash = log.block_hash.ok_or(GuardianSignError::DepositMismatch)?;
+            let block_hash = log.block_hash.ok_or(GuardianSignError::DepositMismatch)?;
             let transaction = log.transaction_hash.ok_or(GuardianSignError::DepositMismatch)?;
-            let canonical = rpc.block(block_id(number)).await?;
-            if number < start || number > end || block_hash(&canonical)?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
-            let receipt = rpc.call("eth_getTransactionReceipt",json!([transaction])).await?;
-            if quantity(&receipt["status"])? != 1 || quantity(&receipt["blockNumber"])? != number || bytes32(&receipt["blockHash"])?.as_slice() != hash.as_slice() || bytes32(&receipt["transactionHash"])?.as_slice() != transaction.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
-            let receipt_logs: Vec<Log> = serde_json::from_value(receipt["logs"].clone()).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
-            let original = serde_json::to_value(&log).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
-            if receipt_logs.iter().filter(|candidate| serde_json::to_value(candidate).ok().as_ref() == Some(&original)).count() != 1 { return Err(GuardianSignError::DepositMismatch.into()); }
+            if number < start || number > end { return Err(GuardianSignError::DepositMismatch.into()); }
             if event.chainIndex != chain.chain_index || event.l2TokenContractId.as_slice()[..28] != [0;28] { return Err(GuardianSignError::DepositMismatch.into()); }
-            let id = u32::from_be_bytes(event.l2TokenContractId.as_slice()[28..].try_into().map_err(|_|GuardianSignError::DepositMismatch)?);
-            verify_token_mapping(rpc, router, Hex(event.token.as_slice().try_into().map_err(|_| GuardianSignError::DepositMismatch)?), id, pinned).await?;
+            let contract_id = u32::from_be_bytes(event.l2TokenContractId.as_slice()[28..].try_into().map_err(|_|GuardianSignError::DepositMismatch)?);
+            let token = Hex(event.token.as_slice().try_into().map_err(|_| GuardianSignError::DepositMismatch)?);
             let mut words = Vec::with_capacity(41);
             for bytes in [event.shieldAddress.0, U256::from_be_slice(event.token.as_slice()).to_be_bytes::<32>(), event.l2TokenContractId.0, event.amount.to_be_bytes::<32>()] {
                 words.extend(bytes.chunks_exact(4).map(|word|u32::from_be_bytes(word.try_into().unwrap())));
@@ -391,22 +400,62 @@ async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, route
             words.push(u32::from(event.chainIndex));
             words.extend(event.noteCommitment.as_slice().chunks_exact(4).map(|word|u32::from_be_bytes(word.try_into().unwrap())));
             let bytes: Vec<u8> = words.iter().flat_map(|word|word.to_be_bytes()).collect();
-            let hash = keccak256(&bytes);
-            if hash != event.leafHash || rpc.eth_call(bridge, "depositLeafHashes(uint256)", Some(u64::from(event.index)), pinned).await?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
-            let leaf = PsyHasher::q_hash_many(&words.into_iter().map(F::from_canonical_u32).collect::<Vec<_>>());
-            events.insert(event.index,(leaf,DepositLeafData {
+            let leaf_hash = keccak256(&bytes);
+            if leaf_hash != event.leafHash { return Err(GuardianSignError::DepositMismatch.into()); }
+            let log_json = serde_json::to_value(&log).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
+            let record = DepositLeafData {
                 shield_address: bytes32_words(&event.shieldAddress.0),
                 token: address_words(event.token.as_slice()),
                 l2_token_contract_id: bytes32_words(&event.l2TokenContractId.0),
                 amount: bytes32_words(&event.amount.to_be_bytes::<32>()),
                 chain_index: u32::from(event.chainIndex),
                 note_commitment: bytes32_words(event.noteCommitment.as_slice()),
-            }));
+            };
+            event_block=event_block.max(number);
+            deposits.insert(event.index, DepositLogEvidence { index: event.index, block_number: number, block_hash, transaction, log_json, token, contract_id, leaf_hash, words, record });
         }
         if end == anchor.block_number { break; }
         start = end + 1;
     }
+    verify_deposit_evidence(rpc, router, bridge, &deposits, pinned).await?;
+    let events = deposits.into_iter().map(|(index, deposit)| {
+        let leaf = PsyHasher::q_hash_many(&deposit.words.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        (index, (leaf, deposit.record))
+    }).collect();
     Ok((events,event_block))
+}
+
+/// Router pairs are read once per (token, contract) and headers once per block; every value they
+/// check is fixed by the pinned block or the canonical height, so deduplication proves the same facts.
+async fn verify_deposit_evidence(rpc: &CustodyRpc<'_>, router: Hex20, bridge: Hex20, deposits: &BTreeMap<u32, DepositLogEvidence>, pinned: &Value) -> Result<()> {
+    let pairs: BTreeSet<([u8; 20], u32)> = deposits.values().map(|deposit| (deposit.token.0, deposit.contract_id)).collect();
+    for (token, contract_id) in pairs {
+        verify_token_mapping(rpc, router, Hex(token), contract_id, pinned).await?;
+    }
+    let numbers: BTreeSet<u64> = deposits.values().map(|deposit| deposit.block_number).collect();
+    let mut header_reads = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        header_reads.push(async move { rpc.block(block_id(number)).await.and_then(|block| block_hash(&block)).map(|hash| (number, hash)) });
+    }
+    let canonical_hashes: BTreeMap<u64, [u8; 32]> = stream::iter(header_reads).buffered(DEPOSIT_RPC_CONCURRENCY).try_collect().await?;
+    for deposit in deposits.values() {
+        if canonical_hashes.get(&deposit.block_number).map(|hash| hash.as_slice()) != Some(deposit.block_hash.as_slice()) { return Err(GuardianSignError::DepositMismatch); }
+    }
+    let mut deposit_reads = Vec::with_capacity(deposits.len());
+    for deposit in deposits.values() {
+        deposit_reads.push(verify_deposit_receipt_and_leaf(rpc, bridge, deposit, pinned));
+    }
+    stream::iter(deposit_reads).buffered(DEPOSIT_RPC_CONCURRENCY).try_collect::<Vec<()>>().await?;
+    Ok(())
+}
+
+async fn verify_deposit_receipt_and_leaf(rpc: &CustodyRpc<'_>, bridge: Hex20, deposit: &DepositLogEvidence, pinned: &Value) -> Result<()> {
+    let receipt = rpc.call("eth_getTransactionReceipt",json!([deposit.transaction])).await?;
+    if quantity(&receipt["status"])? != 1 || quantity(&receipt["blockNumber"])? != deposit.block_number || bytes32(&receipt["blockHash"])?.as_slice() != deposit.block_hash.as_slice() || bytes32(&receipt["transactionHash"])?.as_slice() != deposit.transaction.as_slice() { return Err(GuardianSignError::DepositMismatch); }
+    let receipt_logs: Vec<Log> = serde_json::from_value(receipt["logs"].clone()).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
+    if receipt_logs.iter().filter(|candidate| serde_json::to_value(candidate).ok().as_ref() == Some(&deposit.log_json)).count() != 1 { return Err(GuardianSignError::DepositMismatch); }
+    if rpc.eth_call(bridge, "depositLeafHashes(uint256)", Some(u64::from(deposit.index)), pinned).await?.as_slice() != deposit.leaf_hash.as_slice() { return Err(GuardianSignError::DepositMismatch); }
+    Ok(())
 }
 
 pub async fn fetch_deposit_records(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Vec<DepositLeafData>> {
@@ -1084,7 +1133,8 @@ mod tests {
         assert_eq!(pending[0]["params"][0]["data"].as_str().unwrap().len(), 10);
         assert_eq!(call_height(&pending[0]["params"][1]), Some(HEIGHT_B));
         let leaves: Vec<_> = calls.iter().filter(|call| method(call) == "eth_call" && call["params"][0]["data"].as_str().unwrap_or("").starts_with(&selector("depositLeafHashes(uint256)"))).collect();
-        let indexes: Vec<_> = leaves.iter().map(|call| u32_arg(call["params"][0]["data"].as_str().unwrap()).unwrap()).collect();
+        let mut indexes: Vec<_> = leaves.iter().map(|call| u32_arg(call["params"][0]["data"].as_str().unwrap()).unwrap()).collect();
+        indexes.sort_unstable();
         assert_eq!(indexes, (SAVED_COUNT..NEW_COUNT).collect::<Vec<_>>());
         assert!(leaves.iter().all(|call| call_height(&call["params"][1]) == Some(HEIGHT_B)));
         let receipts: std::collections::BTreeSet<_> = calls.iter().filter(|call| method(call) == "eth_getTransactionReceipt").map(|call| call["params"][0].as_str().unwrap().to_owned()).collect();
@@ -1137,5 +1187,40 @@ mod tests {
         assert!(calls.iter().any(|call| method(call) == "eth_call" && call["params"][0]["data"].as_str().unwrap_or("").starts_with(&selector("depositLeafHashes(uint256)"))));
         assert!(calls.iter().any(|call| method(call) == "eth_getTransactionReceipt"));
         assert!(calls.iter().all(|call| !is_historical(call)));
+    }
+
+    #[tokio::test]
+    async fn new_batch_reads_one_router_pair_and_one_event_header_for_many_deposits() {
+        let prepared = prepare_new_batch();
+        let fixture = serve_l1(prepared.server).await;
+        let state = saved_deposit_tree_state();
+        verify_deposit_anchor(Some(&state), &fixture.endpoint(), &next_anchor(&state.anchor)).await.unwrap();
+        let calls = fixture.calls();
+        assert!(NEW_COUNT - SAVED_COUNT > 1);
+        assert_eq!(router_eth_calls(&calls), 2, "one forward and one reverse read for the single token pair");
+        let event_headers = calls.iter().filter(|call| method(call) == "eth_getBlockByNumber" && parse_qty(&call["params"][0]) == Some(HEIGHT_B)).count();
+        assert_eq!(event_headers, 3, "anchor ancestry twice plus one shared event header");
+    }
+
+    #[tokio::test]
+    async fn new_batch_rejects_one_failed_receipt_among_concurrent_reads() {
+        let mut prepared = prepare_new_batch();
+        let failed = prepared.server.logs[2]["transactionHash"].as_str().unwrap().to_owned();
+        prepared.server.receipts.get_mut(&failed).unwrap()["status"] = serde_json::json!("0x0");
+        let fixture = serve_l1(prepared.server).await;
+        let state = saved_deposit_tree_state();
+        let error = verify_deposit_anchor(Some(&state), &fixture.endpoint(), &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn new_batch_rejects_a_log_whose_block_hash_is_not_canonical_before_receipts() {
+        let mut prepared = prepare_new_batch();
+        prepared.server.logs[1]["blockHash"] = serde_json::json!(hex32(&[0x5a; 32]));
+        let fixture = serve_l1(prepared.server).await;
+        let state = saved_deposit_tree_state();
+        let error = verify_deposit_anchor(Some(&state), &fixture.endpoint(), &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+        assert!(!fixture.calls().iter().any(|call| method(call) == "eth_getTransactionReceipt"));
     }
 }
