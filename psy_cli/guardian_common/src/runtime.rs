@@ -364,16 +364,26 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 pub fn load_signing_key(config: &GuardianRuntimeConfig) -> Result<psy_provider::wallet::secp_wallet::Wallet> {
-    let env_name = config.signing_key_password_env.as_str();
+    load_signing_key_from_path(Path::new(&config.signing_key_secret_path), &config.signing_key_password_env)
+}
+
+pub fn load_guardian_signing_key(guardian_id: u8) -> Result<psy_provider::wallet::secp_wallet::Wallet> {
+    load_signing_key_from_path(&guardian_keystore_path(guardian_id)?, guardian_password_env(guardian_id)?)
+}
+
+fn load_signing_key_from_path(path: &Path, env_name: &str) -> Result<psy_provider::wallet::secp_wallet::Wallet> {
     if !matches!(env_name, "GUARDIAN_1_KEYSTORE_PASSWORD" | "GUARDIAN_2_KEYSTORE_PASSWORD" | "GUARDIAN_3_KEYSTORE_PASSWORD") {
         return Err(GuardianSignError::KeyUnavailable);
     }
     let password = Zeroizing::new(std::env::var(env_name).map_err(|_| GuardianSignError::KeyUnavailable)?);
-    let (key_directory, key_relative) = split_protected(Path::new(&config.signing_key_secret_path))?;
+    let (key_directory, key_relative) = split_protected(path)?;
     let mut file = protected_file(&key_directory, &key_relative)?;
     let before = file.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
     let _encrypted = read_file(&mut file, 1024 * 1024)?;
+    #[cfg(target_os = "linux")]
     let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let fd_path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
     let key = psy_provider::wallet::secp_wallet::Wallet::load_encrypted_keystore(&fd_path, secret_text(password.as_bytes(), true)?).map_err(|_| GuardianSignError::KeyUnavailable)?;
     let after = file.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
     if before.len() != after.len() || before.mtime() != after.mtime() || before.mtime_nsec() != after.mtime_nsec()

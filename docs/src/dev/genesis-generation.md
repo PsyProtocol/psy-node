@@ -241,13 +241,13 @@ Shared guardian code lives in the `psy_cli/guardian_common` crate (`lib.rs` decl
 
 ### 4.1 Guardians-root inputs and identity
 
-No input contains a signing secret. The helper and the generator read `psy-genesis/config.json` no-follow and duplicate-free, and neither writes it. Keystore contents are never opened here; only file metadata is.
+The helper and the generator read `psy-genesis/config.json` no-follow and duplicate-free, and neither writes it. Fresh reset preflight opens the three encrypted guardian keystores and compares their public member hashes to the selected config before any reset.
 
 | Input | Required | Exact rule |
 |---|---|---|
 | `guardian_initial_member_hashes` | yes | Three `QHashOut` commitments at `networks[CURRENT_NETWORK].guardian_initial_member_hashes`. Generation and fresh preflight both derive the account through `initial_account`; fresh preflight also requires the three to be pairwise distinct. A missing or invalid value fails before generation or destruction. |
 | sibling `multisig_policy` artifact | derived | `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. Read once; the raw bytes stay in that directory. |
-| guardian keystores | fresh preflight, metadata only | The three `guardian_keystore_path` files. Each must already be an effective-uid regular file in mode `0600`, with no symlink and no extra hard link. Passwords are environment-only and are not inspected (`guardians_root.rs:107-139`). |
+| guardian keystores | fresh preflight | The three `guardian_keystore_path` files must be effective-uid regular files in mode `0600` with protected paths. Each is opened using only its `GUARDIAN_<id>_KEYSTORE_PASSWORD`, and its public hash must match the corresponding configured member. |
 
 `ChainEndpoint` is `{ chain_index, chain_id, bridge, deployment_block, rpc_url }`, parsed at runtime from the selected deployment documents. It is not a generation or fresh-preflight input and not an `l1_endpoints` field of `psy-genesis/config.json`. Repeatable `--l1-config` paths replace the selected network's `l1_config_url`. A local summary has no `l1_chains` key. Its sibling `Bridge_Proxy.json` must be present: `address` must match the summary `bridge`, and `deployment_block` is `receipt.blockNumber`. A remote `l1_config_url` document supplies no proxy receipt. Each `l1_chains` entry must already carry `deployment_block`. A missing or unparsable value fails startup. There is no block-zero fallback and no automatic remote migration. `parse_chain_documents` requires unique `chain_index` and unique chain id and rejects a missing or conflicting value. Nothing in generation or the fresh helper writes those documents or the canonical config (`psy_cli/guardian_common/src/runtime.rs:188-315`; `dev/locSetupV4.ts:358-375`).
 
@@ -272,7 +272,7 @@ Those four files are runtime databases. The existing owner-only `db/` directory 
 
 `GuardianConfig` is an in-memory value, not a serialized file. `GuardianConfig::load(rpc_config, guardian_root, local_documents)` decodes the daemon `--rpc-config` and keeps the selected network. Nonempty repeatable `--l1-config` paths replace `l1_config_url`; otherwise the runtime fetches that URL and requires `l1_chains[].deployment_block` on every entry. `from_network` then requires the three member commitments, three guardian endpoints, history, and the parsed chain documents, including `deployment_block`. Protocol fees are computed and verified there; no operator fee ceiling is configured or read. `build_runtime_config(guardian_id)` derives `<guardian_root>/db/guardian-{id}.redb` and the password variable name and copies those `ChainEndpoint` values into `GuardianRuntimeConfig.l1_rpc_urls`. The relayer reads `<guardian_root>/db/relayer.redb` (`psy_cli/guardian_common/src/runtime.rs:125-315`).
 
-The one secret path per guardian is `$HOME/.psy/keystore/guardian-<id>.keystore.json`, from `guardian_keystore_path`. Its password is the environment variable from `guardian_password_env`, never a file and never serialized. The fresh preflight walks keystore metadata without following symlinks and never opens the files. `guardian-service` alone reads keystore contents, through `load_signing_key` (`runtime.rs:101-115,248-263`).
+The one secret path per guardian is `$HOME/.psy/keystore/guardian-<id>.keystore.json`, from `guardian_keystore_path`. Its password is the environment variable from `guardian_password_env`, never a file and never serialized. Fresh preflight and `guardian-service` both use the protected keystore reader; fresh preflight compares the derived public hash to the configured member before reset.
 
 #### 4.2.1 Offline compressed journal migration
 
@@ -351,7 +351,7 @@ For that historical revision, first-signature timing, quorum, and whole-flow E2E
 | `guardian-service` meets an empty database file | `DatabaseUnavailable`. Opening the raw empty file fails closed. The service does not delete or reinitialize it, and this is not a journal error (`psy_cli/guardian_common/src/db.rs:164`; `psy_cli/psy_relayer_cli/src/guardian/service.rs:341-348`). |
 
 ## Security Considerations
-Preserve matching source revisions, configuration, and generated artifact cohorts. Never publish root `private_keys.json`, validator or faucet secrets, or a guardian keystore password. Generation does not authorize deployment or publication. Treat fingerprint, provenance, and membership mismatches as failures rather than bypassing verification. Neither generation nor the fresh helper writes `psy-genesis/config.json`; guardian keystore contents are read exclusively by `guardian-service` through protected file descriptors, and its password comes only from `GUARDIAN_<id>_KEYSTORE_PASSWORD`.
+Preserve matching source revisions, configuration, and generated artifact cohorts. Never publish root `private_keys.json`, validator or faucet secrets, or a guardian keystore password. Generation does not authorize deployment or publication. Treat fingerprint, provenance, and membership mismatches as failures rather than bypassing verification. Neither generation nor the fresh helper writes `psy-genesis/config.json`; fresh preflight and `guardian-service` read guardian keystores through protected file descriptors, and passwords come only from `GUARDIAN_<id>_KEYSTORE_PASSWORD`.
 
 ## Related Documents
 

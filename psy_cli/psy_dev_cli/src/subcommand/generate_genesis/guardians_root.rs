@@ -7,9 +7,8 @@
 //! guardian policy is derived from the selected network's read-only
 //! `guardian_initial_member_hashes` (through the shared account derivation);
 //! no policy string, authorization object, or digest
-//! is read or produced. Keystore contents are never opened — only their file
-//! metadata, at the `guardian_keystore_path` locations derived from `$HOME`.
-//! Keystore passwords are environment-only and are never inspected here.
+//! is read or produced. Fresh reset checks each keystore against its configured
+//! public member using the guardian-specific password environment variable.
 
 use std::{
     ffi::CString,
@@ -30,22 +29,45 @@ use super::{compiler_checkout, read_compiler_contract, require_abi_method_agreem
 /// accepted by metadata only; an existing path must be one regular file owned
 /// by this user in mode 0600 and is never opened. The stable canonical config
 /// is then read and parsed strictly and its read-only guardian policy fields
-/// are validated, followed by the three guardian keystore metadata paths and
-/// the multisig policy compiler artifact. `genesis.json` is not checked here
-/// — reset removes it under the separate cleanup mode rule. This does not
-/// read genesis, secret contents, deployment output, a chain, or any
-/// environment value.
+/// are validated, followed by the three guardian keystores and their configured
+/// public members, and the multisig policy compiler artifact. `genesis.json`
+/// is not checked here; reset removes it under the separate cleanup mode rule.
 pub fn preflight_fresh_devnet_inputs(repo_root: &Path) -> anyhow::Result<()> {
     for path in super::fresh_devnet_secret_outputs(repo_root) {
         super::preflight_owned_regular_destination(&path)
             .with_context(|| format!("fresh output {}", path.display()))?;
     }
-    checked_canonical_network_policy(&read_canonical_network(repo_root)?)?;
+    let network = read_canonical_network(repo_root)?;
+    checked_canonical_network_policy(&network)?;
     verify_secret_metadata()?;
     let compiler_root = compiler_checkout(repo_root)?;
     let compiled = read_compiler_contract(&compiler_root, "multisig_policy")?;
     require_abi_method_agreement(&compiled)?;
     require_policy_contract(&compiled)?;
+    verify_guardian_members(&network)?;
+    Ok(())
+}
+
+fn verify_guardian_members(network: &NetworkConfigGoldilocks) -> anyhow::Result<()> {
+    use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonPermutation};
+    use psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key;
+
+    let members = network.guardian_initial_member_hashes.context("guardian member hashes missing")?;
+    for id in 1..=3u8 {
+        let key = guardian_common::runtime::load_guardian_signing_key(id)
+            .map_err(|_| anyhow!("guardian {id} keystore could not be opened with GUARDIAN_{id}_KEYSTORE_PASSWORD"))?;
+        let public_key = key.compressed_public_key();
+        let hash = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(
+            psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&public_key),
+        );
+        validate_guardian_member(id, hash, &members)?;
+    }
+    Ok(())
+}
+
+fn validate_guardian_member(id: u8, hash: psy_client_common::data::qhashout::QHashOut<plonky2::field::goldilocks_field::GoldilocksField>, members: &[psy_client_common::data::qhashout::QHashOut<plonky2::field::goldilocks_field::GoldilocksField>; 3]) -> anyhow::Result<()> {
+    ensure!((1..=3).contains(&id), "invalid guardian id {id}");
+    ensure!(hash == members[usize::from(id - 1)], "guardian {id} keystore does not match configured member {id}");
     Ok(())
 }
 
@@ -217,6 +239,17 @@ mod tests {
     use parth_core::crypto::hash::traits::ZeroableHash;
 
     type Hash4 = psy_client_common::data::qhashout::QHashOut<plonky2::field::goldilocks_field::GoldilocksField>;
+
+    #[test]
+    fn guardian_members_require_matching_slots() {
+        let members = [Hash4::from_values(1, 0, 0, 0), Hash4::from_values(2, 0, 0, 0), Hash4::from_values(3, 0, 0, 0)];
+        for id in 1..=3 {
+            assert!(validate_guardian_member(id, members[usize::from(id - 1)], &members).is_ok());
+            assert!(validate_guardian_member(id, members[usize::from(id % 3)], &members).is_err());
+        }
+        assert!(validate_guardian_member(0, members[0], &members).is_err());
+        assert!(validate_guardian_member(4, members[0], &members).is_err());
+    }
 
     /// A complete valid selected network, with the guardian policy fields.
     fn canonical_network_config() -> serde_json::Value {
