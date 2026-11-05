@@ -165,6 +165,9 @@ The planner marks that job `HASH_CHILDREN_STANDARD` with two children and one de
 
 See [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) for the authorization gate around this node.
 
+The test-only JTMB backend implements the same circuit-63 witness and `finalize_public_input_hash` / `finalize_reward_root63` commitments in `psy_jtmb_testing_core/src/proving/circuits/guta/realm_finalize_guta.rs`. Its worker still takes one root-GUTA proof dependency and uses standard reward mode 0 with the output commitment as the second reward child. Before signing a test proof it verifies the child signature and whitelist, checkpoint and epoch-anchor paths, scheduled proposer, validator identity and account paths, and the 60-bit fee delta. The JTMB library selects the same runtime rotation configuration as the Plonky2 library; its finalizer fingerprint binds the network domain, rotation parameters, and tree heights. JTMB remains a test-only trusted-authority proof format; this implementation does not authorize it for devnet, rollback validation, or live E2E acceptance, and does not change Plonky2 cache or Groth16 artifacts.
+
+
 ### 4.4 Coordinator lift (mode 3)
 
 A coordinator GUTA that wraps one realm job uses `LIFT_CHILD` (`coordinator_guta_planner.rs:481-490`):

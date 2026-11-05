@@ -41,7 +41,7 @@ type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
 const DEFAULT_SD_KEY_FINGERPRINT: &str = "9faca812159aeeca40980d2483315265c69249ee4537f1d962457f16f3fe527a";
-const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
+const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4", "1,3,5", "0,3,6"];
 
 
 #[derive(Clone, Debug)]
@@ -848,7 +848,7 @@ mod tests {
     fn default_faucet_policy_circuit_matches_genesis_and_exported_identity() {
         use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
         use psy_prover::wallet::memory_wallet::get_allow_method_sd_key_fingerprint;
-        use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
+        use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
 
         let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
         let relayer = PsyCompactUserDefinition {

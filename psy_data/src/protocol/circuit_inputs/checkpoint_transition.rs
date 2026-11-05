@@ -96,6 +96,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 #[cfg(test)]
 mod behavior_tests {
     use super::*;
+    use parth_core::crypto::hash::traits::HashTo4Felts;
     use parth_core::{crypto::hash::traits::{MerkleHasher, MerkleZeroHasher}, felt::{ToU64Value, ZeroableFelt}, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
 
     type Hash = QHashOut<PF>;

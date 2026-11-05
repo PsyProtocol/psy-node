@@ -31,6 +31,7 @@ pub struct DPLocalUser<Hasher, Hash: Copy + PartialEq + Default + std::fmt::Debu
     pub uct: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     pub contract_trees: HashMap<u32, SimpleMemoryMerkleRecorderStore<Hasher, Hash>>,
     pub user_leaf: PQEDUserLeaf<F, Hash>,
+    user_leaf_hash: Hash,
 }
 
 impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug, F: QFelt64> DPLocalUser<Hasher, Hash, F> {
@@ -39,6 +40,7 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
             user_id: user_leaf.user_id.to_u64_value(),
             uct: SimpleMemoryMerkleRecorderStore::new(global_contract_tree_height),
             contract_trees: HashMap::new(),
+            user_leaf_hash: user_leaf.qfhash::<Hasher>(),
             user_leaf,
         }
     }
@@ -47,6 +49,7 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
             user_id,
             uct: SimpleMemoryMerkleRecorderStore::new(global_contract_tree_height),
             contract_trees: HashMap::new(),
+            user_leaf_hash: Hash::get_zero_value(),
             user_leaf: PQEDUserLeaf {
                 public_key: Hash::get_zero_value(),
                 user_state_tree_root: Hasher::get_zero_hash(global_contract_tree_height as usize),
@@ -57,6 +60,13 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
                 user_id: F::from_u64_value(user_id),
             },
         }
+    }
+    fn update_user_leaf(&mut self, user_leaf: PQEDUserLeaf<F, Hash>, user_leaf_hash: Hash) -> anyhow::Result<()> {
+        anyhow::ensure!(user_leaf_hash == Hash::get_zero_value() || user_leaf_hash == user_leaf.qfhash::<Hasher>(),
+            "user leaf preimage does not match global user tree proof");
+        self.user_leaf = user_leaf;
+        self.user_leaf_hash = user_leaf_hash;
+        Ok(())
     }
     async fn ensure_contract_heights_in_cache_or_fetch<DF: PsyUserContractDataFetcher<F, Hash> + Send + Sync + 'static>(
         data_fetcher: Arc<DF>,
@@ -92,12 +102,10 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
                 user_leaf.user_id.to_u64_value()
             ));
         }
-        if self.user_leaf.qfhash::<Hasher>() == user_leaf.qfhash::<Hasher>() {
-            //println!("User leaf hash matches, no sync needed");
-            return Ok(());
-        }
         let needs_state_sync = user_leaf.user_state_tree_root != self.uct.get_root();
-        self.user_leaf = user_leaf;
+        let proof = data_fetcher.df_get_global_user_tree_proof(checkpoint_id, self.user_id).await?;
+        anyhow::ensure!(proof.verify::<Hasher>(), "invalid global user tree proof");
+        self.update_user_leaf(user_leaf, proof.value)?;
         if !needs_state_sync {
             //println!("User state tree root matches, no state sync needed");
             return Ok(());
@@ -190,11 +198,7 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
         latest_checkpoint_tree_root: Hash,
         txs: &[DPContractUpdate<Hash>],
     ) -> anyhow::Result<SubmitUserEndCapNonProofInput<F, Hash>> {
-        let start_leaf_hash = if self.user_leaf.last_checkpoint_id == F::ZERO_VALUE && self.user_leaf.nonce == F::ZERO_VALUE {
-            Hash::get_zero_value()
-        } else {
-            self.user_leaf.qfhash::<Hasher>()
-        };
+        let start_leaf_hash = self.user_leaf_hash;
         let mut state_history = Vec::with_capacity(txs.len());
         for tx in txs {
             if !self.contract_trees.contains_key(&tx.contract_id) {
@@ -255,6 +259,40 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
         end_cap_input.core.stats.slots_modified = F::from_u64_value(total_slots_modified);
         let da_fees = total_slots_modified.checked_mul(1000).ok_or_else(|| anyhow::anyhow!("DA fee overflow"))?;
         end_cap_input.core.stats.da_fees_collected = F::from_u64_value(da_fees);
+        self.user_leaf_hash = end_leaf_hash;
         Ok(end_cap_input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parth_core::{PF, PHash, pgoldilocks::PoseidonHasher};
+    type User = DPLocalUser<PoseidonHasher, PHash, PF>;
+
+    #[test]
+    fn genesis_user_with_zero_nonce_uses_existing_leaf_hash() {
+        let mut leaf = User::new_empty(42, 4).user_leaf;
+        leaf.public_key = PHash::from_values(1, 2, 3, 4);
+        let expected = leaf.qfhash::<PoseidonHasher>();
+        let mut user = User::new(4, leaf);
+        let input = user.run_ups(&DashMapContractHeightCache::new(), 7, PHash::default(), &[]).unwrap();
+        assert_ne!(expected, PHash::default());
+        assert_eq!(input.core.state_transition.start_user_leaf_hash, expected);
+        let next = user.run_ups(&DashMapContractHeightCache::new(), 8, PHash::default(), &[]).unwrap();
+        assert_eq!(next.core.state_transition.start_user_leaf_hash, input.core.state_transition.end_user_leaf_hash);
+    }
+
+    #[test]
+    fn user_tree_value_distinguishes_empty_and_materialized_accounts() {
+        let mut user = User::new_empty(42, 4);
+        let mut leaf = user.user_leaf.clone();
+        leaf.public_key = PHash::from_values(1, 2, 3, 4);
+        user.update_user_leaf(leaf, PHash::default()).unwrap();
+        let input = user.run_ups(&DashMapContractHeightCache::new(), 7, PHash::default(), &[]).unwrap();
+        assert_eq!(input.core.state_transition.start_user_leaf_hash, PHash::default());
+        let saved = user.user_leaf_hash;
+        assert!(user.update_user_leaf(user.user_leaf.clone(), PHash::from_values(9, 9, 9, 9)).is_err());
+        assert_eq!(user.user_leaf_hash, saved);
     }
 }

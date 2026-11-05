@@ -139,7 +139,7 @@ pub enum SdKeyPolicyTemplateKindArg {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct RegisterUserArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -147,7 +147,7 @@ pub struct RegisterUserArgs {
 
 #[derive(Clone, Args)]
 pub struct DeployContractArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     /// Wallet source: `--private-key` remains compatible, while keystore
     /// sources use `--keystore-path` and optional `--wallet-password`.
@@ -167,7 +167,7 @@ pub struct DeployContractArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct UpdateContractArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, env, hide_env_values = true)]
     pub private_key: String,
@@ -198,7 +198,7 @@ pub struct UpdateContractArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct SubmitEndCapArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, short)]
     pub private_key: String,
@@ -216,7 +216,7 @@ pub struct SubmitEndCapArgs {
 
 #[derive(Clone, Args)]
 pub struct UserIdArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, default_value = "0d47fda4480f045506b085ba6921fc86d8cc6feb1b533292db4b1a3af8f89eab", env)]
     pub pub_key: QHashOut<GoldilocksField>,
@@ -224,7 +224,7 @@ pub struct UserIdArgs {
 
 #[derive(Clone, Args)]
 pub struct UserEventDataArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -236,7 +236,7 @@ pub struct UserEventDataArgs {
 
 #[derive(Clone, Args)]
 pub struct UserLeafArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, help = "User public key (queries coordinator)", conflicts_with = "user_id")]
     pub pub_key: Option<QHashOut<GoldilocksField>>,
@@ -249,7 +249,7 @@ pub struct UserLeafArgs {
 // Tree-related args
 #[derive(Clone, Args)]
 pub struct UserContractStateTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -261,7 +261,7 @@ pub struct UserContractStateTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractStateTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -275,7 +275,7 @@ pub struct UserContractStateTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractStateIMTLeafPreimageArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -289,7 +289,7 @@ pub struct UserContractStateIMTLeafPreimageArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractStateTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -303,7 +303,7 @@ pub struct UserContractStateTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -313,7 +313,7 @@ pub struct UserContractTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -325,7 +325,7 @@ pub struct UserContractTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct UserContractTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -337,7 +337,7 @@ pub struct UserContractTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct UserRegistrationTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -345,7 +345,7 @@ pub struct UserRegistrationTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct UserRegistrationTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -355,7 +355,7 @@ pub struct UserRegistrationTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct UserRegistrationTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -365,7 +365,7 @@ pub struct UserRegistrationTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct UserTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -373,7 +373,7 @@ pub struct UserTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct UserTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -383,7 +383,7 @@ pub struct UserTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct UserTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -393,7 +393,7 @@ pub struct UserTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct UserSubTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -407,7 +407,7 @@ pub struct UserSubTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractFunctionTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -417,7 +417,7 @@ pub struct ContractFunctionTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractFunctionTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -429,7 +429,7 @@ pub struct ContractFunctionTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractFunctionTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -441,7 +441,7 @@ pub struct ContractFunctionTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -449,7 +449,7 @@ pub struct ContractTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -459,7 +459,7 @@ pub struct ContractTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -469,7 +469,7 @@ pub struct ContractTreeMerkleProofArgs {
 
 #[derive(Clone, Args)]
 pub struct WithdrawalTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -477,13 +477,13 @@ pub struct WithdrawalTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct LatestCheckpointTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
 }
 
 #[derive(Clone, Args)]
 pub struct CheckpointTreeRootArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -491,7 +491,7 @@ pub struct CheckpointTreeRootArgs {
 
 #[derive(Clone, Args)]
 pub struct CheckpointTreeLeafHashArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -501,7 +501,7 @@ pub struct CheckpointTreeLeafHashArgs {
 
 #[derive(Clone, Args)]
 pub struct CheckpointTreeMerkleProofArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -512,7 +512,7 @@ pub struct CheckpointTreeMerkleProofArgs {
 // Metadata-related args
 #[derive(Clone, Args)]
 pub struct ContractLeafDataArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub contract_id: u64,
@@ -520,7 +520,7 @@ pub struct ContractLeafDataArgs {
 
 #[derive(Clone, Args)]
 pub struct CheckpointLeafDataArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -528,7 +528,7 @@ pub struct CheckpointLeafDataArgs {
 
 #[derive(Clone, Args)]
 pub struct ContractCodeDefinitionArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub contract_id: u64,
@@ -536,13 +536,13 @@ pub struct ContractCodeDefinitionArgs {
 
 #[derive(Clone, Args)]
 pub struct LatestBlockStateArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
 }
 
 #[derive(Clone, Args)]
 pub struct BlockStateArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[arg(long, env)]
     pub checkpoint_id: u64,
@@ -550,7 +550,7 @@ pub struct BlockStateArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct ClaimAmountArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
 
     #[clap(long)]
@@ -565,7 +565,7 @@ pub struct ClaimAmountArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct TxGetStatusArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
 
     #[clap(long, alias = "from-checkpoint", alias = "checkpoint-id")]
@@ -600,7 +600,7 @@ pub enum RpcProviderType {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct GetCheckpointIdForUniquePendingIdArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long)]
     pub unique_pending_id: u64,
@@ -610,7 +610,7 @@ pub struct GetCheckpointIdForUniquePendingIdArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct GenerateBatchProofMinerRewardProofsArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long)]
     pub unique_pending_id: u64,
@@ -626,7 +626,7 @@ pub struct GenerateBatchProofMinerRewardProofsArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct ClaimRewardsArgs {
-    #[clap(long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, env, help = "Ethereum reward token address; its addresses provider discovers the StateManager")]
     pub reward_token: String,
@@ -687,7 +687,7 @@ pub struct CompileAndDeployArgs {
     #[clap(long)]
     pub source: String,
 
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
 
     #[clap(long, env, hide_env_values = true)]
@@ -766,7 +766,7 @@ pub struct SimulateArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct PrivateClaimArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, short = 'p', env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
@@ -788,7 +788,7 @@ pub struct PrivateClaimArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct PrivateTransferArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, short = 'p', env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
@@ -814,7 +814,7 @@ pub struct PrivateTransferArgs {
 
 #[derive(Clone, Args)]
 pub struct ClaimDepositArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -856,7 +856,7 @@ pub struct ClaimDepositArgs {
 
 #[derive(Clone, Args)]
 pub struct BatchClaimArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -872,7 +872,7 @@ pub struct BatchClaimArgs {
 
 #[derive(Clone, Args)]
 pub struct WithdrawArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -907,7 +907,7 @@ pub struct WithdrawArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct DeriveShieldArgs {
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[clap(long, short = 'p', conflicts_with = "user_id", required_unless_present = "user_id")]
     pub private_key: Option<String>,
@@ -982,7 +982,7 @@ pub struct DepositArgs {
     #[clap(long = "source-chain-index", env, default_value_t = 0)]
     pub source_chain_index: u32,
     /// RPC config path (for looking up L2 addresses)
-    #[clap(long, env, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     /// Optional file path to write the generated DepositInclusion proof JSON
     /// that claim_deposit later consumes with --deposit-proof.
@@ -1004,7 +1004,7 @@ pub struct DepositArgs {
 #[derive(Clone, Args)]
 pub struct ClaimWithdrawalArgs {
     /// Psy RPC config file (for network name → deployment lookup)
-    #[clap(env, long, default_value = "config.json")]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     /// psy-services URL
     #[clap(long, env, default_value = "http://localhost:3000")]

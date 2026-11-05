@@ -1278,7 +1278,7 @@ function l1StartedDetector(line: string): boolean {
 
 
 const REALM_P2P_OUT_DIR = "./local_checkpoints/realm_p2p";
-export const REALM_P2P_SUB_IDS = [1, 2] as const;
+export const REALM_P2P_SUB_IDS = [1, 2, 3] as const;
 /** Local-devnet genesis pre-places ZK validators only for realms `[0, count)`. */
 export const LOCAL_DEVNET_VALIDATOR_REALM_COUNT = 2;
 export const LOCAL_DEVNET_VALIDATORS_PER_REALM = REALM_P2P_SUB_IDS.length;
@@ -1303,7 +1303,7 @@ export function realmValidatorUserId(realmId: number, subId: number, height: num
 /**
  * Dense Strategy5 registration reserved for a local-devnet validator.
  * Registration 2 is reserved for the bridge relayer (user_id 524288), so
- * validators use: (0,1)->0, (1,1)->1, (1,2)->3, (0,2)->4.
+ * validators use: (0,1)->0, (1,1)->1, (1,2)->3, (0,2)->4, (1,3)->5, (0,3)->6.
  */
 export function reservedValidatorRegistrationId(realmId: number, subId: number): number {
     if (!Number.isInteger(realmId) || realmId < 0 || realmId >= LOCAL_DEVNET_VALIDATOR_REALM_COUNT) {
@@ -1315,7 +1315,7 @@ export function reservedValidatorRegistrationId(realmId: number, subId: number):
         throw new Error(`Validator sub id must be in 1..${LOCAL_DEVNET_VALIDATORS_PER_REALM}, got ${subId}`);
     }
     if (subId === 1) return realmId;
-    return 4 - realmId;
+    return 2 * subId - realmId;
 }
 
 /** Strategy5 user id for a local-devnet registration id. */
@@ -3323,6 +3323,11 @@ export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = p
 /** Component selection contract: core-only launchers have no SDK sidecar consumer. */
 export function selectedUiDependencies(startAll: boolean, options: { psyPrivacyBridge?: boolean; ide?: boolean; explorer?: boolean; modeAWebWalletBridge?: boolean }): boolean {
     return startAll || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
+}
+
+/** Component selection contract: only full startup and Groth16-wrapping consumers read bridge trust setup. */
+export function requiresBridgeCustody(startAll: boolean, options: { relayer?: boolean; bridgeProposerDaemon?: boolean; proveProxyCount?: number }): boolean {
+    return startAll || !!options.relayer || !!options.bridgeProposerDaemon || (options.proveProxyCount ?? 0) > 0;
 }
 
 async function ensureDevEnvironment(
@@ -5765,6 +5770,7 @@ interface ProcessOptions {
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
     resume?: boolean;
+    jtmbResume?: boolean;
 }
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
@@ -6293,9 +6299,12 @@ export class DevNetProcessManager {
         }
     }
 
-    async restartApplications(cwd: string = "."): Promise<void> {
+    async restartApplications(cwd: string = ".", jtmbOnly = false): Promise<void> {
         const { persistent, applications } = splitDevnetProcesses(this.spawnedProcesses);
-        const required = ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"];
+        if (jtmbOnly && (this.provingBackend !== "jtmb-poseidon-goldilocks" || !/^jtmb[-a-z0-9]*$/.test(process.env[DEVNET_NAMESPACE_ENV] || ""))) {
+            throw new Error("JTMB restart requires a dedicated JTMB supervisor and namespace");
+        }
+        const required = jtmbOnly ? ["db", ...persistent.map((process) => process.name)] : ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"];
         const missing = required.filter((name) => !persistent.some((process) => process.name === name && process.isRunning()));
         if (missing.length > 0) {
             throw new Error(`[DevNet][control] restart requires running infrastructure; missing ${missing.join(", ")}`);
@@ -6376,6 +6385,7 @@ export class DevNetProcessManager {
         const skipBuild = skipBuildEnabled();
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         const resume = !!options.resume;
+        const jtmbResume = !!options.jtmbResume;
         const startBridgeProposerDaemon = !resume && shouldRequireGuardianRoot(startAll, options);
         const daemonConfigPath = startBridgeProposerDaemon
             ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), startAll || !!options.purge)
@@ -6431,9 +6441,21 @@ export class DevNetProcessManager {
         };
 
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
-        const names = resume
+        const names = (resume || jtmbResume)
             ? await resolveBoundDevnetNames(cwd, this.getEnv())
             : await this.admitNamespace(cwd);
+        if (jtmbResume) {
+            if (backend !== 'jtmb-poseidon-goldilocks' || !names.namespace || !/^jtmb[-a-z0-9]*$/.test(names.namespace)) throw new Error('JTMB resume requires a bound JTMB namespace and backend');
+            this.admittedNames = names;
+            await requireRegularFile(path.join(cwd, 'genesis.json'));
+            await requireRegularFile(path.join(cwd, REALM_P2P_OUT_DIR, 'config.json'));
+            for (const file of realmP2pSecretPaths(Array.from({ length: realmsCount }, (_, index) => startRealmId + index), realmEdgeCount)) await requireRegularFile(path.join(cwd, file));
+            for (const volume of devnetDbVolumeNames(names)) {
+                const result = await runTeardownCommand(['docker', 'volume', 'inspect', volume], undefined, PURGE_DOCKER_TIMEOUT_MS);
+                if (result.timedOut || result.code !== 0 || !result.stdoutComplete) throw new Error(`JTMB resume requires volume ${volume}`);
+            }
+            await requireReleaseBinaries([{ name: 'psy_node_cli', path: path.join(cwd, 'target/release/psy_node_cli') }, { name: 'psy_worker_cli', path: path.join(cwd, 'target/release/psy_worker_cli') }]);
+        }
         if (resume) {
             this.admittedNames = names;
             const realmIds = Array.from({ length: realmsCount }, (_, index) => startRealmId + index);
@@ -6511,7 +6533,7 @@ export class DevNetProcessManager {
             }
         }
         if (this.needsStartDb) {
-            const startDbCmd = resume ? ['./dev/start_db.sh', '--persist'] : ['./dev/start_db.sh', '--fresh'];
+            const startDbCmd = (resume || jtmbResume) ? ['./dev/start_db.sh', '--persist'] : ['./dev/start_db.sh', '--fresh'];
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -6531,7 +6553,7 @@ export class DevNetProcessManager {
         let realmP2pConfig: FullNetworkConfig | null = null;
         if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            if (resume) {
+            if (resume || jtmbResume) {
                 const config = JSON.parse(await fs.promises.readFile(path.join(cwd, REALM_P2P_OUT_DIR, "config.json"), "utf-8")) as FullNetworkConfig;
                 realmP2pConfig = { ...config, defaultNetwork: selectedRuntimeConfigKey("local-devnet") };
             } else {
@@ -7878,7 +7900,7 @@ async function acquireDevnetLock(repoRoot: string): Promise<DevnetLock> {
     }
     return new DevnetLock(holder);
 }
-export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume" | "shutdown" | "shutdown-purge";
+export type DevnetControlCommand = "restart" | "jtmb-restart" | "rollback-stop" | "rollback-resume" | "shutdown" | "shutdown-purge";
 
 interface DevnetControlResponse {
     ok: boolean;
@@ -7894,7 +7916,7 @@ export function devnetControlSocketPath(repoRoot: string): string {
 }
 
 function parseDevnetControlCommand(value: string): DevnetControlCommand {
-    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown" || value === "shutdown-purge") return value;
+    if (value === "restart" || value === "jtmb-restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown" || value === "shutdown-purge") return value;
     throw new Error(`[DevNet][control] unsupported command ${value}`);
 }
 
@@ -8040,6 +8062,7 @@ async function runMain() {
             "mode-a-web-wallet-bridge": { type: "boolean" },
             "daemonlize": { type: "boolean" },
             resume: { type: "boolean" },
+            "jtmb-resume": { type: "boolean" },
             "skip-bridge": { type: "boolean" },
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
@@ -8083,6 +8106,8 @@ async function runMain() {
     const control = values["control"] as string | undefined;
 
     const provingBackend = values["proving-backend"];
+    const jtmbResume = !!values['jtmb-resume'];
+    if (jtmbResume && (resumeRequested || !db || !coordinator || !hasOnlyOptions || provingBackend !== 'jtmb-poseidon-goldilocks' || daemonlize || teardown || purge || control || l1 || relayer || psyPrivacyBridge || ide || explorer || modeAWebWalletBridge || faucetServer || !!dummyProvers || proveProxyCount !== 0)) throw new Error('JTMB resume requires a foreground isolated JTMB core');
     const envString = values["env"];
     const help = !!values["help"];
     if (control) {
@@ -8262,12 +8287,14 @@ Usage: bun run dev/locSetupV4.ts [options]
     process.on('SIGINT', () => void shutdown());
     process.on('SIGTERM', () => void shutdown());
     try {
-    if (!teardown && !retained.resume) {
+    if (!teardown && !retained.resume && !jtmbResume) {
+        const startAll = !hasOnlyOptions || !!values.all;
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
             selectedUi: selectedUiDependencies(!hasOnlyOptions, { psyPrivacyBridge, ide, explorer, modeAWebWalletBridge }),
+            skipBridgeCustody: !requiresBridgeCustody(startAll, { relayer, bridgeProposerDaemon, proveProxyCount }),
             env: envVars,
         });
     }
@@ -8330,6 +8357,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
             resume: retained.resume,
+            jtmbResume,
         };
 
         if (daemonlize) {
@@ -8357,8 +8385,8 @@ Usage: bun run dev/locSetupV4.ts [options]
                         }),
                     };
                 }
-                if (command === "restart") {
-                    await globalManager.restartApplications(REPO_ROOT);
+                if (command === "restart" || command === "jtmb-restart") {
+                    await globalManager.restartApplications(REPO_ROOT, command === "jtmb-restart");
                     return "Devnet application processes restarted; DB and Anvil retained";
                 }
                 if (command === "rollback-stop") {

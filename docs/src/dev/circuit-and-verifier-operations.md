@@ -261,8 +261,8 @@ PSY_REALM_P2P_PUBLIC_HOST=127.0.0.1 \
 ./target/release/psy_node_cli init-realm-p2p-keys \
   --out-dir local_checkpoints/realm_p2p \
   --realm-ids 0,1 \
-  --validators-per-realm 2 \
-  --validator-user-ids 0,262144,1048576,1572864 \
+  --validators-per-realm 3 \
+  --validator-user-ids 0,262144,786432,1048576,1572864,1310720 \
   --edges-per-validator 1
 ```
 

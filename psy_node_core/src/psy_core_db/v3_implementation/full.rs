@@ -11,7 +11,7 @@ use parth_core::{
         tag_tree::TagTreeMerkleProof,
     },
     data::{
-        db::row::QDatabaseSingleIdTableRow,
+        db::row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId},
         hash::{
             checkpointed_merkle_node::CheckpointedMerkleHash,
             hash256::Hash256,
@@ -32,6 +32,7 @@ use psy_data::{
         }, ffs_sizes::{PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf,
     },
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     psy_core_db::{
@@ -55,6 +56,51 @@ use crate::{
         helpers::*,
     },
 };
+
+fn parse_zk_public_key_ffs<Hash: Q256BitHash>(
+    data: &[u8],
+) -> anyhow::Result<Vec<QDatabaseSingleIdTableRowNoCheckpointId<PZKPublicKeyInfo<Hash>>>> {
+    let value_size = PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
+    let row_size = 8 + value_size;
+    anyhow::ensure!(data.len() % row_size == 0, "invalid zk public key FFS length");
+    data.chunks_exact(row_size)
+        .map(|row| {
+            let user_id = u64::from_le_bytes(row[..8].try_into()?);
+            let public_key_info = PZKPublicKeyInfo::psy_ser_from_slice(&row[8..])?;
+            Ok(QDatabaseSingleIdTableRowNoCheckpointId::new(user_id, public_key_info))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod zk_public_key_ffs_tests {
+    use super::*;
+    #[test]
+    fn parses_non_contiguous_user_ids_and_preserves_public_key_values() -> anyhow::Result<()> {
+        type Hash = parth_core::PHash;
+        let keys = [
+            PZKPublicKeyInfo { fingerprint: Hash::from_values(1, 2, 3, 4), public_key_param: Hash::from_values(5, 6, 7, 8) },
+            PZKPublicKeyInfo { fingerprint: Hash::from_values(9, 10, 11, 12), public_key_param: Hash::from_values(13, 14, 15, 16) },
+        ];
+        let mut data = Vec::new();
+        for (user_id, key) in [(17u64, &keys[0]), (1_114_112u64, &keys[1])] {
+            data.extend_from_slice(&user_id.to_le_bytes());
+            data.extend_from_slice(&key.psy_ser_to_bytes_vec()?);
+        }
+        let rows = parse_zk_public_key_ffs::<Hash>(&data)?;
+        assert_eq!(rows.iter().map(|row| row.obj_id).collect::<Vec<_>>(), [17, 1_114_112]);
+        assert_eq!(rows[0].value.fingerprint, keys[0].fingerprint);
+        assert_eq!(rows[0].value.public_key_param, keys[0].public_key_param);
+        assert_eq!(rows[1].value.fingerprint, keys[1].fingerprint);
+        assert_eq!(rows[1].value.public_key_param, keys[1].public_key_param);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_truncated_zk_public_key_ffs_row() {
+        assert!(parse_zk_public_key_ffs::<parth_core::PHash>(&[0; 71]).is_err());
+    }
+}
 
 fn bridge_deposit_leaf_obj_id(chain_id: u64, deposit_index: u64) -> anyhow::Result<u64> {
     if chain_id > u32::MAX as u64 || deposit_index > u32::MAX as u64 {
@@ -2981,13 +3027,12 @@ impl<
     }
 
     async fn set_zk_public_keys_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
-        let object_size = PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
+        let rows = parse_zk_public_key_ffs::<N::QHash>(data)?;
         self.store
-            .db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
+            .db_insert_many_single_checkpointed_objects_at_checkpoint_t(
                 &self.user_public_key_table,
-                object_size,
                 checkpoint_id,
-                data,
+                &rows,
             )
             .await
     }

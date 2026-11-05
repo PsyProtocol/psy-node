@@ -82,6 +82,22 @@ fn public_key_hash_to_user_id_row<N: QNetworkTreeConstants, Hash: Q256BitHash>(
     }
 }
 
+fn append_zk_public_key_ffs<N: QNetworkTreeConstants>(
+    output: &mut Vec<u8>,
+    registration_id: u64,
+    public_key_info: &[u8],
+) {
+    debug_assert_eq!(public_key_info.len(), 64);
+    let user_id = get_user_id_from_user_registration_id(
+        registration_id,
+        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        N::REALM_GLOBAL_USER_TREE_HEIGHT,
+        N::GROUP_REALM_HEIGHT,
+    );
+    output.extend_from_slice(&user_id.to_le_bytes());
+    output.extend_from_slice(public_key_info);
+}
+
 
 pub async fn read_register_user_gatherer_backup_file_path<
     N: QNetworkTreeConstants,
@@ -158,8 +174,11 @@ pub async fn read_register_user_gatherer_backup_file<
     let mut new_leaf_hashes = Vec::with_capacity(expected_count as usize);
     for i in 0..expected_count {
         let offset = (i * 64) as usize;
-        new_user_public_keys_ffs.extend_from_slice(&(start_next_user_id + i).to_le_bytes());
-        new_user_public_keys_ffs.extend_from_slice(&public_keys_no_id[offset..offset + 64]);
+        append_zk_public_key_ffs::<N>(
+            &mut new_user_public_keys_ffs,
+            start_next_user_id + i,
+            &public_keys_no_id[offset..offset + 64],
+        );
         let leaf_hash = hash_two_from_slice::<Hash, Hasher>(&public_keys_no_id[offset..offset + 64]);
         new_public_key_hash_to_user_id_rows.push(public_key_hash_to_user_id_row::<N, Hash>(
             leaf_hash,
@@ -378,9 +397,7 @@ impl<
             ));
         }
         self.new_user_public_keys_file.write_all(&item).await?;
-        self.new_user_public_keys_ffs
-            .extend_from_slice(self.next_user_id.to_le_bytes().as_slice());
-        self.new_user_public_keys_ffs.extend_from_slice(&item);
+        append_zk_public_key_ffs::<N>(&mut self.new_user_public_keys_ffs, self.next_user_id, &item);
         let hash = hash_two_from_slice::<N::QHash, N::HasherBase>(&item);
         let u64_hash_mapping_row = public_key_hash_to_user_id_row::<N, N::QHash>(hash, self.next_user_id);
         self.new_public_key_hash_to_user_id_rows_ffs
@@ -1346,7 +1363,7 @@ mod tests_backup_v1 {
     use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
     use psy_serialize::FastFixedSerializable;
 
-    use super::{public_key_hash_to_user_id_row, read_register_user_gatherer_backup_file_path};
+    use super::{append_zk_public_key_ffs, public_key_hash_to_user_id_row, read_register_user_gatherer_backup_file_path};
 
     type N = PsyNetworkLocalDevnetConstants;
     type Hasher = PoseidonHasher;
@@ -1355,6 +1372,22 @@ mod tests_backup_v1 {
     const RUB2_MAGIC_U32: u32 = 0x32425552;
     const PLAUSIBLE_BLOCK_TIME_SECONDS: u64 = 1_700_000_000;
     const MILLISECOND_BLOCK_TIME: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn zk_public_key_ffs_uses_strategy_mapped_user_id() {
+        let key = [7u8; 64];
+        let mut ffs = Vec::new();
+        append_zk_public_key_ffs::<N>(&mut ffs, 17, &key);
+        let expected_user_id = get_user_id_from_user_registration_id(
+            17,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            N::GROUP_REALM_HEIGHT,
+        );
+        assert_eq!(u64::from_le_bytes(ffs[..8].try_into().unwrap()), expected_user_id);
+        assert_ne!(expected_user_id, 17);
+        assert_eq!(&ffs[8..], &key);
+    }
 
     fn build_backup_bytes(
         magic_u32: u32,

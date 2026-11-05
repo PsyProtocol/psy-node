@@ -493,7 +493,7 @@ for p in 1337 13380 13381 13390 13391 3000 9999; do ! nc -z 127.0.0.1 "$p"; done
 for p in 8545 9545 10545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 ```
 
-4. Generate and execute one rollback plan for the Coordinator and one for every Realm processor identity `(realm_id, realm_sub_id)` (default `make run-all`: four Realm plans for realms `0`/`1` × subs `1`/`2`). Realm plans require `--realm-id` and `--realm-sub-id` matching the processor derived from its identity key. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
+4. Generate and execute one rollback plan for the Coordinator and one for every Realm processor identity `(realm_id, realm_sub_id)` (default `make run-all`: six Realm plans for realms `0`/`1` × subs `1`/`2`/`3`). Realm plans require `--realm-id` and `--realm-sub-id` matching the processor derived from its identity key. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
 5. Before resuming a bridge-enabled stack, run `psy_dev_cli restore-bridge-state` once for the common target. Supply one `--processor-config`, explicit `--processor-role`, and completed `--rp-path` per configured processor in matching order, plus `--target`, `--rpc-config local_checkpoints/realm_p2p/config.json` (the launcher's `PSY_CONFIG_PATH`, not `psy-genesis/config.json`: that source file's realm `validators` arrays are empty and restore rejects them), local `--chain-document` deployment metadata, `--guardians-root`, `--proof-dir`, the retained `--stop-sentinel`, and all `--coordinator-endpoint` / `--realm-endpoint` probes. The inventory must cover the configured Coordinator and every Realm validator. Keep the same configuration and plans on retry.
 
    The restore reconstructs checkpoint-authenticated account/contract state from retained Scylla stores, deposit frontiers from finalized canonical L1 events, and withdrawal preimages from existing Realm end-cap archives. Missing archive coverage or any state/root mismatch is an error, not permission to write empty journals. All four existing journals are exclusively locked and replaced transactionally per database; signer rows remain unchanged. Immutable `.pre-restore-<operation>` backups and a synced `bridge-restore.intent.json` precede journal mutation. Do not start any application while that intent is incomplete. Retry the identical invocation to finish a partial restore; never overwrite or delete its original backups. Completion is operation-specific (`bridge-restore.<operation>.done.json`), not an old generic done flag.
@@ -611,6 +611,72 @@ The component selectors are `--db`, `--coordinator`, `--prove-proxy`, `--faucet-
 `--mode-a-web-wallet-bridge`. Without `--all`, selectors choose component mode and disable full-mode worker defaults. `make run-all` explicitly supplies `--all`, preserving its component/count overrides while requiring the protected fresh-local-start sequence. Explicit worker and proxy counts control startup, including a zero proxy count. Realm P2P is not a selector or modifier: every Realm launch uses it.
 Component selectors do not automatically select runtime dependencies: for example, `--coordinator` does not select `--db`, `--relayer` does not select Layer 1 or the
 core, and `--psy-privacy-bridge` does not select Nostr (`dev/locSetupV4.ts:3950-3969,4454-4704,4706-4718`).
+Core-only component selection also skips bridge custody setup (trust setup and bridge-relayer keystore checks): only full startup, relayer selection, and prove proxies
+consume those files (`dev/locSetupV4.ts:3328-3330,3387,8277`).
+
+### 10.4 Isolated JTMB core tests
+
+`make jtmb-restart` restarts application processes through the running foreground
+supervisor while retaining the database, Genesis, and P2P identities. The supervisor
+must use `jtmb-poseidon-goldilocks` and a dedicated `jtmb-` namespace. It requires
+the database and every tracked persistent component to remain running; Anvil is
+not required for the core-only stack. This command does not rebuild binaries.
+It cannot recover a stopped supervisor. Supervisors started before this control
+command was added must first be replaced through the supported lifecycle.
+
+JTMB is test-only. Use a dedicated checkout, a `jtmb-` namespace, and separate
+runtime storage. These targets do not run `make run-all`, Layer 1, guardians,
+relayers, frontends, or proof proxies. They are not rollback or Plonky2 acceptance
+evidence. Existing verified `genesis.json`, matching P2P identities (when Genesis
+already contains validator bindings), sibling/nested contracts protocol config,
+and current release binaries from the preflight in section 2 are prerequisites.
+The targets never regenerate Genesis, replace missing identities, or purge state.
+
+```bash
+# Terminal 1: the existing foreground supervisor, two Realms and three validators each.
+make jtmb-start JTMB_NAMESPACE=jtmb-test
+
+# Terminal 2: inspect the running backend and all seven RPC state roots.
+make jtmb-status
+
+# Register new ordinary accounts, then prepare and deploy one compiled contract to L2.
+make jtmb-register JTMB_REGISTER_COUNT=10
+make jtmb-deploy JTMB_CONTRACT=psy-genesis/token.json
+
+# 20 distinct ordinary accounts x 5 confirmed rounds = 100 simulated EndCaps.
+make jtmb-batch JTMB_USERS=20 JTMB_ROUNDS=5 JTMB_CONCURRENCY=10
+
+# Run registration, L2 deployment, then EndCaps sequentially on an already-running stack.
+make jtmb-test JTMB_REGISTER_COUNT=10 JTMB_USERS=20 JTMB_ROUNDS=5
+
+# Non-purge shutdown through the existing lifecycle command.
+make jtmb-stop
+```
+
+`dev/jtmbTest.ts` reuses the launcher's Strategy5 mapping and Realm HTTP-port
+calculation. It selects distinct registered ordinary accounts, excluding user 0,
+all validators and the reserved relayer. `JTMB_USERS` counts selected accounts;
+it does not assume their physical user IDs are contiguous. `JTMB_TIMEOUT` defaults
+to 180 seconds for confirmation. Each round requires nonce +1 for every selected
+account, identical user leaves on all three Realm replicas, and matching global
+state roots at one common checkpoint across all seven RPC endpoints. Any failed
+client or confirmation check fails the Make target.
+
+Registration is confirmed against registration-tree leaf values, not submission
+responses alone. The L2 deployment test prepares the existing compiled artifact
+through `psy_user_cli`, submits it directly to the coordinator core RPC, and checks
+the included contract leaf and code. It does not exercise the optional services
+ABI-upload path or deploy anything to L1. By default it uses a key from the most
+recent successful `jtmb-register` run; an already-registered `PRIVATE_KEY` may be
+supplied through the environment. Keys are never passed in argv. Public results
+and client logs are under `local_checkpoints/jtmb_tests/<run>/`; new registration
+keys remain in that run's private, mode-0600 `private_keys.json` inside a mode-0700
+directory. Do not share that key file with test evidence.
+
+`jtmb-start` is a fresh core-component launch: the existing launcher refuses
+occupied infrastructure/storage rather than adopting it. `jtmb-stop` preserves
+storage; it is not a reset/restart shortcut. Use the lifecycle procedures above
+for any later state-preserving operation or separately authorized cleanup.
 
 ## 11. CLI Option Reference
 
@@ -693,7 +759,7 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | `WALLET_PASSWORD` | Existing prompt/development policy | Decrypts L1 deployment and relayer keystores; not consumed for public Genesis enrollment. | `dev/locSetupV4.ts` (`resolveWalletPassword`, `planGenesisGeneration`) |
 | `GUARDIAN_<id>_KEYSTORE_PASSWORD` | Localhost test value `devnet` | Names `GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, or `GUARDIAN_3_KEYSTORE_PASSWORD` by guardian id. All three carry `devnet` for `$HOME/.psy/keystore/guardian-<id>.keystore.json`. No password file is read, including `guardian-<id>.password`. | `psy_cli/guardian_common/src/runtime.rs:102-108,250-254`; [genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning) |
 | Canonical guardian policy | Required before generation | Three distinct nonzero public `guardian_initial_member_hashes` commitments on the selected network in `psy-genesis/config.json`. No operator fee ceiling, account path, environment variable, or file flag. Protocol fees stay computed and verified. | `dev/locSetupV4.ts:3129-3189`; `client_prover/psy_core/psy_config/src/lib.rs:79-83` |
-| `PSY_SKIP_KEYSTORE`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` refreshes remote trust setup; every other value skips refresh but still requires mandatory local files. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2670-2706`; `Makefile:17`                                                |
+| `PSY_SKIP_KEYSTORE`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` refreshes remote trust setup; every other value skips refresh but still requires mandatory local files. Core-only component selection (no `--all`, no relayer, no bridge proposer daemon, no prove proxy) skips the trust-setup and bridge-relayer-keystore checks entirely because those processes are the only consumers (`requiresBridgeCustody`). | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2670-2706,3328-3330,3387`; `Makefile:17`                                                |
 | `PSY_KEYSTORE_R2_PREFIX` | Required only for exact `PSY_SKIP_KEYSTORE=0`; no default | Public `psy-proving-keystores` R2 prefix, e.g. `localhost-<digest>`: one `[A-Za-z0-9._-]{1,128}` segment, without `..`, slash or whitespace. Anonymous HTTPS curl; no legacy alias. | `dev/locSetupPolicy.ts` (`r2CurlArgs`); `dev/locSetupV4.ts` (`downloadKeystoreObject`) |
 | `PSY_FROZEN_DEPS` | Off; exact `1` enables | Require preinstalled contracts/UI dependencies and current selected-UI SDK artifacts. Always run real Envio codegen through the guarded offline/frozen-lock adapter; do not rewrite the indexer manifest or run ordinary installs/approve-builds. | `dev/frozenDeps.ts`; `runFrozenEnvioCodegen` |
 | `PSY_FROZEN_DEPS_PNPM` | Required in frozen mode | Absolute reviewed cached pnpm 10.33.0 `bin/pnpm.cjs`; no package-manager download. | `dev/frozenDeps.ts` |
@@ -984,7 +1050,7 @@ bun run dev/locSetupV4.ts \
   --realm-workers 2
 ```
 
-This selects validator positions 1 and 2, creates four Realm processors and eight distinct Realm edges, and injects
+This selects validator positions 1, 2 and 3, creates six Realm processors and twelve distinct Realm edges, and injects
 their public standard-P2P identities and routable addresses into the selected genesis/runtime configuration. Every
 edge has a unique secret filename, P2P listen port, and HTTP port; the launcher rejects any requested cross-family or
 same-family port collision before mutation or startup.

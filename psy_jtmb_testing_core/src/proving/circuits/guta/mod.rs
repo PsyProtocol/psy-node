@@ -9,3 +9,4 @@ pub mod verify_two_guta_upgrade_checkpoint;
 pub mod verify_two_guta_linear_transition_upgrade_checkpoint;
 pub mod verify_guta_to_cap_upgrade_checkpoint;
 pub mod verify_guta_left_linear_right_leaf_upgrade_checkpoint;
+pub mod realm_finalize_guta;

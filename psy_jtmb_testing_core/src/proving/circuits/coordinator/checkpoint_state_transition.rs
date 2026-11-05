@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node_single, traits::{MerkleHasher, QFieldHashable}}, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node_single, traits::{FieldQHasher, HashTo4Felts, MerkleHasher, QFieldHashable}}, felt::FromPrimitiveValuesFelt, protocol::core_types::Q256BitHash};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
@@ -49,9 +49,13 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
         known_genesis_fingerprint: C::Hash,
     ) -> Self {
         let circuit_type = ProvingJobCircuitType::GenerateRollupStateTransitionProof;
+        let mut config = vec![C::F::from_u64_value(1), C::F::from_u64_value(checkpoint_tree_height as u64)];
+        config.extend(known_part_1_fingerprint.to_4_felts());
+        config.extend(known_genesis_fingerprint.to_4_felts());
+        let config_hash = C::Hasher::q_hash_many(&config);
         let verifier_data = PsyTestJTMBProofVerifierData::new_from_compressed_public_key(
             circuit_type as u32,
-            [0u8; 32],
+            config_hash.into_owned_32bytes(),
             &private_key.get_public_key(),
         );
         let fingerprint = verifier_data.get_fingerprint::<C::Hash, C::Hasher, C::F>();
@@ -108,12 +112,19 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
             checkpoint_state_transition_circuit_fingerprint: self.fingerprint, 
         };
 
-        let expected_prev_pi = prev_pi_struct.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
+        let expected_prev_pi = prev_pi_struct.get_chain_hash_from_previous::<C::Hasher>(&input.start_chain_hash);
+        jtmb_connect_ref(&input.previous_chain_hash, &previous_checkpoint_proof.public_inputs_hash, "Previous chain hash mismatch")?;
+        jtmb_connect_ref(&input.checkpoint_state_transition_circuit_fingerprint, &self.fingerprint, "Checkpoint circuit fingerprint mismatch")?;
         
         // 1. Verify Part 1 Proof
         part_1_verifier_data.verify_proof::<C::Hasher, C::Hash, C::F>(part_1_proof)?;
         let p1_fp = part_1_verifier_data.get_fingerprint::<C::Hash, C::Hasher, C::F>();
         jtmb_connect_ref(&p1_fp, &self.known_part_1_fingerprint, "Part 1 proof fingerprint mismatch")?;
+        let expected_part_1_pi = C::Hasher::two_to_one(
+            &input.partial.part_1_header.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(), &part_1_reward_root);
+        jtmb_connect_ref(&expected_part_1_pi, &part_1_proof.public_inputs_hash, "Part 1 public inputs mismatch")?;
+        jtmb_connect_ref(&input.partial.part_1_header.guta_proof_header.checkpoint_tree_root,
+            &input.previous_checkpoint_proof.root, "Part 1 checkpoint root mismatch")?;
 
         // 2. Verify Previous Checkpoint Proof
         let is_genesis_prev = input.append_checkpoint_tree_proof.index == 1;
@@ -181,7 +192,7 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
             checkpoint_state_transition_circuit_fingerprint: self.fingerprint,
         };
         
-        let public_inputs_hash = current_pi_struct.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
+        let public_inputs_hash = current_pi_struct.get_chain_hash_from_previous::<C::Hasher>(&previous_checkpoint_proof.public_inputs_hash);
 
         self.verifier_data.generate_proof_with_signer::<C::Hasher, C::Hash, C::F, _>(
             public_inputs_hash,
@@ -286,7 +297,12 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         };
         println!("expected_old_public_inputs_preimage: {:#?}", expected_old_public_inputs);
         println!("expected_new_public_inputs_preimage: {:#?}", expected_new_public_inputs);
-        let expected_old_public_inputs_hash = expected_old_public_inputs.qfhash::<C::Hasher>();
+        let expected_old_public_inputs_hash = if witness.append_checkpoint_tree_proof.index == 1 {
+            let root_leaf = C::Hasher::two_to_one(&witness.previous_checkpoint_proof.root, &witness.previous_checkpoint_proof.value);
+            C::Hasher::two_to_one(&root_leaf, &self.known_genesis_fingerprint)
+        } else {
+            expected_old_public_inputs.get_chain_hash_from_previous::<C::Hasher>(&witness.start_chain_hash)
+        };
         //let expected_new_public_inputs_hash = expected_new_public_inputs.qfhash::<C::Hasher>();
         let actual_old_public_inputs_hash = prev_checkpoint_proof.public_inputs_hash;
         //println!("old_checkpoint_leaf: {:#?}", old_checkpoint_leaf);
@@ -308,5 +324,80 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
             &prev_checkpoint_proof,
             &prev_verifier_data,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parth_common::memory_stores::simple_merkle_tree::SimpleMerkleTree;
+    use parth_core::{PF, PHash, pgoldilocks::PoseidonHasher};
+    use psy_data::{agg::AggStateTransitionWithStats, guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, protocol::circuit_inputs::{agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, checkpoint_transition::QCQEDCheckpointStateTransitionInputPartial}, v1::qdata::{checkpoint::PQEDCheckpointLeafStats, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+    use crate::{protocol_types::JTMBPoseidonGoldilocksConfig, proving::circuits::coordinator::checkpoint_state_transition_genesis::QEDCheckpointStateTransitionGenesisCircuit};
+
+    #[test]
+    fn checkpoint_chain_binds_predecessor_and_part_1_through_three_steps() -> anyhow::Result<()> {
+        type C = JTMBPoseidonGoldilocksConfig;
+        let key = MemorySecp256K1SinglePrivateKeyWallet::new_from_private_key_bytes(&[7; 32])?;
+        let genesis = QEDCheckpointStateTransitionGenesisCircuit::<C>::new(&key);
+        let part_1_verifier = PsyTestJTMBProofVerifierData::new_from_compressed_public_key(
+            ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA as u32, [0; 32], &key.get_public_key());
+        let circuit = QEDCheckpointStateTransitionCircuit::<C>::new(&key, 4,
+            part_1_verifier.get_fingerprint::<PHash, PoseidonHasher, PF>(), genesis.fingerprint);
+        let zero = PHash::default();
+        let transition = AggStateTransitionWithStats { state_transition_start: zero, state_transition_end: zero, total_proofs_generated: 0 };
+        let mut partial = QCQEDCheckpointStateTransitionInputPartial {
+            part_1_header: QCAggUserRegistartionDeployContractsGUTAInput {
+                register_users_state_transition: transition, deploy_contracts_state_transition: transition, update_contracts_state_transition: transition,
+                guta_proof_header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: zero, checkpoint_tree_root: zero,
+                    state_transition: SubTreeNodeStateTransition { old_node_value: zero, new_node_value: zero, node_index: PF::from_u64_value(0), node_level: PF::from_u64_value(0) },
+                    stats: GUTAStats::get_zero_value(), total_aggregation_proofs_generated: PF::from_u64_value(0),
+                },
+            },
+            old_stats: PQEDCheckpointLeafStats::get_empty_stats(), block_time: PF::from_u64_value(1),
+            pm_jobs_completed: PPMJobsCompletedStats { deploy_contracts_completed: PF::from_u64_value(0), register_users_completed: PF::from_u64_value(0), gutas_completed: PF::from_u64_value(0) },
+            validator_tree_root: zero,
+        };
+        let mut checkpoints = SimpleMerkleTree::<PoseidonHasher, PHash>::new(4);
+        let initial_leaf = partial.get_old_checkpoint_leaf::<PoseidonHasher>();
+        checkpoints.set_leaf(0, initial_leaf.qfhash::<PoseidonHasher>());
+        let mut previous = genesis.prove_base(checkpoints.get_root(), initial_leaf.qfhash::<PoseidonHasher>(), genesis.fingerprint)?;
+        let mut previous_verifier = genesis.verifier_data;
+        let mut start_chain = zero;
+        let child_rewards = PHash::from_values(1, 2, 3, 4);
+        let worker_tag = PHash::from_values(5, 6, 7, 8);
+        for index in 1..=3 {
+            partial.block_time = PF::from_u64_value(index);
+            partial.part_1_header.guta_proof_header.checkpoint_tree_root = checkpoints.get_root();
+            let previous_checkpoint_proof = checkpoints.get_leaf(index - 1);
+            let part_1_pi = PoseidonHasher::two_to_one(&partial.part_1_header.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), &child_rewards);
+            let part_1 = part_1_verifier.generate_proof_with_signer::<PoseidonHasher, PHash, PF, _>(part_1_pi, &key)?;
+            let mut input = QCQEDCheckpointStateTransitionInput {
+                partial: partial.clone(), append_checkpoint_tree_proof: checkpoints.set_leaf(index, zero), previous_checkpoint_proof,
+                genesis_checkpoint_state_transition_hash: genesis.fingerprint,
+                last_old_checkpoint_tree_leaf_hash: zero, last_old_checkpoint_tree_root_hash: zero,
+                previous_chain_hash: previous.public_inputs_hash, start_chain_hash: start_chain,
+                checkpoint_state_transition_circuit_fingerprint: circuit.fingerprint,
+            };
+            let reward = hash_tag_tree_node_single::<PHash, PoseidonHasher>(&child_rewards, &worker_tag);
+            input.update_for_prover::<PoseidonHasher>(reward);
+            let proof = circuit.prove_base(worker_tag, &input, child_rewards, &part_1, &part_1_verifier, &previous, &previous_verifier)?;
+            assert_eq!(proof.public_inputs_hash, input.get_chain_hash_from_previous_with_fingerprint::<PoseidonHasher>(previous.public_inputs_hash, circuit.fingerprint));
+            circuit.verifier_data.verify_proof::<PoseidonHasher, PHash, PF>(&proof)?;
+            let mut bad = input.clone(); bad.previous_chain_hash = zero;
+            assert!(circuit.prove_base(worker_tag, &bad, child_rewards, &part_1, &part_1_verifier, &previous, &previous_verifier).is_err());
+            let mut bad = input.clone(); bad.partial.part_1_header.update_contracts_state_transition.state_transition_end = child_rewards;
+            assert!(circuit.prove_base(worker_tag, &bad, child_rewards, &part_1, &part_1_verifier, &previous, &previous_verifier).is_err());
+            if index > 1 {
+                let mut bad = input.clone(); bad.start_chain_hash = zero;
+                assert!(circuit.prove_base(worker_tag, &bad, child_rewards, &part_1, &part_1_verifier, &previous, &previous_verifier).is_err());
+            }
+            checkpoints.set_leaf(index, input.append_checkpoint_tree_proof.new_value);
+            partial.old_stats = input.partial.get_new_checkpoint_leaf::<PoseidonHasher>(reward).stats;
+            start_chain = previous.public_inputs_hash;
+            previous = proof; previous_verifier = circuit.verifier_data;
+        }
+        Ok(())
     }
 }

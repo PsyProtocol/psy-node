@@ -20,6 +20,22 @@ use crate::{
     lite::user_state::{DPContractUpdate, DPLocalUser},
 };
 
+fn get_allowed_contracts(contract_ids: &[u64], heights: &[u8]) -> anyhow::Result<Vec<(u64, u8)>> {
+    anyhow::ensure!(
+        contract_ids.len() == heights.len(),
+        "Contract state height count mismatch: requested {}, received {}",
+        contract_ids.len(), heights.len()
+    );
+    let allowed_contracts: Vec<_> = contract_ids.iter().copied().zip(heights.iter().copied())
+        .filter(|(_, height)| *height > 0)
+        .collect();
+    anyhow::ensure!(
+        !allowed_contracts.is_empty(),
+        "No contracts with nonzero state tree heights found in the requested contract IDs"
+    );
+    Ok(allowed_contracts)
+}
+
 pub struct DPUserSimulationChainState<Hasher, Hash: Copy + PartialEq + Default + std::fmt::Debug, F, DF: PsyDummyProverComboFetcher<F, Hash> + Send + Sync + 'static> {
     pub checkpoint_id: u64,
     pub checkpoint_root: Hash,
@@ -59,11 +75,8 @@ impl<
         let contract_height_cache = DashMapContractHeightCache::new();
         let contract_ids: Vec<u64> = (0..100).collect();
         let heights = data_fetcher.df_get_contract_state_heights(u64::MAX, contract_ids.clone()).await?;
-        if heights.contains(&0) {
-            anyhow::bail!("Some contract heights are zero, cannot proceed");
-        }
-        for (contract_id, height) in contract_ids.iter().zip(heights.iter()) {
-            contract_height_cache.add_contract(*contract_id as u32, *height, Hasher::get_zero_hash(*height as usize));
+        for (contract_id, height) in get_allowed_contracts(&contract_ids, &heights)? {
+            contract_height_cache.add_contract(contract_id as u32, height, Hasher::get_zero_hash(height as usize));
         }
 
         Ok(Self::new(
@@ -215,5 +228,31 @@ impl<
         }
 
         Ok(inputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_allowed_contracts;
+
+    #[test]
+    fn allowed_contracts_preserve_ids_across_zero_heights() {
+        assert_eq!(
+            get_allowed_contracts(&[0, 1, 2, 3, 4], &[32, 0, 16, 0, 8]).unwrap(),
+            vec![(0, 32), (2, 16), (4, 8)]
+        );
+    }
+
+    #[test]
+    fn allowed_contracts_reject_no_state_trees() {
+        assert!(get_allowed_contracts(&[0, 1], &[0, 0]).unwrap_err().to_string().contains("No contracts"));
+        assert!(get_allowed_contracts(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn allowed_contracts_reject_incomplete_or_extra_heights() {
+        for heights in [&[32][..], &[32, 16, 8][..]] {
+            assert!(get_allowed_contracts(&[0, 1], heights).unwrap_err().to_string().contains("count mismatch"));
+        }
     }
 }

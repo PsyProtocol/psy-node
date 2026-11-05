@@ -5,7 +5,6 @@ use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use crate::proof::PsyTestJTMBProofVerifierData;
 use crate::proof::{PsyTestJTMBProof, PsyTestJTMBProofVerifierDataWithFingerprint};
 

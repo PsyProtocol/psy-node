@@ -364,10 +364,20 @@ echo "-----------------------------------------------------"
 # the TypeScript supervisor restarts the DB group. Intentional SIGINT/SIGTERM
 # (cleanup above) exits 0.
 EXIT_CODE=0
-if wait -n; then
-    EXIT_CODE=0
-else
-    EXIT_CODE=$?
+# `wait -n` requires bash 4.3+; macOS ships bash 3.2, so poll the tracked
+# service pipeline PIDs and reap the first one that exits.
+EXITED_INDEX=-1
+while true; do
+    for i in "${!SERVICE_PIDS[@]}"; do
+        if ! kill -0 "${SERVICE_PIDS[$i]}" 2>/dev/null; then
+            EXITED_INDEX=$i
+            break 2
+        fi
+    done
+    sleep 2
+done
+if [ "$EXITED_INDEX" -ge 0 ]; then
+    wait "${SERVICE_PIDS[$EXITED_INDEX]}" 2>/dev/null || EXIT_CODE=$?
 fi
 
 # Disable the trap so cleanup cannot run during our own container shutdown.

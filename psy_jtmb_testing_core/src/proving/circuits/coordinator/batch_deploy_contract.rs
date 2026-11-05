@@ -63,6 +63,7 @@ impl<C: JTMBCircuitConfig> BatchDeployContractsCircuit<C> {
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
         verify_batch_deploy::<C::Hash, C::F, C::Hasher>(
             &input.spiderman_append_proof,
+            &input.contract_ids,
             &input.contract_leaves,
             self.contract_tree_height,
             self.batch_sub_tree_height,

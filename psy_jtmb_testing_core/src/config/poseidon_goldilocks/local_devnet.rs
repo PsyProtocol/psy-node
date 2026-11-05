@@ -18,7 +18,10 @@ type Hasher = PoseidonHasher;
 pub fn get_psy_node_jtmb_poseidon_goldilocks_config_for_network(network: PsyChainNetworkType) -> anyhow::Result<PsyNodeCircuitFingerprintConfig<Hash>> {
     let (verifier, _circuit_manager) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(network)?;
 
-    let lib = verifier.library;
+    get_psy_node_jtmb_poseidon_goldilocks_config_from_library(&verifier.library)
+}
+
+fn get_psy_node_jtmb_poseidon_goldilocks_config_from_library(lib: &impl PsyJTMBCircuitInfoLibraryCore<Hash>) -> anyhow::Result<PsyNodeCircuitFingerprintConfig<Hash>> {
     let guta_circuit_whitelist_root = lib
         .get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint, ProvingJobCircuitType::GUTATwoGUTALinear)?
         .root;
@@ -32,9 +35,8 @@ pub fn get_psy_node_jtmb_poseidon_goldilocks_config_for_network(network: PsyChai
 
     let deploy_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_deploy_contracts_fingerprint, &agg_state_transition_fingerprint);
 
-    // NOTE: the jtmb dummy proving stack does not implement the batch update
-    // contracts circuits yet; placeholder zero root until it does
-    let update_contracts_circuit_whitelist_root = Hash::get_zero_value();
+    let batch_update_contracts_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchUpdateContracts)?;
+    let update_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_update_contracts_fingerprint, &agg_state_transition_fingerprint);
 
     let checkpoint_state_transition_circuit_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?;
     let genesis_checkpoint_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?;
@@ -102,6 +104,25 @@ mod tests {
             genesis.checkpoint_stats.block_time.to_u64_value(),
             1_764_248_609
         );
+        Ok(())
+    }
+    #[test]
+    fn update_contract_whitelist_matches_coordinator_verifier() -> anyhow::Result<()> {
+        use crate::{proving::coordinator_helper::QEDCoordinatorCircuitManager, utils::{simple_circuit_info_library::JTMBSimpleCircuitLibrary, jtmb_standard_circuit::QJTMBProofCircuitBase}};
+        use parth_common::{secp256k1::MemorySecp256K1SinglePrivateKeyWallet, realm_rotation::RealmRotationConfig};
+        let key = MemorySecp256K1SinglePrivateKeyWallet::new_from_private_key_bytes(&[7; 32])?;
+        let manager = QEDCoordinatorCircuitManager::<JTMBPoseidonGoldilocksConfig>::new(
+            &key, 4, 4, 4, 8, 1, 32, 64, 1, 2, 8, 2, 4, Hash::from_values(1, 2, 3, 4),
+            RealmRotationConfig { checkpoints_per_epoch: 32, validator_sub_ids: vec![1, 2, 3] });
+        let mut library = JTMBSimpleCircuitLibrary::<JTMBPoseidonGoldilocksConfig>::new();
+        manager.register_library(&mut library);
+        let config = get_psy_node_jtmb_poseidon_goldilocks_config_from_library(&library)?;
+        let expected = Hasher::two_to_one(
+            &manager.batch_update_contracts.get_fingerprint(),
+            &manager.agg_state_transition.get_fingerprint(),
+        );
+        assert_ne!(expected, Hash::get_zero_value());
+        assert_eq!(config.update_contracts_circuit_whitelist_root, expected);
         Ok(())
     }
 }

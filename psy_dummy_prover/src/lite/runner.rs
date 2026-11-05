@@ -10,6 +10,34 @@ use tokio::time::sleep;
 
 use crate::{api::combo_dummy_fetcher::PsyDummyProverComboFetcher, lite::chain_state::DPUserSimulationChainState, traits::DummyUPSProver};
 
+async fn submit_end_cap_with_retry<Submit, Submitted>(mut submit: Submit, delay: Duration) -> anyhow::Result<()>
+where
+    Submit: FnMut() -> Submitted,
+    Submitted: std::future::Future<Output = anyhow::Result<()>>,
+{
+    for attempt in 1..=20 {
+        match submit().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                let future_checkpoint = message.contains("Submitted end cap for checkpoint ")
+                    && message.contains(", but current checkpoint is ");
+                // Forwarding currently returns only the explicit Invalid reject
+                // reason. Retry this bounded rejection too; transport failures
+                // are ambiguous about acceptance and must not be resubmitted.
+                let forwarded_rejection = message.contains("EndCap forward rejected by proposer ")
+                    && message.contains("(reason Invalid)");
+                if attempt == 20 || !(future_checkpoint || forwarded_rejection) {
+                    return Err(error);
+                }
+                tracing::warn!(attempt, error = %error, "EndCap rejected; retrying the same proof");
+                sleep(delay * attempt.min(4)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
 pub async fn run_dummy_prover_lite<
     Hasher: FieldQHasher<F, Hash>,
     DF: PsyDummyProverComboFetcher<F, Hash> + Send + Sync + 'static,
@@ -82,7 +110,13 @@ let global_user_tree_height = coordinator_global_user_tree_height + realm_global
         let mut current_chunk = Vec::with_capacity(BATCH_SUBMIT_SIZE);
 
         for (i, (ec, p)) in end_cap_inputs.into_iter().zip(proofs.into_iter()).enumerate() {
-            current_chunk.push(data_fetcher.df_submit_end_cap_proof(ec, p));
+            let fetcher = data_fetcher.clone();
+            current_chunk.push(submit_end_cap_with_retry(move || {
+                let fetcher = fetcher.clone();
+                let ec = ec.clone();
+                let p = p.clone();
+                async move { fetcher.df_submit_end_cap_proof(ec, p).await }
+            }, Duration::from_millis(250)));
             if current_chunk.len() == BATCH_SUBMIT_SIZE || i == total_users_usize - 1 {
                 let submit_futs = current_chunk.drain(..).collect::<Vec<_>>();
                 futures::future::try_join_all(submit_futs).await?;
@@ -97,4 +131,45 @@ let global_user_tree_height = coordinator_global_user_tree_height + realm_global
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn end_cap_submission_retries_future_checkpoint_until_accepted() {
+        let calls = Cell::new(0);
+        submit_end_cap_with_retry(|| {
+            calls.set(calls.get() + 1);
+            std::future::ready(if calls.get() < 3 {
+                Err(anyhow::anyhow!("Submitted end cap for checkpoint 503, but current checkpoint is 502"))
+            } else { Ok(()) })
+        }, Duration::ZERO).await.unwrap();
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn end_cap_submission_bounds_explicit_forwarded_rejections() {
+        let calls = Cell::new(0);
+        let error = submit_end_cap_with_retry(|| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err(anyhow::anyhow!("EndCap forward rejected by proposer 1 (reason Invalid)")))
+        }, Duration::ZERO).await.unwrap_err();
+        assert_eq!(calls.get(), 20);
+        assert!(error.to_string().contains("reason Invalid"));
+    }
+
+    #[tokio::test]
+    async fn end_cap_submission_does_not_retry_ambiguous_or_other_failures() {
+        for message in ["connection closed", "invalid signature", "AlreadySubmitted", "Submitted end cap for checkpoint 1, but user's last checkpoint is 2"] {
+            let calls = Cell::new(0);
+            assert!(submit_end_cap_with_retry(|| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!(message)))
+            }, Duration::ZERO).await.is_err());
+            assert_eq!(calls.get(), 1);
+        }
+    }
 }

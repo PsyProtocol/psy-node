@@ -19,6 +19,7 @@ use crate::{
             agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTACircuit,
             batch_append_user_registration_tree::BatchAppendUserRegistrationTreeCircuit,
             batch_deploy_contract::BatchDeployContractsCircuit,
+            batch_update_contract::BatchUpdateContractsCircuit,
             checkpoint_state_transition::QEDCheckpointStateTransitionCircuit,
             checkpoint_state_transition_genesis::QEDCheckpointStateTransitionGenesisCircuit, dummy_agg_state_transition::AggStateTransitionDummyCircuitV2,
         },
@@ -34,6 +35,7 @@ use crate::{
 pub struct QEDCoordinatorCircuitManager<C: JTMBCircuitConfig> {
     pub append_user_registration_tree: BatchAppendUserRegistrationTreeCircuit<C>,
     pub batch_deploy_contracts: BatchDeployContractsCircuit<C>,
+    pub batch_update_contracts: BatchUpdateContractsCircuit<C>,
     pub agg_state_transition: AggStateTransitionCircuitV2<C>,
     pub dummy_agg_state_transition: AggStateTransitionDummyCircuitV2<C>,
     pub agg_user_register_deploy_contracts_guta: VerifyAggUserRegistartionDeployContractsGUTACircuit<C>,
@@ -61,6 +63,8 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         global_contract_tree_height: usize,
         batch_deploy_contract_sub_tree_height: usize,
         max_contract_state_tree_height: usize,
+        chain_domain: C::Hash,
+        rotation: parth_common::realm_rotation::RealmRotationConfig,
     ) -> Self {
         let max_guta_nca_merkle_proof_height = (global_user_tree_height - global_user_tree_realm_height).max(global_user_tree_realm_height);
 
@@ -71,6 +75,8 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
             max_guta_nca_merkle_proof_height,
+            chain_domain,
+            rotation,
         );
 
         let append_user_registration_tree = BatchAppendUserRegistrationTreeCircuit::new(
@@ -81,6 +87,13 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         );
 
         let batch_deploy_contracts = BatchDeployContractsCircuit::new(
+            private_key,
+            global_contract_tree_height,
+            batch_deploy_contract_sub_tree_height,
+            max_contract_state_tree_height,
+        );
+
+        let batch_update_contracts = BatchUpdateContractsCircuit::new(
             private_key,
             global_contract_tree_height,
             batch_deploy_contract_sub_tree_height,
@@ -109,10 +122,18 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
             verifier_data_cap_height: 3,
         };
 
+        let update_conf = TPAltCircuitFingerprintConfig {
+            leaf_fingerprint: batch_update_contracts.get_fingerprint(),
+            aggregator_fingerprint: agg_state_transition.get_fingerprint(),
+            dummy_fingerprint: dummy_agg_state_transition.get_fingerprint(),
+            verifier_data_cap_height: 3,
+        };
+
         let agg_user_register_deploy_contracts_guta = VerifyAggUserRegistartionDeployContractsGUTACircuit::new(
             private_key,
             user_reg_conf,
             deploy_conf,
+            update_conf,
             guta_circuits.guta_circuit_whitelist_root,
             guta_circuit_whitelist_tree_height,
         );
@@ -139,6 +160,7 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         Self {
             append_user_registration_tree,
             batch_deploy_contracts,
+            batch_update_contracts,
             agg_state_transition,
             dummy_agg_state_transition,
             agg_user_register_deploy_contracts_guta,
@@ -154,6 +176,7 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         let circuits: Vec<&dyn QJTMBProofCircuitBase<C::Hash>> = vec![
             &self.append_user_registration_tree,
             &self.batch_deploy_contracts,
+            &self.batch_update_contracts,
             &self.agg_state_transition,
             &self.dummy_agg_state_transition,
             &self.agg_user_register_deploy_contracts_guta,
@@ -166,6 +189,8 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         }
 
         library.register_circuit(ProvingJobCircuitType::BatchDeployContractsAggregate, self.agg_state_transition.get_fingerprint(), self.agg_state_transition.get_verifier_data().clone());
+        library.register_circuit(ProvingJobCircuitType::BatchUpdateContractsAggregate, self.agg_state_transition.get_fingerprint(), self.agg_state_transition.get_verifier_data().clone());
+        library.register_circuit(ProvingJobCircuitType::DummyBatchUpdateContractsAggregate, self.dummy_agg_state_transition.get_fingerprint(), self.dummy_agg_state_transition.get_verifier_data().clone());
         library.register_circuit(ProvingJobCircuitType::DummyBatchDeployContractsAggregate, self.dummy_agg_state_transition.get_fingerprint(), self.dummy_agg_state_transition.get_verifier_data().clone());
 
         self.guta_circuits.register_library(library);
@@ -181,6 +206,9 @@ impl<C: JTMBCircuitConfig> QNextGenWorkerGenericInfo<QProvingJobDataID> for QEDC
             | ProvingJobCircuitType::BatchDeployContractsAggregate
             | ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate
             | ProvingJobCircuitType::DummyBatchDeployContractsAggregate
+            | ProvingJobCircuitType::BatchUpdateContracts
+            | ProvingJobCircuitType::BatchUpdateContractsAggregate
+            | ProvingJobCircuitType::DummyBatchUpdateContractsAggregate
             | ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA
             | ProvingJobCircuitType::GenerateRollupStateTransitionProof
             | ProvingJobCircuitType::GenesisBlockCheckpointStateTransition => true,
@@ -211,6 +239,13 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> PsyWorkerGener
                 self.agg_state_transition.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?
             },
             ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate | ProvingJobCircuitType::DummyBatchDeployContractsAggregate => {
+                self.dummy_agg_state_transition.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?
+            },
+            ProvingJobCircuitType::BatchUpdateContracts => self.batch_update_contracts.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => {
+                self.agg_state_transition.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?
+            },
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate => {
                 self.dummy_agg_state_transition.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?
             },
             ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA => self.agg_user_register_deploy_contracts_guta.jtmb_prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)?,
