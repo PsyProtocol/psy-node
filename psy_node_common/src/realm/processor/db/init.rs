@@ -1620,6 +1620,12 @@ pub(crate) mod realm_db_test_env {
         pub guta_submit_attempts: Mutex<u64>,
         /// when set, `rc_submit_guta_proof` fails after counting the attempt
         pub fail_guta_submissions: Mutex<bool>,
+        /// upcoming `rc_submit_guta_proof` calls that fail as an unavailable Coordinator
+        pub unavailable_guta_submissions: Mutex<u64>,
+        /// upcoming realm-root queries that fail as an unavailable Coordinator
+        pub unavailable_realm_root_queries: Mutex<u64>,
+        /// upcoming latest-checkpoint reads that fail as an unavailable Coordinator
+        pub unavailable_latest_checkpoint_reads: Mutex<u64>,
         /// checkpoints the coordinator commits while it handles one `rc_submit_guta_proof` call
         pub checkpoints_committed_during_guta_submit: Mutex<u64>,
         pub wait_calls: Mutex<u64>,
@@ -1674,6 +1680,25 @@ pub(crate) mod realm_db_test_env {
         pub(crate) fn set_fail_guta_submissions(&self, fail: bool) {
             *self.fail_guta_submissions.lock().unwrap() = fail;
         }
+        pub(crate) fn set_unavailable_guta_submissions(&self, count: u64) {
+            *self.unavailable_guta_submissions.lock().unwrap() = count;
+        }
+        pub(crate) fn set_unavailable_realm_root_queries(&self, count: u64) {
+            *self.unavailable_realm_root_queries.lock().unwrap() = count;
+        }
+        pub(crate) fn set_unavailable_latest_checkpoint_reads(&self, count: u64) {
+            *self.unavailable_latest_checkpoint_reads.lock().unwrap() = count;
+        }
+        fn take_unavailable_call(counter: &Mutex<u64>) -> anyhow::Result<()> {
+            let mut remaining = counter.lock().unwrap();
+            if *remaining == 0 {
+                return Ok(());
+            }
+            *remaining -= 1;
+            Err(anyhow::Error::new(crate::p2p::realm_coordinator::CoordinatorRpcUnavailable {
+                message: "injected unavailable Coordinator".to_string(),
+            }))
+        }
         pub(crate) fn guta_submit_attempt_count(&self) -> u64 {
             *self.guta_submit_attempts.lock().unwrap()
         }
@@ -1706,6 +1731,7 @@ pub(crate) mod realm_db_test_env {
     #[async_trait]
     impl RealmCoordinatorClient<PF, PHash> for FakeRealmCoordinatorClient {
         async fn rc_get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
+            Self::take_unavailable_call(&self.unavailable_latest_checkpoint_reads)?;
             Ok(*self.latest_checkpoint_id.lock().unwrap())
         }
         async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64> {
@@ -1763,6 +1789,7 @@ pub(crate) mod realm_db_test_env {
             if let Some(hook) = hook {
                 hook(self, checkpoint_id);
             }
+            Self::take_unavailable_call(&self.unavailable_realm_root_queries)?;
             Ok(self.realm_root_at(checkpoint_id))
         }
         async fn rc_submit_guta_proof(
@@ -1778,6 +1805,7 @@ pub(crate) mod realm_db_test_env {
             for _ in 0..committed_meanwhile {
                 self.commit_next_checkpoint();
             }
+            Self::take_unavailable_call(&self.unavailable_guta_submissions)?;
             if *self.fail_guta_submissions.lock().unwrap() {
                 anyhow::bail!("injected GUTA submission failure");
             }

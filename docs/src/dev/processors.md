@@ -63,7 +63,9 @@ Starting = 0, Running = 1, Error = 2, Stopping = 3, Stopped = 4
 
 `should_run()` is true only for `Starting | Running`. `Error` is sticky: `mark_running`, `begin_shutdown`, and `mark_stopped` are no-ops once parked. An unknown raw value resolves to `Error`.
 
-Both runner loops call `process_block` on their slot tick. On `Err` they `set_error` and log that the processor is parked until a manual restart. The loop then sleeps while `state == Error`. Gatherers share the same status and stop on the next `should_run()` poll ([Gatherers](gatherers.md#2-lifecycle)).
+Both runner loops call `process_block` on their slot tick. On `Err` the Coordinator runner calls `require_recovery` and logs that the processor is parked until a manual restart; the loop then sleeps while `state == Error`. Gatherers share the same status and stop on the next `should_run()` poll ([Gatherers](gatherers.md#2-lifecycle)).
+
+The Realm runner (`psy_node_common/src/realm/processor/core/runner.rs`) does not park on a block error. A retryable `GutaSubmitError` only re-syncs metadata. Any other error re-enters `run_init_catchup` (`core/startup.rs`), which recovers committed state first and replaces the GUTA gatherer only when the gatherer task has finished or the committed realm root after recovery is not the gathering start root; otherwise the gatherer keeps the EndCaps it already accepted. Before a block can fail that way, an unavailable Coordinator (`CoordinatorRpcUnavailable`, `p2p/realm_coordinator.rs`) does not end it: the inclusion wait retries for up to 300 consecutive unavailable reads, and an unavailable first GUTA submit is left to the wait's resend (`db/sync.rs`). A failure before the GUTA submit, such as a P2P vote shortfall, abandons the sealed generation, so the next one gathers on a root that cannot be committed and is replaced.
 
 ```mermaid
 stateDiagram-v2

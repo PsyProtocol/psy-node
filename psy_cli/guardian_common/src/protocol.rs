@@ -17,6 +17,14 @@ pub const RECORD_MAGIC: [u8; 8] = *b"PSYGR001";
 pub const RECORD_VERSION: u32 = 1;
 pub const RECORD_HEADER_LEN: usize = 20;
 pub const RECORD_COMPRESSION_LEVEL: i32 = 3;
+/// Included sessions kept by every guardian and relayer journal, newest first; a guardian
+/// that falls behind by fewer sessions can still import the gap from any peer.
+pub const RETAINED_SESSION_COUNT: u64 = 64;
+
+/// Lowest session nonce kept after importing `nonce`.
+pub fn oldest_retained_session_nonce(nonce: u64) -> u64 {
+    nonce.saturating_sub(RETAINED_SESSION_COUNT - 1)
+}
 
 /// Versioned zstd envelope around exact inner bytes. Canonical for database rows and HTTP bodies.
 ///

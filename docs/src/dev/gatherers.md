@@ -183,7 +183,15 @@ pending id, so a stalled older request cannot overwrite a newer admission. An En
 dropped with an error.
 
 Recovery covers generation discard, a lost proposal race, Fatal re-entry,
-process exit and the retired-queue tail drain. A redelivered copy cannot apply
+process exit and the retired-queue tail drain. A discarded generation that
+accepted EndCaps and holds no deferred ones is final, so the gatherer lists its
+pending id with `add_discarded_end_cap_generation`, and the next pass settles
+that pending id's records immediately, without
+`END_CAP_REDELIVERY_DELAY_CHECKPOINTS`; the cursor later skips them. Deferred
+EndCaps return to the next generation when the discarded builder drops, so a
+discard holding them, and a reverted cycle, keep the delayed path. The two
+passes run independently, so an error in one does not stop the other. Only a
+discard that holds EndCaps logs a warning. A redelivered copy cannot apply
 twice: once the original lands, the copy's old leaf no longer matches, and the
 planner skips it.
 

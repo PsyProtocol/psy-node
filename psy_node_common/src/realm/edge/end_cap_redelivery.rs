@@ -61,12 +61,19 @@ where
     N::ZKProof: 'static,
 {
     pub async fn redeliver_abandoned_end_caps(&self) -> anyhow::Result<EndCapRedeliveryCounts> {
-        let rid = self.realm_identifier;
-        let (processing_unique_pending_id, _) = self.temp_db.get_unique_pending_ids(&rid).await?;
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
         let mut counts = EndCapRedeliveryCounts::default();
+        // Neither pass may block the other: both run, then the first error is returned.
+        let discarded = self.redeliver_discarded_generations(latest_checkpoint_id, &mut counts).await;
+        let retired = self.redeliver_retired_end_caps(latest_checkpoint_id, &mut counts).await;
+        discarded.and(retired).map(|()| counts)
+    }
+
+    async fn redeliver_retired_end_caps(&self, latest_checkpoint_id: u64, counts: &mut EndCapRedeliveryCounts) -> anyhow::Result<()> {
+        let rid = self.realm_identifier;
+        let (processing_unique_pending_id, _) = self.temp_db.get_unique_pending_ids(&rid).await?;
         let Some(mut cursor) = self.temp_db.get_end_cap_redelivery_cursor(&rid).await? else {
-            return Ok(counts);
+            return Ok(());
         };
         while cursor.saturating_add(END_CAP_REDELIVERY_RETIRED_MARGIN_PENDING_IDS) < processing_unique_pending_id {
             for user_id in self.temp_db.get_end_cap_redelivery_user_ids(&rid, cursor).await? {
@@ -85,17 +92,43 @@ where
                     continue;
                 }
                 if latest_checkpoint_id < record.admitted_checkpoint_id.saturating_add(END_CAP_REDELIVERY_DELAY_CHECKPOINTS) {
-                    return Ok(counts);
+                    return Ok(());
                 }
-                self.settle_end_cap(user_id, record, &observed, latest_checkpoint_id, &mut counts).await?;
+                self.settle_end_cap(user_id, record, &observed, latest_checkpoint_id, counts).await?;
             }
             self.temp_db.remove_end_cap_redelivery_user_ids(&rid, cursor).await?;
             if !self.temp_db.set_end_cap_redelivery_cursor(&rid, Some(cursor), cursor + 1).await? {
-                return Ok(counts);
+                return Ok(());
             }
             cursor += 1;
         }
-        Ok(counts)
+        Ok(())
+    }
+
+    /// A discarded generation without deferred EndCaps is never included, so its EndCaps settle now
+    /// instead of after the inclusion delay; the cursor later skips the records settled here.
+    async fn redeliver_discarded_generations(&self, latest_checkpoint_id: u64, counts: &mut EndCapRedeliveryCounts) -> anyhow::Result<()> {
+        let rid = self.realm_identifier;
+        for unique_pending_id in self.temp_db.get_discarded_end_cap_generations(&rid).await? {
+            for user_id in self.temp_db.get_end_cap_redelivery_user_ids(&rid, unique_pending_id).await? {
+                let Some(observed) = self.temp_db.get_end_cap_redelivery(&rid, user_id).await? else {
+                    continue;
+                };
+                let record = match EndCapRedeliveryRecord::from_bytes(&observed) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(user_id, error = %format!("{error:#}"), "Leaving an undecodable EndCap redelivery record to the cursor pass");
+                        continue;
+                    }
+                };
+                if record.admitted_unique_pending_id != unique_pending_id {
+                    continue;
+                }
+                self.settle_end_cap(user_id, record, &observed, latest_checkpoint_id, counts).await?;
+            }
+            self.temp_db.remove_discarded_end_cap_generation(&rid, unique_pending_id).await?;
+        }
+        Ok(())
     }
 
     async fn settle_end_cap(
@@ -198,6 +231,7 @@ mod tests {
         psy_temp_db::{
             tt_get_end_cap_redelivery_key, EndCapRedeliveryRecord, GatheringGeneration, QTempDBEndCapRedeliveryStore,
             QTempDBPendingIdWriter, QTempDBSubmitStatusWriter, TEMP_TABLE_ID_END_CAP_REDELIVERY_BYTES,
+            TEMP_TABLE_ID_END_CAP_REDELIVERY_DISCARDED_BYTES,
         },
         store::traits::temp_db::QTempDatabaseRawKVWriterBase,
     };
@@ -324,6 +358,42 @@ mod tests {
         assert_eq!(settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS - 1, None).await?, EndCapRedeliveryCounts::default());
         assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID));
         assert_eq!(stored_record(&env).await?, Some(record));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discarded_generation_is_redelivered_without_the_delay() -> anyhow::Result<()> {
+        let (env, record) = retired_admission().await?;
+        let rid = test_realm_identifier();
+        env.temp_db.set_end_cap_redelivery_cursor(&rid, None, RETIRED_PENDING_ID).await?;
+        env.temp_db.add_discarded_end_cap_generation(&rid, RETIRED_PENDING_ID).await?;
+        env.temp_db.add_discarded_end_cap_generation(&rid, PROCESSING_PENDING_ID).await?;
+        let counts = settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS - 1, None).await?;
+        assert_eq!(counts, EndCapRedeliveryCounts { redelivered: 1, ..Default::default() });
+        assert_eq!(env.user_update_queue.published_count(), 2);
+        let redelivered = stored_record(&env).await?.context("redelivered record")?;
+        assert_eq!(redelivered.admitted_unique_pending_id, GATHERING_PENDING_ID);
+        assert_eq!((redelivered.end_cap_input, redelivered.proof), (record.end_cap_input, record.proof));
+        assert!(env.temp_db.get_discarded_end_cap_generations(&rid).await?.is_empty());
+        // The cursor passes the retired pending id without settling the record a second time.
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID + 1));
+        assert!(env.temp_db.get_end_cap_redelivery_user_ids(&rid, RETIRED_PENDING_ID).await?.is_empty());
+        assert_eq!(settle_at(&env, END_CAP_REDELIVERY_DELAY_CHECKPOINTS, None).await?, EndCapRedeliveryCounts::default());
+        assert_eq!(env.user_update_queue.published_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_pass_still_runs_when_the_discarded_list_is_unreadable() -> anyhow::Result<()> {
+        let (env, _) = retired_admission().await?;
+        let rid = test_realm_identifier();
+        env.temp_db.set_end_cap_redelivery_cursor(&rid, None, RETIRED_PENDING_ID).await?;
+        let key = tt_get_end_cap_redelivery_key(rid.realm_id, rid.realm_sub_id, TEMP_TABLE_ID_END_CAP_REDELIVERY_DISCARDED_BYTES, 0);
+        env.temp_db.qtdb_raw_kv_put_value(&key, &[1, 2, 3]).await?;
+        env.db.set_latest_checkpoint_id(END_CAP_REDELIVERY_DELAY_CHECKPOINTS).await?;
+        assert!(env.handler.redeliver_abandoned_end_caps().await.is_err());
+        assert_eq!(env.user_update_queue.published_count(), 2, "the retired pending id must still be redelivered");
+        assert_eq!(env.temp_db.get_end_cap_redelivery_cursor(&rid).await?, Some(RETIRED_PENDING_ID + 1));
         Ok(())
     }
 

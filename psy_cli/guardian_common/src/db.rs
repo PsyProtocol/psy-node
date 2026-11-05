@@ -399,7 +399,7 @@ impl GuardianDb {
     /// The service must authenticate the record and derive its deltas before calling.
     /// This transaction checks durable continuity; it does not assert provider trust.
     /// The caller proved the session and that `checkpoint_hash` is its bound checkpoint leaf.
-    /// One write commits the session, included deposit tree states, latest-inclusion session-nonce metadata, the sole account checkpoint, and drops this account's signed and session rows older than the imported nonce.
+    /// One write commits the session, included deposit tree states, latest-inclusion session-nonce metadata, the sole account checkpoint, and drops this account's signed rows through the imported nonce and session rows below the retained window.
     pub async fn import_session(&mut self, value: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: super::protocol::Hash4) -> Result<GuardianSession> {
         let request = value.record.request_json.decode()?;
         request.validate_authorization(&self.config)?;
@@ -775,11 +775,12 @@ fn insert_session(tx: &redb::WriteTransaction, value: &GuardianSession) -> Resul
     Ok(())
 }
 
-/// Drops signed decisions through `nonce` and imported sessions strictly older than `nonce`.
-/// Session `nonce`, later signed rows, deposits, the account, and withdrawal indexes stay.
+/// Drops signed decisions through `nonce` and imported sessions below the retained window.
+/// The latest `RETAINED_SESSION_COUNT` sessions, later signed rows, deposits, the account,
+/// and withdrawal indexes stay.
 fn prune_imported_history(tx: &redb::WriteTransaction, network: u64, user: u64, nonce: u64) -> Result<()> {
     let through = (Bound::Included((network, user, 0)), Bound::Included((network, user, nonce)));
-    let older = (Bound::Included((network, user, 0)), Bound::Excluded((network, user, nonce)));
+    let older = (Bound::Included((network, user, 0)), Bound::Excluded((network, user, super::protocol::oldest_retained_session_nonce(nonce))));
     for (table, range) in [(GUARDIAN_SIGNED, through), (GUARDIAN_SESSION, older)] {
         let mut rows = tx.open_table(table).map_err(unavailable)?;
         let keys = rows.range(range).map_err(unavailable)?.map(|entry| entry.map(|(key, _)| key.value())).collect::<std::result::Result<Vec<_>, _>>().map_err(unavailable)?;
@@ -1436,8 +1437,8 @@ mod tests {
         assert!(foreign.is_none() && !more);
         drop(reader); let file = owned.reopen();
         let reopened = GuardianDb::open(file, KEY, Arc::new(super::super::protocol::codec_config_fixture(network))).await.expect("authorized rows reopen");
-        let (row, has_more) = reopened.session_reader().load_session_page(network, user, 0).await.unwrap();
-        assert!(row.is_some() && !has_more);
+        let (row, has_more) = reopened.session_reader().load_session_page(network, user, 2).await.unwrap();
+        assert!(row.is_some_and(|(nonce, _)| nonce == 3) && !has_more);
     }
 
     #[tokio::test]
@@ -1547,8 +1548,7 @@ mod tests {
         owned.db().import_session(&second, &[], 2, Hash4::default()).await.expect("import nonce 2");
         assert!(owned.db().lookup_signed(network, user, 1).await.expect("pruned signed").is_none());
         assert!(owned.db().lookup_signed(network, user, 2).await.expect("signed N pruned").is_none());
-        assert!(owned.db().load_sessions(network, user, None, 64).await.expect("sessions").iter().all(|session| session.nonce >= 2));
-        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("retained session").len(), 1);
+        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("retained sessions").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![1, 2]);
         let retained = owned.db().lookup_signed(network, user, 4).await.expect("pending lookup").expect("pending N+1");
         assert!(retained.signature.is_none());
         assert_eq!(retained.request_bytes, pending.request_bytes);
@@ -1571,7 +1571,7 @@ mod tests {
         }
         owned.db().import_session(&third, &[], 3, Hash4::default()).await.expect("import nonce 3");
         let sessions = owned.db().load_sessions(network, user, None, 64).await.expect("after nonce 3");
-        assert_eq!(sessions.iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(sessions.iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert!(owned.db().lookup_signed(network, user, 2).await.expect("pruned signed two").is_none());
         assert!(owned.db().lookup_signed(network, user, 3).await.expect("no fabricated signed").is_none());
         let kept = owned.db().lookup_signed(network, user, 4).await.expect("pending after 3").expect("pending retained");
@@ -1587,7 +1587,7 @@ mod tests {
         assert_eq!(owned.db().import_session(&modified, &[changed.clone()], 1, Hash4::default()).await.expect_err("old conflict"), GuardianSignError::NonceConflict);
         let unchanged = owned.db().load_account(network, user).await.expect("cursor unchanged");
         assert_eq!((unchanged.state, unchanged.imported_nonce), (GuardianAccountState::Active, Some(3)));
-        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("latest remains").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("retained window unchanged").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert_eq!(owned.db().load_deposit_tree_states(network, user).await.expect("deposits unchanged"), vec![changed.clone()]);
         assert_eq!(owned.db().inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity unchanged"), Some(1));
         assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("nonce index unchanged"), Some(1));
@@ -1596,16 +1596,39 @@ mod tests {
         different.record.endcap_proof_hex = "0x01".to_owned();
         assert_eq!(owned.db().import_session(&different, &[], 3, Hash4::default()).await.expect_err("latest conflict"), GuardianSignError::AccountHalted);
         assert_eq!(owned.db().load_account(network, user).await.expect("halted latest").imported_nonce, Some(3));
-        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("latest row").len(), 1);
+        assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("retained rows").len(), 3);
 
         let file = owned.reopen();
         let mut restored = GuardianDb::open(file, KEY, Arc::new(super::super::protocol::codec_config_fixture(network))).await.expect("reopen pruned");
         assert_eq!(restored.load_account(network, user).await.expect("restored").imported_nonce, Some(3));
-        assert_eq!(restored.load_sessions(network, user, None, 64).await.expect("restored sessions").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(restored.load_sessions(network, user, None, 64).await.expect("restored sessions").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert!(restored.lookup_signed(network, user, 4).await.expect("pending retained").is_some());
         assert!(restored.lookup_signed(network, user, 3).await.expect("no fabricated").is_none());
         assert_eq!(restored.inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("restored identity"), Some(1));
         assert_eq!(restored.nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("restored nonce index"), Some(1));
+    }
+    #[tokio::test]
+    async fn import_keeps_the_latest_retained_window_and_serves_its_gap() {
+        let network = 90116u64;
+        let user = 524288u64;
+        let mut owned = TestDb::create(&active(network, 0)).await;
+        let last = super::super::protocol::RETAINED_SESSION_COUNT + 2;
+        for nonce in 1..=last {
+            owned.db().import_session(&history(network, nonce, vec![]), &[], nonce, Hash4::default()).await.expect("import");
+        }
+        let oldest = super::super::protocol::oldest_retained_session_nonce(last);
+        assert_eq!(oldest, 3);
+        let nonces: Vec<u64> = owned.db().load_sessions(network, user, None, 64).await.expect("sessions").iter().map(|session| session.nonce).collect();
+        assert_eq!(nonces, (oldest..=last).collect::<Vec<_>>());
+        let reader = owned.db().session_reader();
+        let (next, has_more) = reader.load_session_page(network, user, 10).await.expect("gap page");
+        assert_eq!((next.map(|(nonce, _)| nonce), has_more), (Some(11), true));
+        let (pruned, _) = reader.load_session_page(network, user, 1).await.expect("pruned prefix page");
+        assert_eq!(pruned.map(|(nonce, _)| nonce), Some(oldest), "a gap below the window reports the oldest retained session, which the caller refuses");
+        drop(reader);
+        let file = owned.reopen();
+        let mut restored = GuardianDb::open(file, KEY, Arc::new(super::super::protocol::codec_config_fixture(network))).await.expect("reopen with retained window");
+        assert_eq!(restored.load_sessions(network, user, None, 64).await.expect("restored").len() as u64, super::super::protocol::RETAINED_SESSION_COUNT);
     }
     #[tokio::test]
     async fn duplicate_keys_keep_latest_session_and_distinct_append_indexes() {
@@ -1768,9 +1791,9 @@ mod tests {
         }
         assert_eq!(db.begin_read().unwrap().open_table(GUARDIAN_SCHEMA).unwrap().get(()).unwrap().unwrap().value(), RAW_SCHEMA_VERSION);
         let migrated = migrate_guardian_journal(&db, KEY, &config).unwrap();
-        assert!(migrated.rewritten && migrated.signed == 1 && migrated.sessions == 1);
+        assert!(migrated.rewritten && migrated.signed == 1 && migrated.sessions == 2);
         let again = migrate_guardian_journal(&db, KEY, &config).unwrap();
-        assert_eq!(again, GuardianJournalMigration { signed: 1, sessions: 1, rewritten: false });
+        assert_eq!(again, GuardianJournalMigration { signed: 1, sessions: 2, rewritten: false });
         let stored = snapshot(&db);
         for (key, bytes) in &raw {
             let saved = stored.iter().find(|(name, _)| name == key).unwrap().1.as_slice();
@@ -1784,8 +1807,8 @@ mod tests {
         assert_eq!(kept.request_bytes, pending.request_bytes);
         assert_eq!(super::super::protocol::GuardianSignRequest::from_canonical_bytes(&kept.request_bytes).unwrap().request_id().unwrap(), pending_id);
         let sessions = restored.load_sessions(network, user, None, 64).await.unwrap();
-        assert_eq!(sessions.iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![2]);
-        assert_eq!(sessions[0].record.request_json.decode().unwrap().request_id().unwrap(), session_id);
+        assert_eq!(sessions.iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(sessions[1].record.request_json.decode().unwrap().request_id().unwrap(), session_id);
         assert!(restored.lookup_signed(network, user, 1).await.unwrap().is_none());
     }
 

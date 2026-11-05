@@ -4045,7 +4045,9 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         let call_data = ContractCallData::new(approved_calls);
         let mut builder = wallet.begin_trace_build_at_checkpoint(public_key, BRIDGE_USER_ID_U64, head, nonce, root).await?;
         for call in &call_data.contract_calls { builder.trace_call(call.clone()).await?; }
-        let trace = builder.finalize_tx_trace(call_data.software_defined_call.clone()).await?;
+        let mut trace = builder.finalize_tx_trace(call_data.software_defined_call.clone()).await?;
+        // Guardians load contract code from L2 and authenticate it by the proven code root.
+        trace.contract_codes.clear();
         let trace_envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data).context("trace call_data json")?).context("guardian trace json build")?;
         let envelope_bytes = serde_json::to_string(&trace_envelope).context("guardian trace envelope serialize")?;
         tracing::info!(bytes = envelope_bytes.len(), "guardian request envelope built");
