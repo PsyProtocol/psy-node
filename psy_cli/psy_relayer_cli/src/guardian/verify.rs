@@ -274,10 +274,15 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     }
     if request.operation == GuardianOperation::Bridge {
         if current_policy != ending_policy { return Err(GuardianSignError::PolicyMismatch.into()); }
+        let mut anchor_verifications = Vec::with_capacity(request.deposit_anchors.len());
         for anchor in &request.deposit_anchors {
             let chain = config.chain(anchor.chain_index)?;
             let reserved = reserved_deposit_tree_state(context.reserved_deposit_tree_states, context.history, anchor.chain_index);
-            let (old_root, new_root, state) = guardian_common::verify_l1::verify_deposit_anchor(reserved, chain, anchor).await?;
+            anchor_verifications.push(guardian_common::verify_l1::verify_deposit_anchor(reserved, chain, anchor));
+        }
+        let verified_anchors = futures::future::join_all(anchor_verifications).await;
+        for (anchor, verified) in request.deposit_anchors.iter().zip(verified_anchors) {
+            let (old_root, new_root, state) = verified?;
             verify_chain_state(context, &supplied, 2, anchor.chain_index, anchor.old_count, old_root).await?;
             let mut inputs = vec![u64::from(anchor.chain_index), u64::from(anchor.new_count)];
             inputs.extend(hash_words(new_root));
