@@ -293,6 +293,7 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 | Rollback | Operator-driven rewind of local durable head. Separate from catch-up. |
 | Baseline replay | Re-verify FFS against the authenticated previous checkpoint before a vote or durable write. |
 | Proof base | Checkpoint that authenticates a gatherer cycle start. |
+| Unreadable proof base | Proof base whose top user tree proof is missing or ahead of the local Realm subtree; finalize treats it as not authenticating. |
 | `load_changed_leaves_on_imt_indexed_trees` | Nonempty FFS-changed contract-state leaves on IMT-indexed trees. |
 
 ## 10. Naming checklist
