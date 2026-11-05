@@ -120,7 +120,7 @@ JTMB_CONCURRENCY ?= 10
 JTMB_CONTRACT ?= psy-genesis/token.json
 JTMB_TIMEOUT ?= 180
 
-.PHONY: jtmb-start jtmb-stop jtmb-status jtmb-batch jtmb-register jtmb-deploy jtmb-test
+.PHONY: jtmb-start jtmb-stop jtmb-status jtmb-batch jtmb-register jtmb-deploy jtmb-deploy-batch jtmb-test
 jtmb-start:
 	bun run dev/jtmbTest.ts check-start --namespace "$(JTMB_NAMESPACE)"
 	PSY_DEVNET_NAMESPACE=$(JTMB_NAMESPACE) PSY_SKIP_KEYSTORE=1 PSY_SKIP_BRANCH_CHECK=1 PSY_SKIP_BUILD=1 bun run dev/locSetupV4.ts --db --coordinator --realms-count 2 --realm-edge-nodes 1 --coordinator-workers 2 --realm-workers 1 --prove-proxy 0 --proving-backend jtmb-poseidon-goldilocks
@@ -132,6 +132,11 @@ jtmb-stop:
 jtmb-status:
 	bun run dev/jtmbTest.ts status
 
+.PHONY: jtmb-restart
+jtmb-restart:
+	bun run dev/jtmbTest.ts check-stop
+	bun run dev/locSetupV4.ts --control jtmb-restart
+
 jtmb-batch:
 	bun run dev/jtmbTest.ts batch --users $(JTMB_USERS) --rounds $(JTMB_ROUNDS) --concurrency $(JTMB_CONCURRENCY) --timeout $(JTMB_TIMEOUT)
 
@@ -140,6 +145,9 @@ jtmb-register:
 
 jtmb-deploy:
 	bun run dev/jtmbTest.ts deploy --contract "$(JTMB_CONTRACT)" --timeout $(JTMB_TIMEOUT)
+
+jtmb-deploy-batch:
+	bun run dev/jtmbTest.ts deploy-batch --count $(JTMB_REGISTER_COUNT) --concurrency $(JTMB_CONCURRENCY) --contract "$(JTMB_CONTRACT)" --timeout $(JTMB_TIMEOUT)
 
 jtmb-test:
 	$(MAKE) jtmb-register

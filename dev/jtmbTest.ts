@@ -222,6 +222,59 @@ async function deployContract(net: Network, output: string, contract: string, ti
     console.log(`L2 contract ${contractId} deployed and included at checkpoint ${checkpoint}`);
 }
 
+async function deployContracts(net: Network, output: string, contract: string, count: number, concurrency: number, timeout: number): Promise<void> {
+    const tests = path.join(ROOT, "local_checkpoints/jtmb_tests");
+    const registration = readdirSync(tests).sort().reverse().find(name => name.includes("-register-")
+        && existsSync(path.join(tests, name, "results.json")) && existsSync(path.join(tests, name, "private_keys.json")));
+    if (!registration) throw new Error("Run make jtmb-register first");
+    const keys: string[] = readJson(path.join(tests, registration, "private_keys.json"));
+    const registered: number[] = readJson(path.join(tests, registration, "results.json")).user_ids;
+    if (count > keys.length || count > registered.length) throw new Error(`Batch count exceeds available registered keys (${keys.length})`);
+    if (new Set(keys.slice(0, count)).size !== count) throw new Error("Registered deployer keys are not distinct");
+    const startCheckpoint = await getCommonCheckpoint(net.urls);
+    const firstContractId = Number((await rpc(net.coordinator, "get_latest_l2_block_state", [])).next_contract_id);
+    const prepared = await mapConcurrent(keys.slice(0, count), concurrency, async (key, index) => {
+        const command = path.join(output, `deploy-command-${index}.json`);
+        await runCli("psy_user_cli", ["deploy-contract", "--rpc-config", net.config, "--contract-path", path.resolve(contract), "--output-path", command],
+            path.join(output, `prepare-deploy-${index}.log`), Math.max(timeout, 600), key);
+        const payload = readJson(command);
+        if (Number(payload.deploy_contract.deployer) !== Number(registered[index])) throw new Error(`Prepared deployer mismatch at item ${index}`);
+        return { index, payload };
+    });
+    const submissions = await Promise.all(prepared.map(async ({ index, payload }) => ({ index, result: await rpc(net.coordinator, "deploy_contract", [payload]) })));
+    saveJson(path.join(output, "submitted.json"), { start_checkpoint: startCheckpoint,
+        contract_ids: Array.from({ length: count }, (_, index) => firstContractId + index), submissions });
+    const inclusion = await waitFor(async () => {
+        const checkpoint = await getCommonCheckpoint(net.urls);
+        const hashes = await Promise.all(Array.from({ length: count }, (_, index) => rpc(net.coordinator,
+            "get_contract_tree_leaf_hash", [checkpoint, firstContractId + index])));
+        return hashes.every(hash => !/^0+$/.test(hash)) ? checkpoint : undefined;
+    }, timeout);
+    const inclusionCheckpoints = await Promise.all(Array.from({ length: count }, async (_, index) => {
+        const contractId = firstContractId + index;
+        for (let checkpoint = startCheckpoint + 1; checkpoint <= inclusion; checkpoint++) {
+            const hash = await rpc(net.coordinator, "get_contract_tree_leaf_hash", [checkpoint, contractId]);
+            if (!/^0+$/.test(hash)) return checkpoint;
+        }
+        throw new Error(`Contract ${contractId} has no inclusion checkpoint in the observed range`);
+    }));
+    const contracts = await Promise.all(Array.from({ length: count }, async (_, index) => {
+        const contractId = firstContractId + index;
+        const [leaf, code] = await Promise.all([rpc(net.coordinator, "get_contract_leaf_data", [contractId]),
+            rpc(net.coordinator, "get_contract_code_definition", [contractId])]);
+        const expected = prepared[index].payload.deploy_contract;
+        if (Number(leaf.deployer) !== Number(expected.deployer) || JSON.stringify(code) !== JSON.stringify(expected.code_definition)) {
+            throw new Error(`Deployed contract ${contractId} differs from its prepared command`);
+        }
+        return { contract_id: contractId, checkpoint: inclusionCheckpoints[index], leaf };
+    }));
+    const sameCheckpoint = new Set(inclusionCheckpoints).size === 1;
+    saveJson(path.join(output, "results.json"), { start_checkpoint: startCheckpoint, final_checkpoint: inclusion,
+        same_checkpoint: sameCheckpoint, inclusion_checkpoints: inclusionCheckpoints, contracts });
+    console.log(`${count} contracts included; first inclusion checkpoints ${[...new Set(inclusionCheckpoints)].join(", ")}; same checkpoint: ${sameCheckpoint}`);
+    if (!sameCheckpoint) throw new Error("Batch contracts were split across checkpoints; see results.json");
+}
+
 async function main(): Promise<void> {
     const { positionals, values } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: {
         namespace: { type: "string", default: "jtmb-test" }, users: { type: "string", default: "10" }, rounds: { type: "string", default: "10" },
@@ -239,7 +292,7 @@ async function main(): Promise<void> {
     requireJTMB();
     const net = getNetwork();
     if (command === "status") { console.log(JSON.stringify({ backend: BACKEND, checkpoint: await getCommonCheckpoint(net.urls), rpc_endpoints: net.urls }, null, 2)); return; }
-    if (!["batch", "register", "deploy"].includes(command)) throw new Error("Expected batch, register, deploy, status, check-start, or check-stop");
+    if (!["batch", "register", "deploy", "deploy-batch"].includes(command)) throw new Error("Expected batch, register, deploy, deploy-batch, status, check-start, or check-stop");
     const numbers = [values.users, values.rounds, values.count, values.concurrency, values.timeout].map(Number);
     if (numbers.some(value => !Number.isSafeInteger(value) || value < 1)) throw new Error("Counts and timeout must be positive integers");
     const [users, rounds, count, concurrency, timeout] = numbers;
@@ -248,7 +301,8 @@ async function main(): Promise<void> {
     console.log(`evidence: ${output}`);
     if (command === "batch") await runBatch(net, output, users, rounds, concurrency, timeout);
     else if (command === "register") await registerUsers(net, output, count, concurrency, timeout);
-    else await deployContract(net, output, values.contract, timeout);
+    else if (command === "deploy") await deployContract(net, output, values.contract, timeout);
+    else await deployContracts(net, output, values.contract, count, concurrency, timeout);
 }
 
 if (import.meta.main) main().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -5770,6 +5770,7 @@ interface ProcessOptions {
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
     resume?: boolean;
+    jtmbResume?: boolean;
 }
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
@@ -6298,9 +6299,12 @@ export class DevNetProcessManager {
         }
     }
 
-    async restartApplications(cwd: string = "."): Promise<void> {
+    async restartApplications(cwd: string = ".", jtmbOnly = false): Promise<void> {
         const { persistent, applications } = splitDevnetProcesses(this.spawnedProcesses);
-        const required = ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"];
+        if (jtmbOnly && (this.provingBackend !== "jtmb-poseidon-goldilocks" || !/^jtmb[-a-z0-9]*$/.test(process.env[DEVNET_NAMESPACE_ENV] || ""))) {
+            throw new Error("JTMB restart requires a dedicated JTMB supervisor and namespace");
+        }
+        const required = jtmbOnly ? ["db", ...persistent.map((process) => process.name)] : ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"];
         const missing = required.filter((name) => !persistent.some((process) => process.name === name && process.isRunning()));
         if (missing.length > 0) {
             throw new Error(`[DevNet][control] restart requires running infrastructure; missing ${missing.join(", ")}`);
@@ -6381,6 +6385,7 @@ export class DevNetProcessManager {
         const skipBuild = skipBuildEnabled();
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         const resume = !!options.resume;
+        const jtmbResume = !!options.jtmbResume;
         const startBridgeProposerDaemon = !resume && shouldRequireGuardianRoot(startAll, options);
         const daemonConfigPath = startBridgeProposerDaemon
             ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), startAll || !!options.purge)
@@ -6436,9 +6441,21 @@ export class DevNetProcessManager {
         };
 
         const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
-        const names = resume
+        const names = (resume || jtmbResume)
             ? await resolveBoundDevnetNames(cwd, this.getEnv())
             : await this.admitNamespace(cwd);
+        if (jtmbResume) {
+            if (backend !== 'jtmb-poseidon-goldilocks' || !names.namespace || !/^jtmb[-a-z0-9]*$/.test(names.namespace)) throw new Error('JTMB resume requires a bound JTMB namespace and backend');
+            this.admittedNames = names;
+            await requireRegularFile(path.join(cwd, 'genesis.json'));
+            await requireRegularFile(path.join(cwd, REALM_P2P_OUT_DIR, 'config.json'));
+            for (const file of realmP2pSecretPaths(Array.from({ length: realmsCount }, (_, index) => startRealmId + index), realmEdgeCount)) await requireRegularFile(path.join(cwd, file));
+            for (const volume of devnetDbVolumeNames(names)) {
+                const result = await runTeardownCommand(['docker', 'volume', 'inspect', volume], undefined, PURGE_DOCKER_TIMEOUT_MS);
+                if (result.timedOut || result.code !== 0 || !result.stdoutComplete) throw new Error(`JTMB resume requires volume ${volume}`);
+            }
+            await requireReleaseBinaries([{ name: 'psy_node_cli', path: path.join(cwd, 'target/release/psy_node_cli') }, { name: 'psy_worker_cli', path: path.join(cwd, 'target/release/psy_worker_cli') }]);
+        }
         if (resume) {
             this.admittedNames = names;
             const realmIds = Array.from({ length: realmsCount }, (_, index) => startRealmId + index);
@@ -6516,7 +6533,7 @@ export class DevNetProcessManager {
             }
         }
         if (this.needsStartDb) {
-            const startDbCmd = resume ? ['./dev/start_db.sh', '--persist'] : ['./dev/start_db.sh', '--fresh'];
+            const startDbCmd = (resume || jtmbResume) ? ['./dev/start_db.sh', '--persist'] : ['./dev/start_db.sh', '--fresh'];
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -6536,7 +6553,7 @@ export class DevNetProcessManager {
         let realmP2pConfig: FullNetworkConfig | null = null;
         if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            if (resume) {
+            if (resume || jtmbResume) {
                 const config = JSON.parse(await fs.promises.readFile(path.join(cwd, REALM_P2P_OUT_DIR, "config.json"), "utf-8")) as FullNetworkConfig;
                 realmP2pConfig = { ...config, defaultNetwork: selectedRuntimeConfigKey("local-devnet") };
             } else {
@@ -7883,7 +7900,7 @@ async function acquireDevnetLock(repoRoot: string): Promise<DevnetLock> {
     }
     return new DevnetLock(holder);
 }
-export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume" | "shutdown" | "shutdown-purge";
+export type DevnetControlCommand = "restart" | "jtmb-restart" | "rollback-stop" | "rollback-resume" | "shutdown" | "shutdown-purge";
 
 interface DevnetControlResponse {
     ok: boolean;
@@ -7899,7 +7916,7 @@ export function devnetControlSocketPath(repoRoot: string): string {
 }
 
 function parseDevnetControlCommand(value: string): DevnetControlCommand {
-    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown" || value === "shutdown-purge") return value;
+    if (value === "restart" || value === "jtmb-restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown" || value === "shutdown-purge") return value;
     throw new Error(`[DevNet][control] unsupported command ${value}`);
 }
 
@@ -8045,6 +8062,7 @@ async function runMain() {
             "mode-a-web-wallet-bridge": { type: "boolean" },
             "daemonlize": { type: "boolean" },
             resume: { type: "boolean" },
+            "jtmb-resume": { type: "boolean" },
             "skip-bridge": { type: "boolean" },
             "teardown": { type: "boolean" },
             "purge": { type: "boolean" },
@@ -8088,6 +8106,8 @@ async function runMain() {
     const control = values["control"] as string | undefined;
 
     const provingBackend = values["proving-backend"];
+    const jtmbResume = !!values['jtmb-resume'];
+    if (jtmbResume && (resumeRequested || !db || !coordinator || !hasOnlyOptions || provingBackend !== 'jtmb-poseidon-goldilocks' || daemonlize || teardown || purge || control || l1 || relayer || psyPrivacyBridge || ide || explorer || modeAWebWalletBridge || faucetServer || !!dummyProvers || proveProxyCount !== 0)) throw new Error('JTMB resume requires a foreground isolated JTMB core');
     const envString = values["env"];
     const help = !!values["help"];
     if (control) {
@@ -8267,7 +8287,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     process.on('SIGINT', () => void shutdown());
     process.on('SIGTERM', () => void shutdown());
     try {
-    if (!teardown && !retained.resume) {
+    if (!teardown && !retained.resume && !jtmbResume) {
         const startAll = !hasOnlyOptions || !!values.all;
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
@@ -8337,6 +8357,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             modeAWebWalletBridge,
             daemonlize: !!values.daemonlize,
             resume: retained.resume,
+            jtmbResume,
         };
 
         if (daemonlize) {
@@ -8364,8 +8385,8 @@ Usage: bun run dev/locSetupV4.ts [options]
                         }),
                     };
                 }
-                if (command === "restart") {
-                    await globalManager.restartApplications(REPO_ROOT);
+                if (command === "restart" || command === "jtmb-restart") {
+                    await globalManager.restartApplications(REPO_ROOT, command === "jtmb-restart");
                     return "Devnet application processes restarted; DB and Anvil retained";
                 }
                 if (command === "rollback-stop") {

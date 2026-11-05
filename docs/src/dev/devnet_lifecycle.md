@@ -616,6 +616,14 @@ consume those files (`dev/locSetupV4.ts:3328-3330,3387,8277`).
 
 ### 10.4 Isolated JTMB core tests
 
+`make jtmb-restart` restarts application processes through the running foreground
+supervisor while retaining the database, Genesis, and P2P identities. The supervisor
+must use `jtmb-poseidon-goldilocks` and a dedicated `jtmb-` namespace. It requires
+the database and every tracked persistent component to remain running; Anvil is
+not required for the core-only stack. This command does not rebuild binaries.
+It cannot recover a stopped supervisor. Supervisors started before this control
+command was added must first be replaced through the supported lifecycle.
+
 JTMB is test-only. Use a dedicated checkout, a `jtmb-` namespace, and separate
 runtime storage. These targets do not run `make run-all`, Layer 1, guardians,
 relayers, frontends, or proof proxies. They are not rollback or Plonky2 acceptance
