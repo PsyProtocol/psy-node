@@ -241,6 +241,8 @@ mod tests {
                     user_id, [id as u64, 2, 3, 4], [id as u64, 6, 7, 8]));
             }
             let validator_proof = validators.get_leaf(validator_tree_index(realm_id, sub_id));
+            let validator_leaves = (((realm_id as u64) << 8)..(((realm_id as u64) + 1) << 8))
+                .map(|index| validators.get_leaf(index).value).collect::<Vec<_>>();
             let roots = PQEDCheckpointGlobalStateRoots {
                 contract_tree_root: zero, deposit_tree_root: zero, withdrawal_tree_root: zero,
                 user_registration_tree_root: zero, user_tree_root: global_user_proof.root, validator_tree_root: validator_proof.root,
@@ -285,6 +287,7 @@ mod tests {
                 old_realm_root_proof,
                 validator_user_id: user.user_id, validator_node_id_hash_limbs: [sub_id as u64, 2, 3, 4],
                 validator_bls_hash_limbs: [sub_id as u64, 6, 7, 8], validator_tree_proof: validator_proof,
+                validator_leaves,
                 validator_user_leaf: user.clone(), validator_user_tree_proof: global_user_proof,
                 current_validator_user_leaf: current_user, current_validator_user_tree_proof: current_proof.clone(),
                 validator_fee_delta_proof: DeltaMerkleProofCore {
