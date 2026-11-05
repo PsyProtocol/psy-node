@@ -50,7 +50,7 @@ use crate::bridge::{
 const DEFAULT_PROOF_DIR: &str = "/tmp/psy_bridge_proofs";
 const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEFAULT_MAX_CHECKPOINT_BATCH: u64 = 64;
-const MAX_DEPOSITS_PER_L2_ROUND: u32 = 32;
+const MAX_DEPOSITS_PER_L2_ROUND: u32 = 96;
 /// Per-round catchup truncation size; default 64 preserves prior daemon behavior.
 const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 
@@ -4405,15 +4405,15 @@ mod tests {
 
     #[test]
     fn finalized_deposit_append_target_bounds_the_live_backlog() {
-        assert_eq!(finalized_deposit_append_target(1221, 1862, 1844), 1253);
+        assert_eq!(finalized_deposit_append_target(1221, 1862, 1844), 1317);
     }
 
     #[test]
     fn finalized_deposit_append_target_retains_smaller_ready_prefixes() {
         assert_eq!(finalized_deposit_append_target(100, 200, 117), 117);
         assert_eq!(finalized_deposit_append_target(100, 115, 117), 115);
-        assert_eq!(finalized_deposit_append_target(100, 132, 132), 132);
-        assert_eq!(finalized_deposit_append_target(100, 133, 133), 132);
+        assert_eq!(finalized_deposit_append_target(100, 196, 196), 196);
+        assert_eq!(finalized_deposit_append_target(100, 197, 197), 196);
     }
 
     #[test]
@@ -4427,7 +4427,7 @@ mod tests {
     fn finalized_deposit_append_target_is_per_chain() {
         let targets = [(1221, 1862, 1844), (153, 166, 166), (13, 15, 15)]
             .map(|(l2_count, pending, finalized_pending)| finalized_deposit_append_target(l2_count, pending, finalized_pending));
-        assert_eq!(targets, [1253, 166, 15]);
+        assert_eq!(targets, [1317, 166, 15]);
     }
 
     #[test]
@@ -4435,7 +4435,7 @@ mod tests {
         let mut l2_count = 1221;
         while l2_count < 1844 {
             let target = finalized_deposit_append_target(l2_count, 1862, 1844);
-            assert!(target > l2_count && target - l2_count <= 32);
+            assert!(target > l2_count && target - l2_count <= MAX_DEPOSITS_PER_L2_ROUND);
             assert_eq!(finalized_deposit_append_target(l2_count, 1862, 1844), target);
             l2_count = target;
         }
@@ -4444,7 +4444,7 @@ mod tests {
 
     #[test]
     fn finalized_deposit_append_target_does_not_overflow() {
-        assert_eq!(finalized_deposit_append_target(u32::MAX - 40, u32::MAX, u32::MAX), u32::MAX - 8);
+        assert_eq!(finalized_deposit_append_target(u32::MAX - 100, u32::MAX, u32::MAX), u32::MAX - 4);
         assert_eq!(finalized_deposit_append_target(u32::MAX - 10, u32::MAX, u32::MAX), u32::MAX);
         assert_eq!(finalized_deposit_append_target(u32::MAX, u32::MAX, u32::MAX), u32::MAX);
     }
