@@ -2,7 +2,7 @@
   "schema_version": 2,
   "worker_queue_ack_wait_ms": 30000,
   "release_id": "core-testnet-20261030-sd192",
-  "runtime_commit": "f0b98b3e10b557225fb1bd76e2010c7f524aecd9",
+  "runtime_commit": "708b72d9babffb6a188749a8d6dd11b5eb3bccc4",
   "psy_network": "testnet",
   "network": "psy-public-testnet",
   "proving_backend": "plonky2-poseidon-goldilocks",

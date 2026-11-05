@@ -4,9 +4,9 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "2103d6bd64ca3da55458c2bdaf19a6d2029099798167015648a2727b94623582",
-    "topology": "832ed3fec7982bf4b61654c06829e8b16b2f8a853c1605152d9779d601a4b55c",
-    "artifacts": "28729b455e42496e373d2e39b38b027e35174e7cdbc4cfb1d5c1708f8a74c12b",
+    "release_profile": "2b62ba8fae932f4025420491083765e77552a7ef69798ec520ff6d19ebe172db",
+    "topology": "1b10ef59cb969258e5ce19698ccf01db41885c08cdb483888cf44248202e5660",
+    "artifacts": "a733a1fea9c19cccd8df9551cf6f20552f8f03422100e43015c36929ee7ab1c0",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
@@ -16,7 +16,7 @@
     "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
-    "runtime": "f0b98b3e10b557225fb1bd76e2010c7f524aecd9",
+    "runtime": "708b72d9babffb6a188749a8d6dd11b5eb3bccc4",
     "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -26,8 +26,8 @@
     "notifier": "d80a89f390623f59d7bad0750a485793aee31358"
   },
   "binaries": {
-    "psy_dev_cli": "b7cdd6abea71cecee8153cbd31f35000849b2daa03bf2445b15cd1b6b11b3c1d",
-    "psy_node_cli": "5d87efb14c7bf103a1200f28e8d26ee316c8977517b688eda117936b590af700",
+    "psy_dev_cli": "24e38e050ba5682c6983ed93d3f2ec854dc19dc0934f88e43e6cb14dc7756bf0",
+    "psy_node_cli": "cad208383af4932c7778d86d81bbefbee26a42675f4d1c17e632b9f4f0e725f4",
     "psy_relayer_cli": "0ee99cec3f457cc9d199effdfd96288057a0197c9ecd42e968dbc3738dfe0795",
     "psy_user_cli": "22e195614b2fda5eeeed883d1e81fe924fb6283e48c73c92eef2f905ee178d20",
     "psy_worker_cli": "5ff85cb3aa05addd3241ef5426415f739e2f1e1710569b3570609cd762a69559",
