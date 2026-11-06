@@ -87,7 +87,7 @@ jobs:
             triple: aarch64-unknown-linux-gnu
           - runner: macos-15-intel
             triple: x86_64-apple-darwin
-          - runner: macos-14
+          - runner: macos-15
             triple: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
@@ -97,6 +97,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - name: Initialize public release build submodule
+        shell: bash
+        run: |
+          git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init psy-genesis
 
       - name: Configure GitHub dependency fetches
         env:
@@ -109,10 +114,6 @@ jobs:
           : "${GH_TOKEN:?PSY_RELEASE_REPOSITORY_TOKEN is required}"
           auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
-
-      - name: Initialize release build submodules
-        shell: bash
-        run: git submodule update --init psy-genesis
 
       - name: Set up Go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
