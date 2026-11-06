@@ -1154,6 +1154,9 @@ where
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
 
         self.ensure_genesis_applied(genesis_block_update).await?;
+        // Backup recovery below replays other validators' proposals against local contract heights,
+        // so heights an older build failed to store are repaired first.
+        self.backfill_missing_contract_heights().await?;
         let genesis_tip = self.db.get_latest_checkpoint_id().await?;
         self.publish_validator_leaves(proposal_fetch, genesis_tip).await?;
 
