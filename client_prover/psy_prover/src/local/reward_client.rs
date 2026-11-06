@@ -972,7 +972,7 @@ impl RewardClient {
                 if matches!(method, "eth_getCode" | "eth_call") && missing_block && attempt < 6 {
                     let delay_secs = 1u64 << (attempt - 1);
                     tracing::warn!(method, attempt, delay_secs, %error, "reward L1 block unavailable; retrying the same snapshot");
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    crate::session::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     continue;
                 }
                 anyhow::bail!("reward L1 {method} failed after {attempt} attempt(s): {error}");
