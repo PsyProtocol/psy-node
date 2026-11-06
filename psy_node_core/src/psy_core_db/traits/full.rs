@@ -75,6 +75,20 @@ pub trait PsyNodeValidatorTreeDatabaseWriter<Hash> {
     async fn validator_tree_set_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64, preimage: &ValidatorLeafPreimage) -> anyhow::Result<()>;
 }
 
+/// The Edge RPC client parses this message, so its text is part of the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopUserTreeProofNotFound {
+    pub checkpoint_id: u64,
+}
+
+impl std::fmt::Display for TopUserTreeProofNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "User tree proof not found for checkpoint_id {}", self.checkpoint_id)
+    }
+}
+
+impl std::error::Error for TopUserTreeProofNotFound {}
+
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeGlobalUserTreeDatabaseReader<Hash> {

@@ -98,6 +98,7 @@ Current contract (`realm_end_cap_gatherer.rs`):
 2. Validator and checkpoint proofs use the planner's fixed checkpoint rather than the advancing Coordinator head.
 3. A builder created while the previous generation is still proving starts on that generation's end root, which its planner checkpoint cannot authenticate. If the current gathering checkpoint is newer, either targets the same rotation epoch or still schedules this validator at its next target (`load_scheduled_proposer_sub_id`), and authenticates the cycle start, finalize reverts the journal, recreates the planner on that proof base, and replays the generation's accepted EndCaps (`planner.accepted_end_cap_jobs`, with their recorded contract updates) and deferred EndCaps in order. A replay that accepts a different count fails closed.
 4. If no such checkpoint exists, finalize reverts the journal and returns an empty batch; accepted EndCaps from that generation are discarded.
+   A proof base is unreadable, and so does not authenticate the cycle start, when its top user tree proof is not written yet (`TopUserTreeProofNotFound`) or carries a Realm root the local subtree has not reached (`ProofBaseRealmRootMismatch`, another proposer's batch before its state updates apply). Both reach this discard instead of failing the block; any other proof read failure stays fatal.
 5. A successful finalize commits the tree and publishes the committed root so the next gathering generation can start while the processor proves and submits the completed generation.
 
 FastForward remains the follower path for applying an included proposal; it is separate from generation discard.
@@ -183,7 +184,15 @@ pending id, so a stalled older request cannot overwrite a newer admission. An En
 dropped with an error.
 
 Recovery covers generation discard, a lost proposal race, Fatal re-entry,
-process exit and the retired-queue tail drain. A redelivered copy cannot apply
+process exit and the retired-queue tail drain. A discarded generation that
+accepted EndCaps and holds no deferred ones is final, so the gatherer lists its
+pending id with `add_discarded_end_cap_generation`, and the next pass settles
+that pending id's records immediately, without
+`END_CAP_REDELIVERY_DELAY_CHECKPOINTS`; the cursor later skips them. Deferred
+EndCaps return to the next generation when the discarded builder drops, so a
+discard holding them, and a reverted cycle, keep the delayed path. The two
+passes run independently, so an error in one does not stop the other. Only a
+discard that holds EndCaps logs a warning. A redelivered copy cannot apply
 twice: once the original lands, the copy's old leaf no longer matches, and the
 planner skips it.
 

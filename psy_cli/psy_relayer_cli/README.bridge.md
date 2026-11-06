@@ -33,7 +33,7 @@ Signing and proving preserve the request bytes, account identity derived from th
 proving also preserves the collected signatures. Exact retries keep the current stage and
 proof, while conflicting payloads and backward transitions are rejected. Authenticated
 inclusion commits the account checkpoint, deposit prefixes, and withdrawal indexes together.
-`relayer_request` keeps the latest `Included` row and at most one unresolved next request. The schema-3 compression migration is lossless and bumps the schema marker 2→3: every existing request row stays until the next authenticated import deletes the older ones in that commit. Bounded retention required no further marker bump. Only those large request rows are bounded. Withdrawal indexes and `retired_claim_withdrawals` still grow. Freed redb pages are reused; the file shrinks only by an offline compact. A Guardian exactly one session behind can catch up from the retained `Included` row. A larger gap stays unavailable. Deleting the database and starting over is not supported, and a saved copy of the previous `Included` row does not recover the gap without the checkpoint's canonical conditions. Pruning is not a rollback or timeout repair.
+`relayer_request` keeps the latest `RETAINED_SESSION_COUNT` (64) `Included` rows and at most one unresolved next request. The schema-3 compression migration is lossless and bumps the schema marker 2→3: every existing request row stays until the next authenticated import deletes the rows below the retained window in that commit. Bounded retention required no further marker bump. Only those large request rows are bounded. Withdrawal indexes and `retired_claim_withdrawals` still grow. Freed redb pages are reused; the file shrinks only by an offline compact. A Guardian up to 63 sessions behind can catch up from the retained `Included` rows. A larger gap stays unavailable. Deleting the database and starting over is not supported, and a saved copy of the previous `Included` row does not recover the gap without the checkpoint's canonical conditions. Pruning is not a rollback or timeout repair.
 
 ### Schema 3
 
@@ -52,7 +52,7 @@ Guardian `db/guardian-{id}.redb` (`guardian_common::db`, marker `guardian_schema
 | `guardian_withdrawal_nonce` | `(network_magic, user_id, chain_index, nonce)` | `u64` |
 | `included_withdrawal_burns` | `(network_magic, user_id, sender, token_contract, burn_nonce)` | `u64` |
 
-On a successful `import_session` of nonce `N`, `prune_imported_history` deletes this account's `guardian_signed` rows through `N` (included bound) and `guardian_session` rows strictly below `N` (excluded bound). Session `N` stays. Signed rows above `N` stay. Deposit, account, and both withdrawal indexes are not pruned (`psy_cli/guardian_common/src/db.rs:777-787`).
+On a successful `import_session` of nonce `N`, `prune_imported_history` deletes this account's `guardian_signed` rows through `N` (included bound) and `guardian_session` rows strictly below `oldest_retained_session_nonce(N)` (excluded bound), so the latest `RETAINED_SESSION_COUNT` (64) sessions stay. Signed rows above `N` stay. Deposit, account, and both withdrawal indexes are not pruned (`psy_cli/guardian_common/src/db.rs`, `prune_imported_history`). The relayer keeps the same window of `Included` rows, so a guardian up to 63 sessions behind can import the gap from any history origin.
 
 Relayer `db/relayer.redb` (`journal_schema` `u64` **3**) has exactly these eight tables:
 
@@ -65,7 +65,7 @@ Relayer `db/relayer.redb` (`journal_schema` `u64` **3**) has exactly these eight
 | `deposit_tree_states` | `(network_magic, user_id, chain_index)` | bincode `DepositTreeState` |
 | `included_withdrawal_burns` | `(network_magic, user_id, sender, token_contract, burn_nonce)` | `u64` |
 | `guardian_withdrawal_nonce` | `(network_magic, user_id, chain_index, nonce)` | `u64` |
-| `relayer_request` | `u64` `session_nonce` | `PSYGR001` envelope of the canonical JSON stage row. Steady state: latest `Included` plus at most one unresolved next nonce. Migration keeps every row until the next authenticated import |
+| `relayer_request` | `u64` `session_nonce` | `PSYGR001` envelope of the canonical JSON stage row. Steady state: the latest `RETAINED_SESSION_COUNT` `Included` rows plus at most one unresolved next nonce. Migration keeps every row until the next authenticated import |
 
 Startup of either database accepts a tableless redb file or that exact eight-table set with marker `3`. A zero-length file, marker `2`, a partial set, and any other table set are rejected. Neither open migrates them.
 

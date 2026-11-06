@@ -39,6 +39,7 @@ use psy_node_core::{
     p2p::validator_lookup::load_realm_validators_from_tree,
     psy_core_db::traits::full::{
         PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeGlobalUserTreeDatabaseReader, PsyRealmProcessorStore,
+        TopUserTreeProofNotFound,
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
@@ -102,6 +103,31 @@ impl<Hash: std::fmt::Debug> std::fmt::Display for RealmFastForwardBaseMismatch<H
 }
 
 impl<Hash: std::fmt::Debug> std::error::Error for RealmFastForwardBaseMismatch<Hash> {}
+
+/// Typed refusal of a proof base whose synced top proof carries a Realm root the local subtree has not reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofBaseRealmRootMismatch<Hash> {
+    pub checkpoint_id: u64,
+    pub local_realm_root: Hash,
+    pub top_proof_realm_root: Hash,
+}
+
+impl<Hash: std::fmt::Debug> std::fmt::Display for ProofBaseRealmRootMismatch<Hash> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Finalizer local realm root {:?} does not match stored top proof realm root {:?} at checkpoint {}",
+            self.local_realm_root, self.top_proof_realm_root, self.checkpoint_id
+        )
+    }
+}
+
+impl<Hash: std::fmt::Debug> std::error::Error for ProofBaseRealmRootMismatch<Hash> {}
+
+/// Only a proof base not yet written locally or ahead of the local subtree is unreadable; other failures stay fatal.
+fn is_unreadable_proof_base<Hash: std::fmt::Debug + Send + Sync + 'static>(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<TopUserTreeProofNotFound>() || cause.is::<ProofBaseRealmRootMismatch<Hash>>())
+}
 
 pub fn get_new_realm_end_cap_gatherer_backup_file_path(
     backup_file_directory: &str,
@@ -773,9 +799,11 @@ where
         "Validator user proof has an invalid realm boundary at checkpoint {}", checkpoint_id);
     let mut bottom = store.global_user_tree_get_merkle_proof_sub_tree(
         checkpoint_id, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::GLOBAL_USER_TREE_HEIGHT, user_id).await?;
-    anyhow::ensure!(bottom.siblings.len() == N::REALM_GLOBAL_USER_TREE_HEIGHT as usize
-        && bottom.index == user_id && bottom.root == top.value,
-        "Finalizer local realm root does not match stored top proof at checkpoint {}", checkpoint_id);
+    anyhow::ensure!(bottom.siblings.len() == N::REALM_GLOBAL_USER_TREE_HEIGHT as usize && bottom.index == user_id,
+        "Finalizer local realm proof has an invalid shape at checkpoint {}", checkpoint_id);
+    if bottom.root != top.value {
+        return Err(ProofBaseRealmRootMismatch { checkpoint_id, local_realm_root: bottom.root, top_proof_realm_root: top.value }.into());
+    }
     // Merkle siblings run from leaf to root; stop local reads at the realm boundary.
     bottom.siblings.extend_from_slice(&top.siblings);
     bottom.root = top.root;
@@ -962,10 +990,7 @@ impl<
         {
             return Ok(false);
         }
-        let validator_user_id = self.gathering_start_validator_user_leaf.user_id.to_u64_value();
-        let (_, realm_root_proof) = validator_user_tree_proofs::<N, _>(
-            self.config.tree_store.as_ref(), proof_base_id, validator_user_id, self.config.realm_id_u64).await?;
-        if realm_root_proof.value != self.start_global_user_tree_root {
+        if self.get_proof_base_realm_root(proof_base_id).await? != Some(self.start_global_user_tree_root) {
             return Ok(false);
         }
         tree.revert_changes();
@@ -1009,6 +1034,21 @@ impl<
             self.status.gathering_unique_pending_id, planner_checkpoint_id, proof_base_id, end_cap_count
         );
         Ok(true)
+    }
+
+    async fn get_proof_base_realm_root(&mut self, proof_base_id: u64) -> anyhow::Result<Option<N::QHash>> {
+        let validator_user_id = self.gathering_start_validator_user_leaf.user_id.to_u64_value();
+        match validator_user_tree_proofs::<N, _>(self.config.tree_store.as_ref(), proof_base_id, validator_user_id, self.config.realm_id_u64).await {
+            Ok((_, realm_root_proof)) => Ok(Some(realm_root_proof.value)),
+            Err(error) if is_unreadable_proof_base::<N::QHash>(&error) => {
+                tracing::warn!(
+                    "Proof base {} for pending id {} is unreadable and does not authenticate cycle start: {:#}",
+                    proof_base_id, self.status.gathering_unique_pending_id, error
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1306,21 +1346,23 @@ impl<
             );
         }
         let planner_checkpoint_id = self.guta_planner.current_checkpoint_id;
-        let (_, planner_realm_root_proof) = validator_user_tree_proofs::<N, _>(
-            self.config.tree_store.as_ref(),
-            planner_checkpoint_id,
-            self.gathering_start_validator_user_leaf.user_id.to_u64_value(),
-            self.config.realm_id_u64,
-        )
-        .await?;
-        if planner_realm_root_proof.value != self.start_global_user_tree_root
+        if self.get_proof_base_realm_root(planner_checkpoint_id).await? != Some(self.start_global_user_tree_root)
             && !self.recreate_planner_on_proof_base(tree, &authenticated).await?
         {
-            tracing::warn!(
-                "Discarding EndCap generation whose proof base {} does not authenticate cycle start {:?}",
-                planner_checkpoint_id,
-                self.start_global_user_tree_root
-            );
+            let accepted_end_cap_count = self.guta_planner.total_end_caps_processed;
+            let deferred_end_cap_count = self.guta_planner.future_pending_end_cap_jobs.len();
+            if accepted_end_cap_count == 0 && deferred_end_cap_count == 0 {
+                tracing::info!(
+                    "Discarding empty EndCap generation for pending id {} whose proof base {} does not authenticate cycle start {:?}",
+                    self.status.gathering_unique_pending_id, planner_checkpoint_id, self.start_global_user_tree_root
+                );
+            } else {
+                tracing::warn!(
+                    accepted_end_cap_count, deferred_end_cap_count,
+                    "Discarding EndCap generation for pending id {} whose proof base {} does not authenticate cycle start {:?}; the Edge redelivers its accepted EndCaps",
+                    self.status.gathering_unique_pending_id, planner_checkpoint_id, self.start_global_user_tree_root
+                );
+            }
             tree.revert_changes();
             self.guta_planner.current_validator_user_leaf = Some(self.gathering_start_validator_user_leaf.clone());
             *self.config.current_validator_user_leaf.lock()
@@ -1330,6 +1372,10 @@ impl<
             self.config.status.write()
                 .map_err(|_| anyhow::anyhow!("error writing gathering start root"))?
                 .gathering_realm_start_root = reverted_root;
+            // Deferred EndCaps return to the next generation on drop, so only a generation without them is final.
+            if accepted_end_cap_count > 0 && deferred_end_cap_count == 0 {
+                self.config.temp_db.add_discarded_end_cap_generation(&authenticated.realm_identifier, self.status.gathering_unique_pending_id).await?;
+            }
             return Ok(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(reverted_root),
                 job_ids: vec![],

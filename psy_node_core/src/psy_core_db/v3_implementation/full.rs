@@ -2661,7 +2661,7 @@ impl<
             .await?
             .filter(|row| row.checkpoint_id == checkpoint_id)
             .map(|row| row.value)
-            .ok_or_else(|| anyhow::anyhow!("User tree proof not found for checkpoint_id {}", checkpoint_id))
+            .ok_or_else(|| anyhow::Error::new(TopUserTreeProofNotFound { checkpoint_id }))
     }
 }
 

@@ -596,7 +596,24 @@ mod end_cap_handoff_tests {
         Ok(())
     }
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum ProofBaseRecord {
+        Written,
+        Missing,
+        ForeignRealmRoot,
+        ForeignRealmIndex,
+        ForeignPlannerRealmRoot,
+    }
+
     async fn finalize_generation_started_before_inclusion(proof_base_id: u64, is_other_proposer_scheduled: bool) -> anyhow::Result<OverlappedGeneration> {
+        finalize_generation_on_proof_base(proof_base_id, is_other_proposer_scheduled, ProofBaseRecord::Written).await
+    }
+
+    async fn finalize_generation_on_proof_base(
+        proof_base_id: u64,
+        is_other_proposer_scheduled: bool,
+        record: ProofBaseRecord,
+    ) -> anyhow::Result<OverlappedGeneration> {
         let mut fixture = HandoffFixture::new().await?;
         if is_other_proposer_scheduled {
             schedule_other_validator(&mut fixture, proof_base_id)?;
@@ -607,8 +624,24 @@ mod end_cap_handoff_tests {
         let first = runner.finalize(FIRST_QUEUE, SECOND_QUEUE).await?;
         assert_one_end_cap(&fixture, &first, &item, 1).await?;
         let first_end_tree = fixture.tree.read().await.clone();
-        for checkpoint_id in 1..=proof_base_id {
+        let last_written_id = if record == ProofBaseRecord::Missing { proof_base_id - 1 } else { proof_base_id };
+        for checkpoint_id in 1..=last_written_id {
             fixture.save_checkpoint(checkpoint_id, Some(&item)).await?;
+        }
+        if record == ProofBaseRecord::ForeignRealmRoot {
+            // Another proposer's batch is in the synced top proof before its state updates reach the local subtree.
+            fixture.chain.coordinator_global_user_tree.set_e_leaf(0, PHash::from_values(91, 92, 93, 94));
+            let top = fixture.chain.coordinator_global_user_tree.get_e_leaf(0);
+            fixture.chain.db.global_user_tree_set_top_tree_merkle_proof(proof_base_id, &top).await?;
+        }
+        if record == ProofBaseRecord::ForeignPlannerRealmRoot {
+            fixture.chain.coordinator_global_user_tree.set_e_leaf(0, PHash::from_values(95, 96, 97, 98));
+            let top = fixture.chain.coordinator_global_user_tree.get_e_leaf(0);
+            fixture.chain.db.global_user_tree_set_top_tree_merkle_proof(0, &top).await?;
+        }
+        if record == ProofBaseRecord::ForeignRealmIndex {
+            let top = fixture.chain.coordinator_global_user_tree.get_e_leaf(1);
+            fixture.chain.db.global_user_tree_set_top_tree_merkle_proof(proof_base_id, &top).await?;
         }
         // Production order: the replacement bootstraps on the first end root while checkpoint 0 is still the gathering base.
         fixture.replace_generation(0);
@@ -635,7 +668,13 @@ mod end_cap_handoff_tests {
         assert_one_end_cap(fixture, second, next, 2).await?;
         fixture.assert_backup(2, first_end_tree, second, Some(next)).await?;
         assert!(fixture.config.future_pending_end_cap_jobs.read().unwrap().is_empty());
+        assert!(discarded_generations(fixture).await?.is_empty());
         Ok(())
+    }
+
+    async fn discarded_generations(fixture: &HandoffFixture) -> anyhow::Result<Vec<u64>> {
+        let realm_identifier = fixture.config.status.read().unwrap().realm_identifier;
+        psy_node_core::psy_temp_db::QTempDBEndCapRedeliveryStore::get_discarded_end_cap_generations(fixture.config.temp_db.as_ref(), &realm_identifier).await
     }
 
     #[tokio::test]
@@ -655,6 +694,43 @@ mod end_cap_handoff_tests {
         let tree = overlapped.fixture.tree.read().await;
         assert_eq!(tree.get_root(), first_end_root);
         assert_eq!(tree.get_leaf_value(0), overlapped.item.new_user_leaf_hash);
+        drop(tree);
+        // The Edge settles the discarded generation's admitted EndCap without waiting for inclusion.
+        assert_eq!(discarded_generations(&overlapped.fixture).await?, vec![2]);
         Ok(())
+    }
+
+    async fn assert_generation_discarded_without_failing(record: ProofBaseRecord) -> anyhow::Result<()> {
+        let overlapped = finalize_generation_on_proof_base(2, false, record).await?;
+        let first_end_root = overlapped.first_end_tree.get_root();
+        assert_empty(&overlapped.second, first_end_root);
+        assert_eq!(overlapped.fixture.tree.read().await.get_root(), first_end_root);
+        assert_eq!(discarded_generations(&overlapped.fixture).await?, vec![2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_on_a_missing_proof_base_is_discarded_without_failing() -> anyhow::Result<()> {
+        assert_generation_discarded_without_failing(ProofBaseRecord::Missing).await
+    }
+
+    #[tokio::test]
+    async fn generation_on_a_proof_base_with_a_foreign_realm_root_is_discarded_without_failing() -> anyhow::Result<()> {
+        assert_generation_discarded_without_failing(ProofBaseRecord::ForeignRealmRoot).await
+    }
+
+    #[tokio::test]
+    async fn generation_on_a_corrupt_proof_base_still_fails() -> anyhow::Result<()> {
+        let error = match finalize_generation_on_proof_base(2, false, ProofBaseRecord::ForeignRealmIndex).await {
+            Ok(_) => anyhow::bail!("a proof base for another realm must fail finalize"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("invalid realm boundary at checkpoint 2"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_whose_planner_base_is_unreadable_moves_to_the_newer_proof_base() -> anyhow::Result<()> {
+        assert_generation_moved(&finalize_generation_on_proof_base(1, false, ProofBaseRecord::ForeignPlannerRealmRoot).await?).await
     }
 }

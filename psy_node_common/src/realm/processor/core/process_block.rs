@@ -684,27 +684,16 @@ where
                 self.db.state.realm_sub_id_u64
             );
             self.db
-                .coordinator_client
-                .rc_submit_guta_proof(
+                .submit_guta_proof(
                     submission_header,
                     root_job_proof.clone(),
-                    self.db.state.realm_id_u64,
                     Some(proposal.protocol_encode_to_vec()),
                     Some(certificate.protocol_encode_to_vec()),
                 )
                 .await?;
         } else {
             tracing::info!("Submitting GUTA proof to Coordinator...");
-            self.db
-                .coordinator_client
-                .rc_submit_guta_proof(
-                    submission_header,
-                    root_job_proof.clone(),
-                    self.db.state.realm_id_u64,
-                    None,
-                    None,
-                )
-                .await?;
+            self.db.submit_guta_proof(submission_header, root_job_proof.clone(), None, None).await?;
         }
 
         timer.lap("submit_guta_proof");

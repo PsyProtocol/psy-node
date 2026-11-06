@@ -72,6 +72,13 @@ pub trait QTempDBEndCapRedeliveryStore {
 
     /// Moves the cursor from `observed` to `next`; returns false when another Edge moved it first.
     async fn set_end_cap_redelivery_cursor(&self, rid: &QRealmIdentifier, observed: Option<u64>, next: u64) -> anyhow::Result<bool>;
+
+    /// Marks a gathering generation the processor discarded, so its admitted EndCaps are settled without the inclusion delay.
+    async fn add_discarded_end_cap_generation(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<()>;
+
+    async fn get_discarded_end_cap_generations(&self, rid: &QRealmIdentifier) -> anyhow::Result<Vec<u64>>;
+
+    async fn remove_discarded_end_cap_generation(&self, rid: &QRealmIdentifier, unique_pending_id: u64) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

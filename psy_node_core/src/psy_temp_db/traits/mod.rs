@@ -91,7 +91,8 @@ pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
-    QTempDBWorkerReputationStore
+    QTempDBWorkerReputationStore +
+    QTempDBEndCapRedeliveryStore
 {
 
 }
@@ -111,6 +112,7 @@ impl<
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
-    QTempDBWorkerReputationStore,
+    QTempDBWorkerReputationStore +
+    QTempDBEndCapRedeliveryStore,
 > StandardProcessorTempDBStoreBase<JobId, Hash> for T {
 }

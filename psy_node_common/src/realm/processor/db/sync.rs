@@ -5,6 +5,7 @@ use parth_core::{
         merkle_proof::MerkleProofCore,
         traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash},
     },
+    data::hash::checkpointed_merkle_node::CheckpointedMerkleHash,
     protocol::core_types::QNetworkTypesConfig,
 };
 use psy_data::{
@@ -23,7 +24,38 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::realm::processor::{db::PsyRealmDatabaseProcessor, guta_resend::REALM_GUTA_RESEND_MIN_CHECKPOINTS};
+use crate::{
+    p2p::realm_coordinator::CoordinatorRpcUnavailable,
+    realm::processor::{db::PsyRealmDatabaseProcessor, guta_resend::REALM_GUTA_RESEND_MIN_CHECKPOINTS},
+};
+
+const COORDINATOR_UNAVAILABLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT: u32 = 300;
+
+/// Pauses and returns Ok while the Coordinator is unavailable, up to the consecutive limit; any other error is returned.
+async fn pause_after_coordinator_unavailable(
+    error: anyhow::Error,
+    realm_id: u64,
+    waited_realm_root: &str,
+    consecutive_unavailable_count: &mut u32,
+) -> anyhow::Result<()> {
+    if !CoordinatorRpcUnavailable::is_cause_of(&error) {
+        return Err(error);
+    }
+    *consecutive_unavailable_count += 1;
+    if *consecutive_unavailable_count > MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT {
+        return Err(error.context(format!(
+            "Coordinator unavailable {} consecutive times while waiting for realm root {}",
+            MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT, waited_realm_root
+        )));
+    }
+    tracing::warn!(
+        "Realm {} Coordinator unavailable while waiting for realm root {} (attempt {}); retrying: {:#}",
+        realm_id, waited_realm_root, consecutive_unavailable_count, error
+    );
+    tokio::time::sleep(COORDINATOR_UNAVAILABLE_RETRY_DELAY).await;
+    Ok(())
+}
 
 fn require_checkpoint_metadata<F, Hash, H>(
     checkpoint_id: u64,
@@ -296,11 +328,15 @@ where
         let start_wait_checkpoint = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         // Checkpoint the latest submission attempt is measured from. Taking the larger of the
         // coordinator's answer and the local head can only delay a resend.
-        let mut resend_baseline_checkpoint = self
-            .coordinator_client
-            .rc_get_latest_checkpoint_id()
-            .await?
-            .max(start_wait_checkpoint);
+        let waited_realm_root = format!("{:?}", new_realm_root);
+        let mut consecutive_unavailable_count = 0u32;
+        let mut resend_baseline_checkpoint = match self.coordinator_client.rc_get_latest_checkpoint_id().await {
+            Result::Ok(coordinator_head) => coordinator_head.max(start_wait_checkpoint),
+            Err(error) => {
+                pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                start_wait_checkpoint
+            }
+        };
         let mut resend_attempts: u64 = 0;
         let mut metadata_checkpoint_id = self.state.last_committed_checkpoint_id;
 
@@ -310,18 +346,14 @@ where
         );
 
         loop {
-            // 1. Sync Checkpoint Tree to get latest proofs locally
-            self.checkpoint_tree_backup_manager
-                .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
-                .await?;
-
-            let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
-
-            // 2. Query Coordinator for the Realm's state at the absolute Tip
-            // We use `latest_synced_checkpoint_id` to get the latest state available to us.
-            let realm_state = self.coordinator_client
-                .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
-                .await?;
+            let (latest_synced_checkpoint_id, realm_state) = match self.read_synced_realm_root().await {
+                Result::Ok(observed) => observed,
+                Err(error) => {
+                    pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                    continue;
+                }
+            };
+            consecutive_unavailable_count = 0;
             tracing::info!("realm state {}", serde_json::to_string_pretty(&realm_state)?);
 
             // 3. Evaluate State
@@ -432,15 +464,18 @@ where
                             err
                         );
                     }
-                    resend_baseline_checkpoint = self
-                        .coordinator_client
-                        .rc_get_latest_checkpoint_id()
-                        .await?
-                        .max(latest_synced_checkpoint_id);
+                    resend_baseline_checkpoint = match self.coordinator_client.rc_get_latest_checkpoint_id().await {
+                        Result::Ok(coordinator_head) => coordinator_head.max(latest_synced_checkpoint_id),
+                        Err(error) => {
+                            pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                            latest_synced_checkpoint_id
+                        }
+                    };
                 }
 
-                // Sleep via client wait
-                self.coordinator_client.rc_wait_for_next_checkpoint().await?;
+                if let Err(error) = self.coordinator_client.rc_wait_for_next_checkpoint().await {
+                    pause_after_coordinator_unavailable(error, self.state.realm_id_u64, &waited_realm_root, &mut consecutive_unavailable_count).await?;
+                }
                 
             } else {
                 // Case: The root changed to something else entirely.
@@ -451,6 +486,43 @@ where
                     old_realm_root, new_realm_root, realm_state.value, realm_state.checkpoint_id
                 );
             }
+        }
+    }
+
+    async fn read_synced_realm_root(&mut self) -> anyhow::Result<(u64, CheckpointedMerkleHash<N::QHash>)> {
+        self.checkpoint_tree_backup_manager
+            .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
+            .await?;
+        let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        let realm_state = self
+            .coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
+            .await?;
+        Result::Ok((latest_synced_checkpoint_id, realm_state))
+    }
+
+    /// Submits a GUTA proof before the inclusion wait. An unavailable Coordinator may still have
+    /// received it, so that case returns Ok and leaves delivery to the wait's resend.
+    pub async fn submit_guta_proof(
+        &self,
+        submission_header: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        submission_proof: Vec<u8>,
+        submission_proposal: Option<Vec<u8>>,
+        submission_certificate: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .coordinator_client
+            .rc_submit_guta_proof(submission_header, submission_proof, self.state.realm_id_u64, submission_proposal, submission_certificate)
+            .await;
+        match result {
+            Err(error) if CoordinatorRpcUnavailable::is_cause_of(&error) => {
+                tracing::warn!(
+                    "Realm {} GUTA proof delivery is uncertain; waiting for inclusion and resending if it is not included: {:#}",
+                    self.state.realm_id_u64, error
+                );
+                Result::Ok(())
+            }
+            result => result,
         }
     }
 
@@ -565,6 +637,8 @@ where
             self.db
                 .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, realm_proof)
                 .await?;
+            self.sync_contract_heights_registered_at(checkpoint_id, &checkpoint_sync.block_state)
+                .await?;
             self.db
                 .set_l2_block_state(checkpoint_id, &checkpoint_sync.block_state)
                 .await?;
@@ -572,6 +646,119 @@ where
             latest_sync_info = Some(sync_info);
         }
         Ok(latest_sync_info)
+    }
+
+    /// Stores, at `checkpoint_id`, the heights of the contracts the Coordinator registered there: the ids from
+    /// the previous checkpoint's `next_contract_id` up to `block_state.next_contract_id`.
+    ///
+    /// Every path that persists a checkpoint's block state must call this before writing it. The marker-based
+    /// `sync_contract_heights` calls start from the `next_contract_id` stored at the local marker, so once a
+    /// block state that already counts a new contract is stored and the marker reaches it (for example when
+    /// `commit_state` adopts another validator's proposal), those calls never fetch that contract's height.
+    /// Baseline replay then reads height 0 and the validator refuses to vote.
+    pub(super) async fn sync_contract_heights_registered_at(
+        &self,
+        checkpoint_id: u64,
+        block_state: &QEDL2BlockState,
+    ) -> anyhow::Result<()> {
+        if checkpoint_id == 0 {
+            return Ok(());
+        }
+        let previous_checkpoint_id = checkpoint_id - 1;
+        let previous_next_contract_id = match self.db.try_get_complete_l2_block_state(previous_checkpoint_id).await? {
+            Some(previous) => previous.next_contract_id,
+            None => {
+                self.coordinator_client
+                    .rc_get_realm_sync_info(previous_checkpoint_id, self.state.realm_id_u64)
+                    .await
+                    .with_context(|| {
+                        format!("block state of checkpoint {previous_checkpoint_id} unavailable for contract height sync")
+                    })?
+                    .checkpoint_sync_info
+                    .block_state
+                    .next_contract_id
+            }
+        };
+        self.sync_contract_heights(previous_next_contract_id, block_state.next_contract_id, checkpoint_id)
+            .await
+    }
+
+    /// Repairs contract heights that databases written before `sync_contract_heights_registered_at` never
+    /// stored. For every registered contract whose local height at the latest complete checkpoint is 0 while
+    /// the Coordinator reports a height there, it locates the checkpoint at which the Coordinator first reports
+    /// a non-zero height and stores that height at it, so baseline replay at any later checkpoint reads it.
+    /// When the Coordinator's height at the local checkpoint differs from the one at creation, that value is
+    /// stored at the local checkpoint as well. The heights come from the same Coordinator RPC the normal sync
+    /// path trusts. Returns the number of contracts repaired.
+    pub async fn backfill_missing_contract_heights(&self) -> anyhow::Result<usize> {
+        let marker = self.db.get_latest_checkpoint_id().await?;
+        let (checkpoint_id, block_state) = self.get_latest_available_l2_block_state(marker).await?;
+        let ids: Vec<u64> = (0..block_state.next_contract_id as u64).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let local = self.db.get_contract_tree_heights(checkpoint_id, &ids).await?;
+        let missing: Vec<u64> = ids.iter().zip(local.iter()).filter(|(_, height)| **height == 0).map(|(id, _)| *id).collect();
+        let mut repaired = 0usize;
+        for chunk in missing.chunks(1000) {
+            let remote = self.coordinator_client.rc_get_contract_tree_state_heights(checkpoint_id, chunk.to_vec()).await?;
+            anyhow::ensure!(
+                remote.len() == chunk.len(),
+                "Contract height count mismatch at checkpoint {}: requested {} ids, got {} heights",
+                checkpoint_id,
+                chunk.len(),
+                remote.len()
+            );
+            for (&contract_id, &height_at_checkpoint) in chunk.iter().zip(remote.iter()) {
+                if height_at_checkpoint == 0 {
+                    continue;
+                }
+                let (created_at, height_at_creation) = self.first_nonzero_contract_height(contract_id, checkpoint_id).await?;
+                self.db.set_contract_tree_heights(created_at, &[(contract_id, height_at_creation)]).await?;
+                if height_at_creation != height_at_checkpoint && created_at != checkpoint_id {
+                    self.db.set_contract_tree_heights(checkpoint_id, &[(contract_id, height_at_checkpoint)]).await?;
+                }
+                tracing::warn!(
+                    "Backfilled missing contract height: contract_id={} height={} created_at_checkpoint={} local_checkpoint={} height_at_local_checkpoint={}",
+                    contract_id,
+                    height_at_creation,
+                    created_at,
+                    checkpoint_id,
+                    height_at_checkpoint
+                );
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            tracing::warn!("Backfilled {} missing contract heights at local checkpoint {}", repaired, checkpoint_id);
+        }
+        Ok(repaired)
+    }
+
+    /// Binary search for the first checkpoint at or below `upper` where the Coordinator reports a non-zero
+    /// height for `contract_id`; the caller has already seen a non-zero height at `upper`.
+    async fn first_nonzero_contract_height(&self, contract_id: u64, upper: u64) -> anyhow::Result<(u64, u8)> {
+        let height_at = |checkpoint_id: u64| async move {
+            let heights = self.coordinator_client.rc_get_contract_tree_state_heights(checkpoint_id, vec![contract_id]).await?;
+            heights.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("Coordinator returned no height for contract {} at checkpoint {}", contract_id, checkpoint_id)
+            })
+        };
+        let mut low = 0u64;
+        let mut high = upper;
+        let mut found = height_at(upper).await?;
+        anyhow::ensure!(found != 0, "contract {} has no height at checkpoint {}", contract_id, upper);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let height = height_at(middle).await?;
+            if height != 0 {
+                high = middle;
+                found = height;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok((high, found))
     }
 
     async fn sync_contract_heights(&self, start_id: u32, end_id: u32, checkpoint_id: u64) -> anyhow::Result<()> {
@@ -1042,6 +1229,131 @@ mod sync_tests {
         Ok(())
     }
 
+    /// A follower adopts another validator's proposal in three steps: `sync_with_coordinator`
+    /// persists the checkpoint metadata, `commit_state` moves the marker to the including
+    /// checkpoint, and `sync_to_coordinator_checkpoint_id` then finds the marker already there.
+    /// When that checkpoint registers contracts, the heights must still be stored at it, or a
+    /// later baseline replay fails with `MissingAuthenticatedState` and the follower refuses
+    /// to vote.
+    #[tokio::test]
+    async fn adopted_checkpoint_keeps_heights_of_contracts_registered_at_it() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        let genesis_next_contract_id = env.db.get_l2_block_state(0).await?.next_contract_id;
+        assert!(
+            genesis_next_contract_id < update.checkpoint_sync_info.block_state.next_contract_id,
+            "checkpoint 1 must register contracts for this test"
+        );
+        let registered: Vec<u64> = (genesis_next_contract_id as u64..update.checkpoint_sync_info.block_state.next_contract_id as u64).collect();
+        env.seed_checkpoint_one(update.clone(), local_root);
+
+        env.processor.sync_with_coordinator().await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0, "metadata sync must not move the marker");
+        assert_eq!(
+            env.db.get_contract_tree_heights(1, &registered).await?,
+            vec![8u8; registered.len()],
+            "persisted checkpoint metadata must carry the heights of contracts registered at it"
+        );
+
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await?;
+        env.processor.sync_to_coordinator_checkpoint_id(1).await?;
+
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &registered).await?, vec![8u8; registered.len()]);
+        assert_eq!(
+            env.db.get_contract_tree_heights(0, &registered).await?,
+            vec![0u8; registered.len()],
+            "contracts registered at checkpoint 1 must not appear at checkpoint 0"
+        );
+        Ok(())
+    }
+
+    /// A database left by an older build counts contracts at its latest checkpoint but reads height 0 for
+    /// them. The startup backfill stores the Coordinator's height at the registration checkpoint, skips
+    /// contracts the Coordinator also reports as 0, and does nothing on a second run.
+    #[tokio::test]
+    async fn backfill_restores_heights_missing_at_the_local_checkpoint() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        assert_eq!(update.checkpoint_sync_info.block_state.next_contract_id, 2);
+        env.seed_checkpoint_one(update.clone(), local_root);
+
+        // Commit checkpoint 1 while the Coordinator still reports no heights, which leaves the same
+        // database state the old build left: next_contract_id = 2 with both heights reading 0.
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(0u64, (5u64, 4u8)), (1u64, (5u64, 6u8))].into_iter().collect();
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &[0, 1]).await?, vec![0, 0]);
+
+        // The Coordinator's history: contract 0 registered at checkpoint 1, contract 1 not yet registered.
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(0u64, (1u64, 4u8)), (1u64, (5u64, 6u8))].into_iter().collect();
+        assert_eq!(env.processor.backfill_missing_contract_heights().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &[0, 1]).await?, vec![4, 0]);
+        assert_eq!(
+            env.db.get_contract_tree_heights(0, &[0]).await?,
+            vec![0],
+            "the backfill must not place a height before the registration checkpoint"
+        );
+        assert_eq!(env.processor.backfill_missing_contract_heights().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_nonzero_contract_height_finds_the_registration_checkpoint() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(30u64, (49_775u64, 2u8)), (0u64, (0u64, 32u8))].into_iter().collect();
+        assert_eq!(env.processor.first_nonzero_contract_height(30, 51_896).await?, (49_775, 2));
+        assert_eq!(env.processor.first_nonzero_contract_height(30, 49_775).await?, (49_775, 2));
+        assert_eq!(env.processor.first_nonzero_contract_height(0, 51_896).await?, (0, 32));
+        assert!(env.processor.first_nonzero_contract_height(30, 49_774).await.is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn wait_for_realm_update_publishes_unchanged_checkpoint_proof_before_inclusion() -> anyhow::Result<()> {
         use parth_core::{crypto::hash::traits::QFieldHashable, pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants};
@@ -1354,6 +1666,102 @@ mod sync_tests {
         assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
         assert_eq!(env.processor.state.last_committed_checkpoint_id, 3);
         assert_eq!(env.processor.state.last_committed_realm_end_root, new_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_retries_while_the_coordinator_is_unavailable() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        let new_root = zh(77);
+        env.stage_checkpoint_chain(2);
+        env.coordinator.seed_realm_root(2, new_root);
+        env.coordinator.set_unavailable_realm_root_queries(2);
+
+        let sync_info = env
+            .processor.wait_for_realm_update_sync_with_coordinator(new_root, header, &proof, TEST_RESEND_AFTER_CHECKPOINTS, None, None)
+            .await?;
+
+        assert_eq!(*env.coordinator.unavailable_realm_root_queries.lock().unwrap(), 0);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 2);
+        assert_eq!(env.processor.state.last_committed_realm_end_root, new_root);
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_still_fails_on_a_diverged_root_after_unavailability() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(1);
+        env.coordinator.seed_realm_root(1, zh(88));
+        env.coordinator.set_unavailable_realm_root_queries(1);
+
+        let err = wait_error(&mut env, zh(78), header, &proof, TEST_RESEND_AFTER_CHECKPOINTS).await;
+
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(*env.coordinator.unavailable_realm_root_queries.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coordinator_unavailable_pause_stops_at_the_consecutive_limit() {
+        let unavailable = || anyhow::Error::new(crate::p2p::realm_coordinator::CoordinatorRpcUnavailable {
+            message: "connection refused".to_string(),
+        });
+        let mut count = super::MAX_CONSECUTIVE_COORDINATOR_UNAVAILABLE_COUNT;
+        let err = super::pause_after_coordinator_unavailable(unavailable(), TEST_REALM_ID, "root", &mut count).await.unwrap_err();
+        assert!(format!("{err:#}").contains("consecutive times"), "unexpected error: {err:#}");
+
+        let mut count = 0;
+        let err = super::pause_after_coordinator_unavailable(anyhow::anyhow!("proof mismatch"), TEST_REALM_ID, "root", &mut count)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "proof mismatch");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_retries_an_unavailable_first_head_read() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        let new_root = zh(79);
+        env.stage_checkpoint_chain(1);
+        env.coordinator.seed_realm_root(1, new_root);
+        env.coordinator.set_unavailable_latest_checkpoint_reads(1);
+
+        let sync_info = env
+            .processor.wait_for_realm_update_sync_with_coordinator(new_root, header, &proof, TEST_RESEND_AFTER_CHECKPOINTS, None, None)
+            .await?;
+
+        assert_eq!(*env.coordinator.unavailable_latest_checkpoint_reads.lock().unwrap(), 0);
+        assert_eq!(sync_info.checkpoint_sync_info.checkpoint_id, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_proof_leaves_an_unavailable_coordinator_to_the_resend() -> anyhow::Result<()> {
+        let env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.coordinator.set_unavailable_guta_submissions(1);
+
+        env.processor.submit_guta_proof(header, proof, None, None).await?;
+
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
+        assert!(env.coordinator.submitted_gutas.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_proof_returns_a_rejection() -> anyhow::Result<()> {
+        let env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.coordinator.set_fail_guta_submissions(true);
+
+        let err = env.processor.submit_guta_proof(header, proof, None, None).await.unwrap_err();
+
+        assert!(err.to_string().contains("injected GUTA submission failure"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
         Ok(())
     }
 

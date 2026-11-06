@@ -187,7 +187,10 @@ where
     where
         N::HasherBase: parth_core::crypto::hash::traits::MerkleZeroHasher<N::QHash>,
     {
-        self.abort_guta_gatherer().await;
+        let gathering_realm_start_root = self.db.state.gathering_realm_start_root;
+        // Recovery replays other validators' proposals against local contract heights, so heights an
+        // older build failed to store are repaired before any of them is verified.
+        self.db.backfill_missing_contract_heights().await?;
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(
             &self.db.db,
             self.db.state.last_committed_checkpoint_id,
@@ -206,6 +209,16 @@ where
             )
             .await?;
         self.db.sync_to_coordinator_set_checkpoint_id().await?;
+        // Recovery may have committed a transition, so the shared roots are re-read before the gatherer is judged.
+        self.db.set_committed_realm_roots_from_db().await?;
+        let is_gatherer_running = self.guta_gatherer_join.as_ref().is_some_and(|handle| !handle.is_finished());
+        if is_gatherer_running && self.db.state.last_committed_realm_end_root == gathering_realm_start_root {
+            tracing::info!(
+                "init catch-up keeps the running GUTA gatherer: committed realm root {:?} is its gathering start root",
+                gathering_realm_start_root
+            );
+            return Ok(());
+        }
         self.recreate_guta_gatherer().await
     }
 
@@ -472,6 +485,61 @@ pub(crate) mod startup_tests {
 
         env.processor.setup().await?;
         env.processor.write_all_updates_to_db().await?;
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    fn gatherer_task_id(env: &RealmProcessorTestEnv) -> tokio::task::Id {
+        env.processor.guta_gatherer_join.as_ref().expect("gatherer owner").id()
+    }
+
+    #[tokio::test]
+    async fn init_catchup_keeps_running_gatherer_whose_start_root_is_committed() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let gatherer_before = gatherer_task_id(&env);
+        let consumers_before = env.db_env.guta_queue.ensured_consumer_count();
+
+        env.processor.run_init_catchup().await?;
+
+        assert_eq!(gatherer_task_id(&env), gatherer_before);
+        assert!(!env.guta_gatherer_handle.is_finished());
+        assert_eq!(env.db_env.guta_queue.ensured_consumer_count(), consumers_before);
+        let state = &env.processor.db.state;
+        assert_eq!(state.gathering_realm_start_root, state.last_committed_realm_end_root);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_catchup_recreates_gatherer_whose_start_root_is_not_committed() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let gatherer_before = gatherer_task_id(&env);
+        env.processor.db.state.gathering_realm_start_root = crate::realm::processor::db::realm_db_test_env::zh(91);
+
+        env.processor.run_init_catchup().await?;
+
+        assert_ne!(gatherer_task_id(&env), gatherer_before);
+        assert!(env.guta_gatherer_handle.is_finished());
+        assert!(!env.processor.guta_gatherer_join.as_ref().unwrap().is_finished());
+        let state = &env.processor.db.state;
+        assert_eq!(state.gathering_realm_start_root, state.last_committed_realm_end_root);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_catchup_recreates_a_finished_gatherer() -> anyhow::Result<()> {
+        let mut env = RealmProcessorTestEnv::create().await?;
+        let gatherer_before = gatherer_task_id(&env);
+        env.guta_gatherer_handle.abort();
+        while !env.guta_gatherer_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        env.processor.run_init_catchup().await?;
+
+        assert_ne!(gatherer_task_id(&env), gatherer_before);
+        assert!(!env.processor.guta_gatherer_join.as_ref().unwrap().is_finished());
         env.abort_gatherers();
         Ok(())
     }

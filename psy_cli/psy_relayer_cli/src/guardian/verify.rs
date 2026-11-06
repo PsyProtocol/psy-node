@@ -8,7 +8,7 @@ use psy_client_data::{config::store_config::PsyHasher, qdata::{checkpoint::{PsyC
 use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, TOKEN_BURN_METHOD_ID};
 use psy_crypto::hash::{merkle::core::MerkleProofCore, traits::{hasher::{FieldQHasher, MerkleZeroHasher}, qhashable::QFieldHashable}};
 use psy_provider::{provider::RpcProvider, request::QIMTMembershipProofRPCRequest};
-use psy_prover::{session::session::WalletSession, trace::{TxTrace, TraceStep}};
+use psy_prover::{session::session::WalletSession, trace::{TxTrace, TraceContractCode, TraceStep}};
 use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureWitness, StoredMultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
 
 use guardian_common::protocol::*;
@@ -253,7 +253,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let network_magic = psy_config::parse_magic_hex(&context.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
     if request.network_magic != network_magic { return Err(GuardianSignError::AuthorizationMismatch.into()); }
     request.validate_authorization(config)?;
-    let supplied = request.decode_trace()?;
+    let mut supplied = request.decode_trace()?;
     let checkpoint = supplied.anchor.start_checkpoint_id;
     if checkpoint > context.verified_checkpoint_id { return Err(GuardianSignError::CheckpointProofUnavailable.into()); }
     let checkpoint_path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id, checkpoint).await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
@@ -274,10 +274,15 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     }
     if request.operation == GuardianOperation::Bridge {
         if current_policy != ending_policy { return Err(GuardianSignError::PolicyMismatch.into()); }
+        let mut anchor_verifications = Vec::with_capacity(request.deposit_anchors.len());
         for anchor in &request.deposit_anchors {
             let chain = config.chain(anchor.chain_index)?;
             let reserved = reserved_deposit_tree_state(context.reserved_deposit_tree_states, context.history, anchor.chain_index);
-            let (old_root, new_root, state) = guardian_common::verify_l1::verify_deposit_anchor(reserved, chain, anchor).await?;
+            anchor_verifications.push(guardian_common::verify_l1::verify_deposit_anchor(reserved, chain, anchor));
+        }
+        let verified_anchors = futures::future::join_all(anchor_verifications).await;
+        for (anchor, verified) in request.deposit_anchors.iter().zip(verified_anchors) {
+            let (old_root, new_root, state) = verified?;
             verify_chain_state(context, &supplied, 2, anchor.chain_index, anchor.old_count, old_root).await?;
             let mut inputs = vec![u64::from(anchor.chain_index), u64::from(anchor.new_count)];
             inputs.extend(hash_words(new_root));
@@ -304,6 +309,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     } else { calls.push(policy_call(request.operation, &witness)?); }
     let expected = ContractCallData::new(calls);
     if serde_json::to_value(&expected).map_err(|_| GuardianSignError::MalformedRequest)? != request.trace_json.decode()?.call_data { return Err(GuardianSignError::UnsupportedCall.into()); }
+    supplied.contract_codes = load_trace_contract_codes(context.provider, &supplied).await?;
     verify_trace_contracts(&supplied)?;
     let fees: Vec<_> = supplied.steps.iter().filter_map(|step| if let TraceStep::BurnFee(step) = step { Some(step) } else { None }).collect();
     if fees.len() != 1 || fees[0].contract_id != 0 || fees[0].method_id != TOKEN_BURN_METHOD_ID || fees[0].method_name != "burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
@@ -326,20 +332,65 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     Ok((VerifiedGuardianSession { trace: replayed, ..verified }, deposit_tree_states))
 }
 
+fn contract_code_root(contract_id: u64, code: &[u8]) -> Result<Hash4> {
+    let id = u32::try_from(contract_id).map_err(|_| GuardianSignError::ProofMismatch)?;
+    let definition: psy_client_data::qdata::contract::ContractCodeDefinition = bincode::deserialize(code).map_err(|_| GuardianSignError::ProofMismatch)?;
+    if definition.state_tree_height != contract_height(id)? { return Err(GuardianSignError::ProofMismatch); }
+    let mut hashes = Vec::with_capacity(definition.functions.len());
+    for function in &definition.functions {
+        let method = psy_vm::dpn::contract::cfc_code_definition_to_dapen_fc(function).map_err(|_| GuardianSignError::ProofMismatch)?;
+        hashes.push(psy_vm::dpn::contract::hash_dpn_function::<F>(&method));
+    }
+    Ok(psy_client_data::qblock::cmds::deploy_contract::get_code_root_by_code_hashes::<F, PsyHasher>(&hashes, psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT - 1))
+}
+
+/// Process-wide, keyed by the root each code hashes to, so an entry only serves a step claiming that root.
+static CONTRACT_CODES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<(u64, [u64; 4]), Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
+const MAX_CACHED_CONTRACT_CODES: usize = 8;
+
+fn validate_contract_code(contract_id: u64, claimed_root: Hash4, definition: &psy_client_data::qdata::contract::ContractCodeDefinition) -> Result<Vec<u8>> {
+    let code = bincode::serialize(definition).map_err(|_| GuardianSignError::ProofMismatch)?;
+    if contract_code_root(contract_id, &code)? != claimed_root { return Err(GuardianSignError::ProofMismatch); }
+    Ok(code)
+}
+
+fn code_root_key(contract_id: u64, root: Hash4) -> (u64, [u64; 4]) {
+    (contract_id, root.0.elements.map(|limb| limb.to_canonical_u64()))
+}
+
+/// Traces carry no contract code. Each called contract's code is loaded from L2 in first-call order,
+/// the order the trace builder uses, and must hash to the code root its first step claims;
+/// `verify_trace_contracts` then authenticates that root against the checkpoint.
+pub(crate) async fn load_trace_contract_codes(provider: &RpcProvider, trace: &TxTrace) -> Result<Vec<TraceContractCode>> {
+    let mut codes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for step in &trace.steps {
+        let Some(cfc) = step.as_cfc() else { continue };
+        if !seen.insert(cfc.contract_id) { continue; }
+        contract_height(u32::try_from(cfc.contract_id).map_err(|_| GuardianSignError::UnsupportedCall)?)?;
+        let key = code_root_key(cfc.contract_id, cfc.cfc_inclusion_proof.contract_inclusion_proof.contract_leaf.code_root);
+        let cached = CONTRACT_CODES.lock().map_err(|_| GuardianSignError::DatabaseUnavailable)?.get(&key).cloned();
+        let code = match cached {
+            Some(code) => code,
+            None => {
+                let definition = provider.get_contract_code_definition(cfc.contract_id).await.map_err(|_| GuardianSignError::L2RpcUnavailable)?;
+                let code = validate_contract_code(cfc.contract_id, cfc.cfc_inclusion_proof.contract_inclusion_proof.contract_leaf.code_root, &definition)?;
+                let mut cache = CONTRACT_CODES.lock().map_err(|_| GuardianSignError::DatabaseUnavailable)?;
+                if cache.len() >= MAX_CACHED_CONTRACT_CODES { cache.clear(); }
+                cache.insert(key, code.clone());
+                code
+            }
+        };
+        codes.push(TraceContractCode { contract_id: cfc.contract_id, code });
+    }
+    Ok(codes)
+}
+
 fn verify_trace_contracts(trace: &TxTrace) -> Result<()> {
     let mut codes = BTreeMap::new();
     for code in &trace.contract_codes {
         if codes.contains_key(&code.contract_id) { return Err(GuardianSignError::ProofMismatch); }
-        let id = u32::try_from(code.contract_id).map_err(|_| GuardianSignError::ProofMismatch)?;
-        let definition: psy_client_data::qdata::contract::ContractCodeDefinition = bincode::deserialize(&code.code).map_err(|_| GuardianSignError::ProofMismatch)?;
-        if definition.state_tree_height != contract_height(id)? { return Err(GuardianSignError::ProofMismatch); }
-        let mut hashes = Vec::with_capacity(definition.functions.len());
-        for function in &definition.functions {
-            let method = psy_vm::dpn::contract::cfc_code_definition_to_dapen_fc(function).map_err(|_| GuardianSignError::ProofMismatch)?;
-            hashes.push(psy_vm::dpn::contract::hash_dpn_function::<F>(&method));
-        }
-        let root = psy_client_data::qblock::cmds::deploy_contract::get_code_root_by_code_hashes::<F, PsyHasher>(&hashes, psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT - 1);
-        codes.insert(code.contract_id, root);
+        codes.insert(code.contract_id, contract_code_root(code.contract_id, &code.code)?);
     }
     for step in &trace.steps {
         let Some(step) = step.as_cfc() else { continue; };
@@ -872,6 +923,22 @@ mod tests {
         trace.steps.push(TraceStep::ZkSign(psy_prover::trace::ZkSignStep { fingerprint, proof_tree_start_root: Hash4::ZERO, proof_tree_end_root: Hash4::ZERO, sign_circuit_source: psy_prover::trace::TraceSignCircuitSource::Multisig, sign_witness: serde_json::to_vec(&witness).unwrap(), public_key_param: account.public_key_param().unwrap(), sign_verifier_data_alt: psy_client_common::data::alt::AltVerifierOnlyCircuitData { constants_sigmas_cap: vec![], circuit_digest: Hash4::ZERO } }));
         let expected = ContractCallData::new(vec![ContractCallArgs { contract_id: u64::from(crate::bridge::constants::WITHDRAWAL_TREE_CONTRACT_ID), method_name: "append_withdrawal".into(), inputs: vec![0; APPEND_WITHDRAWAL.input_felt_count as usize] }]);
         (config, request, trace, expected, root)
+    }
+
+    #[test]
+    fn loaded_contract_code_must_hash_to_the_claimed_root() {
+        let (_, _, trace, _, _) = recovery_commitment_fixture();
+        let contract_id = trace.contract_codes[0].contract_id;
+        let definition: psy_client_data::qdata::contract::ContractCodeDefinition = bincode::deserialize(&trace.contract_codes[0].code).unwrap();
+        let root = contract_code_root(contract_id, &trace.contract_codes[0].code).unwrap();
+        assert_eq!(validate_contract_code(contract_id, root, &definition).unwrap(), trace.contract_codes[0].code);
+        assert_eq!(validate_contract_code(contract_id, Hash4::from_values(1, 2, 3, 4), &definition).unwrap_err(), GuardianSignError::ProofMismatch);
+        let mut changed = definition.clone();
+        changed.functions.push(changed.functions[0].clone());
+        assert_eq!(validate_contract_code(contract_id, root, &changed).unwrap_err(), GuardianSignError::ProofMismatch);
+        let mut wrong_height = definition;
+        wrong_height.state_tree_height += 1;
+        assert_eq!(validate_contract_code(contract_id, root, &wrong_height).unwrap_err(), GuardianSignError::ProofMismatch);
     }
 
     #[test]
