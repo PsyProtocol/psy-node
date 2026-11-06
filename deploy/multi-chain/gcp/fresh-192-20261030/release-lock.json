@@ -214,7 +214,7 @@
     "install_relayer.py": "5e15d87644ec078eb40f4f62b69c34da4a1b02770888d9c63b5b6b7a8319e184",
     "install_services.py": "56b4be1afc66fde56f6e0a461b3a9350d419e4a38aecc982127db1f78748e3df",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
-    "prepare_faucet.py": "4d219b12c569f4ace495ea03e9a26436be91d48a100575980babdcdd505eb697",
+    "prepare_faucet.py": "74019690fe26d427ef70cbeda86507ba188b8c97f57a51715d540123d63299db",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "bad8ba5f20d8e4b7deda67fbefa06b94fda5bb2fa67002df052ba1c5f0a9cf1c",
     "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",

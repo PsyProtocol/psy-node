@@ -244,10 +244,15 @@ def wait_for_faucet(ctx):
             return False
         return "result" in answer
 
+    first_restarts = unit_state(ctx).get("NRestarts")
+
     def read_failure():
-        # activating is a restart in progress; the unit's start limit turns a loop into failed.
-        if unit_state(ctx).get("ActiveState") not in LIVE_STATES:
+        # The unit has no start limit, so a crash loop shows up only as a growing restart count.
+        state = unit_state(ctx)
+        if state.get("ActiveState") not in LIVE_STATES:
             return "faucet unit failed or stopped"
+        if state.get("NRestarts") != first_restarts:
+            return "faucet unit restarted while starting; read its journal"
         return None
     wait_until(is_ready, read_failure, READY_POLL_SECONDS, READY_SECONDS, "faucet RPC")
 

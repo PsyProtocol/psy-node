@@ -83,10 +83,10 @@ Keep concurrency bounded separately according to proving capacity.
 
 `prepare_faucet.py` packages, installs and activates the batched Faucet from the release lock: the runtime
 `psy_user_cli`, canonical config, operator-set hash, account, listen port, unit name and install paths all come
-from the lock. The unit keeps the live batch10 settings: `MemoryMax=20G`, `MemorySwapMax=0`, `RAYON_NUM_THREADS=4`,
+from the lock. The unit keeps the live batch10 settings: `MemoryMax=28G`, `MemorySwapMax=0`, `RAYON_NUM_THREADS=4`,
 `PSY_FAUCET_WINDOW_CHECKPOINTS=120`, Turnstile off, `Restart=on-failure`. Claims depart every 5 s, up to 10
 recipients per operator End Cap, at most 3 End Caps proving at once; each SD-key proof adds about 3.76 GiB on top
-of about 4.7 GiB after the circuit build (about 60 s), so 3 in flight is the ceiling under 20 GiB.
+of about 4.7 GiB after the circuit build (about 60 s), so 3 in flight is the ceiling; arc99x2 measured about 17.9 GiB with 3 in flight, so the unit allows 28 GiB. The unit has no start limit: it restarts on failure with a delay growing from 10 s to 300 s, so a Realm outage at startup cannot leave it stopped.
 
 The operators are Genesis's 100 operators; nothing is read from an earlier release's custody. Pin the operator file
 once: `release_lock.py update-faucet-operators --lock <lock> --operators <faucetOperators.json>` (prints no keys).

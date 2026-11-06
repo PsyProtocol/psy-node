@@ -19,6 +19,7 @@ class FakeRemote:
         self.ws, self.ids = ws, ids
         self.report, self.copies, self.scripts, self.claims = None, [], [], []
         self.pid, self.state, self.binary_hash = 0, "active", ws.lock["binaries"]["psy_user_cli"]
+        self.restarts = 3
         self.claim_answer, self.inclusion_failure, self.inclusion_calls = None, None, []
 
     def missing_aliases(self, aliases):
@@ -40,7 +41,7 @@ class FakeRemote:
                 self.on_activate()
             return ""
         if script.startswith("systemctl show"):
-            return f"ActiveState={self.state}\nMainPID={self.pid}\nNRestarts=3\n"
+            return f"ActiveState={self.state}\nMainPID={self.pid}\nNRestarts={self.restarts}\n"
         if "echo missing" in script:
             if self.report is None:
                 return "missing\n"
@@ -247,6 +248,15 @@ class FaucetStepTests(base.PrepareTestCase):
             self.assertIn("failed or stopped", failure())
             self.remote.state = "inactive"
             self.assertIn("failed or stopped", failure())
+
+    def test_a_crash_loop_stops_the_wait(self):
+        with unittest.mock.patch.object(faucet, "wait_until") as waited:
+            self.remote.state = "activating"
+            faucet.wait_for_faucet(self.ctx)
+            failure = waited.call_args.args[1]
+            self.assertIsNone(failure())
+            self.remote.restarts = 4
+            self.assertIn("restarted while starting", failure())
 
     def test_inclusion_gates_the_fence_and_a_rerun_never_reclaims(self):
         self.pending()
