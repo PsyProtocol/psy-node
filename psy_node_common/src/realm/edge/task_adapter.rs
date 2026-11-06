@@ -262,6 +262,9 @@ where
         let unique_pending_id = lease.job.unique_pending_id;
         let output_id = id.get_output_id();
         // Every write below is an overwrite with the same value: safe to repeat.
+        // The claim tag first: the processor binds the published result to it
+        // (RealmFinalizeGUTA reward root), as it does for a legacy claim.
+        h.temp_db.set_proof_claim_tag(&h.realm_identifier, unique_pending_id, id.get_input_witness_id(), tag).await?;
         h.temp_db.set_proof_miner_rewards_tree_value(&h.realm_identifier, unique_pending_id, output_id, reward_value).await?;
         h.proof_store.put_proof_bytes_for_job_id(output_id, unique_pending_id, &proof).await?;
         for (key, node) in metadata.get_new_rewards_tag_tree_updates::<N::HasherBase>(tag, &children, reward_value)? {
