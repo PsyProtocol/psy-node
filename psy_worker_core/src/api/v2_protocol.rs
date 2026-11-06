@@ -16,6 +16,9 @@ use psy_worker_admission::{
 
 const REQUEST_VALID_MS: u64 = 30_000;
 const SOLVE_BATCH: u64 = 1 << 20;
+/// Edges allow 120 signed requests per key per minute; claims at this pace
+/// leave room for submissions and status reads.
+const CLAIM_INTERVAL_MS: u64 = 600;
 
 impl std::fmt::Debug for V2State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -30,6 +33,8 @@ pub struct V2State {
     leases: DashMap<([u8; 32], QProvingJobDataID), LeaseRecord>,
     /// One PoW recovery at a time; other claims wait for its result.
     recovery: tokio::sync::Mutex<()>,
+    /// Earliest time of the next claim request, in ms since the epoch.
+    next_claim_ms: tokio::sync::Mutex<u64>,
     max_bits: u16,
 }
 
@@ -43,7 +48,7 @@ pub fn enabled_from_env() -> anyhow::Result<Option<V2State>> {
                 Err(_) => 30,
             };
             Ok(Some(V2State { generations: DashMap::new(), scopes: DashMap::new(), leases: DashMap::new(),
-                recovery: tokio::sync::Mutex::new(()), max_bits }))
+                recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits }))
         }
         Ok(other) => anyhow::bail!("unsupported PSY_WORKER_TASK_PROTOCOL {other}"),
         Err(_) => anyhow::bail!("PSY_WORKER_TASK_PROTOCOL is not valid unicode"),
@@ -54,6 +59,15 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 
 fn category(error: &ClientError) -> Option<&str> {
     match error { ClientError::Call(object) => Some(object.message()), _ => None }
+}
+
+fn retry_after_ms(error: &ClientError) -> Option<u64> {
+    let ClientError::Call(object) = error else { return None };
+    let data: serde_json::Value = serde_json::from_str(object.data()?.get()).ok()?;
+    match &data["retry_after_ms"] {
+        serde_json::Value::String(ms) => ms.parse().ok(),
+        value => value.as_u64(),
+    }
 }
 
 impl V2State {
@@ -110,15 +124,33 @@ impl V2State {
         Ok(activated.current.generation)
     }
 
+    async fn back_off(&self, error: &ClientError) {
+        let wait = retry_after_ms(error).unwrap_or(60_000).min(120_000);
+        println!("[worker/v2] rate limited, next claim in {wait} ms");
+        *self.next_claim_ms.lock().await = now_ms() + wait;
+    }
+
     /// Claim one task, recovering admission once if the edge requires it.
     pub async fn claim<S: Secp256K1WalletProvider>(&self, client: &HttpClient, url_hash: [u8; 32], signer: &S, public_key: &CompressedPublicKey, tag: Hash32)
         -> anyhow::Result<Option<serde_json::Value>> {
         let scope = self.scope(client, url_hash).await?;
         let request = ClaimRequest { reward_tag: tag };
         for attempt in 0..2 {
+            {
+                let mut next = self.next_claim_ms.lock().await;
+                let now = now_ms();
+                if *next > now { tokio::time::sleep(std::time::Duration::from_millis(*next - now)).await; }
+                *next = now_ms() + CLAIM_INTERVAL_MS;
+            }
             let generation = match self.generations.get(&scope.hash()).map(|g| *g) {
                 Some(generation) => generation,
-                None => self.recover(client, &scope, signer, public_key).await?,
+                None => match self.recover(client, &scope, signer, public_key).await {
+                    Ok(generation) => generation,
+                    Err(error) => match error.downcast_ref::<ClientError>().filter(|e| category(e) == Some("RATE_LIMITED")) {
+                        Some(limited) => { self.back_off(limited).await; return Ok(None); }
+                        None => return Err(error),
+                    },
+                },
             };
             let auth = self.sign(signer, public_key, &scope, AdmissionMethod::ClaimTask, generation, request.payload_hash())?;
             match client.claim_task_v2(auth, request.clone()).await {
@@ -128,6 +160,7 @@ impl V2State {
                     return Ok(Some(response.task));
                 }
                 Err(error) if category(&error) == Some("NO_WORK") => return Ok(None),
+                Err(error) if category(&error) == Some("RATE_LIMITED") => { self.back_off(&error).await; return Ok(None); }
                 Err(error) if attempt == 0 && matches!(category(&error), Some("POW_REQUIRED" | "ADMISSION_STALE")) => {
                     self.generations.remove(&scope.hash());
                 }
@@ -166,7 +199,7 @@ mod tests {
     #[test]
     fn worker_wallet_signatures_verify_on_the_edge() {
         let state = V2State { generations: DashMap::new(), scopes: DashMap::new(), leases: DashMap::new(),
-            recovery: tokio::sync::Mutex::new(()), max_bits: 30 };
+            recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits: 30 };
         let scope = AdmissionScope { network_id: FixedBytes([1; 32]), admission_epoch: FixedBytes([2; 32]), node_type: 1, realm_id: 0, realm_sub_id: 0 };
         let policy = AdmissionPolicy::for_base_bits(8);
         for seed in 1..=32u8 {
