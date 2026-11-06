@@ -132,6 +132,15 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 
 
 
+/// `PSY_EDGE_WORKER_ONLY=1`: serve worker RPCs only, beside the validator's edge.
+fn worker_only_edge() -> anyhow::Result<bool> {
+    match std::env::var("PSY_EDGE_WORKER_ONLY").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(false),
+        Ok("1") => Ok(true),
+        _ => anyhow::bail!("PSY_EDGE_WORKER_ONLY must be 0 or 1"),
+    }
+}
+
 pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
     psy_plonky2_circuits::node::config::networks::resolver::ensure_plonky2_network(config.network)?;
     let realm_sub_id = crate::node::realm_p2p::resolve_edge_sub_id(config)?;
@@ -200,15 +209,22 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 0,
                 proof_verifier,
             );
-            let (built, proposer_edge_node_ids, realm_edge_node_ids) =
-                crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?;
-            handler.set_realm_p2p(
-                built.handle.commands(),
-                proposer_edge_node_ids,
-                realm_edge_node_ids,
-            );
-            crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
-            handler.spawn_end_cap_redelivery();
+            if worker_only_edge()? {
+                // A side edge beside the validator's own edge: it shares the
+                // validator's queues and stores, so it must not join the realm
+                // network under the same NodeId or run a second EndCap redelivery.
+                tracing::warn!("worker-only edge: realm p2p and EndCap redelivery are not started");
+            } else {
+                let (built, proposer_edge_node_ids, realm_edge_node_ids) =
+                    crate::node::realm_p2p::maybe_build_edge_network(config, chain_id)?;
+                handler.set_realm_p2p(
+                    built.handle.commands(),
+                    proposer_edge_node_ids,
+                    realm_edge_node_ids,
+                );
+                crate::node::realm_p2p::spawn_edge_realm_network(built, handler.clone());
+                handler.spawn_end_cap_redelivery();
+            }
             start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(
                 handler,
                 &config.listen,
