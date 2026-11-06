@@ -1637,6 +1637,9 @@ pub(crate) mod realm_db_test_env {
         /// Runs once at the first realm-state query after a test arms it. Header
         /// synchronization does not query realm state, so this is a post-sync boundary.
         pub after_sync_realm_query: Mutex<Option<Box<dyn FnOnce(&Self, u64) + Send>>>,
+        /// contract id -> (registration checkpoint, height); such a contract reports height 0 before
+        /// its registration checkpoint. Contracts not listed report height 8 at every checkpoint.
+        pub registered_contract_heights: Mutex<HashMap<u64, (u64, u8)>>,
     }
 
     impl FakeRealmCoordinatorClient {
@@ -1813,8 +1816,16 @@ pub(crate) mod realm_db_test_env {
             self.submitted_gutas.lock().unwrap().push((realm_id, proof));
             Ok(())
         }
-        async fn rc_get_contract_tree_state_heights(&self, _checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
-            Ok(vec![8u8; contract_ids.len()])
+        async fn rc_get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
+            let registered = self.registered_contract_heights.lock().unwrap();
+            Ok(contract_ids
+                .iter()
+                .map(|id| match registered.get(id) {
+                    Some(&(registered_at, height)) if checkpoint_id >= registered_at => height,
+                    Some(_) => 0,
+                    None => 8,
+                })
+                .collect())
         }
     }
 

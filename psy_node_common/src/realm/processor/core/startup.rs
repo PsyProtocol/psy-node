@@ -188,6 +188,9 @@ where
         N::HasherBase: parth_core::crypto::hash::traits::MerkleZeroHasher<N::QHash>,
     {
         let gathering_realm_start_root = self.db.state.gathering_realm_start_root;
+        // Recovery replays other validators' proposals against local contract heights, so heights an
+        // older build failed to store are repaired before any of them is verified.
+        self.db.backfill_missing_contract_heights().await?;
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(
             &self.db.db,
             self.db.state.last_committed_checkpoint_id,
