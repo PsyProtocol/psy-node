@@ -9,7 +9,10 @@ use futures::StreamExt;
 struct Server { child: Child, dir: std::path::PathBuf, url: String }
 impl Server {
     fn start() -> Self {
-        let port = 20_000 + (std::process::id() % 20_000) as u16;
+        // Tests run in parallel in one process: each server needs its own port.
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = 20_000 + (std::process::id() % 2_000) as u16 * 10 + n;
         let dir = std::env::temp_dir().join(format!("worker-ack-semantics-{}-{port}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let child = Command::new("nats-server").args(["-js", "-a", "127.0.0.1", "-p", &port.to_string(), "-sd"]).arg(&dir)
