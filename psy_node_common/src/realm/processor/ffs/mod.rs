@@ -19,6 +19,7 @@ pub struct VerifiedHistoryCandidate<F: QFelt64, Hash: Q256BitHash> {
     pub updates: PsyPreparedRealmBlockStateUpdates<Hash>,
     pub state_updates: Vec<u8>,
     pub coordinator_update: PsyRealmCoordinatorUpdate<F, Hash>,
+    pub reward_root: Hash,
 }
 
 fn history_error(kind: &str, checkpoint_id: u64, detail: impl std::fmt::Display) -> anyhow::Error {

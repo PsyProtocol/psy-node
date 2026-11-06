@@ -80,6 +80,7 @@ where
             updates,
             state_updates,
             coordinator_update,
+            reward_root,
         } = verified;
         self.ensure_uncommitted_processing_ids(included.checkpoint_id).await?;
         self.state.processing_checkpoint_id = included.checkpoint_id;
@@ -98,6 +99,7 @@ where
                 &updates,
                 ProvingJobCircuitType::GUTANoChange,
                 vec![],
+                Some(reward_root),
             )
             .await?;
         }

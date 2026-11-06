@@ -419,6 +419,7 @@ where
         PsyPreparedRealmBlockStateUpdates<N::QHash>,
         Vec<u8>,
         PsyRealmCoordinatorUpdate<N::F, N::QHash>,
+        N::QHash,
     )> {
         anyhow::ensure!(
             proposal.realm_id == self.state.realm_id_u64 as u32,
@@ -525,6 +526,12 @@ where
             &decoded.output,
         )?;
         require_declared_roots_match_zk_output(&updates, &output)?;
+        let reward_root = psy_data::guta::realm_finalize::finalize_reward_root63::<N::F, N::QHash, N::HasherBase>(
+            &output, &N::QHash::from_owned_32bytes(decoded.worker_tag),
+        );
+        crate::realm::processor::db::require_realm_top_proofs::<N>(
+            &coordinator_update, self.state.realm_id_u64, updates.new_realm_root, Some(reward_root),
+        )?;
         anyhow::ensure!(
             updates.new_realm_root.into_owned_32bytes() != [0u8; 32]
                 || updates.old_realm_root == updates.new_realm_root,
@@ -564,7 +571,7 @@ where
                     hex::encode(proposal.proposal_id)
                 )
             })?;
-        Ok((updates, decoded.state_updates, coordinator_update))
+        Ok((updates, decoded.state_updates, coordinator_update, reward_root))
     }
 
     pub async fn verify_history_transition(
@@ -587,11 +594,12 @@ where
             .verify_history_proposal(included, &proposal, &body)
             .await
         {
-            Ok((updates, state_updates, coordinator_update)) => {
+            Ok((updates, state_updates, coordinator_update, reward_root)) => {
                 Ok(Some(VerifiedHistoryCandidate {
                     updates,
                     state_updates,
                     coordinator_update,
+                    reward_root,
                 }))
             }
             Err(error) => {

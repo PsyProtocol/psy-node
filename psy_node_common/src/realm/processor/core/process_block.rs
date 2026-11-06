@@ -727,6 +727,7 @@ where
                 &db_output,
                 root_job_id.circuit_type,
                 root_job_proof,
+                Some(submission_header.header.new_tag_tree_node_value),
             )
             .await?;
         timer.lap("commit_state");
