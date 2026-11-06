@@ -145,7 +145,7 @@ pub async fn run(args: WalletSessionArgs) -> anyhow::Result<CommandResult> {
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No user id found for sender public key"))?;
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
 
     let (tx_hash, end_user_leaf_hash) = run_with_end_user_leaf_hash(args).await?;
     tracing::info!(

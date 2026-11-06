@@ -225,7 +225,7 @@ async fn publish_private_transfer_backup(
 
 async fn wait_next_checkpoint(provider: &RpcProvider, previous_checkpoint_id: u64) -> anyhow::Result<u64> {
     for _ in 0..60 {
-        let latest = provider.get_latest_block_state().await?.checkpoint_id;
+        let latest = provider.get_realm_latest_checkpoint_id().await?;
         if latest > previous_checkpoint_id {
             return Ok(latest);
         }
@@ -247,7 +247,7 @@ async fn wait_checkpoint_with_note_root(
     let mut next_checkpoint_to_check = min_checkpoint_id;
 
     for _ in 0..120 {
-        let latest = provider.get_latest_block_state().await?.checkpoint_id;
+        let latest = provider.get_realm_latest_checkpoint_id().await?;
         tracing::debug!(
             "wait_checkpoint_with_note_root scanning checkpoints [{}..={}] expected_note_root={}",
             next_checkpoint_to_check,
@@ -332,8 +332,8 @@ async fn wait_checkpoint_with_note_slots_change(
     let mut unchanged_polls = 0u32;
     let mut last_error = String::new();
     for _ in 0..180 {
-        let coordinator_latest = provider.get_coordinator_latest_block_state().await.ok().map(|s| s.checkpoint_id);
-        let realm_latest = provider.get_realm_latest_block_state().await.ok().map(|s| s.checkpoint_id);
+        let coordinator_latest = provider.get_coordinator_latest_checkpoint_id().await.ok();
+        let realm_latest = user_provider.get_realm_latest_checkpoint_id().await.ok();
         if let Some(c) = coordinator_latest {
             max_seen_coordinator = max_seen_coordinator.max(c);
         }
@@ -342,13 +342,12 @@ async fn wait_checkpoint_with_note_slots_change(
         }
         let latest_observable = match (coordinator_latest, realm_latest) {
             (Some(c), Some(r)) => c.min(r),
-            (Some(c), None) => c,
-            (None, Some(r)) => r,
-            (None, None) => {
-                tracing::warn!("wait_checkpoint_with_note_slots_change latest checkpoint rpc failed on both coordinator and realm");
+            (_, None) => {
+                tracing::debug!(?coordinator_latest, "Realm checkpoint RPC failed; waiting for committed Realm height");
                 sleep(Duration::from_secs(1)).await;
                 continue;
-            }
+            },
+            (None, Some(r)) => r,
         };
         if latest_observable > max_seen_latest {
             max_seen_latest = latest_observable;
@@ -454,20 +453,20 @@ async fn wait_checkpoint_with_nonce_change(
     checkpoint_before: u64,
     baseline_nonce: u64,
 ) -> anyhow::Result<u64> {
+    let user_provider = provider.with_user_id_owned(sender_user_id);
     let mut max_seen_latest = checkpoint_before;
     let mut unchanged_polls = 0u32;
     for _ in 0..180 {
-        let coordinator_latest = provider.get_coordinator_latest_block_state().await.ok().map(|s| s.checkpoint_id);
-        let realm_latest = provider.get_realm_latest_block_state().await.ok().map(|s| s.checkpoint_id);
+        let coordinator_latest = provider.get_coordinator_latest_checkpoint_id().await.ok();
+        let realm_latest = user_provider.get_realm_latest_checkpoint_id().await.ok();
         let latest = match (coordinator_latest, realm_latest) {
-            (Some(c), Some(r)) => c.max(r),
-            (Some(c), None) => c,
-            (None, Some(r)) => r,
-            (None, None) => {
-                tracing::warn!("wait_checkpoint_with_nonce_change latest checkpoint rpc failed on both coordinator and realm");
+            (Some(c), Some(r)) => c.min(r),
+            (_, None) => {
+                tracing::debug!(?coordinator_latest, "Realm checkpoint RPC failed; waiting for committed Realm height");
                 sleep(Duration::from_secs(1)).await;
                 continue;
-            }
+            },
+            (None, Some(r)) => r,
         };
         if latest > max_seen_latest {
             max_seen_latest = latest;
@@ -623,7 +622,7 @@ async fn run_note_proof_with_membership_proof(
     let provider = RpcProvider::new_with_config(&rpc_config)?;
     let contract_state_tree_height = get_contract_state_tree_height(&provider, input.contract_id).await?;
     let checkpoint_id = if input.checkpoint_id == u64::MAX {
-        provider.get_latest_block_state().await?.checkpoint_id
+        provider.get_realm_latest_checkpoint_id().await?
     } else {
         input.checkpoint_id
     };
@@ -785,7 +784,7 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No user id found for sender public key"))?;
 
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
     let baseline_user_leaf = provider.get_user_leaf_data(checkpoint_before, sender_user_id).await?;
     let baseline_nonce = baseline_user_leaf.nonce.to_canonical_u64();
     tracing::info!(

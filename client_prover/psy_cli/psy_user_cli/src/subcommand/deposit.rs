@@ -777,7 +777,7 @@ async fn wait_for_deposit_proof(
     let start = std::time::Instant::now();
     loop {
         let elapsed = start.elapsed().as_secs();
-        let checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_id = provider.get_realm_latest_checkpoint_id().await?;
         let tree_count = fetch_deposit_tree_next_index(&provider, checkpoint_id, args.source_chain_index as u64).await?;
         let l1_proved_deposit_count = fetch_proved_deposit_count(&args.l1_rpc_url, bridge_address).await.ok();
         if l1_proved_deposit_count.is_some_and(|count| count > deposit_index) {

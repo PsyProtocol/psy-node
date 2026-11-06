@@ -45,7 +45,7 @@ pub async fn run(args: ProveTxTraceArgs) -> anyhow::Result<CommandResult> {
     );
     let provider = RpcProvider::new_with_config(&rpc_config)?;
     let info = load_wallet_key_info(&args.session.wallet, false)?;
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     match args.session.wallet.sign_type {
         SignType::SDKeyPlonky2Sign => {

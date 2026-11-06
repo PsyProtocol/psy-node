@@ -411,13 +411,15 @@ impl NetworkWallet {
     }
 
     async fn latest_checkpoint(&self) -> Result<u64> {
-        Ok(self.session.st_provider.get_coordinator_latest_block_state().await?.checkpoint_id)
+        Ok(self.session.st_provider.get_coordinator_latest_checkpoint_id().await?)
     }
 
     async fn claim_amount_from(&self, sender_user_id: u64) -> Result<u64> {
         let user = self.require_user()?;
-        let checkpoint = self.latest_checkpoint().await?;
-        self.session.st_provider.get_claim_amount(checkpoint, user.user_id, sender_user_id).await
+        let provider = self.session.st_provider.with_user_id_owned(user.user_id);
+        let checkpoint = provider.get_realm_latest_checkpoint_id().await?
+            .min(provider.with_user_id_owned(sender_user_id).get_realm_latest_checkpoint_id().await?);
+        provider.get_claim_amount(checkpoint, user.user_id, sender_user_id).await
     }
 
     async fn exec_call(&mut self, contract_id: u64, method_name: &str, inputs: Vec<u64>) -> Result<String> {
@@ -1864,10 +1866,9 @@ impl WalletManager {
         let amount = prepared.amount;
 
         let provider = self.state(network).await?.session.st_provider.with_user_id_owned(sender_user_id);
-        let checkpoint_before = self.latest_checkpoint(network).await?;
+        let checkpoint_before = provider.get_realm_latest_checkpoint_id().await?;
         let baseline_count = Self::read_note_count(&provider, sender_user_id, contract_id, note_root_slot, checkpoint_before)
-            .await
-            .unwrap_or(0);
+            .await?;
 
         let leaf_hash = self.submit_prepared_private_transfer_for(network, expected_user_id, &prepared).await?;
 
@@ -1883,7 +1884,7 @@ impl WalletManager {
         let mut membership = None;
         for _ in 0..120 {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let latest = match self.latest_checkpoint(network).await {
+            let latest = match provider.get_realm_latest_checkpoint_id().await {
                 Ok(v) => v,
                 Err(_) => continue, // transport blip is not a verdict
             };
@@ -3360,8 +3361,8 @@ impl WalletManager {
     /// (contract state leaf 0, felt 0) at the latest checkpoint.
     pub async fn balance(&self, network: &NetworkId, contract_id: u64) -> Result<u64> {
         let user = self.require_user(network).await?;
-        let checkpoint = self.latest_checkpoint(network).await?;
         let provider = self.state(network).await?.session.st_provider.with_user_id_owned(user.user_id);
+        let checkpoint = provider.get_realm_latest_checkpoint_id().await?;
         let proof = provider
             .get_user_contract_state_tree_merkle_proof(
                 checkpoint,
