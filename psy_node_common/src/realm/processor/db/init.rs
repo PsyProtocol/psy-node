@@ -892,7 +892,7 @@ where
             ).await?
         };
         self.commit_state(
-            coordinator_update, &prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![],
+            coordinator_update, &prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![], None,
         ).await?;
         tracing::info!("Checkpoint {} recovered successfully.", checkpoint_id);
         self.verify_recovered_root(checkpoint_id, target_root).await?;
@@ -1052,7 +1052,7 @@ where
                 self.state.processing_proc_checkpoint_unique_id = recovery_state.processing_proc_checkpoint_unique_id;
                 self.state.processing_realm_start_root = recovery_state.processing_realm_start_root;
                 self.state.processing_realm_end_root = recovery_state.processing_realm_end_root;
-                self.commit_state(coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![]).await?;
+                self.commit_state(coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], None).await?;
                 tracing::info!(
                     "Checkpoint {} recovered from backup (pending_id={}).",
                     checkpoint_id, candidate

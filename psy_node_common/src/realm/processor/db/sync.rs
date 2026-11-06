@@ -349,6 +349,20 @@ where
                         .await?,
                 };
 
+                // C is the checkpoint where the Coordinator reports this Realm root was included;
+                // sync_info above is fetched through C (or directly at C). Prove leaf C against
+                // the historical tree ending at C, so both index and historical_index are C.
+                let membership = self.checkpoint_tree_backup_manager.checkpoint_tree
+                    .get_historical_merkle_proof_at_historical_index(realm_state.checkpoint_id, realm_state.checkpoint_id);
+                anyhow::ensure!(sync_info.checkpoint_sync_info.checkpoint_id == realm_state.checkpoint_id
+                    && sync_info.checkpoint_sync_info.checkpoint_leaf_hash == membership.value
+                    && sync_info.checkpoint_sync_info.checkpoint_tree_root == membership.root,
+                    "Realm reward proof checkpoint does not match authenticated checkpoint");
+                sync_info.checkpoint_sync_info.ensure_valid::<N::HasherBase>(&membership.siblings)?;
+                super::commit::require_realm_top_proofs::<N>(
+                    &sync_info, self.state.realm_id_u64, new_realm_root,
+                    Some(submission_header.header.new_tag_tree_node_value),
+                )?;
                 // Update mappings for the unique pending ID
                 self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
                     self.state.processing_unique_pending_id,

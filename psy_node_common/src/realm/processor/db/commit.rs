@@ -39,6 +39,49 @@ use crate::realm::{
     queue_key::{RealmUserUpdateQueueKey, RealmProvingWorkQueueKey},
 };
 
+pub(crate) fn require_realm_top_proofs<N: QNetworkTypesConfig>(
+    coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
+    realm_id: u64,
+    realm_root: N::QHash,
+    reward_root: Option<N::QHash>,
+) -> anyhow::Result<()> {
+    let top = &coordinator_update.merkle_proof_to_realm_root;
+    anyhow::ensure!(top.siblings.len() == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize
+        && top.siblings.len() <= 64, "Realm top user proof height mismatch");
+    anyhow::ensure!(top.index == realm_id && (top.siblings.len() == 64 || top.index >> top.siblings.len() == 0),
+        "Realm top user proof index mismatch");
+    anyhow::ensure!(top.value == realm_root, "Realm top user proof value mismatch");
+    anyhow::ensure!(top.root == coordinator_update.checkpoint_sync_info.state_roots.user_tree_root
+        && top.verify::<N::HasherBase>(), "Realm top user proof does not verify against checkpoint user root");
+    let reward = &coordinator_update.reward_tree_top_proof;
+    if reward.is_empty() {
+        anyhow::ensure!(reward_root.is_none() || reward_root == Some(N::QHash::get_zero_value()),
+            "Realm top reward proof missing for submitted reward root");
+        return Ok(());
+    }
+    let mut value = reward_root.ok_or_else(|| anyhow::anyhow!("Realm top reward proof requires authenticated reward root"))?;
+    anyhow::ensure!((reward.leaf.left == N::QHash::get_zero_value()
+        && reward.leaf.right == N::QHash::get_zero_value() && reward.leaf.tag == N::QHash::get_zero_value())
+        || reward.leaf.get_node_hash::<N::HasherBase>() == value, "Realm top reward proof leaf mismatch");
+    anyhow::ensure!(reward.siblings.len() <= 64
+        && (reward.siblings.len() == 64 || reward.index >> reward.siblings.len() == 0),
+        "Realm top reward proof index or height mismatch");
+    // The Coordinator may not retain the subtree preimage. Start at the authenticated
+    // subtree commitment, rather than hashing the opaque leaf preimage.
+    for (level, sibling) in reward.siblings.iter().enumerate() {
+        value = if (reward.index >> level) & 1 == 0 {
+            N::HasherBase::q_two_to_one(value, sibling.sibling)
+        } else {
+            N::HasherBase::q_two_to_one(sibling.sibling, value)
+        };
+        value = N::HasherBase::q_two_to_one(value, sibling.parent_tag);
+    }
+    anyhow::ensure!(value == reward.root
+        && reward.root == coordinator_update.checkpoint_sync_info.checkpoint_leaf.stats.pm_rewards_commitment.gutas_root,
+        "Realm top reward proof does not verify against checkpoint gutas root");
+    Ok(())
+}
+
 async fn write_checkpoint_state_records<N, S>(
     db: &S,
     checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
@@ -102,12 +145,20 @@ pub(crate) async fn apply_prepared_realm_checkpoint<N, S>(
     unique_pending_id: u64,
     proc_id: &QCoreProcCheckpointUniqueId,
     membership: &MerkleProofCore<N::QHash>,
+    reward_root: Option<N::QHash>,
 ) -> anyhow::Result<()>
 where
     N: QNetworkTypesConfig,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
 {
+    let realm_root = if coordinator_update.checkpoint_sync_info.checkpoint_id == 0 {
+        // The trusted Genesis bundle's prepared root uses the full global-tree root.
+        coordinator_update.merkle_proof_to_realm_root.value
+    } else { realm_update.new_realm_root };
+    require_realm_top_proofs::<N>(coordinator_update, realm_update.realm_id, realm_root, reward_root)?;
     let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
+    anyhow::ensure!(checkpoint_id == 0 || realm_update.old_realm_root == realm_update.new_realm_root
+        || !coordinator_update.reward_tree_top_proof.is_empty(), "Realm transition reward proof missing");
     db.set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
         .await?;
     db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, proc_id)
@@ -230,6 +281,7 @@ where
         realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
         _state_transition_circuit_type: ProvingJobCircuitType,
         _zk_proof: Vec<u8>,
+        reward_root: Option<N::QHash>,
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
         let leaf_hash = coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash;
@@ -290,6 +342,12 @@ where
             .ensure_valid::<N::HasherBase>(&membership.siblings)?;
 
         let unique_pending_id = self.state.processing_unique_pending_id;
+        anyhow::ensure!(realm_update.realm_id == self.state.realm_id_u64, "Realm commit identity mismatch");
+        let reward_root = if reward_root.is_none() && !coordinator_update.reward_tree_top_proof.is_empty() {
+            let root = self.tag_tree_rewards_store.rewards_tag_tree_get_root_at_unique_pending_id(unique_pending_id).await?;
+            anyhow::ensure!(root != N::QHash::get_zero_value(), "Realm recovery reward root unavailable");
+            Some(root)
+        } else { reward_root };
         apply_prepared_realm_checkpoint::<N, S>(
             self.db.as_ref(),
             coordinator_update,
@@ -297,6 +355,7 @@ where
             unique_pending_id,
             &self.state.processing_proc_checkpoint_unique_id,
             &membership,
+            reward_root,
         )
         .await?;
         tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
@@ -395,6 +454,69 @@ mod commit_tests {
     use crate::realm::processor::db::realm_db_test_env::*;
 
     #[tokio::test]
+    async fn top_proofs_reject_tampering_before_database_writes() -> anyhow::Result<()> {
+        use parth_core::crypto::hash::{tag_tree::{TagTreeMerkleProof, TagTreeProofNode}, traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash}};
+        use psy_data::{genesis::genesis_block_setup::GenesisValidator, p2p::{BlsSecretKey, NodeId}};
+        let mut genesis_data = genesis_setup_data(1, 4);
+        for position in 1..=TEST_REALM_SUB_ID {
+            let seed = position as u8;
+            let mut secret = [seed; 32];
+            let node = NodeId::from_keypair(&libp2p_identity::Keypair::ed25519_from_bytes(&mut secret)?)?;
+            genesis_data.validators.push(GenesisValidator {
+                realm_id: TEST_REALM_ID as u32,
+                validator_user_id: psy_core::user_id::get_user_id_from_user_registration_id(
+                    position * 2 - 1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT),
+                node_id: node.to_raw(),
+                bls_public_key: BlsSecretKey::key_gen(&[seed; 32])?.public_key().to_bytes(),
+            });
+        }
+        let env = RealmDbTestEnv::create_with_genesis_data(genesis_data).await?;
+        let mut update = env.genesis.coordinator_update.clone();
+        let realm_root = update.merkle_proof_to_realm_root.value;
+        let reward_root = zh(91);
+        let sibling = TagTreeProofNode { sibling: zh(92), parent_tag: zh(93) };
+        let root = PoseidonHasher::q_two_to_one(
+            PoseidonHasher::q_two_to_one(reward_root, sibling.sibling), sibling.parent_tag,
+        );
+        let mut reward = TagTreeMerkleProof::new_empty();
+        reward.root = root;
+        reward.siblings.push(sibling);
+        update.reward_tree_top_proof = reward;
+        update.checkpoint_sync_info.checkpoint_leaf.stats.pm_rewards_commitment.gutas_root = root;
+        super::require_realm_top_proofs::<N>(&update, TEST_REALM_ID, realm_root, Some(reward_root))?;
+        let membership = MerkleProofCore::new_from_params::<PoseidonHasher>(
+            0, update.checkpoint_sync_info.checkpoint_leaf_hash,
+            (0..N::CHECKPOINT_TREE_HEIGHT as usize).map(PoseidonHasher::get_zero_hash).collect(),
+        );
+        for mutation in 0..9 {
+            let mut bad = update.clone();
+            match mutation {
+                0 => bad.merkle_proof_to_realm_root.index ^= 1,
+                1 => bad.merkle_proof_to_realm_root.value = zh(99),
+                2 => bad.merkle_proof_to_realm_root.siblings[0] = zh(99),
+                3 => bad.merkle_proof_to_realm_root.siblings.pop().map(|_| ()).unwrap(),
+                4 => bad.reward_tree_top_proof.siblings[0].sibling = zh(99),
+                5 => bad.reward_tree_top_proof.siblings[0].parent_tag = zh(99),
+                6 => bad.reward_tree_top_proof.root = zh(99),
+                7 => bad.reward_tree_top_proof.index = 2,
+                _ => bad.reward_tree_top_proof.leaf.tag = zh(99),
+            }
+            super::apply_prepared_realm_checkpoint::<N, _>(
+                env.db.as_ref(), &bad, &env.genesis.prepared_updates, 99, &99, &membership, Some(reward_root),
+            ).await.expect_err("tampered proof must fail before writes");
+            assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(99).await?, None);
+            assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        }
+        let mut missing = update.clone();
+        missing.reward_tree_top_proof = TagTreeMerkleProof::new_empty();
+        assert!(super::require_realm_top_proofs::<N>(&missing, TEST_REALM_ID, realm_root, Some(reward_root)).is_err());
+        assert!(super::require_realm_top_proofs::<N>(&update, TEST_REALM_ID, realm_root, None).is_err());
+        assert!(super::require_realm_top_proofs::<N>(&update, TEST_REALM_ID, realm_root, Some(PHash::get_zero_value())).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn set_new_unique_ids_rotates_state_and_ensures_queue_consumers() -> anyhow::Result<()> {
         let mut env = RealmDbTestEnv::create().await?;
         let rid = test_realm_identifier();
@@ -452,7 +574,7 @@ mod commit_tests {
 
         let err = match env
             .processor
-            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![])
+            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![], None)
             .await
         {
             Err(err) => err,
@@ -544,7 +666,7 @@ mod commit_tests {
             update_contract_state_imt_leaves_ffs: vec![],
         };
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], None)
             .await?;
 
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
@@ -593,7 +715,7 @@ mod commit_tests {
             update_contract_state_imt_leaves_ffs: vec![],
         };
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], None)
             .await?;
         // the previous checkpoint's proofs (pending id 0) were dropped; the
         // commit itself still reports checkpoint 1 fully persisted
