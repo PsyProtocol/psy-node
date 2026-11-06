@@ -137,7 +137,7 @@ pub async fn run(args: WithdrawArgs) -> anyhow::Result<CommandResult> {
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No user id found for sender public key"))?;
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
     let (tx_hash, end_user_leaf_hash) =
         submit_end_cap_proof::prove_contract_call_data_once(&args.rpc_config, &args.wallet, contract_call_data).await?;
 

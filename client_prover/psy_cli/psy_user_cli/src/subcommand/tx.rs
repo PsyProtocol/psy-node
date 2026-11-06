@@ -16,7 +16,7 @@ pub async fn get_status(args: TxGetStatusArgs) -> Result<CommandResult> {
     let included_checkpoint = provider
         .wait_for_endcap_inclusion(args.user_id, end_user_leaf_hash, checkpoint_before, Some(180), 1)
         .await?;
-    let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let latest_checkpoint = provider.get_coordinator_latest_checkpoint_id().await?;
 
     let output = StatusResult {
         status: TransactionStatus::Confirmed,

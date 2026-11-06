@@ -884,8 +884,9 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
     async fn get_latest_checkpoint_tree_root(&self) -> anyhow::Result<psy_client_common::data::qhashout::QHashOut<F>> {
         info!("Fetching latest checkpoint tree root");
         let rpc_url = self.get_coordinator_url()?;
-        let input = QLatestCheckpointTreeRootRPCRequest {};
-        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetLatestCheckpointTreeRoot(input), QHashOut<F>);
+        let checkpoint_id = self.get_coordinator_latest_checkpoint_id().await?;
+        let input = QCheckpointTreeRootRPCRequest { checkpoint_id };
+        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetCheckpointTreeRoot(input), QHashOut<F>);
         match response.result {
             ResponseResult::Success(hash) => {
                 debug!(

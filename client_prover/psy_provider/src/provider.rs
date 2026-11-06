@@ -667,24 +667,19 @@ impl psy_client_data::qstore::imm::cmd_processor::QUserIdManager for RpcProvider
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 impl RpcProvider {
-    pub async fn get_realm_latest_block_state(&self) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
-        tracing::info!("Fetching latest realm block state");
+    /// The checkpoint marker advances only after the checkpoint records are committed.
+    pub async fn get_realm_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         let rpc_url = self.get_realm_url(self.current_user_id)?;
-        let input = QLatestBlockStateRPCRequest {};
-        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<GoldilocksField>::GetLatestBlockState(input), PsyBlockState);
+        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetLatestCheckpointId, u64);
         match response.result {
-            ResponseResult::Success(block_state) => {
-                tracing::debug!(
-                    block_state = %serde_json::to_string_pretty(&block_state).unwrap(),
-                    "Successfully fetched block state"
-                );
-                Ok(block_state)
-            }
-            ResponseResult::Error(e) => {
-                tracing::error!("RPC call failed: {:?}", e);
-                Err(anyhow::format_err!("get_realm_latest_block_state rpc call failed `{:?}`", e))
-            }
+            ResponseResult::Success(checkpoint_id) => Ok(checkpoint_id),
+            ResponseResult::Error(e) => Err(anyhow::format_err!("get_realm_latest_checkpoint_id rpc call failed `{:?}`", e)),
         }
+    }
+
+    pub async fn get_realm_latest_block_state(&self) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
+        let checkpoint_id = self.get_realm_latest_checkpoint_id().await?;
+        self.get_realm_block_state(checkpoint_id).await
     }
 
     pub async fn get_realm_block_state(&self, checkpoint_id: u64) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
@@ -707,24 +702,18 @@ impl RpcProvider {
         }
     }
 
-    pub async fn get_coordinator_latest_block_state(&self) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
-        tracing::info!("Fetching latest coordinator block state");
+    pub async fn get_coordinator_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         let rpc_url = self.get_coordinator_url()?;
-        let input = QLatestBlockStateRPCRequest {};
-        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<GoldilocksField>::GetLatestBlockState(input), PsyBlockState);
+        let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetLatestCheckpointId, u64);
         match response.result {
-            ResponseResult::Success(block_state) => {
-                tracing::debug!(
-                    block_state = %serde_json::to_string_pretty(&block_state).unwrap(),
-                    "Successfully fetched block state"
-                );
-                Ok(block_state)
-            }
-            ResponseResult::Error(e) => {
-                tracing::error!("RPC call failed: {:?}", e);
-                Err(anyhow::format_err!("get_coordinator_latest_block_state rpc call failed `{:?}`", e))
-            }
+            ResponseResult::Success(checkpoint_id) => Ok(checkpoint_id),
+            ResponseResult::Error(e) => Err(anyhow::format_err!("get_coordinator_latest_checkpoint_id rpc call failed `{:?}`", e)),
         }
+    }
+
+    pub async fn get_coordinator_latest_block_state(&self) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
+        let checkpoint_id = self.get_coordinator_latest_checkpoint_id().await?;
+        self.get_coordinator_block_state(checkpoint_id).await
     }
 
     pub async fn get_coordinator_block_state(&self, checkpoint_id: u64) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyBlockState> {
@@ -787,6 +776,10 @@ impl RpcProvider {
     }
 
     pub async fn get_claim_amount(&self, checkpoint_id: u64, user_id: u64, claim_user_id: u64) -> anyhow::Result<u64> {
+        let user_checkpoint_id = self.with_user_id_owned(user_id).get_realm_latest_checkpoint_id().await?;
+        let claim_checkpoint_id = self.with_user_id_owned(claim_user_id).get_realm_latest_checkpoint_id().await?;
+        anyhow::ensure!(checkpoint_id <= user_checkpoint_id.min(claim_checkpoint_id),
+            "claim checkpoint {} exceeds committed Realm checkpoints {} and {}", checkpoint_id, user_checkpoint_id, claim_checkpoint_id);
         let contract_id = 0;
         let height = 32;
         let sender_total_sent_index = 3 + user_id * 2;
@@ -902,7 +895,7 @@ impl RpcProvider {
 
     pub async fn wait_next_checkpoint(&self, checkpoint_before: u64, deadline: Option<WaitDeadline>, poll_interval_secs: u64) -> anyhow::Result<u64> {
         loop {
-            let coordinator_latest = self.get_coordinator_latest_block_state().await?.checkpoint_id;
+            let coordinator_latest = self.get_coordinator_latest_checkpoint_id().await?;
             if coordinator_latest > checkpoint_before {
                 return Ok(coordinator_latest);
             }
@@ -928,7 +921,9 @@ impl RpcProvider {
         poll_interval_secs: u64,
     ) -> anyhow::Result<u64> {
         let deadline = deadline_after(timeout_secs);
-        let mut latest = self.get_coordinator_latest_block_state().await?.checkpoint_id;
+        let provider = self.with_user_id_owned(user_id);
+        let mut latest = self.get_coordinator_latest_checkpoint_id().await?
+            .min(provider.get_realm_latest_checkpoint_id().await?);
 
         loop {
             match find_endcap_inclusion_in_range(checkpoint_before, latest, |checkpoint_id| {
@@ -960,17 +955,17 @@ impl RpcProvider {
             }
 
             sleep_for(Duration::from_secs(poll_interval_secs)).await;
-            latest = self.get_coordinator_latest_block_state().await?.checkpoint_id;
+            latest = self.get_coordinator_latest_checkpoint_id().await?
+                .min(provider.get_realm_latest_checkpoint_id().await?);
         }
     }
 
     pub async fn get_tx_status(&self, user_id: u64, nonce: u64) -> anyhow::Result<TxStatus> {
         tracing::info!("Fetching tx status user_id: {}, nonce: {}", user_id, nonce);
-        let latest_checkpoint_id = self.get_latest_block_state().await?.checkpoint_id;
-        let expected_nonce = match self.get_user_leaf_data(latest_checkpoint_id, user_id).await {
-            Ok(user_leaf) => user_leaf.nonce.to_canonical_u64() + 1,
-            Err(_) => 1,
-        };
+        let provider = self.with_user_id_owned(user_id);
+        let latest_checkpoint_id = provider.get_realm_latest_checkpoint_id().await?;
+        let user_leaf = provider.get_user_leaf_data(latest_checkpoint_id, user_id).await?;
+        let expected_nonce = user_leaf.nonce.to_canonical_u64() + 1;
         tracing::debug!("get user {} tx status at nonce {}, expected_nonce {}", user_id, nonce, expected_nonce);
 
         if nonce != expected_nonce {
@@ -2258,6 +2253,115 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+
+    #[tokio::test]
+    async fn latest_block_state_uses_committed_checkpoint() -> anyhow::Result<()> {
+        let server = jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await?;
+        let url = format!("http://{}", server.local_addr()?);
+        let mut module = jsonrpsee::RpcModule::new(());
+        module.register_method("psy_get_latest_checkpoint_id", |_, _, _| 7u64)?;
+        // A block state may be visible before the committed checkpoint marker advances.
+        module.register_method("psy_get_latest_l2_block_state", |_, _, _| {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(PsyBlockState { checkpoint_id: 8, ..Default::default() })
+        })?;
+        module.register_method("psy_get_l2_block_state", |params, _, _| {
+            let input: QBlockStateRPCRequest = params.parse()?;
+            let checkpoint_id = input.checkpoint_id;
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(PsyBlockState { checkpoint_id, ..Default::default() })
+        })?;
+        module.register_method("psy_get_checkpoint_tree_root", |params, _, _| {
+            let input: crate::request::QCheckpointTreeRootRPCRequest = params.parse()?;
+            assert_eq!(input.checkpoint_id, 7);
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(QHashOut::<F>::ZERO)
+        })?;
+        let handle = server.start(module);
+        let provider = RpcProvider {
+            client: Arc::new(Client::new()),
+            endpoint_clients: None,
+            realm_configs: HashMap::from([(0, vec![url.clone()])]),
+            coordinator_configs: HashMap::from([(0, vec![url])]),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        };
+        assert_eq!(provider.get_realm_latest_checkpoint_id().await?, 7);
+        assert_eq!(provider.get_coordinator_latest_checkpoint_id().await?, 7);
+        assert_eq!(provider.get_realm_latest_block_state().await?.checkpoint_id, 7);
+        assert_eq!(provider.get_coordinator_latest_block_state().await?.checkpoint_id, 7);
+        assert_eq!(provider.get_latest_checkpoint_tree_root().await?, QHashOut::<F>::ZERO);
+        handle.stop()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tx_status_uses_target_realm_and_propagates_read_errors() -> anyhow::Result<()> {
+        let server = jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await?;
+        let url = format!("http://{}", server.local_addr()?);
+        let mut module = jsonrpsee::RpcModule::new(());
+        module.register_method("psy_get_latest_checkpoint_id", |_, _, _| 7u64)?;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        module.register_method("psy_get_user_leaf_data", move |params, _, _| {
+            let input: crate::request::QUserLeafDataRPCRequest = params.parse()?;
+            assert_eq!(input.checkpoint_id, 7);
+            assert_eq!(input.user_id, 1_048_576);
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // Realm RPC returns a zero-nonce leaf for a user absent from storage.
+                let leaf = psy_client_data::qdata::user::PsyUserLeaf::<F>::default();
+                return Ok(serde_json::to_value(leaf).unwrap());
+            }
+            Err::<serde_json::Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(-32001, "target realm unavailable", None::<()>))
+        })?;
+        let handle = server.start(module);
+        let provider = RpcProvider {
+            client: Arc::new(Client::new()),
+            endpoint_clients: None,
+            // No route for current_user_id: using that user's Realm must fail.
+            realm_configs: HashMap::from([(1, vec![url])]),
+            coordinator_configs: HashMap::new(),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        };
+        assert!(matches!(provider.get_tx_status(1_048_576, 1).await?, TxStatus::Submittable));
+        let error = provider.get_tx_status(1_048_576, 1).await.expect_err("read failure must not become Submittable");
+        assert!(error.to_string().contains("target realm unavailable"), "{error}");
+        handle.stop()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realm_commit_marker_bounds_confirmation_and_claim_reads() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await?;
+        let url = format!("http://{}", server.local_addr()?);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut module = jsonrpsee::RpcModule::new(());
+        let marker_calls = calls.clone();
+        module.register_method("psy_get_latest_checkpoint_id", move |_, _, _| {
+            if marker_calls.fetch_add(1, Ordering::SeqCst) % 2 == 0 { 10u64 } else { 7u64 }
+        })?;
+        let leaf_reads = reads.clone();
+        module.register_method("psy_get_user_leaf_data", move |_, _, _| {
+            leaf_reads.fetch_add(1, Ordering::SeqCst);
+            Err::<serde_json::Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(-32001, "uncommitted leaf read", None::<()>))
+        })?;
+        let handle = server.start(module);
+        let provider = RpcProvider {
+            client: Arc::new(Client::new()),
+            endpoint_clients: None,
+            realm_configs: HashMap::from([(0, vec![url.clone()])]),
+            coordinator_configs: HashMap::from([(0, vec![url])]),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        };
+        let error = provider.wait_for_endcap_inclusion(0, QHashOut::<F>::ZERO, 8, Some(0), 1).await.unwrap_err();
+        assert!(error.to_string().contains("timeout waiting endcap inclusion"));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let error = provider.get_claim_amount(8, 0, 1).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds committed Realm checkpoints 10 and 7"), "{error}");
+        handle.stop()?;
+        Ok(())
+    }
 
     fn rpc_error(code: crate::request::ErrorCode, message: &'static str) -> crate::request::RpcError {
         crate::request::RpcError {

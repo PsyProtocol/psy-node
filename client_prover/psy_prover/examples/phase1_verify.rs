@@ -111,7 +111,7 @@ async fn run_case(
     call_data: ContractCallData,
     expect_deferred: bool,
 ) -> anyhow::Result<()> {
-    let before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+    let before = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
     let trace = wallet_session.generate_tx_trace(user_pk, call_data).await?;
     let deferred_count = trace
         .steps

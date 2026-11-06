@@ -363,7 +363,7 @@ pub(crate) async fn run_items(
     }
 
     let call_data = ContractCallData::new(ordered_calls);
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
     let trace = builder.finalize_tx_trace_with_opts(call_data.software_defined_call.clone()).await?;
     let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
     let envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data)?)?;

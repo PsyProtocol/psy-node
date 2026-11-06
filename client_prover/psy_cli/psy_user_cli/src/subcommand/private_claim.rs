@@ -24,16 +24,16 @@ const NOTE_TREE_HEIGHT: usize = 20;
 async fn wait_checkpoint_with_nonce_change(provider: &RpcProvider, user_id: u64, checkpoint_before: u64, baseline_nonce: u64) -> anyhow::Result<u64> {
     let mut max_seen_latest = checkpoint_before;
     for _ in 0..180 {
-        let coordinator_latest = provider.get_coordinator_latest_block_state().await.ok().map(|s| s.checkpoint_id);
-        let realm_latest = provider.get_realm_latest_block_state().await.ok().map(|s| s.checkpoint_id);
+        let coordinator_latest = provider.get_coordinator_latest_checkpoint_id().await.ok();
+        let realm_latest = provider.with_user_id_owned(user_id).get_realm_latest_checkpoint_id().await.ok();
         let latest = match (coordinator_latest, realm_latest) {
             (Some(c), Some(r)) => c.min(r),
-            (Some(c), None) => c,
-            (None, Some(r)) => r,
-            (None, None) => {
+            (_, None) => {
+                tracing::debug!(?coordinator_latest, "Realm checkpoint RPC failed; waiting for committed Realm height");
                 sleep(Duration::from_secs(1)).await;
                 continue;
-            }
+            },
+            (None, Some(r)) => r,
         };
         if latest > max_seen_latest {
             max_seen_latest = latest;
@@ -192,7 +192,7 @@ pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<CommandResult> {
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No user id found for receiver public key"))?;
 
-    let checkpoint_before = provider.get_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_realm_latest_checkpoint_id().await?;
     let baseline_nonce = provider
         .get_user_leaf_data(checkpoint_before, receiver_user_id)
         .await?

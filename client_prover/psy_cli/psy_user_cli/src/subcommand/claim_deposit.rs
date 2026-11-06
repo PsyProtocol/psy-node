@@ -545,7 +545,7 @@ async fn run_inner(args: &ClaimDepositArgs) -> anyhow::Result<CommandResult> {
         verifier_data: circuit.get_verifier_config_ref().into(),
     };
 
-    let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let checkpoint_before = provider.get_coordinator_latest_checkpoint_id().await?;
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     submit_end_cap_proof::configure_wallet_session_for_signer(
         &mut wallet_session,

@@ -2130,7 +2130,7 @@ mod personal_registration_tests {
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 async fn registration_checkpoint_id(provider: &RpcProvider) -> anyhow::Result<u64> {
-    Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id)
+    Ok(provider.get_coordinator_latest_checkpoint_id().await?)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -2489,7 +2489,7 @@ impl WalletSession {
     }
 
     async fn check_submit_anchor(&self, user_id: u64, start_user_leaf_hash: QHashOut<F>) -> anyhow::Result<()> {
-        let checkpoint_id = self.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_id = self.st_provider.get_realm_latest_checkpoint_id().await?;
         let latest_user_leaf = self.st_provider.get_user_leaf_data(checkpoint_id, user_id).await?;
         let latest_user_leaf_hash = latest_user_leaf.qfhash::<PsyHasher>();
         if start_user_leaf_hash != QHashOut::ZERO && latest_user_leaf_hash != start_user_leaf_hash {
@@ -9686,7 +9686,7 @@ mod async_split_tests {
 
     async fn wait_for_user_nonce_gt(wallet_session: &WalletSession, user_id: u64, baseline_nonce: u64) -> anyhow::Result<u64> {
         for _ in 0..60 {
-            let checkpoint_id = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+            let checkpoint_id = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
             let user_leaf = wallet_session.st_provider.get_user_leaf_data(checkpoint_id, user_id).await?;
             let nonce = user_leaf.nonce.to_canonical_u64();
             if nonce > baseline_nonce {
@@ -9701,7 +9701,7 @@ mod async_split_tests {
         let registration_id = get_registration_id_from_user_id(user_id);
         let provider = wallet_session.st_provider.with_user_id_owned(user_id);
         for _ in 0..120 {
-            let checkpoint_id = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+            let checkpoint_id = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
             let leaf_hash = provider.get_user_registration_tree_leaf_hash(checkpoint_id, registration_id).await?;
             if leaf_hash != QHashOut::ZERO {
                 return Ok(checkpoint_id);
@@ -9773,7 +9773,7 @@ mod async_split_tests {
         contract_id: u64,
         slot_index: u64,
     ) -> anyhow::Result<QHashOut<GoldilocksField>> {
-        let checkpoint_id = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_id = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
         let contract_leaf = wallet_session.st_provider.get_contract_leaf_data(contract_id).await?;
         let slot = wallet_session
             .st_provider
@@ -10215,7 +10215,7 @@ mod async_split_tests {
         min_value: u64,
     ) -> anyhow::Result<()> {
         for _ in 0..60 {
-            let checkpoint_id = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+            let checkpoint_id = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
             let contract_leaf = wallet_session.st_provider.get_contract_leaf_data(contract_id).await?;
             let slot = wallet_session
                 .st_provider
@@ -10543,7 +10543,7 @@ mod async_split_tests {
         let user1_id = wallet_session.resolve_registered_user_id(user1).await?;
 
         tracing::info!("step-claim test: start mint");
-        let mint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let mint_before = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
         let mint_trace = wallet_session
             .generate_tx_trace(
                 user0,
@@ -10564,7 +10564,7 @@ mod async_split_tests {
         tracing::info!("step-claim test: mint included");
 
         tracing::info!("step-claim test: start transfer");
-        let transfer_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let transfer_before = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
         let transfer_trace = wallet_session
             .generate_tx_trace(
                 user0,
@@ -10824,7 +10824,7 @@ mod async_split_tests {
         // Fund sender for both transfers and receiver for batch-claim fee.
         let baseline_sender_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user0_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -10843,7 +10843,7 @@ mod async_split_tests {
 
         let baseline_receiver_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user1_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user1_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -10863,7 +10863,7 @@ mod async_split_tests {
         // Prepare a public pending claim for receiver.
         let baseline_sender_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user0_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -10910,7 +10910,7 @@ mod async_split_tests {
 
         let private_claim = load_private_transfer_claim_from_file(&mut wallet_session, &note_path, 111, 222).await?;
 
-        let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_before = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
         let baseline_balance = get_contract_slot_value(&wallet_session, user1_id, contract_id, 0).await?.0.elements[0].to_canonical_u64();
 
         let end_user_leaf_hash = wallet_session
@@ -10956,7 +10956,7 @@ mod async_split_tests {
 
         let baseline_sender_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user0_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -10975,7 +10975,7 @@ mod async_split_tests {
 
         let baseline_receiver_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user1_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user1_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -10994,7 +10994,7 @@ mod async_split_tests {
 
         let baseline_sender_nonce = wallet_session
             .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
+            .get_user_leaf_data(wallet_session.st_provider.get_realm_latest_checkpoint_id().await?, user0_id)
             .await?
             .nonce
             .to_canonical_u64();
@@ -11044,7 +11044,7 @@ mod async_split_tests {
             }
         };
 
-        let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_before = wallet_session.st_provider.get_realm_latest_checkpoint_id().await?;
         let baseline_public_balance = get_contract_slot_value(&wallet_session, user1_id, public_contract_id, 0)
             .await?
             .0

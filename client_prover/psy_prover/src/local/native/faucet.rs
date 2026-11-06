@@ -362,7 +362,7 @@ impl PsyFaucetService {
 
     async fn operator_leaf_hash(&self, user_id: u64) -> anyhow::Result<QHashOut<F>> {
         let provider = self.wallet_session.st_provider.with_user_id_owned(user_id);
-        let checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
+        let checkpoint_id = provider.get_realm_latest_checkpoint_id().await?;
         let leaf = provider.get_user_leaf_data(checkpoint_id, user_id).await?;
         Ok(leaf.qfhash::<PsyHasher>())
     }
