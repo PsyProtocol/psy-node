@@ -637,6 +637,8 @@ where
             self.db
                 .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, realm_proof)
                 .await?;
+            self.sync_contract_heights_registered_at(checkpoint_id, &checkpoint_sync.block_state)
+                .await?;
             self.db
                 .set_l2_block_state(checkpoint_id, &checkpoint_sync.block_state)
                 .await?;
@@ -644,6 +646,119 @@ where
             latest_sync_info = Some(sync_info);
         }
         Ok(latest_sync_info)
+    }
+
+    /// Stores, at `checkpoint_id`, the heights of the contracts the Coordinator registered there: the ids from
+    /// the previous checkpoint's `next_contract_id` up to `block_state.next_contract_id`.
+    ///
+    /// Every path that persists a checkpoint's block state must call this before writing it. The marker-based
+    /// `sync_contract_heights` calls start from the `next_contract_id` stored at the local marker, so once a
+    /// block state that already counts a new contract is stored and the marker reaches it (for example when
+    /// `commit_state` adopts another validator's proposal), those calls never fetch that contract's height.
+    /// Baseline replay then reads height 0 and the validator refuses to vote.
+    pub(super) async fn sync_contract_heights_registered_at(
+        &self,
+        checkpoint_id: u64,
+        block_state: &QEDL2BlockState,
+    ) -> anyhow::Result<()> {
+        if checkpoint_id == 0 {
+            return Ok(());
+        }
+        let previous_checkpoint_id = checkpoint_id - 1;
+        let previous_next_contract_id = match self.db.try_get_complete_l2_block_state(previous_checkpoint_id).await? {
+            Some(previous) => previous.next_contract_id,
+            None => {
+                self.coordinator_client
+                    .rc_get_realm_sync_info(previous_checkpoint_id, self.state.realm_id_u64)
+                    .await
+                    .with_context(|| {
+                        format!("block state of checkpoint {previous_checkpoint_id} unavailable for contract height sync")
+                    })?
+                    .checkpoint_sync_info
+                    .block_state
+                    .next_contract_id
+            }
+        };
+        self.sync_contract_heights(previous_next_contract_id, block_state.next_contract_id, checkpoint_id)
+            .await
+    }
+
+    /// Repairs contract heights that databases written before `sync_contract_heights_registered_at` never
+    /// stored. For every registered contract whose local height at the latest complete checkpoint is 0 while
+    /// the Coordinator reports a height there, it locates the checkpoint at which the Coordinator first reports
+    /// a non-zero height and stores that height at it, so baseline replay at any later checkpoint reads it.
+    /// When the Coordinator's height at the local checkpoint differs from the one at creation, that value is
+    /// stored at the local checkpoint as well. The heights come from the same Coordinator RPC the normal sync
+    /// path trusts. Returns the number of contracts repaired.
+    pub async fn backfill_missing_contract_heights(&self) -> anyhow::Result<usize> {
+        let marker = self.db.get_latest_checkpoint_id().await?;
+        let (checkpoint_id, block_state) = self.get_latest_available_l2_block_state(marker).await?;
+        let ids: Vec<u64> = (0..block_state.next_contract_id as u64).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let local = self.db.get_contract_tree_heights(checkpoint_id, &ids).await?;
+        let missing: Vec<u64> = ids.iter().zip(local.iter()).filter(|(_, height)| **height == 0).map(|(id, _)| *id).collect();
+        let mut repaired = 0usize;
+        for chunk in missing.chunks(1000) {
+            let remote = self.coordinator_client.rc_get_contract_tree_state_heights(checkpoint_id, chunk.to_vec()).await?;
+            anyhow::ensure!(
+                remote.len() == chunk.len(),
+                "Contract height count mismatch at checkpoint {}: requested {} ids, got {} heights",
+                checkpoint_id,
+                chunk.len(),
+                remote.len()
+            );
+            for (&contract_id, &height_at_checkpoint) in chunk.iter().zip(remote.iter()) {
+                if height_at_checkpoint == 0 {
+                    continue;
+                }
+                let (created_at, height_at_creation) = self.first_nonzero_contract_height(contract_id, checkpoint_id).await?;
+                self.db.set_contract_tree_heights(created_at, &[(contract_id, height_at_creation)]).await?;
+                if height_at_creation != height_at_checkpoint && created_at != checkpoint_id {
+                    self.db.set_contract_tree_heights(checkpoint_id, &[(contract_id, height_at_checkpoint)]).await?;
+                }
+                tracing::warn!(
+                    "Backfilled missing contract height: contract_id={} height={} created_at_checkpoint={} local_checkpoint={} height_at_local_checkpoint={}",
+                    contract_id,
+                    height_at_creation,
+                    created_at,
+                    checkpoint_id,
+                    height_at_checkpoint
+                );
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            tracing::warn!("Backfilled {} missing contract heights at local checkpoint {}", repaired, checkpoint_id);
+        }
+        Ok(repaired)
+    }
+
+    /// Binary search for the first checkpoint at or below `upper` where the Coordinator reports a non-zero
+    /// height for `contract_id`; the caller has already seen a non-zero height at `upper`.
+    async fn first_nonzero_contract_height(&self, contract_id: u64, upper: u64) -> anyhow::Result<(u64, u8)> {
+        let height_at = |checkpoint_id: u64| async move {
+            let heights = self.coordinator_client.rc_get_contract_tree_state_heights(checkpoint_id, vec![contract_id]).await?;
+            heights.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("Coordinator returned no height for contract {} at checkpoint {}", contract_id, checkpoint_id)
+            })
+        };
+        let mut low = 0u64;
+        let mut high = upper;
+        let mut found = height_at(upper).await?;
+        anyhow::ensure!(found != 0, "contract {} has no height at checkpoint {}", contract_id, upper);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let height = height_at(middle).await?;
+            if height != 0 {
+                high = middle;
+                found = height;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok((high, found))
     }
 
     async fn sync_contract_heights(&self, start_id: u32, end_id: u32, checkpoint_id: u64) -> anyhow::Result<()> {
@@ -1111,6 +1226,131 @@ mod sync_tests {
             Ok(_) => panic!("coordinator behind the local head must fail"),
         };
         assert!(err.to_string().contains("ahead of coordinator"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// A follower adopts another validator's proposal in three steps: `sync_with_coordinator`
+    /// persists the checkpoint metadata, `commit_state` moves the marker to the including
+    /// checkpoint, and `sync_to_coordinator_checkpoint_id` then finds the marker already there.
+    /// When that checkpoint registers contracts, the heights must still be stored at it, or a
+    /// later baseline replay fails with `MissingAuthenticatedState` and the follower refuses
+    /// to vote.
+    #[tokio::test]
+    async fn adopted_checkpoint_keeps_heights_of_contracts_registered_at_it() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        let genesis_next_contract_id = env.db.get_l2_block_state(0).await?.next_contract_id;
+        assert!(
+            genesis_next_contract_id < update.checkpoint_sync_info.block_state.next_contract_id,
+            "checkpoint 1 must register contracts for this test"
+        );
+        let registered: Vec<u64> = (genesis_next_contract_id as u64..update.checkpoint_sync_info.block_state.next_contract_id as u64).collect();
+        env.seed_checkpoint_one(update.clone(), local_root);
+
+        env.processor.sync_with_coordinator().await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0, "metadata sync must not move the marker");
+        assert_eq!(
+            env.db.get_contract_tree_heights(1, &registered).await?,
+            vec![8u8; registered.len()],
+            "persisted checkpoint metadata must carry the heights of contracts registered at it"
+        );
+
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await?;
+        env.processor.sync_to_coordinator_checkpoint_id(1).await?;
+
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &registered).await?, vec![8u8; registered.len()]);
+        assert_eq!(
+            env.db.get_contract_tree_heights(0, &registered).await?,
+            vec![0u8; registered.len()],
+            "contracts registered at checkpoint 1 must not appear at checkpoint 0"
+        );
+        Ok(())
+    }
+
+    /// A database left by an older build counts contracts at its latest checkpoint but reads height 0 for
+    /// them. The startup backfill stores the Coordinator's height at the registration checkpoint, skips
+    /// contracts the Coordinator also reports as 0, and does nothing on a second run.
+    #[tokio::test]
+    async fn backfill_restores_heights_missing_at_the_local_checkpoint() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        env.processor.set_new_unique_ids(None).await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        assert_eq!(update.checkpoint_sync_info.block_state.next_contract_id, 2);
+        env.seed_checkpoint_one(update.clone(), local_root);
+
+        // Commit checkpoint 1 while the Coordinator still reports no heights, which leaves the same
+        // database state the old build left: next_contract_id = 2 with both heights reading 0.
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(0u64, (5u64, 4u8)), (1u64, (5u64, 6u8))].into_iter().collect();
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await?;
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &[0, 1]).await?, vec![0, 0]);
+
+        // The Coordinator's history: contract 0 registered at checkpoint 1, contract 1 not yet registered.
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(0u64, (1u64, 4u8)), (1u64, (5u64, 6u8))].into_iter().collect();
+        assert_eq!(env.processor.backfill_missing_contract_heights().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &[0, 1]).await?, vec![4, 0]);
+        assert_eq!(
+            env.db.get_contract_tree_heights(0, &[0]).await?,
+            vec![0],
+            "the backfill must not place a height before the registration checkpoint"
+        );
+        assert_eq!(env.processor.backfill_missing_contract_heights().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_nonzero_contract_height_finds_the_registration_checkpoint() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        *env.coordinator.registered_contract_heights.lock().unwrap() =
+            [(30u64, (49_775u64, 2u8)), (0u64, (0u64, 32u8))].into_iter().collect();
+        assert_eq!(env.processor.first_nonzero_contract_height(30, 51_896).await?, (49_775, 2));
+        assert_eq!(env.processor.first_nonzero_contract_height(30, 49_775).await?, (49_775, 2));
+        assert_eq!(env.processor.first_nonzero_contract_height(0, 51_896).await?, (0, 32));
+        assert!(env.processor.first_nonzero_contract_height(30, 49_774).await.is_err());
         Ok(())
     }
 

@@ -289,6 +289,10 @@ where
             .checkpoint_sync_info
             .ensure_valid::<N::HasherBase>(&membership.siblings)?;
 
+        // Init catch-up commits checkpoints whose metadata was never persisted by the sync path, and
+        // the marker moves past them here, so the contract heights they register must be stored first.
+        self.sync_contract_heights_registered_at(checkpoint_id, &coordinator_update.checkpoint_sync_info.block_state)
+            .await?;
         let unique_pending_id = self.state.processing_unique_pending_id;
         apply_prepared_realm_checkpoint::<N, S>(
             self.db.as_ref(),
@@ -386,7 +390,9 @@ mod commit_tests {
     use parth_core::{QCoreProcCheckpointUniqueId, PHash};
     use psy_core::job::job_id::ProvingJobCircuitType;
     use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
-    use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreDatabaseBasicContractInfoStoreReader,
+    };
     use psy_node_core::psy_temp_db::QTempDBPendingIdReader;
 
     use crate::realm::processor::db::realm_db_test_env::*;
@@ -549,6 +555,45 @@ mod commit_tests {
         assert_eq!(state.last_committed_unique_pending_id, 1);
         assert_eq!(state.last_committed_proc_checkpoint_unique_id, proc_id);
         assert_eq!(state.last_committed_checkpoint_root, authenticated_root);
+        Ok(())
+    }
+
+    /// Init catch-up commits a checkpoint without the metadata sync running first. The contract
+    /// heights the checkpoint registers must be stored before the marker moves past it.
+    #[tokio::test]
+    async fn commit_state_stores_heights_of_contracts_registered_at_the_checkpoint() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+        let update = env.make_checkpoint_one_update();
+        env.seed_checkpoint_one(update.clone(), local_root);
+        let start = env.db.get_l2_block_state(0).await?.next_contract_id as u64;
+        let end = update.checkpoint_sync_info.block_state.next_contract_id as u64;
+        assert!(start < end, "checkpoint 1 must register contracts for this test");
+        let registered: Vec<u64> = (start..end).collect();
+
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
+            .await?;
+
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_contract_tree_heights(1, &registered).await?, vec![8u8; registered.len()]);
         Ok(())
     }
 
