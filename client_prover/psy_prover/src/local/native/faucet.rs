@@ -24,13 +24,14 @@ use tokio::sync::Semaphore;
 
 use super::{
     faucet_batch::{ClaimQueue, ClaimReceipt, QueuedClaim},
+    faucet_operator_keys::{add_operators, OperatorKey, OPERATOR_ADD_PASSES, OPERATOR_ADD_RETRY_DELAY},
     faucet_operators::{Lease, OperatorPool, Settle, Unavailable},
     faucet_tasks::{complete_claim, ClaimGuard},
 };
 use crate::session::{EndCapSubmissionError, WalletSession};
 
 type C = PoseidonGoldilocksConfig;
-type F = <C as GenericConfig<D>>::F;
+pub(super) type F = <C as GenericConfig<D>>::F;
 const D: usize = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -93,9 +94,9 @@ struct PsyFaucetOperatorConfig {
 }
 
 #[derive(Debug, Clone)]
-struct PsyFaucetOperator {
-    user_id: u64,
-    public_key: QHashOut<F>,
+pub(super) struct PsyFaucetOperator {
+    pub(super) user_id: u64,
+    pub(super) public_key: QHashOut<F>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,7 +287,7 @@ impl PsyFaucetService {
         }
         let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, sd_key_config).await?;
 
-        let mut operators = Vec::with_capacity(config.operators.len());
+        let mut operator_keys = Vec::with_capacity(config.operators.len());
         for operator in &config.operators {
             anyhow::ensure!(
                 operator.sign_type == "sd-key" || operator.sign_type == "SDKeySign",
@@ -302,24 +303,19 @@ impl PsyFaucetService {
                     fingerprint
                 );
             }
-
-            let user_id = operator.user_id.parse::<u64>()?;
-            let private_key = QHashOut::<F>::from_str(&operator.private_key)?;
-            let operator_fingerprint = QHashOut::<F>::from_str(&operator.fingerprint)?;
-            let expected_public_key = QHashOut::<F>::from_str(&operator.address)?;
-            let public_key = wallet_session.add_user_with_user_id(private_key, operator_fingerprint, user_id).await?;
-            anyhow::ensure!(
-                public_key == expected_public_key,
-                "faucet operator {} public key mismatch: config {}, generated {}",
-                user_id,
-                expected_public_key,
-                public_key
-            );
-            operators.push(PsyFaucetOperator { user_id, public_key });
+            operator_keys.push(OperatorKey {
+                user_id: operator.user_id.parse::<u64>()?,
+                private_key: QHashOut::<F>::from_str(&operator.private_key)?,
+                fingerprint: QHashOut::<F>::from_str(&operator.fingerprint)?,
+                expected_public_key: QHashOut::<F>::from_str(&operator.address)?,
+            });
         }
+        let operators =
+            add_operators(&mut wallet_session, operator_keys, OPERATOR_ADD_PASSES, OPERATOR_ADD_RETRY_DELAY).await?;
 
         tracing::info!(
             operator_count = operators.len(),
+            configured_operator_count = config.operators.len(),
             faucet_contract_id = config.faucet_contract_id,
             faucet_method_name = %config.faucet_method_name,
             amount = %config.faucet_per_claim_amount,
@@ -1257,7 +1253,7 @@ mod tests {
         env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
 
         // the offline session initializes, the sd-key circuit registers with a
-        // matching fingerprint, and the operator user lookup then fails on the
+        // matching fingerprint, and every operator add pass then fails on the
         // dead RPC registration index
         let error = PsyFaucetService::from_env(crate::test_support::dead_network_config())
             .await
@@ -1265,7 +1261,7 @@ mod tests {
             .unwrap();
         let message = error.to_string();
         assert!(
-            message.contains("not registered for explicit user_id") || message.contains("connection refused"),
+            message.contains(&format!("no faucet operator could be added after {OPERATOR_ADD_PASSES} passes")),
             "unexpected from_env failure: {message}"
         );
     }

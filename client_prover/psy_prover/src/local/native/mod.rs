@@ -1,5 +1,6 @@
 pub mod faucet;
 mod faucet_batch;
+mod faucet_operator_keys;
 mod faucet_operators;
 mod faucet_tasks;
 pub mod prove_proxy;
