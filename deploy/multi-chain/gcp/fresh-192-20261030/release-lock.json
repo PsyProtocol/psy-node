@@ -4,9 +4,9 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "6f0991fe65f974c026e446d4f4eb0974158f6aaddd408792b0015c026f28e05d",
-    "topology": "c518b6a639b244295273cbb58b91f516a9f3aff8720829099bb98978d18f6ad7",
-    "artifacts": "ad6616c4cf7af3be65780549047409c7b825e241630f025ae298501ee5f570e4",
+    "release_profile": "b706ba064066bf8fe36f2e861f4872f129df9d8f8035d9d0798837c6fe45bac6",
+    "topology": "13f74417890cc34c5929da7073cecf6226cd1f537e864065dd021083d6687020",
+    "artifacts": "a549323855a4eb5b462f8fb8bf8e5d51e4e93ce7c9a87aa6eceaa58ef150a599",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
@@ -16,7 +16,7 @@
     "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
-    "runtime": "61de5a4a6f7d26ac7926246579f07cc5901f6ee6",
+    "runtime": "eadce423f4327b248ee67b9770ade0c44e28c556",
     "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -26,10 +26,10 @@
     "notifier": "d80a89f390623f59d7bad0750a485793aee31358"
   },
   "binaries": {
-    "psy_dev_cli": "1ccf26c9dc02d7607943269a209242b374834df74b9899c63861b8c1f34aad3a",
+    "psy_dev_cli": "e01631cf40f78ad361d5443a5bc3d68b4fd999aefcd5294f20435d789044002f",
     "psy_node_cli": "eedce3e469fa49427c453037c66028a575038d80f93dd8be86e8e6ffd10411f6",
-    "psy_relayer_cli": "59aaf31bfa2a4d80a6f58c9c12b3bd0de6e37fe50c424d2b33be4ff0625aa622",
-    "psy_user_cli": "22e195614b2fda5eeeed883d1e81fe924fb6283e48c73c92eef2f905ee178d20",
+    "psy_relayer_cli": "31a535a936b9737324df8ca9f2f437d94e901995fa328c38198e9a5688c848dd",
+    "psy_user_cli": "987e9f0e9600a36ae39f729dbcd0b8d9045f7eb5d9896b90151cc57b24f6d9e7",
     "psy_worker_cli": "5ff85cb3aa05addd3241ef5426415f739e2f1e1710569b3570609cd762a69559",
     "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
     "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a"
@@ -214,7 +214,7 @@
     "install_relayer.py": "5e15d87644ec078eb40f4f62b69c34da4a1b02770888d9c63b5b6b7a8319e184",
     "install_services.py": "56b4be1afc66fde56f6e0a461b3a9350d419e4a38aecc982127db1f78748e3df",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
-    "prepare_faucet.py": "4d219b12c569f4ace495ea03e9a26436be91d48a100575980babdcdd505eb697",
+    "prepare_faucet.py": "74019690fe26d427ef70cbeda86507ba188b8c97f57a51715d540123d63299db",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "bad8ba5f20d8e4b7deda67fbefa06b94fda5bb2fa67002df052ba1c5f0a9cf1c",
     "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",

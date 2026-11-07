@@ -131,8 +131,7 @@ def unit_text(release, spec_sha):
 Description=Psy Faucet batched claims (10 per End Cap)
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -152,6 +151,8 @@ Environment=PSY_FAUCET_WINDOW_CHECKPOINTS=120
 ExecStart=/usr/bin/python3 -I -B {release.release}/prepare_faucet.py run --release-lock {release.release}/release-lock.json --release-lock-sha256 {release.lock_sha256} --spec-sha256 {spec_sha}
 Restart=on-failure
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
 TimeoutStopSec=180
 KillSignal=SIGINT
 UMask=0077
@@ -165,7 +166,7 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitCORE=0
 LimitNOFILE=65536
-MemoryMax=20G
+MemoryMax=28G
 MemorySwapMax=0
 
 [Install]

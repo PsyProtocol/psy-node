@@ -81,7 +81,7 @@ class FaucetTests(unittest.TestCase):
         self.assertFalse(manifest["public_switch_allowed"])
         self.assertEqual(manifest["operator_count"], 100)
         unit = files[self.release.unit].decode()
-        for value in ("MemoryMax=20G", "MemorySwapMax=0", "Restart=on-failure", "RAYON_NUM_THREADS=4",
+        for value in ("MemoryMax=28G", "MemorySwapMax=0", "Restart=on-failure", "RAYON_NUM_THREADS=4",
                       "PSY_FAUCET_WINDOW_CHECKPOINTS=120", "PSY_FAUCET_REQUIRE_TURNSTILE=0",
                       "MALLOC_CONF=narenas:16", "User=faucet-account", "LoadCredentialEncrypted=operators.json:",
                       "StateDirectory=faucet-state", str(self.release.state),
@@ -97,11 +97,18 @@ class FaucetTests(unittest.TestCase):
         unit = faucet.unit_text(self.release, "0" * 64).decode()
         live = ("Environment=PSY_NETWORK=testnet", "Environment=RUST_LOG=info,psy_provider=warn",
                 "Environment=RAYON_NUM_THREADS=4", "Environment=PSY_FAUCET_REQUIRE_TURNSTILE=0",
-                "Environment=PSY_FAUCET_WINDOW_CHECKPOINTS=120", "MemoryMax=20G", "MemorySwapMax=0",
+                "Environment=PSY_FAUCET_WINDOW_CHECKPOINTS=120", "MemoryMax=28G", "MemorySwapMax=0",
                 "Restart=on-failure", "RestartSec=10", "LimitNOFILE=65536", "KillSignal=SIGINT", "TimeoutStopSec=180",
                 "Environment=MALLOC_CONF=narenas:16,dirty_decay_ms:1000,muzzy_decay_ms:1000")
         for line in live:
             self.assertIn(line + "\n", unit)
+
+    def test_restart_never_hits_the_start_limit(self):
+        # A Realm outage once failed three starts in five minutes and the start limit left the faucet down for hours.
+        unit = faucet.unit_text(self.release, "0" * 64).decode()
+        for line in ("StartLimitIntervalSec=0", "RestartSteps=5", "RestartMaxDelaySec=300"):
+            self.assertIn(line + "\n", unit)
+        self.assertNotIn("StartLimitBurst=", unit)
 
     def test_operator_set_hash_matches_lock(self):
         self.prepare()
