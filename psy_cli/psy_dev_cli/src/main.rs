@@ -58,6 +58,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::FreshDevnetState(args) => {
             subcommand::fresh_devnet_state::run(args.repo_root, args.guardians_root).await?;
         }
+        Commands::Benchmark(args) => {
+            subcommand::benchmark::run(args).await?;
+        }
     }
     Ok(())
 }

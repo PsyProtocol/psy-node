@@ -14,6 +14,7 @@ pub mod fresh_devnet_state;
 pub mod bridge_database;
 pub mod restore_bridge_state;
 pub(crate) mod bridge_state_snapshot;
+pub mod benchmark;
 
 use chain_info::ChainInfoArgs;
 use generate_genesis::GenerateGenesisDataArgs;
@@ -55,6 +56,8 @@ pub enum Commands {
     GenerateGenesisData(GenerateGenesisDataArgs),
     #[command(name = "fresh-devnet-state", about = "Reset owned devnet state under exclusive database locks; the canonical configuration is read-only")]
     FreshDevnetState(FreshDevnetStateArgs),
+    #[command(name = "benchmark", about = "Node end-to-end benchmark scenarios: account pool, registration, contract deploy, and real EndCap proving")]
+    Benchmark(benchmark::BenchmarkArgs),
     #[command(name = "restore-bridge-state", about = "Rebuild the four bridge journals from checkpoint T after every role-local rollback has completed")]
     RestoreBridgeState(restore_bridge_state::RestoreBridgeStateArgs),
 }

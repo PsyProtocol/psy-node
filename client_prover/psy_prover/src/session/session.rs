@@ -2384,7 +2384,25 @@ impl WalletSession {
         Ok(hinted_user_id)
     }
 
+    /// Resolve with bounded retries: a transient RPC failure must not surface
+    /// as "user not registered" — registration is a committed chain fact, and
+    /// the underlying queries can flake on lossy links.
     async fn resolve_registered_user_id(&self, public_key: QHashOut<F>) -> anyhow::Result<u64> {
+        const RETRIES: u32 = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        for attempt in 1..=RETRIES {
+            match self.resolve_registered_user_id_once(public_key).await {
+                Ok(user_id) => return Ok(user_id),
+                Err(error) => {
+                    tracing::warn!(attempt, error = %error, "user id resolution failed; retrying");
+                    super::sleep(RETRY_DELAY).await;
+                }
+            }
+        }
+        self.resolve_registered_user_id_once(public_key).await
+    }
+
+    async fn resolve_registered_user_id_once(&self, public_key: QHashOut<F>) -> anyhow::Result<u64> {
         let mut candidate_ids = self.st_provider.get_user_ids_for_public_key(public_key).await?;
         if candidate_ids.is_empty() {
             anyhow::bail!("no user_id found for public key {}", public_key);
@@ -2400,6 +2418,7 @@ impl WalletSession {
         );
 
         let mut valid_candidates = Vec::new();
+        let mut proof_fetch_error: Option<anyhow::Error> = None;
         for user_id in candidate_ids {
             let registration_id = get_registration_id_from_user_id(user_id);
             match self
@@ -2429,11 +2448,22 @@ impl WalletSession {
                         "dropping candidate: failed to fetch registration merkle proof: {}",
                         err
                     );
+                    proof_fetch_error.get_or_insert(err);
                 }
             }
         }
 
         if valid_candidates.is_empty() {
+            // An RPC failure must not masquerade as "this user does not
+            // exist": if every candidate's proof fetch errored, surface the
+            // fetch failure so callers query again instead of re-registering.
+            if let Some(error) = proof_fetch_error {
+                anyhow::bail!(
+                    "user id resolution for public key {} at checkpoint {} failed: every candidate's registration proof fetch errored (last error: {error:#}); this is an RPC failure, not proof that the user is absent",
+                    public_key,
+                    latest_checkpoint_id
+                );
+            }
             anyhow::bail!(
                 "no valid user_id found for public key {} at checkpoint {}",
                 public_key,

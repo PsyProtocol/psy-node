@@ -94,6 +94,10 @@ alloy-primitives = { workspace = true }
 toml = { workspace = true }
 guardian_common = { path = "../guardian_common" }
 psy_crypto = { workspace = true }
+psy_provider = { workspace = true }
+psy_compiler = { workspace = true }
+psy_user_cli = { path = "../../client_prover/psy_cli/psy_user_cli" }
+fs2 = { workspace = true }
 
 
 [dev-dependencies]

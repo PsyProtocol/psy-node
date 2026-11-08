@@ -23,7 +23,7 @@ PSY_SKIP_BUILD ?= 1
 PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
+.PHONY: all build clean test check check-all benchmark-test bench-pool-create bench-register bench-deploy bench-endcap bench-faucet bench-claim psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
 
 all: build
 
@@ -234,3 +234,77 @@ export-solidity-verifier-reward:
 	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/reward_claim $(CONTRACTS_DIR)/src/RewardClaimVerifier.sol
 
 export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
+
+# ---------------------------------------------------------------------------
+# End-to-end benchmark scenarios (psy_dev_cli benchmark).
+# The binary embeds the PSY_NETWORK build identity; build it with the same
+# network you target, e.g. PSY_NETWORK=testnet make build.
+# ---------------------------------------------------------------------------
+BENCH_POOL_DIR    ?= $(CURDIR)/local_checkpoints/bench-pool
+BENCH_CONTRACT    ?= $(CURDIR)/psy-genesis/token.json
+BENCH_COUNT       ?= 8
+BENCH_CONCURRENCY ?= 4
+BENCH_TX_COUNT    ?= 4
+BENCH_PROVE_CONCURRENCY ?= 2
+BENCH_CONFIRM_TIMEOUT   ?= 600
+# Contract id returned by bench-deploy (override on the command line, or read
+# it from $(BENCH_POOL_DIR)/pool.json ops[].tx_hash of the deploy scenario).
+# Contract id of the latest deploy op whose checkpoint inclusion resolved the
+# numeric id. Override with BENCH_CONTRACT_ID=<id> when needed.
+BENCH_CONTRACT_ID ?= 0
+BENCH_METHOD      ?= transfer
+BENCH_INPUTS      ?= [0, 100]
+
+benchmark-test:
+	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo test --release -p psy_dev_cli --lib benchmark
+
+bench-pool-create:
+	$(BIN_PREFIX)psy_dev_cli benchmark pool-create \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--count $(BENCH_COUNT) \
+		--concurrency $(BENCH_CONCURRENCY)
+
+bench-register:
+	$(BIN_PREFIX)psy_dev_cli benchmark register \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--concurrency $(BENCH_CONCURRENCY)
+
+bench-deploy:
+	$(BIN_PREFIX)psy_dev_cli benchmark deploy \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--contract-path $(BENCH_CONTRACT) \
+		--count $(BENCH_TX_COUNT) \
+		--concurrency $(BENCH_PROVE_CONCURRENCY) \
+		--confirm-timeout-secs $(BENCH_CONFIRM_TIMEOUT)
+
+bench-endcap:
+	@test -n "$(BENCH_CONTRACT_ID)" || (echo "no deploy op with a resolved contract id in $(BENCH_POOL_DIR)/pool.json; run 'make bench-deploy' first (or set BENCH_CONTRACT_ID=0 for the genesis token contract)"; exit 1)
+	$(BIN_PREFIX)psy_dev_cli benchmark endcap \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--contract-id $(BENCH_CONTRACT_ID) \
+		--method-name $(BENCH_METHOD) \
+		--inputs '$(BENCH_INPUTS)' \
+		--tx-count $(BENCH_TX_COUNT) \
+		--concurrency $(BENCH_PROVE_CONCURRENCY) \
+		--confirm-timeout-secs $(BENCH_CONFIRM_TIMEOUT)
+
+bench-faucet:
+	$(BIN_PREFIX)psy_dev_cli benchmark faucet \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--concurrency $(BENCH_CONCURRENCY) \
+		--confirm-timeout-secs $(BENCH_CONFIRM_TIMEOUT)
+
+# Token contract holding claimable faucet funds (token precompile deploys at id 0).
+BENCH_TOKEN_CONTRACT_ID ?= 0
+bench-claim:
+	$(BIN_PREFIX)psy_dev_cli benchmark claim \
+		--pool-dir $(BENCH_POOL_DIR) \
+		--rpc-config $(PSY_CONFIG_PATH) \
+		--contract-id $(BENCH_TOKEN_CONTRACT_ID) \
+		--concurrency $(BENCH_PROVE_CONCURRENCY) \
+		--confirm-timeout-secs $(BENCH_CONFIRM_TIMEOUT)
