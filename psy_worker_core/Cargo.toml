@@ -47,6 +47,7 @@ psy_serialize = { workspace = true }
 pderive = { workspace = true }
 cf_utils = { workspace = true }
 parth_core = { workspace = true }
+psy_worker_admission = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }

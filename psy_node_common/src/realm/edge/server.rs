@@ -62,6 +62,28 @@ pub async fn start_realm_edge_rpc_server<
     let mut rpc_module = RpcModule::new(handler.clone());
     rpc_module.merge(NodeEdgeWorkerRpcServer::into_rpc(handler.clone()))?;
     rpc_module.merge(RealmEdgeRpcServer::into_rpc(handler.clone()))?;
+    if let Some(admission) = psy_worker_admission::rpc::AdmissionEnv::from_env(1, realm_id.try_into()?, realm_sub_id.try_into()?)? {
+        let store = admission.connect().await?;
+        let gate: std::sync::Arc<dyn psy_worker_admission::service::KeyGate> = std::sync::Arc::new(crate::worker_whitelist::AdmissionGate(handler.worker_whitelist.clone()));
+        rpc_module.merge(admission.admission_rpc(store.clone(), Some(gate.clone()))?)?;
+        if admission.tasks_v2 {
+            // V2 tasks share the legacy queue. Enable only where every worker
+            // speaks V2: a legacy claim of the same job is outside the lease.
+            let adapter = std::sync::Arc::new(crate::realm::edge::task_adapter::RealmTaskAdapter {
+                handler: handler.clone(),
+                staging: std::sync::Arc::new(store.clone()),
+                lease_ms: 300_000,
+                staging_ttl_ms: admission.policy.receipt_retention_ms,
+            });
+            let flow = psy_worker_admission::flow::TaskFlow::new(
+                admission.lease_service(store, Some(gate))?, adapter.clone(), adapter, psy_worker_admission::flow::FlowConfig::default(),
+            );
+            rpc_module.merge(psy_worker_admission::rpc::WorkerTaskRpcServer::into_rpc(psy_worker_admission::rpc::TaskRpc::new(flow.clone())))?;
+            tokio::spawn(psy_worker_admission::rpc::run_maintenance(flow, std::time::Duration::from_secs(5)));
+            crate::worker_whitelist::disable_legacy_worker_api();
+            tracing::warn!("worker V2 task protocol enabled; legacy worker claim and submit are refused on this edge");
+        }
+    }
     let handle = server.start(rpc_module);
     print_cf_log_indicator("PSY_REALM_EDGE_RPC_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 

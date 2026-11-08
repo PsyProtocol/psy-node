@@ -32,6 +32,8 @@ pub struct PsyWorkerBasicAPIJobFetcher<Hash, JobId: std::hash::Hash + Eq, Signer
     pub api_signer: Arc<Signer>,
     pub api_signer_public_key: CompressedPublicKey,
     pub user_id: u64,
+    /// `PSY_WORKER_TASK_PROTOCOL=v2`: leases and PoW admission instead of legacy claims.
+    pub v2: Option<crate::api::v2_protocol::V2State>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
 
@@ -53,6 +55,7 @@ impl<
             api_signer: Arc::new(api_signer),
             api_signer_public_key: api_signer_public_key,
             user_id,
+            v2: crate::api::v2_protocol::enabled_from_env().expect("invalid PSY_WORKER_TASK_PROTOCOL configuration"),
             _phantom_hasher: std::marker::PhantomData,
         }
     }
@@ -78,6 +81,7 @@ impl<
             api_signer: Arc::new(api_signer),
             api_signer_public_key: api_signer_public_key,
             user_id,
+            v2: crate::api::v2_protocol::enabled_from_env().expect("invalid PSY_WORKER_TASK_PROTOCOL configuration"),
             _phantom_hasher: std::marker::PhantomData,
         }
     }
@@ -223,8 +227,18 @@ impl<
             tag.clone().into_owned_32bytes(),
         );
 
-        let fetch_result: Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>, _> =
-            api_client.unwrap().get_proving_work_with_child_proofs(signature, timed_request).await;
+        let api_client = api_client.unwrap().value().clone();
+        let fetch_result: anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>> = match &self.v2 {
+            None => api_client.get_proving_work_with_child_proofs(signature, timed_request).await.map_err(Into::into),
+            Some(v2) => {
+                let reward_tag = psy_worker_admission::FixedBytes(tag.clone().into_owned_32bytes());
+                match v2.claim(&api_client, api_url_hash, &*self.api_signer, &self.api_signer_public_key, reward_tag).await {
+                    Ok(Some(task)) => serde_json::from_value(task).map_err(Into::into),
+                    Ok(None) => return Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+        };
         match fetch_result {
             Ok(response) => {
                 let claim_metadata = PsyProvingJobClaimMetadata {
@@ -281,7 +295,13 @@ impl<
             API_REQUEST_SIGNATURE_VALID_DURATION_MS,
             tag.clone().into_owned_32bytes(),
         );
-        let submit_result: Result<(), _> = api_client.submit_proof_raw(signature, request, job_id.clone(), tag, proof).await;
+        let submit_result: anyhow::Result<()> = match &self.v2 {
+            None => api_client.submit_proof_raw(signature, request, job_id.clone(), tag, proof).await.map_err(Into::into),
+            Some(v2) => {
+                let reward_tag = psy_worker_admission::FixedBytes(tag.clone().into_owned_32bytes());
+                v2.submit(&api_client, api_url_hash, &*self.api_signer, &self.api_signer_public_key, job_id.clone(), reward_tag, proof).await
+            }
+        };
         match submit_result {
             Ok(_) => {
                 println!("[worker/basic_fetcher] submit_proof_raw ok: {:?}", job_id);

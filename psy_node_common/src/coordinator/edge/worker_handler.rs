@@ -61,7 +61,7 @@ impl<
         ProofStore,
     >
 {
-    async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
+    pub(crate) async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
         if let Some(proof) = self
             .proof_store
             .get_proof_bytes_by_job_id(job_id.get_output_id(), unique_pending_id)
@@ -442,6 +442,9 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
+        crate::worker_whitelist::ensure_legacy_worker_api_enabled()?;
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
