@@ -1488,17 +1488,26 @@ pub(crate) mod realm_db_test_env {
     /// Root of the append-only checkpoint tree whose first leaves are `leaves` and whose
     /// remaining leaves are empty.
     pub(crate) fn checkpoint_tree_root_for_leaves(leaves: &[PHash]) -> PHash {
+        checkpoint_tree_root_and_siblings_for_leaves(leaves, None).0
+    }
+
+    fn checkpoint_tree_root_and_siblings_for_leaves(leaves: &[PHash], mut index: Option<usize>) -> (PHash, Vec<PHash>) {
         let mut level_nodes = leaves.to_vec();
+        let mut siblings = Vec::new();
         for level in 0..N::CHECKPOINT_TREE_HEIGHT_USIZE {
             if level_nodes.len() % 2 == 1 {
                 level_nodes.push(zh(level));
+            }
+            if let Some(i) = index {
+                siblings.push(level_nodes[i ^ 1]);
+                index = Some(i / 2);
             }
             level_nodes = level_nodes
                 .chunks(2)
                 .map(|pair| PoseidonHasher::two_to_one(&pair[0], &pair[1]))
                 .collect();
         }
-        level_nodes[0]
+        (level_nodes[0], siblings)
     }
 
     pub(crate) fn fingerprint_config() -> PsyNodeCircuitFingerprintConfig<PHash> {
@@ -1586,6 +1595,7 @@ pub(crate) mod realm_db_test_env {
         pub guta_submit_attempts: Mutex<u64>,
         /// when set, `rc_submit_guta_proof` fails after counting the attempt
         pub fail_guta_submissions: Mutex<bool>,
+        pub guta_in_flight_checkpoint_id: Mutex<Option<u64>>,
         /// checkpoints the coordinator commits while it handles one `rc_submit_guta_proof` call
         pub checkpoints_committed_during_guta_submit: Mutex<u64>,
         pub wait_calls: Mutex<u64>,
@@ -1639,6 +1649,9 @@ pub(crate) mod realm_db_test_env {
         }
         pub(crate) fn set_fail_guta_submissions(&self, fail: bool) {
             *self.fail_guta_submissions.lock().unwrap() = fail;
+        }
+        pub(crate) fn set_guta_in_flight_checkpoint_id(&self, checkpoint_id: u64) {
+            *self.guta_in_flight_checkpoint_id.lock().unwrap() = Some(checkpoint_id);
         }
         pub(crate) fn guta_submit_attempt_count(&self) -> u64 {
             *self.guta_submit_attempts.lock().unwrap()
@@ -1731,6 +1744,9 @@ pub(crate) mod realm_db_test_env {
             let committed_meanwhile = *self.checkpoints_committed_during_guta_submit.lock().unwrap();
             for _ in 0..committed_meanwhile {
                 self.commit_next_checkpoint();
+            }
+            if let Some(checkpoint_id) = self.guta_in_flight_checkpoint_id.lock().unwrap().take() {
+                return Err(crate::p2p::guta_submit::GutaSubmitError::retryable_in_flight("in flight", checkpoint_id).into());
             }
             if *self.fail_guta_submissions.lock().unwrap() {
                 anyhow::bail!("injected GUTA submission failure");
@@ -1885,9 +1901,7 @@ pub(crate) mod realm_db_test_env {
         /// from the staged leaves, so a wait that ends in inclusion at any of them can persist
         /// the whole range. Returns the updates in checkpoint order.
         pub(crate) fn stage_checkpoint_chain(&self, count: u64) -> Vec<PsyRealmCoordinatorUpdate<PF, PHash>> {
-            let base = build_realm_genesis(&genesis_setup_data(2, 4))
-                .expect("second genesis builds")
-                .coordinator_update;
+            let base = self.genesis.coordinator_update.clone();
             let mut leaves = vec![self.genesis_leaf_hash()];
             let mut updates = Vec::with_capacity(count as usize);
             for checkpoint_id in 1..=count {
@@ -1896,7 +1910,10 @@ pub(crate) mod realm_db_test_env {
                 update.checkpoint_sync_info.block_state.checkpoint_id = checkpoint_id;
                 update.checkpoint_sync_info.block_state.next_contract_id = 2;
                 leaves.push(update.checkpoint_sync_info.checkpoint_leaf_hash);
-                update.checkpoint_sync_info.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&leaves);
+                let (root, siblings) = checkpoint_tree_root_and_siblings_for_leaves(&leaves, Some(checkpoint_id as usize));
+                update.checkpoint_sync_info.checkpoint_tree_root = root;
+                let proof = MerkleProofCore::new_from_params::<PoseidonHasher>(checkpoint_id, update.checkpoint_sync_info.checkpoint_leaf_hash, siblings);
+                self.coordinator.seed_checkpoint_tree_proof(checkpoint_id, proof);
                 self.coordinator
                     .stage_checkpoint(update.checkpoint_sync_info.checkpoint_leaf_hash, update.clone());
                 updates.push(update);

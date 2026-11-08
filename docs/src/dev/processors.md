@@ -115,6 +115,13 @@ Entry: `realm/processor/core/process_block.rs:422`.
 6. Wait until the Coordinator checkpoint carries the new Realm root, then commit the included state.
 7. Synchronize metadata through the applied checkpoint and delete the processing worker-queue consumer; later transitions are handled by the next `sync_and_verify` iteration.
 
+While waiting for inclusion, the effective GUTA resend interval is at least the Coordinator's
+in-flight window of three committed checkpoints. A configured interval of two remains valid and
+uses that three-checkpoint window; larger configured intervals are unchanged.
+When the Coordinator rejects a resend as still in flight, its retryable response carries
+`open_from_checkpoint_id`. The Realm schedules the next attempt at that checkpoint; errors
+without the hint continue to use the configured interval.
+
 Candidate A proving, P2P consensus, and Coordinator inclusion overlap with builder B accepting EndCaps on A's end root. B keeps its planner checkpoint when that checkpoint authenticates its cycle start. Otherwise B reverts and discards that generation before tree commit; it does not rebase or replay accepted EndCaps.
 
 ## 5. Commit ordering

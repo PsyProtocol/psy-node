@@ -283,15 +283,19 @@ where
             resend_after_checkpoints,
             REALM_GUTA_RESEND_MIN_CHECKPOINTS
         );
+        // Keep the configured minimum compatible while waiting until the Coordinator's
+        // in-flight protection can accept another copy.
+        let resend_after_checkpoints = resend_after_checkpoints.max(crate::p2p::guta_submit::GUTA_IN_FLIGHT_WINDOW_CHECKPOINTS);
         let old_realm_root = self.state.last_committed_realm_end_root;
         let start_wait_checkpoint = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         // Checkpoint the latest submission attempt is measured from. Taking the larger of the
         // coordinator's answer and the local head can only delay a resend.
-        let mut resend_baseline_checkpoint = self
+        let resend_baseline_checkpoint = self
             .coordinator_client
             .rc_get_latest_checkpoint_id()
             .await?
             .max(start_wait_checkpoint);
+        let mut next_resend_checkpoint = resend_baseline_checkpoint.saturating_add(resend_after_checkpoints);
         let mut resend_attempts: u64 = 0;
         let mut metadata_checkpoint_id = self.state.last_committed_checkpoint_id;
 
@@ -406,19 +410,18 @@ where
                     latest_synced_checkpoint_id, old_realm_root
                 );
 
-                if latest_synced_checkpoint_id >= resend_baseline_checkpoint.saturating_add(resend_after_checkpoints) {
+                if latest_synced_checkpoint_id >= next_resend_checkpoint {
                     resend_attempts += 1;
                     tracing::warn!(
-                        "Realm {} GUTA update not included {} checkpoints after the last attempt (baseline {}, synced {}); resending, attempt {}. Old Root: {:?}, New Root: {:?}",
+                        "Realm {} GUTA update not included by checkpoint {} (synced {}); resending, attempt {}. Old Root: {:?}, New Root: {:?}",
                         self.state.realm_id_u64,
-                        resend_after_checkpoints,
-                        resend_baseline_checkpoint,
+                        next_resend_checkpoint,
                         latest_synced_checkpoint_id,
                         resend_attempts,
                         old_realm_root,
                         new_realm_root
                     );
-                    if let Err(err) = self
+                    let result = self
                         .coordinator_client
                         .rc_submit_guta_proof(
                             submission_header,
@@ -427,21 +430,32 @@ where
                             submission_proposal.map(<[u8]>::to_vec),
                             submission_certificate.map(<[u8]>::to_vec),
                         )
-                        .await
-                    {
-                        tracing::error!(
-                            "Realm {} GUTA resend attempt {} failed; retrying after {} more checkpoints: {:#}",
-                            self.state.realm_id_u64,
-                            resend_attempts,
-                            resend_after_checkpoints,
-                            err
-                        );
+                        .await;
+                    let open_from_checkpoint_id = result.as_ref().err().and_then(|err| {
+                        err.chain().find_map(|cause| cause.downcast_ref::<crate::p2p::guta_submit::GutaSubmitError>())
+                            .and_then(|error| error.open_from_checkpoint_id())
+                            .filter(|checkpoint_id| *checkpoint_id >= latest_synced_checkpoint_id)
+                    });
+                    if let Some(checkpoint_id) = open_from_checkpoint_id {
+                        tracing::info!(checkpoint_id, "GUTA remains in flight; waiting until the Coordinator window opens");
+                        next_resend_checkpoint = checkpoint_id;
+                    } else {
+                        if let Err(err) = result {
+                            tracing::error!(
+                                "Realm {} GUTA resend attempt {} failed; retrying after {} more checkpoints: {:#}",
+                                self.state.realm_id_u64,
+                                resend_attempts,
+                                resend_after_checkpoints,
+                                err
+                            );
+                        }
+                        next_resend_checkpoint = self
+                            .coordinator_client
+                            .rc_get_latest_checkpoint_id()
+                            .await?
+                            .max(latest_synced_checkpoint_id)
+                            .saturating_add(resend_after_checkpoints);
                     }
-                    resend_baseline_checkpoint = self
-                        .coordinator_client
-                        .rc_get_latest_checkpoint_id()
-                        .await?
-                        .max(latest_synced_checkpoint_id);
                 }
 
                 // Sleep via client wait
@@ -839,7 +853,7 @@ mod sync_tests {
         PsyNodeCoreDatabaseBasicContractInfoStoreReader,
     };
 
-    use parth_core::{utils::QPGenRandom, PHash, PF};
+    use parth_core::{protocol::core_types::QNetworkTreeConstants, utils::QPGenRandom, PHash, PF};
     use psy_data::guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType;
     use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
 
@@ -854,7 +868,23 @@ mod sync_tests {
     /// Genesis committed, ids rotated, and the coordinator reporting the realm's old root at
     /// checkpoint 0: the state a realm is in right after it submitted a GUTA proof.
     async fn env_waiting_on_old_root() -> anyhow::Result<RealmDbTestEnv> {
-        let mut env = RealmDbTestEnv::create().await?;
+        use psy_data::{genesis::genesis_block_setup::GenesisValidator, p2p::{BlsSecretKey, NodeId}};
+        let mut genesis_data = genesis_setup_data(1, 4);
+        for position in 1..=TEST_REALM_SUB_ID {
+            let seed = position as u8;
+            let mut secret = [seed; 32];
+            let node = NodeId::from_keypair(&libp2p_identity::Keypair::ed25519_from_bytes(&mut secret)?)?;
+            genesis_data.validators.push(GenesisValidator {
+                realm_id: TEST_REALM_ID as u32,
+                validator_user_id: psy_core::user_id::get_user_id_from_user_registration_id(
+                    position * 2 - 1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT),
+                node_id: node.to_raw(),
+                bls_public_key: BlsSecretKey::key_gen(&[seed; 32])?.public_key().to_bytes(),
+            });
+        }
+        let mut env = RealmDbTestEnv::create_with_genesis_data(genesis_data).await?;
+        env.genesis.prepared_updates.new_realm_root = env.genesis.coordinator_update.merkle_proof_to_realm_root.value;
         env.commit_genesis().await?;
         env.processor.set_new_unique_ids(None).await?;
         let old_root = env.processor.state.last_committed_realm_end_root;
@@ -1228,6 +1258,57 @@ mod sync_tests {
         assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
         assert_eq!(*env.coordinator.submitted_gutas.lock().unwrap(), vec![(TEST_REALM_ID, proof.clone())]);
         assert_eq!(*env.coordinator.submitted_guta_headers.lock().unwrap(), vec![header]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_respects_in_flight_window() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(3);
+        env.coordinator.seed_realm_root(3, zh(88));
+        let err = wait_error(&mut env, zh(89), header, &proof, 2).await;
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
+
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(4);
+        env.coordinator.seed_realm_root(4, zh(88));
+        let err = wait_error(&mut env, zh(89), header, &proof, 2).await;
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_resends_at_in_flight_checkpoint() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(6);
+        env.coordinator.set_guta_in_flight_checkpoint_id(5);
+        env.coordinator.seed_realm_root(6, zh(88));
+        let err = wait_error(&mut env, zh(89), header, &proof, 3).await;
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        // The first attempt at C=3 is rejected; the hint schedules another at C=5,
+        // before the normal three-checkpoint interval would expire at C=6.
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 2);
+        assert_eq!(env.coordinator.submitted_gutas.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_resends_when_in_flight_checkpoint_is_current() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(5);
+        env.coordinator.set_guta_in_flight_checkpoint_id(3);
+        env.coordinator.seed_realm_root(5, zh(88));
+        let err = wait_error(&mut env, zh(89), header, &proof, 3).await;
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        // The hint equals C=3; the next wait tick retries at C=4 rather than C=6.
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 2);
+        assert_eq!(env.coordinator.submitted_gutas.lock().unwrap().len(), 1);
         Ok(())
     }
 

@@ -60,11 +60,13 @@ impl From<RpcError> for ErrorObjectOwned {
                 ErrorObject::owned(INVALID_REQUEST_CODE, "Permission denied", None::<()>)
             }
             RpcError::Internal(msg) => ErrorObject::owned(INTERNAL_ERROR_CODE, msg, None::<()>),
-            RpcError::GutaSubmit(submit) => ErrorObject::owned(
-                submit.rpc_code(),
-                submit.message().to_string(),
-                Some(serde_json::json!({ "reason": submit.reason() as u8 })),
-            ),
+            RpcError::GutaSubmit(submit) => {
+                let mut data = serde_json::json!({ "reason": submit.reason() as u8 });
+                if let Some(checkpoint_id) = submit.open_from_checkpoint_id() {
+                    data["open_from_checkpoint_id"] = serde_json::json!(checkpoint_id);
+                }
+                ErrorObject::owned(submit.rpc_code(), submit.message().to_string(), Some(data))
+            },
             RpcError::EndCapSubmit(EndCapSubmitError::AlreadySubmitted { .. }) => {
                 // The relayer's duplicate-recovery parser matches on
                 // ServerError(-32001), the canonical message, and no data.

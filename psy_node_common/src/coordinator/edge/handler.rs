@@ -41,6 +41,7 @@ use crate::{
     },
 };
 use crate::worker_whitelist::WhiteListCache;
+use crate::p2p::guta_submit::GUTA_IN_FLIGHT_WINDOW_CHECKPOINTS;
 
 pub type CanonicalLayoutProofVerifier =
     dyn Fn(&[u8]) -> anyhow::Result<[u64; 19]> + Send + Sync;
@@ -56,10 +57,6 @@ pub struct ContractUpdateAuthContext {
 }
 
 pub type ContractUpdateAuthVerifier = dyn Fn(&ContractUpdateAuthContext) -> anyhow::Result<()> + Send + Sync;
-
-/// Committed checkpoints during which an accepted GUTA update counts as in flight. A copy
-/// accepted at committed checkpoint c commits as c + 1 or c + 2, or never; one is margin.
-pub const GUTA_IN_FLIGHT_WINDOW_CHECKPOINTS: u64 = 3;
 
 fn validate_update_layout_endpoints<F: QFelt64, Hash: Q256BitHash>(
     public_inputs: &[u64; 19],
@@ -911,14 +908,14 @@ impl<
             if record.old_realm_root == submitted_old_realm_root.into_owned_32bytes()
                 && committed_checkpoint_id < open_from_checkpoint_id
             {
-                anyhow::bail!(
+                return Err(GutaSubmitError::retryable_in_flight(format!(
                     "GUTA update for realm_id {} from old root {:?} is already in flight: accepted at checkpoint {}, committed checkpoint is {}; it can be resubmitted from checkpoint {}",
                     realm_id,
                     submitted_old_realm_root,
                     record.accepted_at_checkpoint_id,
                     committed_checkpoint_id,
                     open_from_checkpoint_id
-                );
+                ), open_from_checkpoint_id).into());
             }
         }
         let accepted_record = GutaInFlightRecord {
@@ -1956,8 +1953,50 @@ pub(crate) mod tests {
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64,
         );
         input.header.header.state_transition.node_index = PF::from_u64_value(0);
-        input.job_type_u32 = psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange as u32;
+        input.job_type_u32 = psy_core::job::job_id::ProvingJobCircuitType::RealmFinalizeGUTA as u32;
         input
+    }
+
+    async fn guta_binding(env: &EdgeTestEnv, input: &mut GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        use psy_data::{genesis::genesis_block_setup::GenesisValidator, p2p::{BlsSecretKey, NodeId, ProtocolEncode}};
+        use crate::realm::processor::consensus::{form_certificate, sign_vote};
+        let mut validators = Vec::new();
+        let mut secrets = Vec::new();
+        for seed in 1u8..=2 {
+            let mut identity = [seed; 32];
+            let secret = BlsSecretKey::key_gen(&[seed; 32])?;
+            validators.push(GenesisValidator {
+                realm_id: 0, validator_user_id: u64::from(seed),
+                node_id: NodeId::from_keypair(&libp2p_identity::Keypair::ed25519_from_bytes(&mut identity)?)?.to_raw(),
+                bls_public_key: secret.public_key().to_bytes(),
+            });
+            secrets.push(secret);
+        }
+        let tree = psy_data::p2p::validator_tree::build_validator_tree_genesis::<parth_core::pgoldilocks::PoseidonHasher, PHash>(
+            env.handler.chain_id, &validators, N::REALM_GLOBAL_USER_TREE_HEIGHT,
+        )?;
+        psy_node_core::p2p::validator_lookup::write_validator_tree_genesis(env.db.as_ref(), &tree.nodes_ffs, &tree.preimages).await?;
+        let mut roots = psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots::<PHash>::qp_rand_gen();
+        roots.validator_tree_root = tree.root;
+        env.db.set_checkpoint_global_state_roots(0, &roots).await?;
+        let leaf = psy_data::v1::qdata::checkpoint::PQEDCheckpointLeaf::<PF, PHash>::qp_rand_gen();
+        env.db.set_checkpoint_leaf_data(0, &leaf).await?;
+        env.db.set_checkpoint_root_hash_to_id_mapping(input.header.header.checkpoint_tree_root, 0).await?;
+        let seed = leaf.stats.random_seed.to_4_felts().map(|v| v.to_u64_value());
+        let rotation = parth_common::realm_rotation::RealmRotationConfig { checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH, validator_sub_ids: vec![1, 2] };
+        let proposer = rotation.proposer_sub_id(0, 1, seed)?.expect("validator set is nonempty");
+        let mut proposal = Proposal {
+            chain_id: env.handler.chain_id, realm_id: 0, base_checkpoint_id: 0, proposer_sub_id: proposer,
+            validator_tree_root: tree.root.into_owned_32bytes(), proposal_id: [0; 32], public_output_hash: [0; 32],
+            finalizer_proof_hash: sha256(&[]), backup_hash: [0; 32], body_hash: [0; 32],
+        };
+        proposal.proposal_id = proposal.compute_proposal_id();
+        let votes: Vec<_> = secrets.iter().enumerate().map(|(i, secret)| {
+            let sub_id = i as u16 + 1;
+            (sub_id, sign_vote(secret, sub_id, &proposal).signature)
+        }).collect();
+        let certificate = form_certificate(&proposal, &votes)?;
+        Ok((proposal.protocol_encode_to_vec(), certificate.protocol_encode_to_vec()))
     }
 
     #[tokio::test]
@@ -2000,10 +2039,11 @@ pub(crate) mod tests {
             .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key)
             .await?;
         input.header.header.state_transition.old_node_value = current_root.value;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
         env.temp_db
             .set_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 0, 0, 1)
             .await?;
-        let err = handler.submit_guta_internal(input, vec![], None, None).await.expect_err("double submit must fail");
+        let err = handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await.expect_err("double submit must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
         Ok(())
     }
@@ -2040,7 +2080,8 @@ pub(crate) mod tests {
             .await?;
         input.header.header.state_transition.old_node_value = current_root.value;
 
-        handler.submit_guta_internal(input, vec![], None, None).await?;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
+        handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         // the queue item was published and the proof stored for the derived job id
         assert_eq!(env.guta_queue.published_count(), 1);
@@ -2048,7 +2089,7 @@ pub(crate) mod tests {
             0,
             N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
             0,
-            psy_core::job::job_id::ProvingJobCircuitType::GUTANoChange,
+            psy_core::job::job_id::ProvingJobCircuitType::RealmFinalizeGUTA,
         )?;
         assert!(env.temp_db.contains_proof_for_job_id(job_id, 0).await?);
 
@@ -2086,9 +2127,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_records_the_accepted_update_as_in_flight() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
+        let mut input = submittable_guta_input(&env).await?;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
 
-        env.handler.submit_guta_internal(input, vec![], None, None).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         let (record, _) = env
             .temp_db
@@ -2104,19 +2146,23 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_rejects_a_second_copy_while_the_first_may_be_in_flight() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![], None, None).await?;
+        let mut input = submittable_guta_input(&env).await?;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal.clone()), Some(certificate.clone())).await?;
 
         // two checkpoints later the first copy may still be in the batch that commits next
         advance_coordinator(&env, 1, 2).await?;
         let err = env
             .handler
-            .submit_guta_internal(input, vec![], None, None)
+            .submit_guta_internal(input, vec![], Some(proposal), Some(certificate))
             .await
             .expect_err("a second copy inside the window must be rejected");
 
         assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
         assert!(err.to_string().contains("resubmitted from checkpoint 3"), "unexpected error: {err}");
+        let submit_error = err.downcast_ref::<GutaSubmitError>().expect("in-flight rejection must be typed");
+        assert_eq!(submit_error.rpc_code(), crate::p2p::guta_submit::GUTA_SUBMIT_RETRYABLE_CODE);
+        assert_eq!(submit_error.open_from_checkpoint_id(), Some(3));
         assert_eq!(env.guta_queue.published_count(), 1);
         // rejected before the per-batch marker is set, so it cannot block a later attempt
         assert_eq!(
@@ -2131,11 +2177,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_guta_accepts_a_copy_once_the_first_cannot_be_live() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![], None, None).await?;
+        let mut input = submittable_guta_input(&env).await?;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal.clone()), Some(certificate.clone())).await?;
 
         advance_coordinator(&env, 1, 3).await?;
-        env.handler.submit_guta_internal(input, vec![], None, None).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         assert_eq!(env.guta_queue.published_count(), 2);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
@@ -2153,8 +2200,9 @@ pub(crate) mod tests {
         };
         assert!(env.temp_db.claim_guta_in_flight(&QRealmIdentifier::new(1, 2), 0, None, &earlier).await?);
 
-        let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![], None, None).await?;
+        let mut input = submittable_guta_input(&env).await?;
+        let (proposal, certificate) = guta_binding(&env, &mut input).await?;
+        env.handler.submit_guta_internal(input, vec![], Some(proposal), Some(certificate)).await?;
 
         assert_eq!(env.guta_queue.published_count(), 1);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
