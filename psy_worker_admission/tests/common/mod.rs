@@ -39,7 +39,7 @@ impl MemoryStore {
 }
 #[async_trait]
 impl AtomicAdmissionStore for MemoryStore {
-    async fn request_budget(&self, _: Option<WorkerKey>) -> Result<u64> { self.check()?; Ok(self.time()) }
+    async fn request_budget(&self, _: RequestBudget) -> Result<u64> { self.check()?; Ok(self.time()) }
     async fn load(&self, key: WorkerKey) -> Result<Snapshot> {
         self.check()?;
         let raw = self.records.lock().unwrap().get(&key).cloned();

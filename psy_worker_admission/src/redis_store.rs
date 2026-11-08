@@ -208,10 +208,11 @@ impl RedisAdmissionStore {
 
 #[async_trait]
 impl AtomicAdmissionStore for RedisAdmissionStore {
-    async fn request_budget(&self, key: Option<WorkerKey>) -> Result<u64> {
-        let (suffix, limit) = match key {
-            Some(key) => (hex::encode(key.0), self.policy.requests_per_key_per_minute),
-            None => ("global".into(), self.policy.requests_per_minute),
+    async fn request_budget(&self, budget: RequestBudget) -> Result<u64> {
+        let (suffix, limit) = match budget {
+            RequestBudget::Key(key) => (hex::encode(key.0), self.policy.requests_per_key_per_minute),
+            RequestBudget::Submissions(key) => (format!("submit:{}", hex::encode(key.0)), self.policy.requests_per_key_per_minute),
+            RequestBudget::Shared => ("global".into(), self.policy.requests_per_minute),
         };
         let response: Vec<String> = Script::new(BUDGET).key(format!("{}:policy", self.prefix))
             .key(format!("{}:budget:{suffix}", self.prefix)).arg(&self.policy_hash).arg(limit)
