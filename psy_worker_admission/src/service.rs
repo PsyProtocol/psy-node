@@ -61,10 +61,14 @@ impl AdmissionService {
     pub fn policy(&self) -> &AdmissionPolicy { &self.policy }
 
     pub(crate) async fn authenticate(&self, auth: &RequestAuth, method: AdmissionMethod, payload: Hash32) -> Result<()> {
-        let now = self.store.request_budget(None).await?;
+        let now = self.store.request_budget(RequestBudget::Shared).await?;
         auth.verify(&self.scope, &self.policy, method, payload, now)?;
         if self.gate.as_ref().is_some_and(|gate| !gate.allowed(&auth.public_key)) { return Err(Error::NotAllowed); }
-        self.store.request_budget(Some(auth.public_key)).await?;
+        let budget = match method {
+            AdmissionMethod::SubmitProof => RequestBudget::Submissions(auth.public_key),
+            _ => RequestBudget::Key(auth.public_key),
+        };
+        self.store.request_budget(budget).await?;
         Ok(())
     }
     pub(crate) fn decode(&self, key: WorkerKey, snapshot: &Snapshot) -> Result<WorkerRecord> {

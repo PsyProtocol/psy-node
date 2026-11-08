@@ -134,6 +134,31 @@ async fn redis_bad_signatures_do_not_spend_the_victims_key_budget() {
 
 #[tokio::test]
 #[ignore = "requires redis-server"]
+async fn redis_claim_polling_cannot_starve_a_proof_submission() {
+    let process = RedisProcess::start().await;
+    let policy = AdmissionPolicy::for_base_bits(8);
+    let service = process.lease_service(&policy).await;
+    let namespace = process.namespace(&policy).await;
+    let signer = secret(1); let now = process.time().await;
+    activate(service.admission(), &signer, 0, now).await;
+    let lease = leased(&service, &signer, 1, 60_000, now).await;
+    let worker = hex::encode(key(&signer).0);
+    let mut connection = process.connection().await.unwrap();
+    // Claims and status reads used up the key budget.
+    let _: () = connection.set_ex(format!("{namespace}:budget:{worker}"), policy.requests_per_key_per_minute, 60).await.unwrap();
+    assert!(matches!(service.admission().get_status(auth(&signer, AdmissionMethod::GetStatus, 0, empty_payload(), now)).await,
+        Err(AdmissionError::RateLimited { .. })));
+    let proof = submission(&lease, b"proof");
+    assert!(matches!(service.begin_verification(submit_auth(&signer, 0, &proof, now), proof.clone()).await.unwrap(),
+        lease::SubmissionOutcome::Verify(_)));
+    // Submissions are still limited, by their own counter.
+    let _: () = connection.set_ex(format!("{namespace}:budget:submit:{worker}"), policy.requests_per_key_per_minute, 60).await.unwrap();
+    assert!(matches!(service.begin_verification(submit_auth(&signer, 0, &proof, now), proof).await,
+        Err(AdmissionError::RateLimited { .. })));
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server"]
 async fn redis_corruption_is_fail_closed_and_script_does_not_partially_activate() {
     let process = RedisProcess::start().await;
     let policy = AdmissionPolicy::for_base_bits(8); let (edge, store) = process.service(&policy).await;

@@ -7,6 +7,19 @@ use crate::{protocol::*, AdmissionError as Error, Result};
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionState { NeedsPow, Active }
 
+/// Request counters, each limited per minute. Proof submissions have their own
+/// per-key counter so claim polling can never starve the submission of a proof
+/// that is already computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBudget {
+    /// All requests to the scope, checked before the signature.
+    Shared,
+    /// Every authenticated request except proof submissions.
+    Key(WorkerKey),
+    /// Authenticated proof submissions.
+    Submissions(WorkerKey),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationReceipt {
@@ -97,9 +110,9 @@ pub struct CasWrite {
 /// service's typed transitions, never a public arbitrary reputation setter.
 #[async_trait]
 pub trait AtomicAdmissionStore: Send + Sync {
-    /// None consumes the shared request budget; Some consumes the authenticated
-    /// public key budget. Invalid signatures must not consume a victim's budget.
-    async fn request_budget(&self, key: Option<WorkerKey>) -> Result<u64>;
+    /// Consumes one request from `budget` and returns the store time.
+    /// Invalid signatures must not consume a victim's budget.
+    async fn request_budget(&self, budget: RequestBudget) -> Result<u64>;
     async fn load(&self, key: WorkerKey) -> Result<Snapshot>;
     async fn compare_exchange(&self, key: WorkerKey, write: CasWrite) -> Result<bool>;
 }

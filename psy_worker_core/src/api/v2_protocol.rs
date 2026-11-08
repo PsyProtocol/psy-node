@@ -16,9 +16,16 @@ use psy_worker_admission::{
 
 const REQUEST_VALID_MS: u64 = 30_000;
 const SOLVE_BATCH: u64 = 1 << 20;
-/// Edges allow 120 signed requests per key per minute; claims at this pace
-/// leave room for submissions and status reads.
+/// Edges allow 120 signed requests per key per minute for claims and status
+/// reads, and a separate 120 for proof submissions; claims at this pace leave
+/// room for status reads.
 const CLAIM_INTERVAL_MS: u64 = 600;
+/// Longest single wait before a submission is sent again.
+const SUBMIT_RETRY_MAX_MS: u64 = 30_000;
+/// Wait before resending after a transport failure, such as an edge restart.
+const SUBMIT_TRANSPORT_RETRY_MS: u64 = 1_000;
+/// Stop resending this long before the lease's hard deadline.
+const SUBMIT_DEADLINE_MARGIN_MS: u64 = 5_000;
 
 impl std::fmt::Debug for V2State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -170,6 +177,11 @@ impl V2State {
         anyhow::bail!("admission did not settle")
     }
 
+    /// Submit a proof for a leased job. A proof is expensive and the edge holds
+    /// the job until the lease ends, so a rate limited or undelivered
+    /// submission is sent again, with a fresh signature, until shortly before
+    /// the lease's hard deadline. The edge treats a repeat of the same
+    /// submission as the same request.
     pub async fn submit<S: Secp256K1WalletProvider>(&self, client: &HttpClient, url_hash: [u8; 32], signer: &S, public_key: &CompressedPublicKey,
         job_id: QProvingJobDataID, tag: Hash32, proof: Vec<u8>) -> anyhow::Result<()> {
         let scope = self.scope(client, url_hash).await?;
@@ -177,8 +189,17 @@ impl V2State {
         if lease.reward_tag != tag { anyhow::bail!("lease tag differs from the job's tag"); }
         let submission = ProofSubmission { job: lease.job.clone(), lease_id: lease.lease_id, lease_version: lease.lease_version,
             reward_tag: tag, proof_hash: digest(&proof) };
-        let auth = self.sign(signer, public_key, &scope, AdmissionMethod::SubmitProof, lease.owner_generation, submission.payload_hash(&scope))?;
-        match client.submit_proof_v2(auth, submission, HexBytes(proof)).await? {
+        let payload_hash = submission.payload_hash(&scope);
+        let proof = HexBytes(proof);
+        let give_up_at_ms = lease.hard_deadline_ms.saturating_sub(SUBMIT_DEADLINE_MARGIN_MS);
+        let outcome = send_with_retry(give_up_at_ms, |wait, error| {
+            println!("[worker/v2] submission of {job_id:?} not delivered ({error}), sending again in {wait} ms");
+        }, || async {
+            let auth = self.sign(signer, public_key, &scope, AdmissionMethod::SubmitProof, lease.owner_generation, payload_hash)
+                .map_err(|e| ClientError::Custom(e.to_string()))?;
+            client.submit_proof_v2(auth, submission.clone(), proof.clone()).await
+        }).await?;
+        match outcome {
             SubmitOutcome::Accepted { .. } | SubmitOutcome::InProgress => Ok(()),
             SubmitOutcome::Revoked(receipt) => {
                 self.generations.remove(&scope.hash());
@@ -189,12 +210,109 @@ impl V2State {
     }
 }
 
+/// How long to wait before sending a request again, or None if the error is
+/// final: the edge answered with anything other than RATE_LIMITED, or the
+/// request could not be built.
+fn retry_wait_ms(error: &ClientError) -> Option<u64> {
+    match error {
+        ClientError::Call(_) if category(error) == Some("RATE_LIMITED") =>
+            Some(retry_after_ms(error).unwrap_or(SUBMIT_TRANSPORT_RETRY_MS).clamp(100, SUBMIT_RETRY_MAX_MS)),
+        ClientError::Transport(_) | ClientError::RequestTimeout | ClientError::RestartNeeded(_) => Some(SUBMIT_TRANSPORT_RETRY_MS),
+        _ => None,
+    }
+}
+
+/// Run `attempt` until it succeeds, fails finally, or the next try would start
+/// at or after `give_up_at_ms`.
+async fn send_with_retry<T, F, Fut>(give_up_at_ms: u64, mut on_retry: impl FnMut(u64, &ClientError), mut attempt: F) -> Result<T, ClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ClientError>>,
+{
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(wait) = retry_wait_ms(&error) else { return Err(error) };
+        if now_ms().saturating_add(wait) >= give_up_at_ms { return Err(error); }
+        on_retry(wait, &error);
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use parth_common::secp256k1::MemorySecp256K1Wallet;
     use psy_worker_admission::{AdmissionPolicy, AdmissionScope};
 
     use super::*;
+
+    fn edge_error(code: i32, category: &str, retry_after_ms: Option<&str>) -> ClientError {
+        let data = match retry_after_ms {
+            Some(ms) => serde_json::json!({ "category": category, "retry_after_ms": ms }),
+            None => serde_json::json!({ "category": category, "retry_after_ms": null }),
+        };
+        ClientError::Call(jsonrpsee::types::ErrorObjectOwned::owned(code, category.to_string(), Some(data)))
+    }
+
+    async fn run_script(script: Vec<Result<u32, ClientError>>, give_up_at_ms: u64) -> (Result<u32, ClientError>, usize, Vec<u64>) {
+        let script = std::sync::Mutex::new(std::collections::VecDeque::from(script));
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let mut waits = Vec::new();
+        let result = send_with_retry(give_up_at_ms, |wait, _| waits.push(wait), || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = script.lock().unwrap().pop_front().expect("script exhausted");
+            async move { next }
+        }).await;
+        (result, attempts.into_inner(), waits)
+    }
+
+    #[tokio::test]
+    async fn rate_limited_submission_is_sent_again_after_retry_after() {
+        let started = std::time::Instant::now();
+        let (result, attempts, waits) = run_script(vec![
+            Err(edge_error(-32109, "RATE_LIMITED", Some("150"))),
+            Err(edge_error(-32109, "RATE_LIMITED", Some("120"))),
+            Ok(7),
+        ], now_ms() + 60_000).await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, vec![150, 120]);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(270));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_is_retried() {
+        let (result, attempts, waits) = run_script(vec![Err(ClientError::RequestTimeout), Ok(1)], now_ms() + 60_000).await;
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, vec![SUBMIT_TRANSPORT_RETRY_MS]);
+    }
+
+    #[tokio::test]
+    async fn edge_rejection_other_than_rate_limit_is_final() {
+        let (result, attempts, waits) = run_script(vec![Err(edge_error(-32114, "LEASE_STALE", None))], now_ms() + 60_000).await;
+        assert!(matches!(result, Err(ClientError::Call(ref object)) if object.message() == "LEASE_STALE"));
+        assert_eq!(attempts, 1);
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retries_stop_before_the_lease_deadline() {
+        let (result, attempts, waits) = run_script(vec![Err(edge_error(-32109, "RATE_LIMITED", Some("20000")))], now_ms() + 10_000).await;
+        assert!(matches!(result, Err(ClientError::Call(ref object)) if object.message() == "RATE_LIMITED"));
+        assert_eq!(attempts, 1);
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn retry_wait_is_bounded() {
+        assert_eq!(retry_wait_ms(&edge_error(-32109, "RATE_LIMITED", Some("600000"))), Some(SUBMIT_RETRY_MAX_MS));
+        assert_eq!(retry_wait_ms(&edge_error(-32109, "RATE_LIMITED", Some("1"))), Some(100));
+        assert_eq!(retry_wait_ms(&edge_error(-32109, "RATE_LIMITED", None)), Some(SUBMIT_TRANSPORT_RETRY_MS));
+        assert_eq!(retry_wait_ms(&ClientError::Custom("signing".into())), None);
+    }
 
     #[test]
     fn worker_wallet_signatures_verify_on_the_edge() {
