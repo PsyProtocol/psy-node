@@ -143,7 +143,7 @@ impl WalletSourceArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct WalletSessionArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env = "PSY_CONFIG_PATH")]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
