@@ -250,6 +250,27 @@ pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool
     Ok(String::from_utf8(body)?)
 }
 
+/// A non-2xx HTTP answer whose body was not a JSON-RPC response, such as a proxy's 502 page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcHttpStatusError {
+    pub status: u16,
+}
+
+impl std::fmt::Display for RpcHttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP status {}", self.status)
+    }
+}
+
+impl std::error::Error for RpcHttpStatusError {}
+
+pub(crate) fn rpc_decode_error(status: reqwest::StatusCode, message: String) -> anyhow::Error {
+    if status.is_success() {
+        return anyhow::anyhow!(message);
+    }
+    anyhow::Error::new(RpcHttpStatusError { status: status.as_u16() }).context(message)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct RpcProvider {
@@ -423,7 +444,7 @@ macro_rules! psy_rpc_call_back {
                                     column = e.column(),
                                     "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
                                 );
-                                Err(anyhow::anyhow!(
+                                Err(crate::provider::rpc_decode_error(status, format!(
                                     "failed to parse JSON-RPC response: method={} status={} body_len={} error_category={:?} line={} column={}",
                                     method_name,
                                     status,
@@ -431,7 +452,7 @@ macro_rules! psy_rpc_call_back {
                                     e.classify(),
                                     e.line(),
                                     e.column()
-                                ))
+                                )))
                             } else {
                                 tracing::error!(
                                     url = %url_str,
@@ -442,13 +463,13 @@ macro_rules! psy_rpc_call_back {
                                     error = %e,
                                     "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
                                 );
-                                Err(anyhow::anyhow!(
+                                Err(crate::provider::rpc_decode_error(status, format!(
                                     "failed to parse JSON-RPC response: method={} status={} error={} body={}",
                                     method_name,
                                     status,
                                     e,
                                     body
-                                ))
+                                )))
                             }
                         }
                     }
