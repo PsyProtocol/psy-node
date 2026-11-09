@@ -295,6 +295,7 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 | Proof base | Checkpoint that authenticates a gatherer cycle start. |
 | Unreadable proof base | Proof base whose top user tree proof is missing or ahead of the local Realm subtree; finalize treats it as not authenticating. |
 | `load_changed_leaves_on_imt_indexed_trees` | Nonempty FFS-changed contract-state leaves on IMT-indexed trees. |
+| `BackupGeneration` / `load_backup_generation_ending_at` | A local pending generation located by its EndCap gatherer backup header end root, with its durable pending->proc id and header start root. Recovery replays it; history adoption reuses an unmapped one whose header spans the adopted transition. |
 
 ## 10. Naming checklist
 

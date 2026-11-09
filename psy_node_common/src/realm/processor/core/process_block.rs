@@ -347,7 +347,12 @@ where
             Ok(Some(verified)) if included.checkpoint_id > self.db.state.last_committed_checkpoint_id => {
                 Some(
                     self.db
-                        .apply_history_proposal(&included, verified)
+                        .apply_history_proposal(
+                            &included,
+                            verified,
+                            self.file_system.as_ref(),
+                            &self.guta_gatherer_backup_directory,
+                        )
                         .await?,
                 )
             }
@@ -408,7 +413,12 @@ where
                         if included.checkpoint_id > self.db.state.last_committed_checkpoint_id {
                             Some(
                                 self.db
-                                    .apply_history_proposal(&included, verified)
+                                    .apply_history_proposal(
+                                        &included,
+                                        verified,
+                                        self.file_system.as_ref(),
+                                        &self.guta_gatherer_backup_directory,
+                                    )
                                     .await?,
                             )
                         } else {

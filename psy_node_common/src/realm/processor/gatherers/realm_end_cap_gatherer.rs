@@ -146,6 +146,14 @@ pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: Q
     file_system: &FileSystem,
     path: &str,
 ) -> anyhow::Result<Hash> {
+    Ok(read_realm_backup_start_and_end_roots::<FileSystem, Hash>(file_system, path).await?.1)
+}
+
+/// Discovery hint only, like `read_realm_backup_end_root`; also returns the generation's start root.
+pub async fn read_realm_backup_start_and_end_roots<FileSystem: TokioLikeFileSystem, Hash: QDBHashBase>(
+    file_system: &FileSystem,
+    path: &str,
+) -> anyhow::Result<(Hash, Hash)> {
     const END_ROOT_HEADER_LEN: usize = 4 + 32 + 32;
     let mut file = file_system.file_like_fs_open(path).await?;
     let metadata = file.file_like_metadata().await?;
@@ -162,7 +170,10 @@ pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: Q
         "Realm backup magic mismatch: expected RGE1 or RGE2, got {:x}",
         magic
     );
-    Ok(Hash::from_owned_32bytes(header[36..68].try_into().expect("end root")))
+    Ok((
+        Hash::from_owned_32bytes(header[4..36].try_into().expect("start root")),
+        Hash::from_owned_32bytes(header[36..68].try_into().expect("end root")),
+    ))
 }
 
 
