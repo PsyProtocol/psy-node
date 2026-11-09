@@ -956,12 +956,21 @@ fn transport_error_category(error: &anyhow::Error) -> &'static str {
         .chain()
         .find_map(|cause| {
             if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
-                return Some(if error.is_timeout() { "timeout" } else if error.is_connect() { "unavailable" } else { "other" });
+                let is_proxy_unavailable = error.status().is_some_and(|status| is_proxy_unavailable_status(status.as_u16()));
+                return Some(if error.is_timeout() { "timeout" } else if error.is_connect() || is_proxy_unavailable { "unavailable" } else { "other" });
+            }
+            if let Some(error) = cause.downcast_ref::<psy_provider::provider::RpcHttpStatusError>() {
+                return Some(if is_proxy_unavailable_status(error.status) { "unavailable" } else { "other" });
             }
             cause.downcast_ref::<alloy_transport::TransportError>().map(super::pool_transport::error_category)
         })
         .unwrap_or("other")
 }
+/// 502/503/504: the coordinator ingress has no edge that answers right now.
+fn is_proxy_unavailable_status(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
 /// True only for typed transient failures — a transport error categorized
 /// `timeout`/`unavailable` or the committed-head reader's `L2RpcUnavailable`
 /// — that a later round can plausibly resolve. Everything else (nonce
@@ -4267,6 +4276,42 @@ mod tests {
         assert_eq!(transport_error_category(&error), "unavailable");
         assert!(is_temporary_rpc_error(&error));
         assert!(!is_temporary_rpc_error(&anyhow::anyhow!("{error:#}")));
+    }
+
+    fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!("HTTP/1.1 {status_line}\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        url
+    }
+
+    async fn coordinator_head_error(url: String) -> anyhow::Error {
+        let provider = RpcProvider {
+            client: std::sync::Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()), endpoint_clients: None,
+            realm_configs: HashMap::new(), coordinator_configs: HashMap::from([(0, vec![url])]),
+            users_per_realm: 1, current_user_id: 0,
+        };
+        provider.get_coordinator_latest_block_state().await.expect_err("a non-JSON-RPC answer must fail")
+    }
+
+    #[tokio::test]
+    async fn ingress_without_a_live_edge_is_temporary_but_other_answers_are_not() {
+        for status_line in ["502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout"] {
+            let error = coordinator_head_error(serve_once(status_line, "<html>no upstream</html>")).await;
+            assert!(is_temporary_rpc_error(&error), "{status_line} must be temporary: {error:#}");
+            assert!(error.to_string().starts_with("failed to parse JSON-RPC response"), "message changed: {error}");
+        }
+        for (status_line, body) in [("500 Internal Server Error", "<html>boom</html>"), ("200 OK", "not json")] {
+            let error = coordinator_head_error(serve_once(status_line, body)).await;
+            assert!(!is_temporary_rpc_error(&error), "{status_line} must stay permanent: {error:#}");
+        }
     }
 
     fn deposit_append_call(tag: u8, size: usize) -> Call3 {
