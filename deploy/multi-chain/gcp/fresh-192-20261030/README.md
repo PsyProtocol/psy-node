@@ -406,8 +406,8 @@ known, reviewed ways; a redeploy from this lock changes these units:
 
 | Component | Lock | Live |
 |---|---|---|
-| `psy_node_cli` on the six Realm processors | `64a74b01` | `64a74b01` (same) |
-| `psy_node_cli` on the Edges | `64a74b01` | `27d2059f` (build `753498b8`); the coordinator processor still runs `d2be48b2` |
+| `psy_node_cli` on the six Realm processors and the coordinator processor | `64a74b01` | `64a74b01` (same) |
+| `psy_node_cli` on the Edges | `64a74b01` | `27d2059f` (build `753498b8`) |
 | `psy_worker_cli` | `a5024735` | `a5024735` (same) |
 | `psy_relayer_cli` | `cc8077c8` | `765ef10f` (build `aef2d7ad`) |
 | `psy_dev_cli`, `psy_user_cli` | `f36e9436`, `f2f4762d` | not installed by this release |
