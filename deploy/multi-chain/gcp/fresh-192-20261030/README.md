@@ -401,7 +401,7 @@ maintenance block of another tag inside a listed site is refused by name; the in
 
 ## Live Deployment Versus This Lock (2026-11-09)
 
-The lock pins runtime `43c0569c` (all five CLIs from that pinned build; only `psy_relayer_cli` differs from the `badc109c` build). The live SD192 network differs from it in
+The lock pins runtime `7c72df70` (all five CLIs from that pinned build; only `psy_relayer_cli` differs from the `badc109c` build). The live SD192 network differs from it in
 known, reviewed ways; a redeploy from this lock changes these units:
 
 | Component | Lock | Live |
@@ -409,7 +409,8 @@ known, reviewed ways; a redeploy from this lock changes these units:
 | `psy_node_cli` on the six Realm processors and the coordinator processor | `64a74b01` | `64a74b01` (same) |
 | `psy_node_cli` on the Edges | `64a74b01` | `27d2059f` (build `753498b8`) |
 | `psy_worker_cli` | `a5024735` | `a5024735` (same) |
-| `psy_relayer_cli` | `ce82e759` | `ce82e759` (same) |
+| `psy_relayer_cli` on the three Guardians | `7abf495c` | `7abf495c` (same) |
+| `psy_relayer_cli` on the relayer | `7abf495c` | `ce82e759` (build `43c0569c`; the lock adds only the Guardian observer grace, which the relayer does not run) |
 | `psy_dev_cli`, `psy_user_cli` | `f36e9436`, `f2f4762d` | not installed by this release |
 | Runtime config `coordinator_configs` | three edges (pinned `04d3056c`) | same file on the core hosts |
 | Coordinator clients | `release.json`/topology: ingress `10.148.0.25:15369` | relayer, guardian `rpc.json`, Worker config, Realm processor units, coordinator indexer and Services use the ingress; the x3 user prove-proxy reaches it through the additive gateway forwarder `psy-coordinator-ingress-forward` (`10.250.0.1:15369`); Realm indexers (hash-guarded Services package) still dial the edges, and the gateway edge forwarders `15370`-`15372` remain installed but idle |
