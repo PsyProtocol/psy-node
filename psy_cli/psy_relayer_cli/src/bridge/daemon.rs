@@ -1040,7 +1040,17 @@ async fn run_multichain(
         }
         if read_failed { tokio::time::sleep(poll_interval).await; continue; }
 
-        let mut latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+        let mut latest = match provider.get_coordinator_latest_block_state().await {
+            Ok(head) => head.checkpoint_id,
+            Err(error) if is_temporary_rpc_error(&error) => {
+                tracing::warn!(%error, error_category = transport_error_category(&error), backoff_secs = l2_retry_backoff.as_secs(),
+                    "coordinator head read hit temporary RPC unavailability; retrying");
+                tokio::time::sleep(l2_retry_backoff).await;
+                l2_retry_backoff = (l2_retry_backoff * 2).min(Duration::from_secs(RELAYER_MAX_RETRY_BACKOFF_SECS));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if last_coordinator_head == Some(latest) {
             stalled_rounds += 1;
         } else {
@@ -4242,6 +4252,22 @@ async fn first_nonce_checkpoint(provider: &RpcProvider, config: &guardian_common
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn refused_coordinator_head_read_is_temporary() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let provider = RpcProvider {
+            client: std::sync::Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()), endpoint_clients: None,
+            realm_configs: HashMap::new(), coordinator_configs: HashMap::from([(0, vec![url])]),
+            users_per_realm: 1, current_user_id: 0,
+        };
+        let error = provider.get_coordinator_latest_block_state().await.expect_err("closed port must fail");
+        assert_eq!(transport_error_category(&error), "unavailable");
+        assert!(is_temporary_rpc_error(&error));
+        assert!(!is_temporary_rpc_error(&anyhow::anyhow!("{error:#}")));
+    }
 
     fn deposit_append_call(tag: u8, size: usize) -> Call3 {
         Call3 { target: Address::repeat_byte(tag), allowFailure: false, callData: Bytes::from(vec![tag; size]) }
