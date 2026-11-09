@@ -60,7 +60,7 @@ use crate::{
             DatabaseCheckState, PsyRealmDatabaseProcessor,
         },
         gatherers::realm_end_cap_gatherer::{
-            get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root,
+            get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_start_and_end_roots,
         },
     },
     utils::processor_status::ProcessorStatus,
@@ -172,6 +172,14 @@ fn ensure_latest_pending_within_target(
         }
     }
     Ok(())
+}
+
+/// A local pending generation whose EndCap gatherer backup header ends at a searched root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackupGeneration<Hash> {
+    pub unique_pending_id: u64,
+    pub proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId,
+    pub start_root: Hash,
 }
 
 impl<
@@ -646,6 +654,8 @@ where
     /// Verify one transition, install the verified bytes into its record, then apply.
     async fn apply_verified_transition(
         &mut self,
+        file_system: &FileSystem,
+        guta_gatherer_backup_directory: &str,
         included: &crate::realm::processor::ffs::CheckpointIdentity,
         transition: psy_data::p2p::RealmTransition,
         staged: Option<crate::realm::processor::proposal_backup::StagedProposal>,
@@ -672,7 +682,7 @@ where
             proposal_backup.install(staged).await?;
         }
         Ok(Some(
-            self.apply_history_proposal(included, verified)
+            self.apply_history_proposal(included, verified, file_system, guta_gatherer_backup_directory)
                 .await?,
         ))
     }
@@ -878,7 +888,7 @@ where
                     database_check_state, checkpoint_id, target_tip, target_root, coordinator_update,
                 ).await?;
                 if !recovered_from_backup && !self.retry_history_transition(
-                    checkpoint_id, coordinator_update, transition, proposal_backup, proposal_fetch,
+                    file_system, guta_gatherer_backup_directory, checkpoint_id, coordinator_update, transition, proposal_backup, proposal_fetch,
                     start, staged_transitions, rejected_proposal_ids,
                 ).await? {
                     return Ok(false);
@@ -984,23 +994,55 @@ where
         if !allow_backup || current_unique_pending_id <= last_committed_unique_pending_id {
             return Ok(false);
         }
-        for candidate in (last_committed_unique_pending_id + 1)..=current_unique_pending_id {
+        let mut first_candidate = last_committed_unique_pending_id + 1;
+        while let Some(generation) = self.load_backup_generation_ending_at(
+            file_system, guta_gatherer_backup_directory,
+            first_candidate..=current_unique_pending_id, checkpoint_id, target_root,
+        ).await? {
+            if self.load_matching_backup(
+                file_system, guta_gatherer_backup_directory, global_user_tree,
+                checkpoint_id, generation.unique_pending_id, generation.proc_checkpoint_unique_id,
+                target_root, coordinator_update,
+            ).await? {
+                return Ok(true);
+            }
+            first_candidate = generation.unique_pending_id + 1;
+        }
+        Ok(false)
+    }
+
+    /// First pending generation in `candidates` whose local EndCap gatherer backup ends at
+    /// `end_root` and that has a durable pending->proc record. Init recovery rebuilds and checks the
+    /// batch; history adoption commits already verified updates and trusts only the header roots.
+    pub(crate) async fn load_backup_generation_ending_at(
+        &self,
+        file_system: &FileSystem,
+        guta_gatherer_backup_directory: &str,
+        candidates: std::ops::RangeInclusive<u64>,
+        checkpoint_id: u64,
+        end_root: N::QHash,
+    ) -> anyhow::Result<Option<BackupGeneration<N::QHash>>> {
+        for candidate in candidates {
             let path = get_new_realm_end_cap_gatherer_backup_file_path(
                 guta_gatherer_backup_directory, self.state.realm_id_u64,
                 self.state.realm_sub_id_u64, candidate,
             );
-            match read_realm_backup_end_root::<FileSystem, N::QHash>(file_system, &path.to_string_lossy()).await {
-                Ok(end_root) if end_root == target_root => {
-                    if self.load_matching_backup(
-                        file_system, guta_gatherer_backup_directory, global_user_tree,
-                        checkpoint_id, candidate, target_root, coordinator_update,
-                    ).await? {
-                        return Ok(true);
-                    }
+            match read_realm_backup_start_and_end_roots::<FileSystem, N::QHash>(file_system, &path.to_string_lossy()).await {
+                Ok((start_root, backup_end_root)) if backup_end_root == end_root => {
+                    let Some(proc_checkpoint_unique_id) =
+                        self.db.get_proc_checkpoint_unique_id_for_pending_id(candidate).await?
+                    else {
+                        tracing::warn!(
+                            "Backup pending_id {} matches checkpoint {} end_root but has no durable pending->proc record; skipping instead of borrowing another generation's proc ID.",
+                            candidate, checkpoint_id
+                        );
+                        continue;
+                    };
+                    return Ok(Some(BackupGeneration { unique_pending_id: candidate, proc_checkpoint_unique_id, start_root }));
                 }
-                Ok(end_root) => tracing::debug!(
+                Ok((_, backup_end_root)) => tracing::debug!(
                     "Backup pending_id {} end_root {:?} does not match coordinator target {:?} for checkpoint {}.",
-                    candidate, end_root, target_root, checkpoint_id
+                    candidate, backup_end_root, end_root, checkpoint_id
                 ),
                 Err(e) => tracing::debug!(
                     "Failed to read backup pending_id {} for checkpoint {}: {:?}",
@@ -1008,7 +1050,7 @@ where
                 ),
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     async fn load_matching_backup(
@@ -1018,18 +1060,10 @@ where
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         checkpoint_id: u64,
         candidate: u64,
+        candidate_proc_checkpoint_id: QCoreProcCheckpointUniqueId,
         target_root: N::QHash,
         coordinator_update: &psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate<N::F, N::QHash>,
     ) -> anyhow::Result<bool> {
-        let Some(candidate_proc_checkpoint_id) =
-            self.db.get_proc_checkpoint_unique_id_for_pending_id(candidate).await?
-        else {
-            tracing::warn!(
-                "Backup pending_id {} matches checkpoint {} end_root but has no durable pending->proc record; skipping instead of borrowing another generation's proc ID.",
-                candidate, checkpoint_id
-            );
-            return Ok(false);
-        };
         let mut recovery_state = self.state.clone();
         recovery_state.processing_unique_pending_id = candidate;
         recovery_state.processing_proc_checkpoint_unique_id = candidate_proc_checkpoint_id;
@@ -1080,6 +1114,8 @@ where
 
     async fn retry_history_transition(
         &mut self,
+        file_system: &FileSystem,
+        guta_gatherer_backup_directory: &str,
         checkpoint_id: u64,
         coordinator_update: &psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate<N::F, N::QHash>,
         transition: psy_data::p2p::RealmTransition,
@@ -1104,7 +1140,7 @@ where
                 },
             };
             match self.apply_verified_transition(
-                &included, transition, staged, proposal_backup, rejected_proposal_ids,
+                file_system, guta_gatherer_backup_directory, &included, transition, staged, proposal_backup, rejected_proposal_ids,
             ).await {
                 Ok(Some(_)) => return Ok(true),
                 Ok(None) => tracing::warn!(
