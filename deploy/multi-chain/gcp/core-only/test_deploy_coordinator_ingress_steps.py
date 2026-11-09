@@ -46,6 +46,7 @@ class SiteTextTests(unittest.TestCase):
         self.assertNotIn("non_idempotent", text)
         self.assertEqual([line.strip() for line in text.splitlines() if "listen" in line], ["listen 10.148.0.25:15369;"])
         self.assertIn("client_max_body_size 512m;", text)
+        self.assertNotIn("keepalive", text)
 
 
 class IngressStepTests(unittest.TestCase):
@@ -95,7 +96,9 @@ class IngressStepTests(unittest.TestCase):
 
     def test_install_script_refuses_a_foreign_policy_rc_and_reports_command_errors(self):
         self.assertIn("os.path.lexists('/usr/sbin/policy-rc.d')", steps.INSTALL)
-        self.assertIn("'apt-get', 'update'", steps.INSTALL)
+        self.assertIn("'DPkg::Lock::Timeout=120', 'update'", steps.INSTALL)
+        self.assertLess(steps.INSTALL.index("'dpkg', '--configure', '-a'"), steps.INSTALL.index("'install', '-y'"))
+        self.assertIn("signal.signal(signal.SIGTERM, stop)", steps.INSTALL)
         self.assertNotIn("check=True, capture_output=True", steps.INSTALL)
         compile(steps.INSTALL, "install", "exec")
 

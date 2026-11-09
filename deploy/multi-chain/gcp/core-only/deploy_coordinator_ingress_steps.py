@@ -38,8 +38,12 @@ print(json.dumps(dict(installed=status == 'install ok installed', site=sha(site)
                       default=os.path.lexists(default), active=show('ActiveState'), enabled_unit=show('UnitFileState'),
                       config_ok=test is not None and test.returncode == 0)))
 """
-INSTALL = """import base64, json, os, subprocess, sys
+INSTALL = """import base64, json, os, signal, subprocess, sys
 args = json.loads(sys.stdin.readline())
+def stop(signum, frame):
+    raise SystemExit('interrupted by signal ' + str(signum))
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGHUP, stop)
 env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
 def run(argv):
     done = subprocess.run(argv, env=env, capture_output=True, text=True)
@@ -54,8 +58,9 @@ if status != 'install ok installed':
         file.write('#!/bin/sh\\nexit 101\\n')
     os.chmod('/usr/sbin/policy-rc.d', 0o755)
     try:
-        run(['apt-get', 'update'])
-        run(['apt-get', 'install', '-y', '--no-install-recommends', 'nginx'])
+        run(['dpkg', '--configure', '-a'])
+        run(['apt-get', '-o', 'DPkg::Lock::Timeout=120', 'update'])
+        run(['apt-get', '-o', 'DPkg::Lock::Timeout=120', 'install', '-y', '--no-install-recommends', 'nginx'])
         run(['dpkg', '--configure', '-a'])
     finally:
         os.unlink('/usr/sbin/policy-rc.d')
@@ -66,6 +71,10 @@ os.chmod(temporary, 0o644)
 os.replace(temporary, args['site'])
 if os.path.lexists(args['default']):
     os.unlink(args['default'])
+if os.path.lexists(args['enabled']) and not os.path.islink(args['enabled']):
+    raise SystemExit(args['enabled'] + ' is not a symlink; inspect it before enabling the ingress')
+if os.path.islink(args['enabled']) and os.readlink(args['enabled']) != args['site']:
+    os.unlink(args['enabled'])
 if not os.path.islink(args['enabled']):
     os.symlink(args['site'], args['enabled'])
 run(['/usr/sbin/nginx', '-t'])
