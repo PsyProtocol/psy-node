@@ -4,7 +4,7 @@ use crate::worker::proving_pools::ProvingPools;
 use crate::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerJobFetcher};
 use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task;
 
 pub struct PsyProofMinerWorkerManager<
@@ -42,13 +42,13 @@ impl<
         }
     }
 
-    pub async fn run_worker_loop(&self, poll_interval_ms: u64, batch_size: usize) -> anyhow::Result<()> {
-        self.run_worker_loop_with_pools(poll_interval_ms, batch_size, None).await
+    pub async fn run_worker_loop(&self, poll_interval_ms: u64, batch_size: usize, stop: watch::Receiver<bool>) -> anyhow::Result<()> {
+        self.run_worker_loop_with_pools(poll_interval_ms, batch_size, None, stop).await
     }
 
     /// Like `run_worker_loop`; with `pools`, each job is proved in a thread
-    /// pool of its own instead of rayon's global pool.
-    pub async fn run_worker_loop_with_pools(&self, poll_interval_ms: u64, batch_size: usize, pools: Option<Arc<ProvingPools>>) -> anyhow::Result<()> {
+    /// pool of its own instead of rayon's global pool. After `stop`, claimed jobs are still submitted.
+    pub async fn run_worker_loop_with_pools(&self, poll_interval_ms: u64, batch_size: usize, pools: Option<Arc<ProvingPools>>, stop: watch::Receiver<bool>) -> anyhow::Result<()> {
         print_cf_log_indicator("PSY_PROOF_MINER_WORKER_STARTED", "");
 
         let (job_tx, job_rx) = mpsc::channel::<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>(batch_size);
@@ -59,6 +59,7 @@ impl<
             self.job_fetcher.clone(),
             job_tx,
             poll_interval_ms,
+            stop,
         );
 
         let submitter_handle = Self::spawn_submitter_task(
@@ -84,13 +85,31 @@ impl<
         fetcher: Arc<JobFetcher>,
         job_tx: mpsc::Sender<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>,
         poll_interval_ms: u64,
+        mut stop: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        let stop_watch = (fetcher.clone(), stop.clone());
+        tokio::spawn(async move {
+            let (fetcher, mut stop) = stop_watch;
+            if stop.wait_for(|stop| *stop).await.is_ok() {
+                fetcher.stop_claiming();
+            }
+        });
         tokio::spawn(async move {
             tracing::info!("Fetcher role started - ensuring job queue stays full");
             println!("[worker/fetcher] started");
 
             loop {
-                match job_tx.reserve().await {
+                // A claim already sent is never cancelled: an abandoned claim keeps its lease until the deadline.
+                let reserved = tokio::select! {
+                    biased;
+                    _ = stop.wait_for(|stop| *stop) => {
+                        tracing::info!("Fetcher: stop requested; claiming no new jobs");
+                        println!("[worker/fetcher] stop requested");
+                        break;
+                    }
+                    reserved = job_tx.reserve() => reserved,
+                };
+                match reserved {
                     Ok(permit) => {
                         match fetcher.fetch_new_job().await {
                             Ok(Some(job)) => {
@@ -102,7 +121,10 @@ impl<
                                 tracing::debug!("Fetcher: no proving work available (Ok(None))");
                                 println!("[worker/fetcher] no work");
                                 drop(permit);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+                                tokio::select! {
+                                    _ = stop.wait_for(|stop| *stop) => {}
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {}
+                                }
                             }
                             Err(e) => {
                                 let error = format!("Error fetching job: {:?}", e);
@@ -111,7 +133,10 @@ impl<
                                     println!("[worker/fetcher] error: {}", error);
                                 }
                                 drop(permit);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+                                tokio::select! {
+                                    _ = stop.wait_for(|stop| *stop) => {}
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {}
+                                }
                             }
                         }
                     }
@@ -271,7 +296,8 @@ mod tests {
         let jobs = (0..2).map(|_| Job::qp_rand_gen()).collect();
         let prover = WhereRayonRuns { both_inside: std::sync::Barrier::new(2) };
         let manager = PsyProofMinerWorkerManager::new(Arc::new(ListedJobs { jobs: Mutex::new(jobs), submitted }), Arc::new(()), Arc::new(prover));
-        let worker = tokio::spawn(async move { manager.run_worker_loop_with_pools(1, 2, pools).await });
+        let (_stop_tx, stop) = watch::channel(false);
+        let worker = tokio::spawn(async move { manager.run_worker_loop_with_pools(1, 2, pools, stop).await });
         let mut names = Vec::new();
         for _ in 0..2 {
             let proof = tokio::time::timeout(std::time::Duration::from_secs(30), proofs.recv()).await.expect("a proof within 30 s").expect("the worker is running");
@@ -288,6 +314,40 @@ mod tests {
         let names = prove_two_overlapping_jobs(Some(pools)).await;
         // The job that started first stays in the global pool, whose threads have no name.
         assert!(!names[0].starts_with("prove-") && names[1].starts_with("prove-narrow"), "{:?}", names);
+    }
+
+    struct SlowProver;
+
+    impl PsyWorkerGenericLibraryProverInfoProvider<QProvingJobDataID> for SlowProver {
+        fn prover_can_process_job(&self, _job_id: QProvingJobDataID) -> bool {
+            true
+        }
+    }
+
+    impl PsyWorkerGenericLibraryProver<Hash256, QProvingJobDataID, ()> for SlowProver {
+        fn prove_job_from_api(&self, _library: &(), _input: Job, _tag: Hash256) -> anyhow::Result<Vec<u8>> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(vec![1])
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_claims_nothing_new_and_submits_every_claimed_job() {
+        let (submitted, mut proofs) = mpsc::unbounded_channel();
+        let fetcher = Arc::new(ListedJobs { jobs: Mutex::new((0..20).map(|_| Job::qp_rand_gen()).collect()), submitted });
+        let manager = PsyProofMinerWorkerManager::new(fetcher.clone(), Arc::new(()), Arc::new(SlowProver));
+        let (stop_tx, stop) = watch::channel(false);
+        let worker = tokio::spawn(async move { manager.run_worker_loop_with_pools(1, 2, None, stop).await });
+        tokio::time::timeout(std::time::Duration::from_secs(30), proofs.recv()).await.expect("a first proof").expect("running");
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), worker).await.expect("the loop returns after a stop").unwrap().unwrap();
+        let claimed = 20 - fetcher.jobs.lock().unwrap().len();
+        let mut submitted = 1;
+        while proofs.try_recv().is_ok() {
+            submitted += 1;
+        }
+        assert!(claimed < 20, "the worker kept claiming after the stop");
+        assert_eq!(submitted, claimed, "every claimed job must be proved and submitted before the loop returns");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -333,4 +333,9 @@ impl<
     async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
         self.submit_proof_inner(api_url_hash, job_id, tag, proof).await
     }
+    fn stop_claiming(&self) {
+        if let Some(v2) = &self.v2 {
+            v2.stop_claiming();
+        }
+    }
 }

@@ -43,6 +43,7 @@ pub struct V2State {
     /// Earliest time of the next claim request, in ms since the epoch.
     next_claim_ms: tokio::sync::Mutex<u64>,
     max_bits: u16,
+    claims_stopped: tokio::sync::watch::Sender<bool>,
 }
 
 pub fn enabled_from_env() -> anyhow::Result<Option<V2State>> {
@@ -55,7 +56,8 @@ pub fn enabled_from_env() -> anyhow::Result<Option<V2State>> {
                 Err(_) => 30,
             };
             Ok(Some(V2State { generations: DashMap::new(), scopes: DashMap::new(), leases: DashMap::new(),
-                recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits }))
+                recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits,
+                claims_stopped: tokio::sync::watch::Sender::new(false) }))
         }
         Ok(other) => anyhow::bail!("unsupported PSY_WORKER_TASK_PROTOCOL {other}"),
         Err(_) => anyhow::bail!("PSY_WORKER_TASK_PROTOCOL is not valid unicode"),
@@ -138,20 +140,34 @@ impl V2State {
     }
 
     /// Claim one task, recovering admission once if the edge requires it.
+    pub fn stop_claiming(&self) {
+        self.claims_stopped.send_replace(true);
+    }
+
     pub async fn claim<S: Secp256K1WalletProvider>(&self, client: &HttpClient, url_hash: [u8; 32], signer: &S, public_key: &CompressedPublicKey, tag: Hash32)
         -> anyhow::Result<Option<serde_json::Value>> {
+        let mut stopped = self.claims_stopped.subscribe();
+        if *stopped.borrow() { return Ok(None); }
         let scope = self.scope(client, url_hash).await?;
         let request = ClaimRequest { reward_tag: tag };
         for attempt in 0..2 {
             {
                 let mut next = self.next_claim_ms.lock().await;
                 let now = now_ms();
-                if *next > now { tokio::time::sleep(std::time::Duration::from_millis(*next - now)).await; }
+                if *next > now {
+                    tokio::select! {
+                        _ = stopped.wait_for(|stopped| *stopped) => return Ok(None),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(*next - now)) => {}
+                    }
+                }
                 *next = now_ms() + CLAIM_INTERVAL_MS;
             }
             let generation = match self.generations.get(&scope.hash()).map(|g| *g) {
                 Some(generation) => generation,
-                None => match self.recover(client, &scope, signer, public_key).await {
+                None => match tokio::select! {
+                    _ = stopped.wait_for(|stopped| *stopped) => return Ok(None),
+                    recovered = self.recover(client, &scope, signer, public_key) => recovered,
+                } {
                     Ok(generation) => generation,
                     Err(error) => match error.downcast_ref::<ClientError>().filter(|e| category(e) == Some("RATE_LIMITED")) {
                         Some(limited) => { self.back_off(limited).await; return Ok(None); }
@@ -159,6 +175,7 @@ impl V2State {
                     },
                 },
             };
+            if *stopped.borrow() { return Ok(None); }
             let auth = self.sign(signer, public_key, &scope, AdmissionMethod::ClaimTask, generation, request.payload_hash())?;
             match client.claim_task_v2(auth, request.clone()).await {
                 Ok(response) => {
@@ -317,7 +334,8 @@ mod tests {
     #[test]
     fn worker_wallet_signatures_verify_on_the_edge() {
         let state = V2State { generations: DashMap::new(), scopes: DashMap::new(), leases: DashMap::new(),
-            recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits: 30 };
+            recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(0), max_bits: 30,
+            claims_stopped: tokio::sync::watch::Sender::new(false) };
         let scope = AdmissionScope { network_id: FixedBytes([1; 32]), admission_epoch: FixedBytes([2; 32]), node_type: 1, realm_id: 0, realm_sub_id: 0 };
         let policy = AdmissionPolicy::for_base_bits(8);
         for seed in 1..=32u8 {
@@ -327,5 +345,27 @@ mod tests {
             let auth = state.sign(&wallet, &public_key, &scope, AdmissionMethod::ClaimTask, 0, request.payload_hash()).unwrap();
             auth.verify(&scope, &policy, AdmissionMethod::ClaimTask, request.payload_hash(), now_ms()).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_a_claim_waiting_to_be_sent_without_contacting_the_edge() {
+        let state = std::sync::Arc::new(V2State { generations: DashMap::new(), scopes: DashMap::new(), leases: DashMap::new(),
+            recovery: tokio::sync::Mutex::new(()), next_claim_ms: tokio::sync::Mutex::new(now_ms() + 60_000), max_bits: 30,
+            claims_stopped: tokio::sync::watch::Sender::new(false) });
+        let scope = AdmissionScope { network_id: FixedBytes([1; 32]), admission_epoch: FixedBytes([2; 32]), node_type: 1, realm_id: 0, realm_sub_id: 0 };
+        state.scopes.insert([7; 32], scope);
+        // Nothing listens here: any request would fail instead of returning no job.
+        let client = jsonrpsee::http_client::HttpClientBuilder::default().build("http://127.0.0.1:9").unwrap();
+        let mut wallet = MemorySecp256K1Wallet::new();
+        let public_key = wallet.add_private_key(Hash256([3; 32])).unwrap();
+        let claiming = {
+            let (state, client) = (state.clone(), client.clone());
+            tokio::spawn(async move { state.claim(&client, [7; 32], &wallet, &public_key, FixedBytes([5; 32])).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!claiming.is_finished(), "the claim must be waiting for its interval");
+        state.stop_claiming();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), claiming).await.expect("a stop ends the wait").unwrap();
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 }
