@@ -130,12 +130,12 @@ def validate_topology(topology, lock, profile):
     for value in hosts.values():
         private_ip(value)
     coordinator = topology["coordinator"]
-    fields(coordinator, ("host", "namespace", "edge_ports"), "coordinator")
+    fields(coordinator, ("host", "namespace", "edge_ports", "ingress_port"), "coordinator")
     require(coordinator["namespace"] == namespace + "_coordinator",
             "coordinator namespace differs from approved role")
     require(hosts.get(coordinator["host"]) == "10.148.0.25"
-            and coordinator["edge_ports"] == [15370, 15371, 15372],
-            "coordinator must use 10.148.0.25 ports 15370/15371/15372")
+            and coordinator["edge_ports"] == [15370, 15371, 15372] and coordinator["ingress_port"] == 15369,
+            "coordinator must use 10.148.0.25 edge ports 15370/15371/15372 and ingress port 15369")
     sockets = set()
 
     def socket(host, port):
@@ -145,7 +145,7 @@ def validate_topology(topology, lock, profile):
         require(endpoint not in sockets, "duplicate topology socket")
         sockets.add(endpoint)
 
-    for port in coordinator["edge_ports"]:
+    for port in (coordinator["ingress_port"], *coordinator["edge_ports"]):
         socket(coordinator["host"], port)
     realms = topology["realms"]
     require(isinstance(realms, list) and len(realms) == 2, "exactly two topology Realms required")
@@ -273,8 +273,7 @@ def assemble_config(canonical, p2p, commitments, topology, whitelist, lock, prof
             public["validators"].append(mapped)
             public["rpc_url"].append(f'http://{edge_ip}:{placement["http_port"]}')
         public_realms.append(public)
-    coordinator = [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}"
-                    for port in topology["coordinator"]["edge_ports"]]}]
+    coordinator = [{"id": 0, "rpc_url": [f"http://10.148.0.25:{topology['coordinator']['ingress_port']}"]}]
     network = result["networks"]["testnet"]
     network["realm_configs"] = public_realms
     network["coordinator_configs"] = coordinator

@@ -47,7 +47,7 @@ def fixture(lock=None):
                     guardian_initial_member_hashes=[f"{i:064x}" for i in (1, 2, 3)])
     c = topology["coordinator"]
     selected["coordinator_configs"] = [{"id": 0, "rpc_url": [
-        f'http://{topology["hosts"][c["host"]]}:{port}' for port in c["edge_ports"]]}]
+        f'http://{topology["hosts"][c["host"]]}:{c["ingress_port"]}']}]
     selected["realm_configs"] = []
     genesis = {"validators": [], "users": [{
         "public_key_info": {"fingerprint": "01" * 32, "public_key_param": "02" * 32},
@@ -278,7 +278,7 @@ class PlanTests(unittest.TestCase):
                              "--p2p-listen", "--checkpoint-backup-path"):
                     self.assertIn(flag, argv)
                 start = argv.index("--coordinator-api-urls") + 1
-                self.assertEqual(argv[start:start + 3], [f"http://10.148.0.25:{p}" for p in (15370, 15371, 15372)])
+                self.assertEqual(argv[start:start + 2], ["http://10.148.0.25:15369", "--p2p-identity-key"])
             if "edge" in argv[1]:
                 self.assertIn("--worker-whitelist-config", argv)
                 self.assertEqual(argv[argv.index("--worker-whitelist-config") + 1],
@@ -317,6 +317,23 @@ class PlanTests(unittest.TestCase):
         for s in services:
             if s["argv"][1].endswith("-processor"):
                 self.assertFalse(any(k.startswith("PSY_WORKER_ADMISSION_") for k in s["environment"]))
+
+    def test_coordinator_clients_use_only_the_ingress(self):
+        processors = [s for s in self.report()["services"] if s["argv"][1] == "start-realm-processor"]
+        self.assertEqual(len(processors), 6)
+        for s in processors:
+            start = s["argv"].index("--coordinator-api-urls") + 1
+            self.assertEqual(s["argv"][start], "http://10.148.0.25:15369")
+            self.assertTrue(s["argv"][start + 1].startswith("--"))
+        for port in (15368, 15370, None):
+            with self.subTest(port=port):
+                changed = copy.deepcopy(self.t)
+                if port is None:
+                    del changed["coordinator"]["ingress_port"]
+                else:
+                    changed["coordinator"]["ingress_port"] = port
+                with self.assertRaisesRegex(plan.PlanError, "coordinator"):
+                    plan.make_plan(changed, self.c, self.g, self.w, release_profile=self.profile)
 
     def test_worker_admission_block_is_required_and_bounded(self):
         original = copy.deepcopy(self.t["worker_admission"])

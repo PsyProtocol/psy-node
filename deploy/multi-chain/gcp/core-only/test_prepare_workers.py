@@ -123,9 +123,8 @@ class WorkerPreparationTests(unittest.TestCase):
             self.assertEqual(config["network"], "psy-public-testnet")
             self.assertEqual(config["url_rotation_strategy"], "round-robin")
             urls = config["realm_api_urls"] + config["coordinator_api_urls"]
-            self.assertEqual(len(urls), 3)
             ports = [int(url.rsplit(":", 1)[1]) for url in urls]
-            self.assertEqual(ports, {"coordinator": [15370, 15371, 15372],
+            self.assertEqual(ports, {"coordinator": [15369],
                                      "realm-0": [15380, 15381, 15382], "realm-1": [15383, 15384, 15385]}[role])
             self.assertEqual(config["completed_jobs_log_file"], str(self.rel.state_dir / role / "completed.backup"))
             unit = files[workers.unit_name(self.rel, role)].decode()

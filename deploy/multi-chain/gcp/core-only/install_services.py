@@ -56,7 +56,7 @@ def placement(lock, release_topology):
     add_role(coordinator["host"], "coordinator")
     indexers = {"coordinator": {"args": "coordinator", "backup_subdir": "coordinator_0_0",
                                 "core_unit": f"{core_prefix}coordinator-processor.service",
-                                "edge_url": f"http://{addresses[coordinator['host']]}:{coordinator['edge_ports'][0]}"}}
+                                "edge_url": f"http://{addresses[coordinator['host']]}:{coordinator['ingress_port']}"}}
     sources = {}
     for realm in release_topology["realms"]:
         realm_id, first = realm["id"], realm["validators"][0]

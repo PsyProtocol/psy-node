@@ -154,7 +154,7 @@ def worker_configs(topology, release):
     host = topology["hosts"][coordinator["host"]]
     configs = {}
     for role in THREADS:
-        urls = [f"http://{host}:{port}" for port in coordinator["edge_ports"]]
+        urls = [f"http://{host}:{coordinator['ingress_port']}"]
         realm_urls = []
         if role != "coordinator":
             realm = topology["realms"][int(role[-1])]

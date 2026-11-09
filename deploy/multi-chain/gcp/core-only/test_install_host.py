@@ -196,13 +196,15 @@ class InstallHostTests(unittest.TestCase):
                         "--listen": ["0.0.0.0", "127.0.0.1", "10.148.0.99"],
                         "--port": ["80", "15370", "15385"],
                         "--p2p-listen": ["/ip4/0.0.0.0/tcp/41001", "/ip4/10.148.0.99/tcp/41001", value + "0"],
-                        "--coordinator-api-urls": ["http://10.148.0.99:15370", "http://10.148.0.25:80",
-                                                    "http://10.148.0.25:15371", "http://user:password@10.148.0.25:15370"],
+                        "--coordinator-api-urls": ["http://10.148.0.99:15369", "http://10.148.0.25:80",
+                                                    "http://10.148.0.25:15370", "http://user:password@10.148.0.25:15369"],
                     }
                     for replacement in alternatives[option]:
                         if replacement != value:
                             changes.append(argv[:index] + [replacement] + argv[index + 1:])
-                    changes.append(argv[:index - 1] + argv[index + (3 if option == "--coordinator-api-urls" else 1):])
+                    changes.append(argv[:index - 1] + argv[index + 1:])
+                    if option == "--coordinator-api-urls":
+                        changes.append(argv[:index + 1] + ["http://10.148.0.25:15370"] + argv[index + 1:])
                 for changed in changes:
                     with self.subTest(host=host, unit=unit.name, argv=changed[1:]):
                         updated = "ExecStart=" + " ".join(json.dumps(value) for value in changed)

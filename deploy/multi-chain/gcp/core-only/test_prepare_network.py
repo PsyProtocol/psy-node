@@ -102,8 +102,7 @@ class AssemblyTests(unittest.TestCase):
                 if field == "p2p":
                     value = {**value, "checkpoints_per_epoch": self.profile["checkpoints_per_epoch"]}
                 self.assertEqual(network[field], value)
-            self.assertEqual(network["coordinator_configs"], [{"id": 0, "rpc_url": [
-                f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}])
+            self.assertEqual(network["coordinator_configs"], [{"id": 0, "rpc_url": ["http://10.148.0.25:15369"]}])
             for rid, realm in enumerate(network["realm_configs"]):
                 expected_rpc = []
                 for index, member in enumerate(realm["validators"]):

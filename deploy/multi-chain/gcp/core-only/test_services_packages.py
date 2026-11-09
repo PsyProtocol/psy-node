@@ -19,7 +19,7 @@ TOPOLOGY = {
     "hosts": {"gcp-cp": "10.0.0.25", "gcp-realm-a": "10.0.0.37", "gcp-realm-b": "10.0.0.42", "gcp-realm-c": "10.0.0.43",
               "gcp-edge-1": "10.0.0.36", "gcp-edge-2": "10.0.0.35"},
     "infrastructure": {"redis_url": "redis://10.0.0.12:6379"},
-    "coordinator": {"host": "gcp-cp", "edge_ports": [15370, 15371, 15372]},
+    "coordinator": {"host": "gcp-cp", "edge_ports": [15370, 15371, 15372], "ingress_port": 15369},
     "realms": [{"id": realm, "validators": [
         {"processor_host": host, "edge_host": f"gcp-edge-{realm + 1}", "http_port": 15380 + realm * 3 + index}
         for index, host in enumerate(("gcp-realm-a", "gcp-realm-b", "gcp-realm-c"))]} for realm in (0, 1)]}

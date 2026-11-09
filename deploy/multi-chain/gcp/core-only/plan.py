@@ -133,8 +133,8 @@ def validate_topology(t, release_profile):
         require(value == (canonical if scheme == "tcp" else f"{scheme}://{canonical}"),
                 "infrastructure URL must be canonical, without whitespace or escapes")
     c = t["coordinator"]
-    fields(c, ("host", "namespace", "edge_ports"), "coordinator")
-    require(c["host"] == "gcp-cp-ce" and c["edge_ports"] == [15370, 15371, 15372],
+    fields(c, ("host", "namespace", "edge_ports", "ingress_port"), "coordinator")
+    require(c["host"] == "gcp-cp-ce" and c["edge_ports"] == [15370, 15371, 15372] and c["ingress_port"] == 15369,
             "coordinator placement/ports differ from approved plan")
     namespaces, sockets = set(), set()
 
@@ -152,6 +152,7 @@ def validate_topology(t, release_profile):
         sockets.add(identity)
 
     namespace(c["namespace"], prefix + "_coordinator")
+    socket(c["host"], c["ingress_port"], 15369)
     for port in c["edge_ports"]:
         socket(c["host"], port, 15370)
     require(isinstance(t["realms"], list) and len(t["realms"]) == 2, "exactly two Realms required")
@@ -228,9 +229,7 @@ def validate_inputs(t, config, genesis, whitelist):
     require(isinstance(guardians, list) and len(guardians) == 3, "three Guardian commitments required")
     commitments = [hex_value(x, 32, "Guardian commitment") for x in guardians]
     require(len(set(commitments)) == 3, "duplicate Guardian commitments")
-    c = t["coordinator"]
-    coordinator_urls = [f'http://{t["hosts"][c["host"]]}:{p}' for p in c["edge_ports"]]
-    require(selected["coordinator_configs"] == [{"id": 0, "rpc_url": coordinator_urls}],
+    require(selected["coordinator_configs"] == [{"id": 0, "rpc_url": [coordinator_ingress_url(t)]}],
             "coordinator RPC inventory mismatch")
     require(type(selected["coordinator_configs"][0]["id"]) is int, "invalid coordinator ID")
     public_realms = selected["realm_configs"]
@@ -303,6 +302,11 @@ def check_lock_release(lock, profile):
             "core unit prefix differs from the lock")
 
 
+def coordinator_ingress_url(t):
+    c = t["coordinator"]
+    return f'http://{t["hosts"][c["host"]]}:{c["ingress_port"]}'
+
+
 def worker_admission_env(t, namespace):
     admission = t["worker_admission"]
     return {"PSY_WORKER_ADMISSION_MODE": "observe",
@@ -345,7 +349,7 @@ def services(t):
                        "deployment_ready": False})
 
     c = t["coordinator"]
-    coord_urls = [f'http://{t["hosts"][c["host"]]}:{p}' for p in c["edge_ports"]]
+    coord_urls = [coordinator_ingress_url(t)]
     coord_args = ["--coordinator-id", "0", "--coordinator-sub-id", "0"]
     backup = ["--genesis-data-path", config_root + "/genesis.json",
               "--checkpoint-backup-path", state + "/checkpoints"]

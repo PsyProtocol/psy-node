@@ -242,6 +242,7 @@ def host_inventory(host, release):
 
 
 ADMISSION_ENV_PREFIX = "PSY_WORKER_ADMISSION_"
+COORDINATOR_INGRESS_PORT = 15369
 
 
 def check_admission_env(admission_env, role, redis_url, namespace):
@@ -394,8 +395,7 @@ def validate_unit(name, raw, keys, host, release):
         if role == "realm-edge":
             endpoints.update({"--listen": [HOSTS[host]], "--port": [str(15379 + realm_id * 3 + validator_position)]})
         else:
-            endpoints["--coordinator-api-urls"] = [f'http://{HOSTS["gcp-cp-ce"]}:{port}'
-                                                  for port in (15370, 15371, 15372)]
+            endpoints["--coordinator-api-urls"] = [f'http://{HOSTS["gcp-cp-ce"]}:{COORDINATOR_INGRESS_PORT}']
     endpoint_options = {"--listen", "--port", "--p2p-listen", "--coordinator-api-urls"}
     require({key: value for key, value in options.items() if key in endpoint_options} == endpoints,
             "unit endpoints differ from approved host/role ports")
