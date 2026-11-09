@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import subprocess
@@ -365,6 +366,42 @@ class InstallHostTests(unittest.TestCase):
                 unit.write_bytes(original.replace(b"[Service]\n", b"[Service]\n" + replacement))
                 self.save_manifest()
                 self.assert_rejected()
+
+    def test_edge_worker_admission_environment_is_bound_to_the_unit(self):
+        self.host = "gcp-edge-1"
+        self.package = self.root / self.host
+        self.package.mkdir(mode=0o700)
+        self.create_package()
+        self.assertEqual(self.install(True)["host"], self.host)
+        unit = next(path for path in (self.package / "units").iterdir() if path.name.endswith("realm-0-v1-edge.service"))
+        original = unit.read_bytes()
+        queue = (self.release.namespace_prefix + "_r0_v1").encode()
+        self.assertIn(b'Environment="PSY_WORKER_ADMISSION_QUEUE_ID=' + queue + b'"', original)
+        epoch = re.search(rb"PSY_WORKER_ADMISSION_EPOCH=([0-9a-f]{64})", original)[1]
+        for before, after in ((b"QUEUE_ID=" + queue, b"QUEUE_ID=" + queue[:-1] + b"2"),
+                              (b"MODE=observe", b"MODE=enforce"), (b"TASKS=v2", b"TASKS=off"),
+                              (b"BASE_BITS=26", b"BASE_BITS=28"), (b"EPOCH=" + epoch, b"EPOCH=" + epoch.upper()),
+                              (b"REDIS_URL=redis://10.148.0.12:", b"REDIS_URL=redis://10.148.0.13:"),
+                              (b'Environment="PSY_WORKER_ADMISSION_EPOCH=', b'Environment="PSY_WORKER_ADMISSION_OTHER=')):
+            with self.subTest(after=after):
+                unit.write_bytes(original.replace(before, after))
+                self.save_manifest()
+                self.assert_rejected()
+        for line in (b'Environment="PSY_WORKER_ADMISSION_TASKS=v2"\n', b"Environment=PSY_WORKER_ADMISSION_TASKS=off\n",
+                     b"Environment=PSY_WORKER_ADMISSION_TASKS\n"):
+            with self.subTest(line=line):
+                unit.write_bytes(original.replace(b"[Service]\n", b"[Service]\n" + line))
+                self.save_manifest()
+                self.assert_rejected()
+        unit.write_bytes(re.sub(rb'Environment="PSY_WORKER_ADMISSION_[A-Z_]+=[^"]*"\n', b"", original))
+        self.save_manifest()
+        self.assert_rejected()
+
+    def test_processor_unit_rejects_worker_admission_environment(self):
+        unit = next(path for path in (self.package / "units").iterdir() if path.name.endswith("-processor.service"))
+        unit.write_bytes(unit.read_bytes().replace(b"[Service]\n", b"[Service]\nEnvironment=PSY_WORKER_ADMISSION_MODE=observe\n"))
+        self.save_manifest()
+        self.assert_rejected()
 
     def test_unit_old_paths_and_wrong_keys_rejected(self):
         unit = next((self.package / "units").iterdir())

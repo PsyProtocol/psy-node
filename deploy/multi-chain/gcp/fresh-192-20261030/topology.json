@@ -102,5 +102,10 @@
     }
   ],
   "namespace_prefix": "fresh20261030sd192",
-  "checkpoints_per_epoch": 32
+  "checkpoints_per_epoch": 32,
+  "worker_admission": {
+    "network_id": "d2bc93623b3d3ef88e01e38d2e061a208c4b84240d8a3c38b3357a00a9b05865",
+    "epoch": "971dd1ef8fa341fbf6d20d0a76a296cb1e1907fe67d5482af90f79aa18a3e0b6",
+    "base_bits": 26
+  }
 }

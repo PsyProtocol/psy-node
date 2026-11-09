@@ -109,7 +109,7 @@ def validate_topology(topology, lock, profile):
     fields(topology, ("schema_version", "release_id", "runtime_commit", "psy_network",
                       "network", "proving_backend", "hosts", "infrastructure",
                       "coordinator", "realms", "faucet_operator_count", "namespace_prefix",
-                      "checkpoints_per_epoch", "worker_queue_ack_wait_ms"), "topology")
+                      "checkpoints_per_epoch", "worker_queue_ack_wait_ms", "worker_admission"), "topology")
     integer(topology["faucet_operator_count"], 100, 100, "faucet operator count")
     integer(topology["schema_version"], 2, 2, "topology version")
     namespace = lock["units"]["core_namespace_prefix"]

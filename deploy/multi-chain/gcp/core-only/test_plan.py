@@ -299,6 +299,41 @@ class PlanTests(unittest.TestCase):
         for host in plan.EDGES:
             self.assertEqual(hosts.count(host), 3)
 
+    def test_edges_carry_worker_admission_scoped_to_their_queue(self):
+        admission = self.t["worker_admission"]
+        services = self.report()["services"]
+        edges = [s for s in services if s["argv"][1].endswith("-edge")]
+        self.assertEqual(len(edges), 9)
+        for s in edges:
+            self.assertEqual({k: v for k, v in s["environment"].items() if k.startswith("PSY_WORKER_ADMISSION_")}, {
+                "PSY_WORKER_ADMISSION_MODE": "observe", "PSY_WORKER_ADMISSION_TASKS": "v2",
+                "PSY_WORKER_ADMISSION_NETWORK_ID": admission["network_id"],
+                "PSY_WORKER_ADMISSION_EPOCH": admission["epoch"],
+                "PSY_WORKER_ADMISSION_BASE_BITS": str(admission["base_bits"]),
+                "PSY_WORKER_ADMISSION_REDIS_URL": self.t["infrastructure"]["redis_url"],
+                "PSY_WORKER_ADMISSION_QUEUE_ID": s["namespace"]})
+            self.assertIn('Environment="PSY_WORKER_ADMISSION_QUEUE_ID=' + s["namespace"] + '"', s["systemd_preview"])
+        self.assertEqual(len({s["namespace"] for s in edges}), 7)
+        for s in services:
+            if s["argv"][1].endswith("-processor"):
+                self.assertFalse(any(k.startswith("PSY_WORKER_ADMISSION_") for k in s["environment"]))
+
+    def test_worker_admission_block_is_required_and_bounded(self):
+        original = copy.deepcopy(self.t["worker_admission"])
+        cases = ((lambda a: a.pop("epoch"), "worker admission: unexpected or missing fields"),
+                 (lambda a: a.update(mode="enforce"), "worker admission: unexpected or missing fields"),
+                 (lambda a: a.update(network_id="0" * 64), "invalid worker admission network_id"),
+                 (lambda a: a.update(epoch=original["epoch"].upper()), "epoch must be lowercase hex"),
+                 (lambda a: a.update(base_bits=28), "invalid worker admission base bits"),
+                 (lambda a: a.update(base_bits="26"), "invalid worker admission base bits"))
+        for change, message in cases:
+            with self.subTest(message=message):
+                self.t["worker_admission"] = copy.deepcopy(original)
+                change(self.t["worker_admission"])
+                self.reject(message)
+        del self.t["worker_admission"]
+        self.reject("topology: unexpected or missing fields")
+
     def test_namespace_collision_rejected(self):
         self.t["realms"][1]["validators"][0]["namespace"] = self.t["realms"][0]["validators"][0]["namespace"]
         self.reject("shared namespace")

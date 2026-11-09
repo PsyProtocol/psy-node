@@ -181,6 +181,7 @@ def worker_unit(release, role):
         "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(release.config_dir / "network.json"),
         "Environment=RUST_LOG=info", "Environment=RUST_MIN_STACK=134217728",
         "Environment=RAYON_NUM_THREADS=" + str(THREADS[role]), "Environment=TOKIO_WORKER_THREADS=2",
+        "Environment=PSY_WORKER_TASK_PROTOCOL=v2",
         "ExecStart=" + str(release.release_dir / "psy_worker_cli") + " worker --config "
         + str(release.config_dir / (role + ".json"))
         + " --network psy-public-testnet --proving-backend plonky2-poseidon-goldilocks"

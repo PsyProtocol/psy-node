@@ -74,6 +74,7 @@ class WorkerPreparationTests(unittest.TestCase):
             unit = files[name].decode()
             self.assertIn("Slice=" + slice_name, unit)
             self.assertIn("ReadWritePaths=" + str(self.rel.state_dir / role), unit)
+            self.assertEqual(unit.count("Environment=PSY_WORKER_TASK_PROTOCOL=v2\n"), 1)
         targets, _ = workers.install_paths(files, {r: "test-secret" for r in workers.THREADS}, (999, 999), self.rel)
         self.assertIn(workers.UNITS / slice_name, targets)
 

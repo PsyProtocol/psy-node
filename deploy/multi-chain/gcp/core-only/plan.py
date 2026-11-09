@@ -83,9 +83,16 @@ def validate_topology(t, release_profile):
     topology_fields = ("schema_version", "release_id", "runtime_commit", "psy_network",
                "network", "proving_backend", "hosts", "infrastructure", "coordinator",
                "realms", "faucet_operator_count", "namespace_prefix", "checkpoints_per_epoch",
-               "worker_queue_ack_wait_ms")
+               "worker_queue_ack_wait_ms", "worker_admission")
     require(isinstance(t, dict), "topology must be an object")
     fields(t, topology_fields, "topology")
+    admission = t["worker_admission"]
+    fields(admission, ("network_id", "epoch", "base_bits"), "worker admission")
+    for key in ("network_id", "epoch"):
+        require(hex_value(admission[key], 32, "worker admission " + key) == admission[key],
+                "worker admission " + key + " must be lowercase hex")
+    # Workers solve at most 30 bits and edges add up to 3 after violations.
+    number(admission["base_bits"], 1, 27, "worker admission base bits")
     number(t["faucet_operator_count"], 100, 100, "faucet operator count")
     require(type(t["schema_version"]) is int and t["schema_version"] == 2, "unsupported schema")
     require(isinstance(release_profile, dict), "topology requires a release profile")
@@ -296,6 +303,17 @@ def check_lock_release(lock, profile):
             "core unit prefix differs from the lock")
 
 
+def worker_admission_env(t, namespace):
+    admission = t["worker_admission"]
+    return {"PSY_WORKER_ADMISSION_MODE": "observe",
+            "PSY_WORKER_ADMISSION_NETWORK_ID": admission["network_id"],
+            "PSY_WORKER_ADMISSION_EPOCH": admission["epoch"],
+            "PSY_WORKER_ADMISSION_BASE_BITS": str(admission["base_bits"]),
+            "PSY_WORKER_ADMISSION_REDIS_URL": t["infrastructure"]["redis_url"],
+            "PSY_WORKER_ADMISSION_TASKS": "v2",
+            "PSY_WORKER_ADMISSION_QUEUE_ID": namespace}
+
+
 def services(t):
     paths = core_paths(t["release_id"])
     release, config_root, state = paths["release"], paths["config"], paths["state"]
@@ -311,16 +329,19 @@ def services(t):
                 "--db-namespace", namespace, *args]
         unit_prefix = core_unit_prefix(t["namespace_prefix"])
         unit = unit_prefix + name + ".service"
+        unit_env = dict(env)
+        if role.endswith("-edge"):
+            unit_env.update(worker_admission_env(t, namespace))
         quote = lambda value: '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         preview = "\n".join([
             "[Unit]", "Description=OFFLINE PREVIEW " + name, "After=network-online.target",
             "[Service]", "Type=simple", "User=psy-core", "Group=psy-core",
             "WorkingDirectory=" + release, "UMask=0077",
-            *["Environment=" + quote(k + "=" + v) for k, v in env.items()],
+            *["Environment=" + quote(k + "=" + v) for k, v in unit_env.items()],
             "ExecStart=" + " ".join(quote(arg) for arg in argv), "Restart=on-failure", "",
         ])
         result.append({"host": host, "unit": unit, "namespace": namespace,
-                       "environment": dict(env), "argv": argv, "systemd_preview": preview,
+                       "environment": unit_env, "argv": argv, "systemd_preview": preview,
                        "deployment_ready": False})
 
     c = t["coordinator"]

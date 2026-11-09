@@ -5,7 +5,7 @@
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
     "release_profile": "8fadcbbc4c0a0376041e2b2660002067728cce691e0e876203267e679adb1ff3",
-    "topology": "2d4513895f73455140ac06f43cfc5f83669f4f090ba44ebf730e83400736e92d",
+    "topology": "1a4d178daee9ef624158da7c9c5c150c997f4bde235d0a5636926a1ae32ca6f3",
     "artifacts": "08b5fbe4b5575708dab2878b6f22ddbde28bb9ad34093bb571e99f159f3f029f",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
@@ -210,14 +210,14 @@
     "indexer_backup_mirror.py": "4e5ce785f72a470fffe4f63540ff0573485cb912e6f24979548d5d837c2dc427",
     "install_envio.py": "691edba90ab96718346d9bf27808e70c786fe32827b8d4d640882e2e1fe9f27b",
     "install_guardian.py": "b12f963e776078142dd08a77e894ed54d3f0add0f6e1b54093d3de4b0ddb7b96",
-    "install_host.py": "8f44f6a9360d4ffe903a7694cc390ceff7ba3137dfae9539f74b70e7ab8b5bf3",
+    "install_host.py": "69f18865d55acdc2eb2cf4ddda4dbf8619f2d0e007931521f05bb24c6435c041",
     "install_relayer.py": "5e15d87644ec078eb40f4f62b69c34da4a1b02770888d9c63b5b6b7a8319e184",
     "install_services.py": "56b4be1afc66fde56f6e0a461b3a9350d419e4a38aecc982127db1f78748e3df",
     "prepare_bridge_forwarders.py": "b1936367517d4dfc01272edc64815f1c1d6410ea174a5f50cd2ad71fd666979a",
     "prepare_faucet.py": "74019690fe26d427ef70cbeda86507ba188b8c97f57a51715d540123d63299db",
     "prepare_proxies.py": "496783a6e43614544cb243db0602b6095c2b2149e137e864a8404f646f34d558",
     "prepare_relayer_credential.py": "bad8ba5f20d8e4b7deda67fbefa06b94fda5bb2fa67002df052ba1c5f0a9cf1c",
-    "prepare_workers.py": "40dcca5a6e1acb45c4ebdbda32994302d73e02e3678f60bbaa46fc710a94faf9",
+    "prepare_workers.py": "7c4c491ea3748d7e79b91b0df27672bf0e553c075777e2c0f30655e07e5c78ad",
     "probe_databases.py": "068a5d0652bdd1ff067b7f5a220c9cc0a213fb4abcf5f0cb66216f967b8c3c93",
     "relayer_exec.py": "98befed16fc38214bf7c6c444158b4a4c61d77035eec2352261e66f9386e6fb6"
   }

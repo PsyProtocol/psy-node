@@ -241,6 +241,25 @@ def host_inventory(host, release):
     return {release.unit_prefix + name + ".service" for name in names}, keys
 
 
+ADMISSION_ENV_PREFIX = "PSY_WORKER_ADMISSION_"
+
+
+def check_admission_env(admission_env, role, redis_url, namespace):
+    if not role.endswith("edge"):
+        require(not admission_env, "worker admission environment on a processor unit")
+        return
+    expected = {"MODE": "observe", "TASKS": "v2", "REDIS_URL": redis_url, "QUEUE_ID": namespace}
+    for key in ("NETWORK_ID", "EPOCH"):
+        value = admission_env.get(ADMISSION_ENV_PREFIX + key, "")
+        require(re.fullmatch(r"[0-9a-f]{64}", value) and int(value, 16) != 0, "invalid worker admission " + key)
+        expected[key] = value
+    base_bits = admission_env.get(ADMISSION_ENV_PREFIX + "BASE_BITS", "")
+    require(re.fullmatch(r"[1-9][0-9]?", base_bits) and int(base_bits) <= 27, "invalid worker admission base bits")
+    expected["BASE_BITS"] = base_bits
+    require(admission_env == {ADMISSION_ENV_PREFIX + key: value for key, value in expected.items()},
+            "worker admission environment mismatch")
+
+
 def validate_unit(name, raw, keys, host, release):
     try:
         text = raw.decode("ascii")
@@ -275,8 +294,13 @@ def validate_unit(name, raw, keys, host, release):
     required_env = {"PSY_NETWORK=testnet", "PSY_CONFIG_PATH=" + str(release.config_dir / "config.json")}
     required_env.add("NATS_WORKER_ACK_WAIT_MS=" + str(release.worker_queue_ack_wait_ms))
     optional_env = {"RUST_LOG=info", "RUST_MIN_STACK=134217728", "RAYON_NUM_THREADS=2"}
-    require(required_env <= set(environments) <= required_env | optional_env
-            and len(environments) == len(set(environments)), "unit environment must contain only approved public values")
+    node_env = [value for value in environments if not value.startswith(ADMISSION_ENV_PREFIX)]
+    admission_pairs = [value.partition("=") for value in environments if value.startswith(ADMISSION_ENV_PREFIX)]
+    require(all(separator for _, separator, _ in admission_pairs), "unit environment must contain only approved public values")
+    admission_env = {key: value for key, _, value in admission_pairs}
+    require(required_env <= set(node_env) <= required_env | optional_env
+            and len(node_env) == len(set(node_env)) and len(node_env) + len(admission_env) == len(environments),
+            "unit environment must contain only approved public values")
     fixed = {
         ("Unit", "After"): "network-online.target", ("Unit", "Wants"): "network-online.target",
         ("Unit", "StartLimitIntervalSec"): "600", ("Unit", "StartLimitBurst"): "3",
@@ -330,6 +354,7 @@ def validate_unit(name, raw, keys, host, release):
         require(parsed.scheme == scheme and parsed.port is not None and not parsed.username
                 and not parsed.password and not parsed.path and not parsed.query and not parsed.fragment,
                 "unsafe infrastructure endpoint")
+    check_admission_env(admission_env, role, options["--redis-url"][0], namespace[0])
     paths = {"--genesis-data-path": release.config_dir / "genesis.json",
              "--checkpoint-backup-path": release.state_dir / "checkpoints", "--worker-whitelist-config": release.config_dir / "config.json"}
     for option, expected in paths.items():
