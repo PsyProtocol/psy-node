@@ -11,7 +11,8 @@ use psy_worker_core::{
     worker::proving_pools::{default_total_threads, ProvingPools},
 };
 use std::sync::Arc;
-use tracing::{error, info};
+use tokio::sync::watch;
+use tracing::{error, info, warn};
 
 use super::ProvingPoolsMode;
 
@@ -48,6 +49,7 @@ pub async fn run_worker_inner(
     proving_backend: PsyChainProvingBackendType,
     batch_size: usize,
     pools: Option<Arc<ProvingPools>>,
+    stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Placeholder for actual worker logic
 
@@ -56,10 +58,22 @@ pub async fn run_worker_inner(
         const D: usize = 2;
         let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
 
-        worker.run_worker_loop_with_pools(100, batch_size, pools).await?;
+        worker.run_worker_loop_with_pools(100, batch_size, pools, stop).await?;
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
         let worker = get_simple_proof_miner_worker_for_network_jtmb::<JTMBPoseidonGoldilocksConfig>(network, config).await?;
-        worker.run_worker_loop(100, batch_size).await?;
+        worker.run_worker_loop(100, batch_size, stop).await?;
+    }
+    Ok(())
+}
+
+/// Below the unit's TimeoutStopSec (300 s).
+const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(240);
+
+async fn stop_signal() -> anyhow::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
     }
     Ok(())
 }
@@ -98,6 +112,7 @@ pub async fn run(
     let network = config.network.clone();
 
     let mut handles = Vec::new();
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     let proving_backend = proving_backend
             .unwrap_or(PsyChainProvingBackendTypeInput::Plonky2PoseidonGoldilocks)
@@ -117,6 +132,7 @@ pub async fn run(
         proving_backend,
         batch_size,
         pools,
+        stop_rx,
     ));
     handles.push(handle);
     /*
@@ -155,38 +171,51 @@ pub async fn run(
 
     info!("Started {} worker threads", handles.len());
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Ctrl-C signal received, cleaning up...");
-        }
-        result = async {
-            let mut inner_error = None;
-            for handle in handles {
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        error!("Worker thread failed: {e:#}");
-                        if inner_error.is_none() {
-                            inner_error = Some(e);
-                        }
+    let workers = async {
+        let mut inner_error = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Worker thread failed: {e:#}");
+                    if inner_error.is_none() {
+                        inner_error = Some(e);
                     }
-                    Err(e) => {
-                        error!("Worker thread failed: {e:?}");
-                        if inner_error.is_none() {
-                            inner_error = Some(anyhow::anyhow!("worker task panicked: {e}"));
-                        }
+                }
+                Err(e) => {
+                    error!("Worker thread failed: {e:?}");
+                    if inner_error.is_none() {
+                        inner_error = Some(anyhow::anyhow!("worker task panicked: {e}"));
                     }
                 }
             }
-            inner_error
-        } => {
+        }
+        inner_error
+    };
+    tokio::pin!(workers);
+    tokio::select! {
+        result = &mut workers => {
             if let Some(e) = result {
                 info!("Worker exit.");
                 return Err(e);
             }
             info!("All worker threads completed");
+            info!("Worker exit.");
+            return Ok(());
         }
+        signal = stop_signal() => {
+            signal?;
+        }
+    }
+    info!("Stop signal received: claiming no new jobs, finishing claimed jobs for up to {}s", DRAIN_LIMIT.as_secs());
+    let _ = stop_tx.send(true);
+    match tokio::time::timeout(DRAIN_LIMIT, &mut workers).await {
+        Ok(Some(e)) => {
+            info!("Worker exit.");
+            return Err(e);
+        }
+        Ok(None) => info!("Every claimed job was finished"),
+        Err(_) => warn!("Drain limit reached; exiting with claimed jobs still in flight"),
     }
 
     info!("Worker exit.");

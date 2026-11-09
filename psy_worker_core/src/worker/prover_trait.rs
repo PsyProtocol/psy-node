@@ -25,4 +25,6 @@ pub trait PsyWorkerJobFetcher<Hash, JobId> {
         &self,
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>>;
     async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], job_id: JobId, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()>;
+    /// Every later claim returns no job without contacting the server.
+    fn stop_claiming(&self) {}
 }
