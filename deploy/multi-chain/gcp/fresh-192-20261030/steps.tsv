@@ -6,6 +6,7 @@
 54	py:plan_bridge_packages	Plan Guardian, Relayer, Services and Envio packages in pending mode
 55	py:check_hosts	Check SSH, disk, keystore, L1 balances and nonces
 56	py:ensure_l1_rpc_routing	Put the local L1 nodes first on the gateway RPC proxy and prove they are fresh
+57	py:install_coordinator_ingress	Install the internal coordinator ingress (Nginx) on the coordinator host
 60	py-cutover:fence_ingress	Fence public ingress with Caddy 503
 61	py-cutover:stop_services	Stop services on the cloud hosts
 62	py-cutover:stop_operator_hosts	Stop x1, x2 and x3 (operator, PENDING)
@@ -31,6 +32,7 @@
 82	py:accept_faucet_batch	Accept concurrent Faucet batches
 83	py:accept_five_withdrawals	Accept batch_append_withdrawals_5
 84	py:accept_three_chains	Accept all three chains one at a time; the pause always comes back
+88	py:expand_coordinator_edges	Start the remaining coordinator edges after acceptance and check them behind the ingress
 85	py:deploy_monitoring	Deploy monitoring
 # 87 runs before 86 on purpose: 86 opens deposits to users, needs CONFIRM_OPEN_DEPOSITS=1 and ends an unattended run.
 87	py:accept_psy_withdrawal	Withdraw PSY with the new address and see it settle on L1

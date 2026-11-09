@@ -199,7 +199,7 @@
   },
   "tool_sha256": {
     "activate_bridge.py": "d4100211b1b736bf159eec67c6093dd41de245a3374c9ae7156eac2d5edbb642",
-    "activate_host.py": "092df8bb803a407630b6e6815b9cf124629b0a4c658b4f4be7123f810d31aa0e",
+    "activate_host.py": "cc8793936c72d68242ba5aae4091aae53afc189087aebe072aba3fe95845703a",
     "activate_services.py": "d1654378c69760188c4c1b21028baf91d90ebf534b3d240c4d5e18c4d9ab8b74",
     "admin_pause.py": "458b17f2f2278298650ba264b6e33fd0f5ba4459a68ece6cf0e777d2f524d30f",
     "caddy_ingress.py": "3243caf141032673485139017afd95079947065d2b86a63d099e98ff6582818c",

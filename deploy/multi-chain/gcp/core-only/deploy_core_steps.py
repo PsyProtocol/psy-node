@@ -9,6 +9,7 @@ import json
 from pathlib import Path, PurePosixPath
 import shlex
 
+import deploy_coordinator_ingress_steps as coordinator_ingress
 import deploy_health as health
 import install_host
 import prepare_workers
@@ -24,6 +25,8 @@ BASH = ["/usr/bin/bash", "-s"]
 DOCKER = "/usr/bin/docker"
 SCYLLA_HOST, NATS_HOST = "gcp-scylla", "gcp-nats"
 COORDINATOR_HOST = "gcp-cp-ce"
+# The cutover starts one coordinator edge; expand_coordinator_edges starts the rest after acceptance.
+STARTING_COORDINATOR_EDGE_COUNT = 1
 INSTALL_TIMEOUT_SECONDS = 900
 ACTIVATE_TIMEOUT_SECONDS = 300
 PROBE_TIMEOUT_SECONDS = 120
@@ -107,10 +110,11 @@ class UnitSet:
         return UnitSet(self.host, units, self.exe_path, self.exe_sha256)
 
 
-def core_unit_sets(ctx):
+def core_unit_sets(ctx, coordinator_edge_count):
     release = install_host.load_core_release(ctx.lock)
     exe_path, exe_sha256 = str(release.release_dir / "bin" / "psy_node_cli"), ctx.lock["binaries"]["psy_node_cli"]
-    return {host: UnitSet(host, units, exe_path, exe_sha256) for host, units in health.core_units(ctx).items()}
+    return {host: UnitSet(host, units, exe_path, exe_sha256)
+            for host, units in health.core_units(ctx, coordinator_edge_count).items()}
 
 
 def worker_unit_set(ctx):
@@ -253,7 +257,7 @@ def core_check(ctx):
     for name in ("install_host.py", "activate_host.py"):
         read_checked_tool(ctx, name)
     expected = read_artifacts(ctx).get("core_host_packages", {}).get("manifest_sha256", {})
-    for host in core_unit_sets(ctx):
+    for host in core_unit_sets(ctx, STARTING_COORDINATOR_EDGE_COUNT):
         require(host in expected, f"{host}: artifacts core_host_packages has no manifest hash")
         root = package_root(ctx, "core", host)
         require(root.is_dir(), f"{host}: no core package found")
@@ -279,7 +283,8 @@ def activate_phase(ctx, unit_set, phase):
     selected.check_no_foreign_binary(rows)
     if not host_needs_activation(selected, rows):
         return
-    report = run_tool(ctx, unit_set.host, "activate_host.py", ["--phase", phase, "--apply"], ACTIVATE_TIMEOUT_SECONDS)
+    units = [argument for unit in selected.units for argument in ("--unit", unit)]
+    report = run_tool(ctx, unit_set.host, "activate_host.py", ["--phase", phase, *units, "--apply"], ACTIVATE_TIMEOUT_SECONDS)
     require(report.get("started") is True, f"{unit_set.host}: activation did not report a start")
 
 
@@ -300,7 +305,8 @@ def start_in_order(ctx, sets, topology, targets):
 
 
 def core_apply(ctx):
-    sets, topology = core_unit_sets(ctx), health.read_topology(ctx)
+    coordinator_ingress.ingress_verify(ctx)
+    sets, topology = core_unit_sets(ctx, STARTING_COORDINATOR_EDGE_COUNT), health.read_topology(ctx)
     states = {host: unit_set.read(ctx) for host, unit_set in sets.items()}
     for host, unit_set in sets.items():
         unit_set.check_no_foreign_binary(states[host])
@@ -315,7 +321,7 @@ def core_apply(ctx):
             if host_needs_install(sets[host], states[host]):
                 report = run_tool(ctx, host, "install_host.py", [], INSTALL_TIMEOUT_SECONDS)
                 require(report.get("mode") == "installed", f"{host}: install did not report an installation")
-        start_in_order(ctx, sets, topology, health.edge_targets(topology))
+        start_in_order(ctx, sets, topology, health.edge_targets(topology, STARTING_COORDINATOR_EDGE_COUNT))
     finally:
         for host in staged:
             unstage(ctx, host)
@@ -398,11 +404,11 @@ def check_ack_wait(ctx, require_consumers):
 
 
 def core_verify(ctx):
-    """The 16 units run, the namespaces exist, the nine edges answer and agree, the validators are connected.
+    """The core units run, the namespaces exist, the edges and the ingress agree, the validators are connected.
 
     Advance is not judged here: the Coordinator cannot advance before the Workers run.
     """
-    sets, topology = core_unit_sets(ctx), health.read_topology(ctx)
+    sets, topology = core_unit_sets(ctx, STARTING_COORDINATOR_EDGE_COUNT), health.read_topology(ctx)
     summary = check_core_units(ctx, sets)
     processors = [sets[host] for host in install_host.PROCESSORS]
     coordinator = sets[COORDINATOR_HOST]
@@ -410,7 +416,7 @@ def core_verify(ctx):
     require(namespace_ready(ctx, [topology["coordinator"]["namespace"]],
                             [coordinator.subset(phase_units(coordinator, "processors"))], COORDINATOR_INIT_MARKER),
             "the coordinator namespace is not initialised")
-    heights = wait_for_agreement(ctx, health.edge_targets(topology), list(sets.values()), "nine edges")
+    heights = wait_for_agreement(ctx, health.edge_targets(topology, STARTING_COORDINATOR_EDGE_COUNT), list(sets.values()), "edges")
     wait_for_connections(ctx, topology, list(sets.values()))
     return {"units": summary, "edge_checkpoints": heights, **check_ack_wait(ctx, True)}
 
@@ -476,7 +482,7 @@ def workers_apply(ctx):
 
 
 def all_unit_sets(ctx):
-    return [*core_unit_sets(ctx).values(), worker_unit_set(ctx)]
+    return [*core_unit_sets(ctx, STARTING_COORDINATOR_EDGE_COUNT).values(), worker_unit_set(ctx)]
 
 
 def worker_evidence(ctx, unit_set):
@@ -500,7 +506,7 @@ def wait_for_advance(ctx, targets, unit_sets):
         wait_until(advanced, lambda: unit_failure(ctx, unit_sets), POLL_SECONDS, ADVANCE_WAIT_SECONDS,
                    "edge checkpoints advancing")
     except TimeoutError:
-        raise ValueError("the nine edges did not advance together; no answer from ["
+        raise ValueError("the edges did not advance together; no answer from ["
                          + silent_names(state.get("heights", first)) + "]") from None
     return state["heights"]
 
@@ -530,7 +536,7 @@ def workers_verify(ctx):
     errors = {unit: count for unit, count in marker_counts(ctx, unit_set.host, unit_set.units, WHITELIST_ERROR_PATTERN).items()
               if count}
     require(not errors, "worker logs hold whitelist errors: " + ", ".join(sorted(errors)))
-    heights = wait_for_advance(ctx, health.edge_targets(health.read_topology(ctx)), failure_sets)
+    heights = wait_for_advance(ctx, health.edge_targets(health.read_topology(ctx), STARTING_COORDINATOR_EDGE_COUNT), failure_sets)
     return {"workers": len(rows), "whitelisted_identities": listed, "whitelist_errors": 0, "edge_checkpoints": heights,
             "coordinator_evidence": {label: sorted(counts.values()) for label, counts in state["evidence"].items()},
             "realm_proof_evidence": "deferred to acceptance: an empty chain has no Realm jobs"}
@@ -545,7 +551,7 @@ def gate_required(ctx):
 
 def gate_check(ctx):
     gate_required(ctx)
-    core_unit_sets(ctx)
+    core_unit_sets(ctx, STARTING_COORDINATOR_EDGE_COUNT)
 
 
 def highest_checkpoints(samples):
@@ -566,7 +572,7 @@ def run_gate(ctx, required):
     samples, state = [], {}
 
     def decide():
-        samples.append(health.read_chain_sample(ctx))
+        samples.append(health.read_chain_sample(ctx, STARTING_COORDINATOR_EDGE_COUNT))
         try:
             state["result"] = health.evaluate_l2_stability(samples, required)
         except ValueError as error:
@@ -590,7 +596,7 @@ def gate_apply(ctx):
 def read_complete_sample(ctx, expected_units):
     """The final check retries a sample that missed a silent host, then judges the last one it got."""
     for _ in range(FINAL_READ_ATTEMPTS):
-        sample = health.read_chain_sample(ctx)
+        sample = health.read_chain_sample(ctx, STARTING_COORDINATOR_EDGE_COUNT)
         if len(sample.unit_restart_counts) == expected_units and None not in sample.edge_checkpoint_ids.values():
             break
     return sample
@@ -598,17 +604,58 @@ def read_complete_sample(ctx, expected_units):
 
 def gate_verify(ctx):
     recorded = read_state(ctx, "gate_l2_stability")
-    expected_units = sum(len(units) for units in health.core_units(ctx).values()) + len(health.worker_units(ctx))
+    expected_units = sum(len(units) for units in health.core_units(ctx, STARTING_COORDINATOR_EDGE_COUNT).values()) + len(health.worker_units(ctx))
     sample = read_complete_sample(ctx, expected_units)
     require(len(sample.unit_restart_counts) == expected_units, "not every unit could be read for the final check")
     require(all(count == 0 for count in sample.unit_restart_counts.values()), "a unit has restarted")
     require(not sample.panic_lines, "a unit log has a panic line")
-    require(settled_edges(sample.edge_checkpoint_ids), "the nine edges do not agree in the final check")
+    require(settled_edges(sample.edge_checkpoint_ids), "the edges do not agree in the final check")
     return {**recorded, "units": expected_units, "edges": dict(sample.edge_checkpoint_ids), **check_ack_wait(ctx, True)}
+
+
+# Step 88.
+def coordinator_edge_count(topology):
+    return len(topology["coordinator"]["edge_ports"])
+
+
+def expand_check(ctx):
+    for name in ("install_host.py", "activate_host.py"):
+        read_checked_tool(ctx, name)
+    expected = read_artifacts(ctx).get("core_host_packages", {}).get("manifest_sha256", {})
+    require(COORDINATOR_HOST in expected, f"{COORDINATOR_HOST}: artifacts core_host_packages has no manifest hash")
+    root = package_root(ctx, "core", COORDINATOR_HOST)
+    require(root.is_dir(), f"{COORDINATOR_HOST}: no core package found")
+    check_host_package(ctx, COORDINATOR_HOST, root, expected[COORDINATOR_HOST])
+
+
+def expand_apply(ctx):
+    unit_set = core_unit_sets(ctx, coordinator_edge_count(health.read_topology(ctx)))[COORDINATOR_HOST]
+    edges = unit_set.subset(phase_units(unit_set, "edges"))
+    rows = edges.read(ctx)
+    edges.check_no_foreign_binary(rows)
+    if not host_needs_activation(edges, rows):
+        return
+    stage_files(ctx, COORDINATOR_HOST, package_root(ctx, "core", COORDINATOR_HOST), ("install_host.py", "activate_host.py"))
+    try:
+        activate_phase(ctx, unit_set, "edges")
+    finally:
+        unstage(ctx, COORDINATOR_HOST)
+
+
+def expand_verify(ctx):
+    """Every coordinator edge runs the pinned binary, and the edges and the ingress agree."""
+    topology = health.read_topology(ctx)
+    count = coordinator_edge_count(topology)
+    sets = core_unit_sets(ctx, count)
+    summary = check_core_units(ctx, {COORDINATOR_HOST: sets[COORDINATOR_HOST]})
+    targets = [target for target in health.edge_targets(topology, count) if target.name.startswith("coordinator-")]
+    heights = wait_for_agreement(ctx, targets, [sets[COORDINATOR_HOST]], "coordinator edges and ingress")
+    return {"coordinator_edges": count, "units": summary, "edge_checkpoints": heights}
 
 
 CORE_STEPS = {
     "start_core": Step("start_core", core_check, core_apply, core_verify, cutover=True),
     "start_workers": Step("start_workers", workers_check, workers_apply, workers_verify, cutover=True),
     "gate_l2_stability": Step("gate_l2_stability", gate_check, gate_apply, gate_verify, cutover=True),
+    "expand_coordinator_edges": Step("expand_coordinator_edges", expand_check, expand_apply, expand_verify, cutover=False),
 }

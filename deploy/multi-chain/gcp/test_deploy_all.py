@@ -44,6 +44,7 @@ CONFIRMS = {
 EXPECTED_PAIRS = (
     ("50", "py:verify_release"), ("51", "py:rebuild_binaries"), ("52", "py:verify_artifacts"),
     ("53", "py:prepare_packages"), ("54", "py:plan_bridge_packages"), ("55", "py:check_hosts"),
+    ("56", "py:ensure_l1_rpc_routing"), ("57", "py:install_coordinator_ingress"),
     ("60", "py-cutover:fence_ingress"), ("61", "py-cutover:stop_services"),
     ("62", "py-cutover:stop_operator_hosts"), ("63", "py-cutover:clear_node_state"),
     ("64", "py-cutover:rebuild_databases"), ("65", "py-cutover:start_core"),
@@ -56,7 +57,7 @@ EXPECTED_PAIRS = (
     ("79", "py:publish_frontends"), ("80", "py:accept_entrypoints"),
     ("81", "py:accept_p2p_rotation"), ("82", "py:accept_faucet_batch"),
     ("83", "py:accept_five_withdrawals"), ("84", "py:accept_three_chains"),
-    ("85", "py:deploy_monitoring"), ("87", "py:accept_psy_withdrawal"), ("86", "py:open_deposits"),
+    ("88", "py:expand_coordinator_edges"), ("85", "py:deploy_monitoring"), ("87", "py:accept_psy_withdrawal"), ("86", "py:open_deposits"),
 )
 
 
@@ -409,7 +410,7 @@ class Sd192StepTableTests(unittest.TestCase):
         rows = [line.split("\t")[:2] for line in SD192_STEPS.read_text().splitlines()
                 if line and line[0].isdigit()]
         self.assertEqual(rows, [list(p) for p in EXPECTED_PAIRS])
-        self.assertEqual(len(rows), 34)
+        self.assertEqual(len(rows), 37)
 
     def test_plan_with_the_real_table_needs_no_private_inputs(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("DEPLOY_", "GCP_"))}

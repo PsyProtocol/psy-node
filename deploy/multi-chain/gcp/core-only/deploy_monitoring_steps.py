@@ -162,6 +162,8 @@ def core_targets(lock, topology, host):
             blocks.append(target_block(f"coordinator-edge-{index}", "coordinator", {"replica_id": str(index)},
                                        "edge", unit(f"coordinator-edge-{index}"),
                                        f"http://{addresses[host]}:{port}"))
+        blocks.append(target_block("coordinator-ingress", "coordinator", {}, "ingress", "nginx.service",
+                                   f"http://{addresses[host]}:{coordinator['ingress_port']}"))
     for realm in topology["realms"]:
         for position, validator in enumerate(realm["validators"], 1):
             labels = {"realm_id": str(realm["id"]), "validator_id": str(validator["validator_user_id"]),

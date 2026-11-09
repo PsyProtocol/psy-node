@@ -95,13 +95,16 @@ def preflight(manifest, units, expected, release):
             h.require(value.get("ActiveState") == "inactive" and value.get("MainPID") == "0", "release unit transitioning or failed")
 
 
-def activate(package, phase, release, apply):
+def activate(package, phase, release, apply, unit_names=None):
     h.require(os.geteuid() == 0, "root required")
     h.require(phase in ("processors", "edges"), "invalid phase")
     manifest, payloads = h.read_package(package, release)
     units, _ = h.host_inventory(manifest["host"], release)
     selected = sorted(n for n in units if n.endswith("processor.service") == (phase == "processors"))
     h.require(selected, "host has no units for requested phase")
+    if unit_names is not None:
+        h.require(unit_names and set(unit_names) <= set(selected), "requested units are not units of this phase")
+        selected = sorted(set(unit_names))
     installed(payloads, release)
     expected = manifest["files"]["bin/psy_node_cli"]
     preflight(manifest, units, expected, release)
@@ -136,12 +139,13 @@ def main():
     parser.add_argument("--release-lock-sha256", required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--phase", choices=("processors", "edges"), required=True)
+    parser.add_argument("--unit", action="append", dest="units", help="start only these units of the phase")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     lock = read_release_lock(args.release_lock, args.release_lock_sha256)
     h = load_helper(lock)
     try:
-        print(json.dumps(activate(args.package, args.phase, h.load_core_release(lock), args.apply), sort_keys=True))
+        print(json.dumps(activate(args.package, args.phase, h.load_core_release(lock), args.apply, args.units), sort_keys=True))
     except Exception as error:
         detail = str(error) if isinstance(error, h.InstallError) else type(error).__name__
         raise SystemExit("Activation failed: " + detail + "; no rollback attempted; inspect selected units") from None

@@ -151,11 +151,14 @@ def read_topology(ctx):
     return release_lock.read_document(ctx.release_dir / "topology.json")
 
 
-def edge_targets(topology):
+def edge_targets(topology, coordinator_edge_count):
+    """The running coordinator edges, the coordinator ingress, and every realm edge."""
     hosts = topology["hosts"]
     coordinator = topology["coordinator"]
-    targets = [EdgeTarget(f"coordinator-{index}", coordinator["host"], hosts[coordinator["host"]], port)
-               for index, port in enumerate(coordinator["edge_ports"])]
+    address = hosts[coordinator["host"]]
+    targets = [EdgeTarget(f"coordinator-{index}", coordinator["host"], address, port)
+               for index, port in enumerate(coordinator["edge_ports"][:coordinator_edge_count])]
+    targets.append(EdgeTarget("coordinator-ingress", coordinator["host"], address, coordinator["ingress_port"]))
     for realm in topology["realms"]:
         for position, validator in enumerate(realm["validators"], start=1):
             host = validator["edge_host"]
@@ -163,11 +166,13 @@ def edge_targets(topology):
     return targets
 
 
-def core_units(ctx):
-    """{host: sorted unit names} of the core units, from the installer's own inventory."""
+def core_units(ctx, coordinator_edge_count):
+    """{host: sorted unit names} of the core units that run, from the installer's own inventory."""
     release = install_host.load_core_release(ctx.lock)
     hosts = ("gcp-cp-ce", *install_host.PROCESSORS, *install_host.EDGES)
-    return {host: sorted(install_host.host_inventory(host, release)[0]) for host in hosts}
+    deferred = {f"{release.unit_prefix}coordinator-edge-{index}.service"
+                for index in range(coordinator_edge_count, len(read_topology(ctx)["coordinator"]["edge_ports"]))}
+    return {host: sorted(set(install_host.host_inventory(host, release)[0]) - deferred) for host in hosts}
 
 
 def worker_units(ctx):
@@ -264,10 +269,10 @@ def read_units(ctx, host, units, upload_unit):
     return parse_host_report(output)
 
 
-def read_chain_sample(ctx: DeployContext) -> ChainSample:
+def read_chain_sample(ctx: DeployContext, coordinator_edge_count) -> ChainSample:
     """One sample: the edges first, in one pass, then the slow unit pass per host."""
-    edges = read_edges(ctx, edge_targets(read_topology(ctx)))
-    plan = {host: (units, None) for host, units in core_units(ctx).items()}
+    edges = read_edges(ctx, edge_targets(read_topology(ctx), coordinator_edge_count))
+    plan = {host: (units, None) for host, units in core_units(ctx, coordinator_edge_count).items()}
     workers = worker_units(ctx)
     plan[WORKER_HOST] = (workers, workers[0])
     restarts, pids, panics, uploads = {}, {}, [], -1

@@ -51,13 +51,13 @@ class ActivateTests(unittest.TestCase):
             return ""
         raise AssertionError(argv)
 
-    def run_activation(self, phase="processors", apply=True):
+    def run_activation(self, phase="processors", apply=True, unit_names=None):
         with patch.object(a.os, "geteuid", return_value=0), \
                 patch.object(a.h, "read_package", return_value=(self.manifest, {})), \
                 patch.object(a, "installed"), patch.object(a, "show", side_effect=self.show), \
                 patch.object(a.h, "command", side_effect=self.command), \
                 patch.object(a, "process", side_effect=lambda n, digest, release: {"unit": n, "pid": 123, "exe_sha256": digest}):
-            return a.activate(Path("/unused-private-package"), phase, RELEASE, apply)
+            return a.activate(Path("/unused-private-package"), phase, RELEASE, apply, unit_names)
 
     def test_exact_role_selection_for_all_six_hosts(self):
         for host in a.h.HOSTS:
@@ -76,6 +76,19 @@ class ActivateTests(unittest.TestCase):
                 self.assertEqual([c for c in self.calls if c[1] == "enable"],
                                  [["systemctl", "enable", "--now", n] for n in expected])
                 self.assertFalse(result["checkpoint_progress_verified"] or result["deployment_ready"])
+
+    def test_requested_units_start_alone_and_must_belong_to_the_phase(self):
+        host = "gcp-cp-ce"
+        self.manifest.update(host=host, private_ip=a.h.HOSTS[host])
+        units = sorted(a.h.host_inventory(host, RELEASE)[0])
+        edges = [n for n in units if not n.endswith("processor.service")]
+        processor = next(n for n in units if n.endswith("processor.service"))
+        result = self.run_activation("edges", unit_names=[edges[0]])
+        self.assertEqual(result["units"], [edges[0]])
+        self.assertEqual([c for c in self.calls if c[1] == "enable"], [["systemctl", "enable", "--now", edges[0]]])
+        for names in ([], [processor], [edges[0], "psy-core-other.service"]):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "not units of this phase"):
+                self.run_activation("edges", unit_names=names)
 
     def test_check_only_does_not_enable_or_start(self):
         self.assertFalse(self.run_activation(apply=False)["started"])

@@ -148,18 +148,23 @@ class EvaluateStabilityTests(unittest.TestCase):
 
 
 TOPOLOGY = {"hosts": {"host-cp": "10.0.0.25", "host-e1": "10.0.0.36", "host-e2": "10.0.0.35"},
-            "coordinator": {"host": "host-cp", "edge_ports": [15370, 15371, 15372]},
+            "coordinator": {"host": "host-cp", "edge_ports": [15370, 15371, 15372], "ingress_port": 15369},
             "realms": [{"id": 0, "validators": [{"edge_host": "host-e1", "http_port": 15380 + i} for i in range(3)]},
                        {"id": 1, "validators": [{"edge_host": "host-e2", "http_port": 15383 + i} for i in range(3)]}]}
 
 
 class EdgeTargetTests(unittest.TestCase):
-    def test_nine_edges_with_hosts_addresses_and_ports(self):
-        targets = health.edge_targets(TOPOLOGY)
-        self.assertEqual(len(targets), 9)
-        self.assertEqual([t.name for t in targets[:4]], ["coordinator-0", "coordinator-1", "coordinator-2", "realm-0-v1"])
+    def test_running_coordinator_edges_the_ingress_and_six_realm_edges(self):
+        targets = health.edge_targets(TOPOLOGY, 3)
+        self.assertEqual(len(targets), 10)
+        self.assertEqual([t.name for t in targets[:5]],
+                         ["coordinator-0", "coordinator-1", "coordinator-2", "coordinator-ingress", "realm-0-v1"])
         self.assertEqual((targets[0].host, targets[0].address, targets[0].port), ("host-cp", "10.0.0.25", 15370))
-        self.assertEqual((targets[8].host, targets[8].address, targets[8].port), ("host-e2", "10.0.0.35", 15385))
+        self.assertEqual((targets[3].host, targets[3].address, targets[3].port), ("host-cp", "10.0.0.25", 15369))
+        self.assertEqual((targets[9].host, targets[9].address, targets[9].port), ("host-e2", "10.0.0.35", 15385))
+        starting = [t.name for t in health.edge_targets(TOPOLOGY, 1)]
+        self.assertEqual(starting[:3], ["coordinator-0", "coordinator-ingress", "realm-0-v1"])
+        self.assertEqual(len(starting), 8)
 
 
 class ParseHostReportTests(unittest.TestCase):
@@ -244,20 +249,20 @@ class ReadChainSampleTests(unittest.TestCase):
         self.addCleanup(self.tools.cleanup)
 
     def sample_with(self, remote):
-        return health.read_chain_sample(self.fixture.context(remote))
+        return health.read_chain_sample(self.fixture.context(remote), 1)
 
     def test_the_scripts_exit_zero_when_the_journal_search_finds_nothing(self):
         # journalctl --grep exits 1 on no match; the sample must still be taken.
         sample_value = self.sample_with(BashRemote(self.tools.name))
         self.assertEqual(sample_value.panic_lines, ())
-        self.assertEqual(len(sample_value.unit_restart_counts), 19)
+        self.assertEqual(len(sample_value.unit_restart_counts), 17)
         self.assertEqual(set(sample_value.unit_main_pids.values()), {42})
         self.assertEqual(set(sample_value.edge_checkpoint_ids.values()), {123})
         self.assertEqual(sample_value.proof_upload_count, 0)
 
     def test_panic_lines_are_collected_and_a_unit_without_logs_fails_the_sample(self):
         sample_value = self.sample_with(BashRemote(self.tools.name, panic="thread x panicked at y.rs:1"))
-        self.assertEqual(len(sample_value.panic_lines), 19)
+        self.assertEqual(len(sample_value.panic_lines), 17)
         with self.assertRaisesRegex(ValueError, "has no log lines"):
             self.sample_with(BashRemote(self.tools.name, log=False))
 
@@ -266,8 +271,8 @@ class ReadChainSampleTests(unittest.TestCase):
         self.sample_with(remote)
         self.assertEqual(remote.calls[0], health.EDGE_READER_HOST)
         self.assertEqual(len(remote.calls), 1 + 7)
-        script = health.edge_script(health.edge_targets(self.fixture.topology))
-        self.assertEqual(script.count("&\n"), 9)
+        script = health.edge_script(health.edge_targets(self.fixture.topology, 1))
+        self.assertEqual(script.count("&\n"), 8)
         self.assertIn("\nwait\n", script)
 
     def test_an_edge_that_does_not_answer_is_none_not_a_failure(self):
@@ -277,18 +282,18 @@ class ReadChainSampleTests(unittest.TestCase):
     def test_unreachable_edge_reader_gives_silent_edges_and_a_real_failure_raises(self):
         remote = self.fixtures.FakeRemote(self.fixture, active=True)
         remote.broken[health.EDGE_READER_HOST] = [RemoteConnectionError("x: exit 255", host="x", exit_code=255)]
-        value = health.read_chain_sample(self.fixture.context(remote))
+        value = health.read_chain_sample(self.fixture.context(remote), 1)
         self.assertEqual(set(value.edge_checkpoint_ids.values()), {None})
-        self.assertEqual(len(value.unit_restart_counts), 19)
+        self.assertEqual(len(value.unit_restart_counts), 17)
         remote.broken[health.EDGE_READER_HOST] = [RemoteError("x: exit 1: boom", host="x", exit_code=1)]
         with self.assertRaises(RemoteError):
-            health.read_chain_sample(self.fixture.context(remote))
+            health.read_chain_sample(self.fixture.context(remote), 1)
 
     def test_a_silent_unit_host_omits_its_units_only(self):
         remote = self.fixtures.FakeRemote(self.fixture, active=True)
         remote.broken["gcp-edge-1"] = [RemoteConnectionError("x: exit 255", host="x", exit_code=255)]
-        value = health.read_chain_sample(self.fixture.context(remote))
-        self.assertEqual(len(value.unit_restart_counts), 16)
+        value = health.read_chain_sample(self.fixture.context(remote), 1)
+        self.assertEqual(len(value.unit_restart_counts), 14)
         self.assertEqual(set(value.edge_checkpoint_ids.values()), {1000})
 
     def test_a_unit_that_is_not_active_is_a_failure_not_a_silent_host(self):
@@ -296,15 +301,15 @@ class ReadChainSampleTests(unittest.TestCase):
         host = "gcp-edge-2"
         remote.set_state(host, self.fixture.unit_sets()[host].units[:1], active="failed")
         with self.assertRaisesRegex(ValueError, "not loaded and active"):
-            health.read_chain_sample(self.fixture.context(remote))
+            health.read_chain_sample(self.fixture.context(remote), 1)
 
     def test_restart_counts_come_from_the_listed_units_only(self):
         remote = self.fixtures.FakeRemote(self.fixture, active=True)
-        value = health.read_chain_sample(self.fixture.context(remote))
-        self.assertEqual(len(value.unit_restart_counts), 16 + 3)
-        self.assertEqual(len(value.edge_checkpoint_ids), 9)
+        value = health.read_chain_sample(self.fixture.context(remote), 1)
+        self.assertEqual(len(value.unit_restart_counts), 14 + 3)
+        self.assertEqual(len(value.edge_checkpoint_ids), 8)
         self.assertEqual(value.proof_upload_count, 7)
-        scripts = [health.unit_script(units, None) for units in health.core_units(self.fixture.context(remote)).values()]
+        scripts = [health.unit_script(units, None) for units in health.core_units(self.fixture.context(remote), 1).values()]
         for script in scripts:
             self.assertNotIn("psy-core-*", script)
             self.assertIn("NRestarts", script)

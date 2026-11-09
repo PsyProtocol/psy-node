@@ -23,7 +23,7 @@ NOTIFIER = Path(os.environ["PSY_NOTIFIER_DIR"]) if os.environ.get("PSY_NOTIFIER_
 TARGET = os.environ.get("CARGO_TARGET_DIR")
 TOPOLOGY = {
     "hosts": {"gcp-cp-ce": "10.148.0.25", "gcp-realm-processor": "10.148.0.37", "gcp-edge-1": "10.148.0.36"},
-    "coordinator": {"host": "gcp-cp-ce", "edge_ports": [15370, 15371, 15372]},
+    "coordinator": {"host": "gcp-cp-ce", "edge_ports": [15370, 15371, 15372], "ingress_port": 15369},
     "realms": [{"id": 0, "validators": [
         {"registration_id": 0, "validator_user_id": 7, "processor_host": "gcp-realm-processor", "edge_host": "gcp-edge-1",
          "http_port": 15380},

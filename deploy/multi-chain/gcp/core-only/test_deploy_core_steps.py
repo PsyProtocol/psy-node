@@ -42,6 +42,7 @@ class FakeRemote:
         self.edge_config_sha256 = fixture.lock["inputs"]["runtime_config"]
         self.wrong_binary = set()
         self.fail_run_script = None
+        self.ingress_missing = False
 
     @staticmethod
     def row(unit_set, installed, active):
@@ -96,6 +97,10 @@ class FakeRemote:
             return {"mode": "checked"}
         phase = arguments[arguments.index("--phase") + 1] if "--phase" in arguments else "workers"
         selected = steps.phase_units(unit_set, phase) if phase != "workers" else names
+        if "--unit" in arguments:
+            requested = [arguments[index + 1] for index, value in enumerate(arguments) if value == "--unit"]
+            self.events.append(("units", host, phase, tuple(requested)))
+            selected = [unit for unit in selected if unit in requested]
         self.events.append(("activate", host, phase, self.realm_marker_ready(), self.tablet_ready()))
         for unit in selected:
             sha256 = "0" * 64 if unit in self.wrong_binary else unit_set.exe_sha256
@@ -170,6 +175,10 @@ class FakeRemote:
 
     def run_root_text(self, host, argv, timeout, *, stdin_text=None, show_stderr=False):
         self.check_reachable(host)
+        if argv[3:4] == [steps.coordinator_ingress.READ_STATE]:
+            text = steps.coordinator_ingress.site_text(self.fixture.topology)
+            return json.dumps({"installed": True, "site": None if self.ingress_missing else sha(text), "enabled": True,
+                               "default": False, "active": "active", "enabled_unit": "enabled", "config_ok": True})
         if argv[:4] == steps.ROOT_PYTHON:
             if argv[4:5] == ["nats-consumers"]:
                 assert stdin_text == (self.fixture.ws.tools_dir / "probe_databases.py").read_text()
@@ -245,7 +254,7 @@ class CoreFixture:
 
     def unit_sets(self):
         ctx = self.context(None)
-        sets = steps.core_unit_sets(ctx)
+        sets = steps.core_unit_sets(ctx, len(self.topology["coordinator"]["edge_ports"]))
         sets[health.WORKER_HOST] = steps.worker_unit_set(ctx)
         return sets
 
@@ -412,11 +421,13 @@ class CoreStartTests(StepTestCase):
 
 
 class CoreVerifyTests(StepTestCase):
-    def test_core_verify_passes_with_sixteen_healthy_units_and_nine_agreeing_edges(self):
+    def test_core_verify_passes_with_the_starting_units_and_agreeing_edges(self):
         ctx = self.start(active=True)
         report = steps.core_verify(ctx)
-        self.assertEqual(sum(report["units"].values()), 16)
-        self.assertEqual(len(report["edge_checkpoints"]), 9)
+        self.assertEqual(sum(report["units"].values()), 14)
+        self.assertEqual(sorted(name for name in report["edge_checkpoints"] if name.startswith("coordinator-")),
+                         ["coordinator-0", "coordinator-ingress"])
+        self.assertEqual(len(report["edge_checkpoints"]), 8)
         self.assertEqual(report["ack_wait_ns"], LEASE_NS)
 
     def test_core_verify_does_not_demand_advance(self):
@@ -425,7 +436,7 @@ class CoreVerifyTests(StepTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.remote.height -= 5
-        self.assertEqual(len(steps.core_verify(ctx)["edge_checkpoints"]), 9)
+        self.assertEqual(len(steps.core_verify(ctx)["edge_checkpoints"]), 8)
 
     def test_core_verify_requires_a_connection_per_peer_and_edge_for_every_validator(self):
         ctx = self.start(active=True)
@@ -642,7 +653,7 @@ class WorkerStepTests(StepTestCase):
 
 
 def chain_samples(heights, **options):
-    names = [target.name for target in health.edge_targets(CoreFixtureTopology.topology)]
+    names = [target.name for target in health.edge_targets(CoreFixtureTopology.topology, steps.STARTING_COORDINATOR_EDGE_COUNT)]
     return [health.ChainSample({name: height for name in names}, {}, (), options.get("uploads", index * 3))
             for index, height in enumerate(heights)]
 
@@ -654,7 +665,7 @@ class CoreFixtureTopology:
 class GateTests(StepTestCase):
     def feed(self, samples):
         queue = iter(samples)
-        patcher = patch.object(health, "read_chain_sample", side_effect=lambda ctx: next(queue))
+        patcher = patch.object(health, "read_chain_sample", side_effect=lambda ctx, count: next(queue))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -675,7 +686,7 @@ class GateTests(StepTestCase):
     def test_unfinished_gate_reports_progress_at_the_limit(self):
         ctx = self.start(active=True)
         self.feed(chain_samples([1000 + 2 * index for index in range(30)]))
-        with self.assertRaisesRegex(ValueError, "not passed within 2200s: advanced 58 of 100 checkpoints, 9 of 9 edges"):
+        with self.assertRaisesRegex(ValueError, "not passed within 2200s: advanced 58 of 100 checkpoints, 8 of 8 edges"):
             steps.gate_apply(ctx)
 
     def test_gate_without_proof_uploads_does_not_pass(self):
@@ -714,7 +725,7 @@ class GateTests(StepTestCase):
         ctx = self.start(active=True)
         self.record_gate()
         report = steps.gate_verify(ctx)
-        self.assertEqual(report["units"], 19)
+        self.assertEqual(report["units"], 17)
         self.assertEqual(report["worker_consumers"], 1)
         first_core = lambda r: r.fixture.unit_sets()[COORDINATOR_HOST].units[0]
         for change, message in ((lambda r: r.restarts.update({first_core(r): 1}), "restarted"),
@@ -730,7 +741,7 @@ class GateTests(StepTestCase):
         self.record_gate()
         error = RemoteConnectionError("unreachable", host=EDGE_HOSTS[0], exit_code=255)
         self.remote.broken[EDGE_HOSTS[0]] = [error, error]
-        self.assertEqual(steps.gate_verify(ctx)["units"], 19)
+        self.assertEqual(steps.gate_verify(ctx)["units"], 17)
         ctx = self.start(active=True)
         self.remote.broken[EDGE_HOSTS[0]] = [error] * 9
         with self.assertRaisesRegex(ValueError, "not every unit could be read"):
@@ -740,12 +751,13 @@ class GateTests(StepTestCase):
     def test_a_timed_out_host_is_silent_but_a_failed_command_is_fatal(self):
         ctx = self.start(active=True)
         self.remote.broken[EDGE_HOSTS[0]] = [RemoteError("host: timed out after 120s", host=EDGE_HOSTS[0])]
-        self.assertEqual(len(health.read_chain_sample(ctx).unit_restart_counts), 16)
+        count = steps.STARTING_COORDINATOR_EDGE_COUNT
+        self.assertEqual(len(health.read_chain_sample(ctx, count).unit_restart_counts), 14)
         self.remote.broken[EDGE_HOSTS[0]] = [RemoteError("host: exit 124", host=EDGE_HOSTS[0], exit_code=124)]
-        self.assertEqual(len(health.read_chain_sample(ctx).unit_restart_counts), 16)
+        self.assertEqual(len(health.read_chain_sample(ctx, count).unit_restart_counts), 14)
         self.remote.broken[EDGE_HOSTS[0]] = [RemoteError("host: exit 1: boom", host=EDGE_HOSTS[0], exit_code=1)]
         with self.assertRaises(RemoteError):
-            health.read_chain_sample(ctx)
+            health.read_chain_sample(ctx, count)
 
     def test_gate_verify_without_a_recorded_gate_fails(self):
         ctx = self.start(active=True)
@@ -753,10 +765,58 @@ class GateTests(StepTestCase):
             steps.gate_verify(ctx)
 
 
+class CoordinatorEdgeExpansionTests(StepTestCase):
+    def coordinator_edges(self):
+        return {unit: row["active"] for unit, row in self.remote.units[COORDINATOR_HOST].items() if "coordinator-edge-" in unit}
+
+    def test_cutover_refuses_to_start_without_the_coordinator_ingress(self):
+        ctx = self.start()
+        self.remote.ingress_missing = True
+        with self.assertRaisesRegex(ValueError, "coordinator ingress"):
+            steps.core_apply(ctx)
+        self.assertEqual(self.events("install", "activate"), [])
+
+    def test_cutover_starts_only_the_first_coordinator_edge(self):
+        ctx = self.start()
+        steps.core_apply(ctx)
+        requested = [event for event in self.events("units") if event[1] == COORDINATOR_HOST and event[2] == "edges"]
+        self.assertEqual(len(requested), 1)
+        self.assertEqual([name.rsplit("-", 1)[1] for name in requested[0][3]], ["0.service"])
+        states = self.coordinator_edges()
+        self.assertEqual(sorted(unit for unit, state in states.items() if state == "active"),
+                         [unit for unit in states if unit.endswith("coordinator-edge-0.service")])
+        steps.core_verify(ctx)
+
+    def test_expansion_starts_the_remaining_edges_and_checks_them_with_the_ingress(self):
+        ctx = self.start()
+        steps.core_apply(ctx)
+        steps.expand_check(ctx)
+        steps.expand_apply(ctx)
+        self.assertEqual(set(self.coordinator_edges().values()), {"active"})
+        report = steps.expand_verify(ctx)
+        self.assertEqual(report["coordinator_edges"], 3)
+        self.assertEqual(sorted(report["edge_checkpoints"]),
+                         ["coordinator-0", "coordinator-1", "coordinator-2", "coordinator-ingress"])
+        before = len(self.events("activate"))
+        steps.expand_apply(ctx)
+        self.assertEqual(len(self.events("activate")), before)
+
+    def test_expansion_verify_fails_while_an_edge_or_the_ingress_is_silent(self):
+        ctx = self.start()
+        steps.core_apply(ctx)
+        with self.assertRaisesRegex(ValueError, "not active with the pinned binary"):
+            steps.expand_verify(ctx)
+        steps.expand_apply(ctx)
+        self.remote.heights["coordinator-ingress"] = None
+        with self.assertRaisesRegex(ValueError, "no answer from \\[coordinator-ingress\\]"):
+            steps.expand_verify(ctx)
+
+
 class RegistrationTests(unittest.TestCase):
     def test_core_steps_are_cutover_steps_registered_in_the_orchestrator(self):
-        self.assertEqual(set(steps.CORE_STEPS), {"start_core", "start_workers", "gate_l2_stability"})
-        self.assertTrue(all(step.cutover and step.name == name for name, step in steps.CORE_STEPS.items()))
+        self.assertEqual(set(steps.CORE_STEPS), {"start_core", "start_workers", "gate_l2_stability", "expand_coordinator_edges"})
+        self.assertTrue(all(step.cutover == (name != "expand_coordinator_edges") and step.name == name
+                            for name, step in steps.CORE_STEPS.items()))
         self.assertIn("deploy_core_steps", deploy.STEP_MODULES)
         registry = deploy.build_registry()
         self.assertTrue(set(steps.CORE_STEPS) <= set(registry))
