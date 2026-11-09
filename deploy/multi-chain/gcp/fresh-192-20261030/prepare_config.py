@@ -14,7 +14,7 @@ import preflight
 
 
 RETAINED_FIELDS = ("guardian_initial_member_hashes", "guardian_configs",
-                   "realm_configs", "whitelist", "coordinator_configs")
+                   "realm_configs", "whitelist")
 
 
 def read_pinned(path, digest):
@@ -55,8 +55,6 @@ def build_config(canonical, retained, release):
         public_url(guardian["rpc_url"])
     fields(previous["whitelist"], preflight.worker_labels.policy_fields(previous["whitelist"]))
     preflight.worker_labels.check_labels(previous["whitelist"], preflight.preflight_require)
-    if previous.get("coordinator_configs") != release["coordinator_configs"]:
-        raise ValueError("Coordinator endpoints differ from approved internal placement")
     for coordinator in previous["coordinator_configs"]:
         fields(coordinator, ("id", "rpc_url"))
         if type(coordinator["id"]) is not int or coordinator["id"] != 0:
@@ -79,6 +77,7 @@ def build_config(canonical, retained, release):
                 fields(edge, ("node_id", "addresses"))
     for field in RETAINED_FIELDS:
         network[field] = copy.deepcopy(previous[field])
+    network["coordinator_configs"] = copy.deepcopy(release["coordinator_configs"])
     candidate["defaultNetwork"] = "testnet"
     preflight.config_checks(candidate, release)
     return candidate

@@ -4,7 +4,7 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "2c13863446e84e9689ce3f586dc26ec3b710246ecc82b571dcc4e20b237befc4",
+    "release_profile": "6074b22b17da22df9b9e953515a1d23ea060e2800ae6c6d26880873ce1ea2ae3",
     "topology": "dde9b967bcdd6a4b90861044235f48de4b863a7544159b03c40e8b98848e5f38",
     "artifacts": "24777bab3165b497a7106047fb0e62f4fc640b879f06b77147ce86d90bf42984",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",

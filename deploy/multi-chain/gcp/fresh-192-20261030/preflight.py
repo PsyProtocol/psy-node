@@ -50,8 +50,8 @@ def release_checks(release):
                              {"name": "baseSepolia", "index": 2, "chain_id": 84532}]:
         raise ValueError("chain identity mismatch")
     coordinators = release["coordinator_configs"]
-    if coordinators != [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}]:
-        raise ValueError("unapproved internal Coordinator placement")
+    if coordinators != [{"id": 0, "rpc_url": ["http://10.148.0.25:15369"]}]:
+        raise ValueError("unapproved internal Coordinator placement: clients use the coordinator ingress")
 
 
 def preflight_require(condition, message):

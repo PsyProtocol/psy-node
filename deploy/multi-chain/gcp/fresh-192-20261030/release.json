@@ -9,7 +9,7 @@
   "network_magic": "0x1337CF514544CF69",
   "proving_backend": "plonky2-poseidon-goldilocks",
   "coordinator_configs": [
-    {"id": 0, "rpc_url": ["http://10.148.0.25:15370", "http://10.148.0.25:15371", "http://10.148.0.25:15372"]}
+    {"id": 0, "rpc_url": ["http://10.148.0.25:15369"]}
   ],
   "checkpoints_per_epoch": 32,
   "worker_queue_ack_wait_ms": 30000,

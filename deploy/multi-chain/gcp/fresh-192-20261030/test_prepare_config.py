@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import preflight
 import prepare_config as prepare
 import test_preflight
 
@@ -84,13 +85,20 @@ class ConfigPreparationTests(unittest.TestCase):
         config = prepare.build_config(self.canonical, self.retained, self.release)
         self.assertEqual(config["networks"]["testnet"]["coordinator_configs"], self.release["coordinator_configs"])
 
-    def test_public_or_unapproved_coordinator_is_rejected(self):
+    def test_candidate_coordinator_is_always_the_approved_ingress(self):
         for coordinators in ([], [{"id": 0, "rpc_url": ["https://coordinator.invalid/"]}],
-                             [{"id": 0, "rpc_url": ["http://127.0.0.1:1337/"]}]):
+                             [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}]):
             retained = copy.deepcopy(self.retained)
             retained["networks"]["testnet"]["coordinator_configs"] = coordinators
-            with self.assertRaises(ValueError):
-                prepare.build_config(self.canonical, retained, self.release)
+            config = prepare.build_config(self.canonical, retained, self.release)
+            self.assertEqual(config["networks"]["testnet"]["coordinator_configs"],
+                             [{"id": 0, "rpc_url": ["http://10.148.0.25:15369"]}])
+        for placement in ([{"id": 0, "rpc_url": ["https://coordinator.invalid/"]}],
+                          [{"id": 0, "rpc_url": [f"http://10.148.0.25:{port}" for port in (15370, 15371, 15372)]}]):
+            release = copy.deepcopy(self.release)
+            release["coordinator_configs"] = placement
+            with self.subTest(placement=placement), self.assertRaisesRegex(ValueError, "Coordinator"):
+                preflight.release_checks(release)
 
     def test_worker_labels_are_retained_and_validated(self):
         whitelist = self.retained["networks"]["testnet"]["whitelist"]
