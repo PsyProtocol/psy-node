@@ -3,7 +3,7 @@
   "release_id": "core-testnet-20261030-sd192",
   "prepared_on": "2026-10-31",
   "status": "READY_STATIC",
-  "source_commit": "badc109cf427980e4cd1c114f018abf31e18cc8a",
+  "source_commit": "43c0569ce62483f9190a30e0503fd47fe65e0352",
   "preparation_commits": {
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -23,12 +23,12 @@
   "binaries": {
     "psy_dev_cli": "f36e943675106c813933e29efdda4ffed171f5e53e181046ee9df81ebf79daeb",
     "psy_node_cli": "64a74b01455fcd5518989e03e05c5b5f0072a420e524b368b8858965156857ef",
-    "psy_relayer_cli": "cc8077c8c695bb1cc86bb471458992e6cb4694a9bbffbce6d1eafa5841874cda",
+    "psy_relayer_cli": "ce82e759a57d912c2b087dbefe77687dce8e47ee9865072407e26440f5565245",
     "psy_user_cli": "f2f4762dde5ddf06237cd923ff27e7e28ce51434ca261d42caa2a6604e6c1f80",
     "psy_worker_cli": "a5024735f5001ecdf2bb2287b245ed8b084ea97700a5f3b8762bdb2c2a3556b3"
   },
   "receipts": {
-    "runtime_manifest_sha256": "7fada5affd6e10639c62a3a0b57bf11e6a2c14debc320f1f08892bb0e0ff1f28",
+    "runtime_manifest_sha256": "d6fc4e18515f4a540e608bc6c3bebaaad90c08eac3ffe10ad09de7fd785bf689",
     "tools_manifest_sha256": "c61c14f9c37c97befe6fe21407eea95be99cda4f3afe8ad8e12e6b7ebc0af092",
     "privacy_measurements_sha256": "d2fdb8bc4d715adc17722a62d5511f18652b59768d676579ca73fd20eb7a258a",
     "genesis_spec_sha256": "2ea5bdcd4e6f523cef5949ab81d8795b8e146b5133963c299d048cfc430fd951",

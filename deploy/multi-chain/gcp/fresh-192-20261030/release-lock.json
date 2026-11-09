@@ -4,9 +4,9 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "cfe8fd3ec8886c3f4378a98995b619f3c8d00242a011ade35852f26bd8bdcde8",
-    "topology": "64a512b26196013750320b6b55daa11ec7ccdb773d7f4d3138dabaa2331b127c",
-    "artifacts": "e55673f8a564a2f85431e1050843969f8c009853e07c37ffe708cecbd385f644",
+    "release_profile": "064bf4d13a8db92f63f624cd0c3460e524c648ac589f5f7d6183abc0752b8300",
+    "topology": "6db953db82e8febd942d0d8a647d321f1e4f6e398b46c9915ed969aeb0a735b6",
+    "artifacts": "d1123877b9bb92c2f4532dfb8562b27389df853667765902881b44e99bae67b3",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
@@ -16,7 +16,7 @@
     "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
-    "runtime": "badc109cf427980e4cd1c114f018abf31e18cc8a",
+    "runtime": "43c0569ce62483f9190a30e0503fd47fe65e0352",
     "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -28,7 +28,7 @@
   "binaries": {
     "psy_dev_cli": "f36e943675106c813933e29efdda4ffed171f5e53e181046ee9df81ebf79daeb",
     "psy_node_cli": "64a74b01455fcd5518989e03e05c5b5f0072a420e524b368b8858965156857ef",
-    "psy_relayer_cli": "cc8077c8c695bb1cc86bb471458992e6cb4694a9bbffbce6d1eafa5841874cda",
+    "psy_relayer_cli": "ce82e759a57d912c2b087dbefe77687dce8e47ee9865072407e26440f5565245",
     "psy_user_cli": "f2f4762dde5ddf06237cd923ff27e7e28ce51434ca261d42caa2a6604e6c1f80",
     "psy_worker_cli": "a5024735f5001ecdf2bb2287b245ed8b084ea97700a5f3b8762bdb2c2a3556b3",
     "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
