@@ -4,9 +4,9 @@
   "network": "testnet",
   "network_magic": "0x1337CF514544CF69",
   "inputs": {
-    "release_profile": "6074b22b17da22df9b9e953515a1d23ea060e2800ae6c6d26880873ce1ea2ae3",
-    "topology": "dde9b967bcdd6a4b90861044235f48de4b863a7544159b03c40e8b98848e5f38",
-    "artifacts": "24777bab3165b497a7106047fb0e62f4fc640b879f06b77147ce86d90bf42984",
+    "release_profile": "7a7d799d1cdfb5e23cdb94bbfa4ee1dc2e9d81d314901b02ddba01091ac8e41f",
+    "topology": "3ae2bd52f72854b8979de1cdd3ac215185417f555598295f2ac601f67bcde318",
+    "artifacts": "8ce24da0498a1acf3d563dde15da14b664900456fa08d31a7726ec599970ba64",
     "runtime_config": "04d3056c4e1d000e6b67f11f6f1a4bc2f5c7df9024f182e71c6ced7472f8024d",
     "canonical_config": "7274eebbd98e17c1e76ead05793a9d5c503311469990a93d7aad1e07e07b9db9",
     "genesis": "a448ef86cedea5c35847e22f635e912b77948715dcbb899191301361985dd29f",
@@ -16,7 +16,7 @@
     "retained_paths": "0aa3081a2b887be81a01f49f79c0aa3d59b895fee2b3e2115bba48ed0ec468b9"
   },
   "sources": {
-    "runtime": "753498b8e47166d58224707fb4b3fd5eea90bbbf",
+    "runtime": "aef2d7ad6d2c3ce6e9495e6a5b633e4a446217b2",
     "guardian_key": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
     "compiler": "e9cc57fe5b1d7068f5c40f03b8b7f03058f6813f",
     "genesis": "8346116acce272196bcfeb4d9885a9e9f790f171",
@@ -26,11 +26,11 @@
     "notifier": "d80a89f390623f59d7bad0750a485793aee31358"
   },
   "binaries": {
-    "psy_dev_cli": "7026eed4c8858831b3444acee75aad83899793be52f79a9005610f1b13fbe243",
-    "psy_node_cli": "27d2059f30f2492b6716b977f69e3f8cf9996d071f6b76b7b61d4f52685411ab",
-    "psy_relayer_cli": "34a120fc7b96a8373039917e6a0c8b4d098d3733cb610f1f9f8afe75d587cbd4",
-    "psy_user_cli": "d32739e5ec6b9b643db38ef7b106679f217a79e8c2cbc6ec3f039e5bdf3a469d",
-    "psy_worker_cli": "79c79af86d767dc75bdfb120e45ba5b1c618f5e8a72cc1d6d2f34769474db28c",
+    "psy_dev_cli": "ff34852e483f35af76401f9dfa33867094443344f6d9a7fc575b72ee21713e80",
+    "psy_node_cli": "562a35726294addb3e4827961ec1a2e848617f8fcf10016946129557de83fed0",
+    "psy_relayer_cli": "765ef10f62f41dd9739aaaeae4536d601f9f728f751b6e71f58131b8cd98ddc6",
+    "psy_user_cli": "7f1cb0e6de1ac96e98e54cc41dfcda4202e2f303ce1aec847de44a7ec50e45dd",
+    "psy_worker_cli": "93bde714394fe1c79a4f1f6d81e0490e8c6a52a3b56cb0ebec6e2dcc264acc10",
     "psy-services": "e24e1d5f25cd008db991e396dc31f5e173e9f7c4e49dd94299767f1b9310b844",
     "psy-indexer": "53606d86802e45eab854586d0845f1e3bed24d42def5eda57c1f27ccd3079f4a"
   },

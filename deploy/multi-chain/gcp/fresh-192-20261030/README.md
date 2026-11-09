@@ -398,3 +398,22 @@ After a tool-only change of the lock, recorded state can move to the new lock wi
 53 are removed and rebuilt by the step itself when the lock or an installer changed. A Caddyfile that holds a
 maintenance block of another tag inside a listed site is refused by name; the indexer upstream follows
 `envio.hasura_port` in `fence`.
+
+## Live Deployment Versus This Lock (2026-11-09)
+
+The lock pins runtime `aef2d7ad` (all five CLIs from that pinned build). The live SD192 network differs from it in
+known, reviewed ways; a redeploy from this lock changes these units:
+
+| Component | Lock | Live |
+|---|---|---|
+| `psy_relayer_cli` | `765ef10f` | `765ef10f` (same) |
+| `psy_node_cli` | `562a3572` | `27d2059f` (build `753498b8`); the coordinator processor still runs `d2be48b2` |
+| `psy_worker_cli` | `93bde714` | `79c79af8` (build `753498b8`) |
+| `psy_dev_cli`, `psy_user_cli` | `ff34852e`, `7f1cb0e6` | not installed by this release |
+| Runtime config `coordinator_configs` | three edges (pinned `04d3056c`) | same file on the core hosts |
+| Coordinator clients | `release.json`/topology: ingress `10.148.0.25:15369` | relayer, guardian `rpc.json`, Worker config, Realm processor units, coordinator indexer and Services use the ingress; Realm indexers (hash-guarded Services package) and the gateway forwarders still dial the edges |
+
+The node and worker hashes differ from the live ones only through the `psy_provider` typed HTTP status error added in
+`254a4063`; those binaries were not redeployed. Steps 50 and 53 refuse this lock until the runtime config is regenerated
+with the ingress URL, which belongs to the next fresh deploy. Live host changes made outside the installer keep a
+`.bak-pre-ingress` copy; the coordinator ingress itself is the step 57 site.
