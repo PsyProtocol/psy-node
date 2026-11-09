@@ -53,6 +53,11 @@ static SIGN_REQUESTS: Semaphore = Semaphore::const_new(4);
 /// preparation has no whole-phase deadline: it waits for external evidence until its caller
 /// (client disconnect or the ctrl-c abort of its connection task) cancels it.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A session record carries its inclusion checkpoint, so every history origin
+/// (the relayer and the peer guardians) can publish it only after it observes the
+/// inclusion. The observer therefore sees the on-chain nonce move seconds before
+/// the record is served; measured live: median 9 s, worst 49 s.
+const OBSERVER_HISTORY_GRACE: Duration = Duration::from_secs(120);
 
 struct GuardianService {
     config: GuardianRuntimeConfig,
@@ -404,6 +409,7 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut warned = None;
+        let mut history_lag_since = None;
         loop {
             tokio::select! {
                 _ = stopping.changed() => break,
@@ -412,6 +418,7 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
                     let deadline = tokio::time::Instant::now() + OBSERVE_TIMEOUT;
                     let observed = tokio::time::timeout_at(deadline, service.sync_confirmed_state(Some(deadline))).await;
                     let observer_error = match observed { Err(_) => Some(GuardianSignError::ObserverTimeout), Ok(result) => result.err() };
+                    let observer_error = defer_session_history_lag(&mut history_lag_since, observer_error, Instant::now());
                     warn_observer_authorization(&mut warned, observer_error);
                 }
             }
@@ -757,6 +764,22 @@ async fn verify_included_deposit_anchors(config: &GuardianConfig, included: &[De
         guardian_common::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash)?;
     }
     Ok(())
+}
+
+/// Holds back the observer's `SessionHistoryUnavailable` while it is younger than
+/// `OBSERVER_HISTORY_GRACE`: the expected publication lag of a just-included session,
+/// which the next observation imports on its own. Signing still refuses with the
+/// typed error; only the observer warning waits. Only a successful observation
+/// restarts the grace, so a stall that alternates with timeouts still surfaces.
+fn defer_session_history_lag(since: &mut Option<Instant>, error: Option<GuardianSignError>, now: Instant) -> Option<GuardianSignError> {
+    if error.is_none() {
+        *since = None;
+    }
+    if error != Some(GuardianSignError::SessionHistoryUnavailable) {
+        return error;
+    }
+    let first = *since.get_or_insert(now);
+    if now.saturating_duration_since(first) < OBSERVER_HISTORY_GRACE { None } else { error }
 }
 
 fn warn_observer_authorization(warned: &mut Option<GuardianSignError>, error: Option<GuardianSignError>) {
@@ -1316,6 +1339,28 @@ mod tests {
         refused_server.abort();
         invalid_server.abort();
     }
+    #[test]
+    fn observer_holds_back_session_history_lag_until_the_grace_elapses() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let lag = Some(GuardianSignError::SessionHistoryUnavailable);
+        let mut since = None;
+        // A just-included session is published by its origins seconds later: no warning yet.
+        assert_eq!(defer_session_history_lag(&mut since, lag, at(0)), None);
+        assert_eq!(defer_session_history_lag(&mut since, lag, at(OBSERVER_HISTORY_GRACE.as_secs() - 1)), None);
+        // Still missing after the grace: the guardian is really behind.
+        assert_eq!(defer_session_history_lag(&mut since, lag, at(OBSERVER_HISTORY_GRACE.as_secs())), lag);
+        // A successful observation restarts the grace for the next session.
+        assert_eq!(defer_session_history_lag(&mut since, None, at(200)), None);
+        assert_eq!(since, None);
+        assert_eq!(defer_session_history_lag(&mut since, lag, at(201)), None);
+        // Other observer errors are never held back, and they do not restart the grace:
+        // a stall alternating with timeouts (guardian-3, 2026-11-03) still surfaces.
+        let timeout = Some(GuardianSignError::ObserverTimeout);
+        assert_eq!(defer_session_history_lag(&mut since, timeout, at(250)), timeout);
+        assert_eq!(defer_session_history_lag(&mut since, lag, at(201 + OBSERVER_HISTORY_GRACE.as_secs())), lag);
+    }
+
     #[test]
     fn observer_warns_journal_failure_once_until_quiet_or_success_reset() {
         use std::io::Write;
