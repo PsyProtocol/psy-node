@@ -972,6 +972,16 @@ fn is_temporary_rpc_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.downcast_ref::<guardian_common::protocol::GuardianSignError>() == Some(&guardian_common::protocol::GuardianSignError::L2RpcUnavailable))
 }
 
+/// The Realm has not stored that checkpoint's proof yet; it appears once the Realm catches up.
+/// Session verification reports the same race as `CheckpointProofUnavailable`.
+fn is_missing_checkpoint_proof(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<psy_provider::lps::MissingCheckpointProof>().is_some()
+            || cause.downcast_ref::<guardian_common::protocol::GuardianSignError>()
+                == Some(&guardian_common::protocol::GuardianSignError::CheckpointProofUnavailable)
+    })
+}
+
 async fn run_multichain(
     config: BridgeProposeDaemonConfig,
     chain_configs: Vec<L1Config>,
@@ -1103,6 +1113,11 @@ async fn run_multichain(
                     if state.pending_finalization_range.is_none() {
                         (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
                     }
+                }
+                Err(error) if is_missing_checkpoint_proof(&error) => {
+                    tracing::warn!(%error, "pending guardian recovery is waiting for a checkpoint proof; retrying next round");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
                 }
                 Err(error) if is_temporary_rpc_error(&error) => {
                     tracing::warn!(%error, error_category = transport_error_category(&error), "pending guardian recovery hit temporary RPC unavailability; retrying next round");
@@ -4280,6 +4295,18 @@ async fn first_nonce_checkpoint(provider: &RpcProvider, config: &guardian_common
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn missing_checkpoint_proof_is_recognised_through_context_only_when_typed() {
+        let typed: anyhow::Error = psy_provider::lps::MissingCheckpointProof { checkpoint_id: 84987 }.into();
+        assert!(is_missing_checkpoint_proof(&typed));
+        assert!(is_missing_checkpoint_proof(&typed.context("submit guardian operation")));
+        assert!(!is_missing_checkpoint_proof(&anyhow::anyhow!("User tree proof not found for checkpoint_id 84987")));
+        assert!(!is_temporary_rpc_error(&psy_provider::lps::MissingCheckpointProof { checkpoint_id: 1 }.into()));
+        let unavailable: anyhow::Error = guardian_common::protocol::GuardianSignError::CheckpointProofUnavailable.into();
+        assert!(is_missing_checkpoint_proof(&unavailable.context("verify session")));
+        assert!(!is_missing_checkpoint_proof(&guardian_common::protocol::GuardianSignError::StateMismatch.into()));
+    }
 
     fn deposit_append_call(tag: u8, size: usize) -> Call3 {
         Call3 { target: Address::repeat_byte(tag), allowFailure: false, callData: Bytes::from(vec![tag; size]) }
