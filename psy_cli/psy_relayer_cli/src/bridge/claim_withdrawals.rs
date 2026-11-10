@@ -445,6 +445,22 @@ where
     results
 }
 
+// Services matches the leaf hash inside a bounded scan of the oldest withdrawal
+// events of the chain (default 4096), so a chain past that count never finds
+// newer leaves. Ask for the largest window Services accepts until the lookup
+// is keyed by the leaf hash.
+const CLAIM_PROOF_SCAN_LIMIT: u32 = 10_000;
+
+fn claim_proof_url(services_url: &str, destination_chain_index: u64, nullifier_hex: &str) -> String {
+    format!(
+        "{}/api/v1/bridge/withdrawal-claim-proof?destination_chain_index={}&nullifier={}&scan_limit={}",
+        services_url.trim_end_matches('/'),
+        destination_chain_index,
+        nullifier_hex,
+        CLAIM_PROOF_SCAN_LIMIT,
+    )
+}
+
 async fn fetch_claim_proof(
     http: &reqwest::Client,
     services_url: &str,
@@ -455,12 +471,7 @@ async fn fetch_claim_proof(
     // fields, never separate query parameters. Recomputed from the slot
     // words, never trusted from the stored row rendering.
     let nullifier_hex = u32x8_to_hex(withdrawal_leaf_words(withdrawal)?);
-    let url = format!(
-        "{}/api/v1/bridge/withdrawal-claim-proof?destination_chain_index={}&nullifier={}",
-        services_url.trim_end_matches('/'),
-        withdrawal.destination_chain_index,
-        nullifier_hex,
-    );
+    let url = claim_proof_url(services_url, withdrawal.destination_chain_index, &nullifier_hex);
     tracing::debug!(url = %url, "fetching withdrawal claim proof");
 
     let resp: ApiResponse<WithdrawalClaimProofResult> =
@@ -2028,6 +2039,14 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_proof_url_asks_for_the_widest_scan_window() {
+        assert_eq!(
+            claim_proof_url("http://services/", 0, "0xab"),
+            "http://services/api/v1/bridge/withdrawal-claim-proof?destination_chain_index=0&nullifier=0xab&scan_limit=10000"
+        );
+    }
 
     #[test]
     fn reverse_u32x8_root_hex_reverses_word_order() {
