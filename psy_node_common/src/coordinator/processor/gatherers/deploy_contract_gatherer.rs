@@ -424,18 +424,27 @@ impl<
     ) -> anyhow::Result<()> {
                 println!("update_from_queue_item_with_tree with unique_pending_id: {}, proc_id: {}", self.unique_pending_id, self.pending_core_proc_id);
 
+        // Item-level rejections below are deterministic and item-local (malformed, self-inconsistent,
+        // generation-misaligned): the item is SKIPPED, not Err — Err would drop the whole batch.
         if item.len() < PQEDContractLeafV2::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {
             // min size for a deploy with one leaf
             // added sanity check
-            return Err(anyhow::anyhow!(
-                "Invalid queue item size for DeployContractGatherer: expected at least {}, got {}",
+            tracing::warn!(
+                "DeployContractGatherer skipping invalid queue item: expected at least {} bytes, got {}",
                 PQEDContractLeafV2::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32,
                 item.len()
-            ));
+            );
+            return Ok(());
         }
         let read_item = &mut &item[..];
         let deploy_contract_item: PsyDeployContractQueueItemV2<N::F, N::QHash> =
-            PsyDeployContractQueueItemV2::<N::F, N::QHash>::pio_read_from_io(read_item)?;
+            match PsyDeployContractQueueItemV2::<N::F, N::QHash>::pio_read_from_io(read_item) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    tracing::warn!("DeployContractGatherer skipping unparseable queue item: {}", error);
+                    return Ok(());
+                }
+            };
         let contract_id = self.next_contract_id;
 
         let leaf_hash = deploy_contract_item.contract_leaf.qfhash::<N::HasherBase>();
@@ -447,29 +456,45 @@ impl<
         let (cfc_tree_root, contract_function_tree_leaves_ffs) =
             generate_single_merkle_node_blob_from_leaves_with_tree_height::<N::QHash, N::HasherBase>(contract_id, &deploy_contract_item.function_leaves, N::CONTRACT_FUNCTION_TREE_HEIGHT);
         if cfc_tree_root != deploy_contract_item.contract_leaf.function_tree_root {
-            return Err(anyhow::anyhow!(
-                "DeployContractGatherer function tree root mismatch for contract id {}: expected {:?}, got {:?}",
+            tracing::warn!(
+                "DeployContractGatherer skipping self-inconsistent item for contract id {}: function tree root mismatch: expected {:?}, got {:?}",
                 contract_id,
                 deploy_contract_item.contract_leaf.function_tree_root,
                 cfc_tree_root
-            ));
+            );
+            return Ok(());
         }
 
         tracing::info!("getting deploy contract code definition from temp db for pending id {} with rand key {:?}", unique_pending_id, &deploy_contract_item.rand_key_id);
 
-        let contract_code_defintion_bytes: Option<Vec<u8>> = self
+        // A missing definition (None) is item-level (most commonly accepted under one
+        // pending generation, consumed under another) and is skipped; a read Err propagates.
+        let contract_code_defintion_bytes = self
             .config
             .temp_db
             .get_deploy_contract_code_definition_raw(&realm_identifier, unique_pending_id, &deploy_contract_item.rand_key_id)
             .await?;
 
         if contract_code_defintion_bytes.is_none() {
-            return Err(anyhow::anyhow!(
-                "DeployContractGatherer could not find contract code definition for rand key id {:?} in temp db",
+            tracing::warn!(
+                "DeployContractGatherer skipping deploy for contract id {}: could not find contract code definition for rand key id {:?} in temp db (cross-generation item or expired pending state)",
+                contract_id,
                 &deploy_contract_item.rand_key_id
-            ));
+            );
+            return Ok(());
         }
-        let contract_code_definition = ContractCodeDefinition::pio_read_from_io(&mut &contract_code_defintion_bytes.unwrap()[..])?;
+        let contract_code_definition = match ContractCodeDefinition::pio_read_from_io(&mut &contract_code_defintion_bytes.unwrap()[..]) {
+            Ok(definition) => definition,
+            Err(error) => {
+                tracing::warn!(
+                    "DeployContractGatherer skipping deploy for contract id {}: unparseable code definition for rand key id {:?}: {}",
+                    contract_id,
+                    &deploy_contract_item.rand_key_id,
+                    error
+                );
+                return Ok(());
+            }
+        };
         let contract_code_definition_with_id = ContractCodeDefinitionWithContractId {
             contract_id,
             code_definition: contract_code_definition,
@@ -1332,11 +1357,12 @@ mod gatherer_builder_tests {
     }
 
     #[tokio::test]
-    async fn builder_rejects_invalid_queue_items() -> anyhow::Result<()> {
+    async fn builder_skips_invalid_queue_items_and_keeps_valid_state() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
         let temp_db = Arc::new(InMemoryTempStore::new("deploy_gatherer_test".to_string(), 1, 2));
         let fs = Arc::new(SimpleMockMemoryFileSystem::new());
         seed_code_definition(&temp_db, &[1u8; 16]).await?;
+        seed_code_definition(&temp_db, &[2u8; 16]).await?;
 
         let config = test_config(
             shared_status(tree.get_root(), false),
@@ -1346,30 +1372,37 @@ mod gatherer_builder_tests {
         );
         let mut gatherer = DeployContractGatherer::create_new_with_tree(&mut tree, 55, config).await?;
 
-        // undersized item
-        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; 16]).await);
-        assert!(err.to_string().contains("Invalid queue item size"), "got: {err}");
+        // undersized item: skipped, not an error
+        gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; 16]).await?;
 
         // function tree root that does not match the serialized leaves
         let leaves = function_leaves();
         let bad_fn_leaf = rand_contract_leaf(7, 10);
         let item = deploy_item_bytes(bad_fn_leaf, leaves, [1u8; 16])?;
-        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, item).await);
-        assert!(err.to_string().contains("function tree root mismatch"), "got: {err}");
+        gatherer.update_from_queue_item_with_tree(&mut tree, item).await?;
 
-        // missing code definition in the temp db: the memory temp store errors
-        // on the missing key before the gatherer's own not-found branch
+        // missing code definition: reported as Ok(None) since the absent-key semantics
+        // change, handled by the gatherer's own not-found branch
         let leaves = function_leaves();
-        let mut leaf = rand_contract_leaf(7, 10);
-        leaf.function_tree_root = fn_tree_root_full_height(0, &leaves);
-        let item = deploy_item_bytes(leaf, leaves, [9u8; 16])?;
-        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, item).await);
-        assert!(err.to_string().contains("deploy contract code definition not found"), "got: {err}");
+        let mut no_code_leaf = rand_contract_leaf(7, 10);
+        no_code_leaf.function_tree_root = fn_tree_root_full_height(0, &leaves);
+        let item = deploy_item_bytes(no_code_leaf, leaves, [9u8; 16])?;
+        gatherer.update_from_queue_item_with_tree(&mut tree, item).await?;
 
-        // nothing was recorded for the failed items
+        // every rejection above was skipped without failing the batch and
+        // without burning contract ids
         assert_eq!(gatherer.next_contract_id, 0);
         assert!(gatherer.new_contract_leaves.is_empty());
         assert!(gatherer.new_contract_leaves_ffs.is_empty());
+
+        // one valid item still gathers normally after the skipped ones
+        let leaves = function_leaves();
+        let mut leaf = rand_contract_leaf(7, 10);
+        leaf.function_tree_root = fn_tree_root_full_height(0, &leaves);
+        let item = deploy_item_bytes(leaf, leaves, [2u8; 16])?;
+        gatherer.update_from_queue_item_with_tree(&mut tree, item).await?;
+        assert_eq!(gatherer.next_contract_id, 1);
+        assert_eq!(gatherer.new_contract_leaves.len(), 1);
         Ok(())
     }
 

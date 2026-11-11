@@ -1056,6 +1056,49 @@ mod gatherer_tests {
     }
 
     #[tokio::test]
+    async fn runner_survives_same_round_update_replay() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        let old_leaf = rand_contract_leaf(7, 10);
+
+        let db = Arc::new(create_test_unified_db().await?);
+        let temp_db = Arc::new(InMemoryTempStore::new("contract_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        seed_existing_contract_1(&mut tree, &db, &temp_db, &old_leaf).await?;
+        let committed_root = tree.get_root();
+
+        // the SAME update submitted twice in one gathering round (replay or
+        // double submit): the second copy must be skipped, not fail the batch
+        let subscriber = Arc::new(TopicFakeSubscriber::default());
+        let (deploy_key, update_key) = queue_keys(41);
+        let update_leaves = function_leaves();
+        let mut updated_leaf = old_leaf;
+        updated_leaf.code_root = Hash::qp_rand_gen();
+        updated_leaf.function_tree_root = fn_tree_root_full_height(1, &update_leaves);
+        let update_item = update_item_bytes(1, updated_leaf.clone(), update_leaves)?;
+        subscriber.add_items(&update_key, 41, vec![update_item.clone(), update_item]);
+
+        let config = contract_config(Arc::clone(&db), Arc::clone(&temp_db), Arc::clone(&fs), shared_status(committed_root), 2);
+        let (mut gatherer, join_handle) = ContractQueueGatherer::<N>::new_with_status::<TopicFakeSubscriber, Db, TempDb, Fs>(
+            Arc::clone(&subscriber),
+            config,
+            deploy_key,
+            update_key,
+            tree,
+            running_status(),
+        );
+
+        let output = gatherer.finalize_gathering_and_update_queue_key(42).await?;
+        // the first copy landed, the replay was skipped, the batch survived
+        assert_eq!(output.update.db_output.updated_contract_ids, vec![1u64]);
+        assert_ne!(output.update.db_output.end_global_contract_tree_root, committed_root);
+        assert!(output.deploy.db_output.new_contract_code_definitions.is_empty());
+
+        gatherer.stop_gracefully().await?;
+        join_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_reports_error_when_the_handover_drain_fails() -> anyhow::Result<()> {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
         let db = Arc::new(create_test_unified_db().await?);

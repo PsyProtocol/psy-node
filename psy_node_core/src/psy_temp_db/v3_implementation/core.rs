@@ -11,7 +11,7 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key, tt_get_guta_in_flight_key, GutaInFlightRecord, QTempDBGutaInFlightStore,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_contract_update_submit_status_key, tt_get_deploy_contract_code_definition_key, tt_get_deploy_uncertain_outcome_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
@@ -333,6 +333,15 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBSubmitStatusReader for T {
             //anyhow::bail!("Submitted status not found");
         }
     }
+    async fn get_deploy_uncertain_outcome(
+        &self,
+        rid: &QRealmIdentifier,
+        deployer: u64,
+        deploy_content_hash: &[u8; 32],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = tt_get_deploy_uncertain_outcome_key(rid.realm_id, rid.realm_sub_id, deployer, deploy_content_hash);
+        Ok(self.qtdb_raw_kv_get_value(&key).await?.filter(|value| !value.is_empty()))
+    }
 }
 
 /*
@@ -408,7 +417,7 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempD
 
 }
 #[async_trait]
-impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBSubmitStatusWriter for T {
+impl<T: QTempDatabaseRawKVWriterBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBSubmitStatusWriter for T {
     async fn set_submitted_status_for_pending(
         &self,
         rid: &QRealmIdentifier,
@@ -429,6 +438,46 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBSubmitStatusWriter for T {
     ) -> anyhow::Result<bool> {
         let key = tt_get_submit_status_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_or_realm_id);
         self.qtdb_raw_kv_put_value_if_absent(&key, &status.to_le_bytes()).await
+    }
+    async fn put_contract_update_submitted_if_absent(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        contract_id: u64,
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_contract_update_submit_status_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, contract_id);
+        self.qtdb_raw_kv_put_value_if_absent(&key, &1u64.to_le_bytes()).await
+    }
+    async fn clear_contract_update_submitted(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        contract_id: u64,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_contract_update_submit_status_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, contract_id);
+        self.qtdb_raw_kv_delete_key(&key).await
+    }
+    async fn claim_deploy_uncertain_outcome(
+        &self,
+        rid: &QRealmIdentifier,
+        deployer: u64,
+        deploy_content_hash: &[u8; 32],
+        observed: Option<&[u8]>,
+        new_value: &[u8],
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_deploy_uncertain_outcome_key(rid.realm_id, rid.realm_sub_id, deployer, deploy_content_hash);
+        self.qtdb_raw_kv_compare_and_set(&key, observed, new_value).await
+    }
+    async fn release_deploy_uncertain_outcome(
+        &self,
+        rid: &QRealmIdentifier,
+        deployer: u64,
+        deploy_content_hash: &[u8; 32],
+        owned_value: &[u8],
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_deploy_uncertain_outcome_key(rid.realm_id, rid.realm_sub_id, deployer, deploy_content_hash);
+        // an empty value reads back as absent
+        self.qtdb_raw_kv_compare_and_set(&key, Some(owned_value), &[]).await
     }
 }
 
@@ -456,7 +505,9 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBDeployContractDataReader for
                 Ok(Some(value_bytes))
             }
         } else {
-            anyhow::bail!("deploy contract code definition not found (key: {})", hex::encode(&key));
+            // An absent key is a MISSING definition (accepted under one pending generation,
+            // consumed under another), not a storage failure: report None so callers skip the item.
+            Ok(None)
         }
     }
 }

@@ -25,6 +25,19 @@ pub const TEMP_TABLE_ID_SUBMIT_STATUS_BYTES: [u8; 2] = [0x53, 0x53]; // 'SS'
 pub const TEMP_TABLE_SUBMIT_STATUS_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
 pub const TEMP_TABLE_SUBMIT_STAUTS_VALUE_SIZE: usize = 8; // u64
 
+pub const TEMP_TABLE_ID_CONTRACT_UPDATE_SUBMIT_STATUS: u16 = 0x5355; // 'US'
+pub const TEMP_TABLE_ID_CONTRACT_UPDATE_SUBMIT_STATUS_BYTES: [u8; 2] = [0x55, 0x53]; // 'US'
+pub const TEMP_TABLE_CONTRACT_UPDATE_SUBMIT_STATUS_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
+
+pub const TEMP_TABLE_ID_DEPLOY_UNCERTAIN_OUTCOME: u16 = 0x5544; // 'DU'
+pub const TEMP_TABLE_ID_DEPLOY_UNCERTAIN_OUTCOME_BYTES: [u8; 2] = [0x44, 0x55]; // 'DU'
+pub const TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_KEY_SIZE: usize = 48; // 4 + 2 + 2 + 8 + 32
+// guard value: target checkpoint id (8 bytes LE) + owning submission's nonce (16 bytes)
+pub const TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_TARGET_BYTES: usize = 8;
+pub const TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_NONCE_BYTES: usize = 16;
+pub const TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_VALUE_SIZE: usize =
+    TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_TARGET_BYTES + TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_NONCE_BYTES;
+
 pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES: u16 = 0x5543; // 'CU'
 pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES_BYTES: [u8; 2] = [0x43, 0x55]; // 'CU'
 pub const TEMP_TABLE_USER_CONTRACT_TREE_UPDATES_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
@@ -332,6 +345,46 @@ pub fn tt_write_submit_status_key<Writer: psy_io::Write>(
     writer.write_all(&unique_pending_id.to_le_bytes())?;
     writer.write_all(&user_or_realm_id.to_le_bytes())?;
     Ok(())
+}
+
+// --- Contract Update Submit Status ---
+
+// Same shape as the end-cap submit status but in its own key family (the id is a
+// CONTRACT id, not a user/realm id): 4 + 2 + 2 + 8 (unique_pending_id) + 8 (contract_id) = 24
+#[inline(always)]
+pub fn tt_get_contract_update_submit_status_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    contract_id: u64,
+) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_CONTRACT_UPDATE_SUBMIT_STATUS_BYTES);
+    key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
+    key[16..24].copy_from_slice(&contract_id.to_le_bytes());
+    key
+}
+
+// --- Deploy Uncertain Outcome ---
+
+// Deploy outcome guard: CAS-claimed before publishing, bound to a per-submission nonce
+// (TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_*); key = 4 + 2 + 2 + 8 (deployer) + 32 (content_hash) = 48
+#[inline(always)]
+pub fn tt_get_deploy_uncertain_outcome_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    deployer: u64,
+    deploy_content_hash: &[u8; 32],
+) -> [u8; 48] {
+    let mut key = [0u8; 48];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_DEPLOY_UNCERTAIN_OUTCOME_BYTES);
+    key[8..16].copy_from_slice(&deployer.to_le_bytes());
+    key[16..48].copy_from_slice(deploy_content_hash);
+    key
 }
 
 // --- User Contract Tree Updates ---

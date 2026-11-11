@@ -638,6 +638,9 @@ impl<
             &queue_item.contract_leaf,
         )?;
 
+        // Snapshot the gathering generation at admission; re-checked before publishing
+        // so a submission can never land in a queue whose gatherer already handed over.
+        let gathering_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) =
             self.get_deploy_contract_queue_key().await?;
         let deploy_content_hash = compute_deploy_contract_content_hash(
@@ -648,15 +651,97 @@ impl<
                 .into_owned_32bytes(),
             code_definition.state_tree_height as u64,
         );
-        self.temp_db
+        // Deploy outcome guard: claimed before publishing, resolved when the target checkpoint commits; the nonce binds claim and release to one submission
+        let deployer_id = queue_item.contract_leaf.deployer.to_u64_value();
+        // serialize before claiming so a serialization failure cannot leak the guard
+        let code_definition_bytes = code_definition.psy_ser_into_bytes_vec()?;
+        // the queue item lands in the NEXT checkpoint (see end_cap_generation_target)
+        let target_checkpoint_id = gathering_generation
+            .checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("gathering checkpoint ID overflow at deploy outcome guard"))?;
+        let mut guard_value = [0u8; psy_node_core::psy_temp_db::TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_VALUE_SIZE];
+        guard_value[..8].copy_from_slice(&target_checkpoint_id.to_le_bytes());
+        guard_value[8..].copy_from_slice(&rand::random::<[u8; psy_node_core::psy_temp_db::TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_NONCE_BYTES]>());
+        // a failed claim CAS means the guard changed mid-read: re-read and retry, bounded
+        const MAX_DEPLOY_GUARD_CLAIM_ATTEMPTS: u32 = 4;
+        let mut claim_attempts = 0u32;
+        loop {
+            claim_attempts += 1;
+            let latest_committed = self.get_latest_checkpoint_id_internal().await?;
+            let observed = self
+                .temp_db
+                .get_deploy_uncertain_outcome(&self.realm_identifier, deployer_id, &deploy_content_hash)
+                .await?;
+            if let Some(ref observed_value) = observed {
+                let previous_target = deploy_outcome_guard_target(observed_value)?;
+                if previous_target > latest_committed {
+                    anyhow::bail!(
+                        "a previous submission of this deploy content (deployer {}, content {}) has an unknown delivery outcome until checkpoint {} commits (latest committed {}); wait for the checkpoint and check whether the contract exists before resubmitting",
+                        deployer_id,
+                        hash_to_hex(&deploy_content_hash),
+                        previous_target,
+                        latest_committed
+                    );
+                }
+            }
+            if self
+                .temp_db
+                .claim_deploy_uncertain_outcome(&self.realm_identifier, deployer_id, &deploy_content_hash, observed.as_deref(), &guard_value)
+                .await?
+            {
+                break;
+            }
+            if claim_attempts >= MAX_DEPLOY_GUARD_CLAIM_ATTEMPTS {
+                anyhow::bail!(
+                    "identical deploy submissions are racing (deployer {}, content {}); retry the submission",
+                    deployer_id,
+                    hash_to_hex(&deploy_content_hash)
+                );
+            }
+        }
+        // refuse a claim whose target committed or generation expired while the request was paused; the stale claim is self-resolving, leave it
+        if target_checkpoint_id <= self.get_latest_checkpoint_id_internal().await?
+            || self.temp_db.get_gathering_generation(&self.realm_identifier).await? != gathering_generation
+        {
+            anyhow::bail!(
+                "the gathering generation expired before this deploy submission (deployer {}, content {}) was admitted; retry the submission",
+                deployer_id,
+                hash_to_hex(&deploy_content_hash)
+            );
+        }
+        if let Err(error) = self
+            .temp_db
             .set_deploy_contract_code_definition_raw(
                 &self.realm_identifier,
                 unique_pending_id,
                 &queue_item.rand_key_id,
-                code_definition.psy_ser_into_bytes_vec()?,
+                code_definition_bytes,
             )
-            .await?;
-        self.contract_queue
+            .await
+        {
+            // definite non-delivery: release only this request's claim
+            if let Err(release_error) = self
+                .temp_db
+                .release_deploy_uncertain_outcome(&self.realm_identifier, deployer_id, &deploy_content_hash, &guard_value)
+                .await
+            {
+                tracing::warn!("failed to release the deploy outcome guard: {}", release_error);
+            }
+            return Err(error);
+        }
+        // A stale ephemeral publish may land in a queue whose gatherer already
+        // retired.
+        let current_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
+        anyhow::ensure!(
+            current_generation == gathering_generation,
+            "gathering generation changed during deploy storage/delivery: stored {:?}, current {:?}; delivery is not confirmed",
+            gathering_generation,
+            current_generation,
+        );
+        // From the publish attempt on, delivery is UNCERTAIN (ambiguous transport errors, handover drain across a flip); the held guard resolves at its target checkpoint commit, so a blind resubmission stays refused until then.
+        let publish_result = self
+            .contract_queue
             .publish_ephemeral_queue_item_owned_bytes(
                 &queue_key,
                 self.realm_id_u64,
@@ -665,7 +750,21 @@ impl<
                 0,
                 queue_item.psy_ser_into_bytes_vec()?,
             )
-            .await?;
+            .await;
+        if let Err(error) = publish_result {
+            anyhow::bail!(
+                "deploy queue publish failed; delivery status unknown, do not assume the deploy was dropped: {}",
+                error
+            );
+        }
+        let delivered_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
+        if delivered_generation != gathering_generation {
+            anyhow::bail!(
+                "gathering generation changed during deploy delivery: stored {:?}, current {:?}; delivery status unknown — the item may still have been captured by the retiring gatherer, and resubmitting may deploy a duplicate contract; check the contract state first",
+                gathering_generation,
+                delivered_generation,
+            );
+        }
         Ok(hash_to_hex(&deploy_content_hash))
     }
 
@@ -724,6 +823,9 @@ impl<
             .await
             .map_err(|_| anyhow::anyhow!("deployer key is not registered"))?;
 
+        // Snapshot the gathering generation at admission; re-checked before publishing
+        // so a submission can never land in a queue whose gatherer already handed over.
+        let gathering_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_update_contract_queue_key().await?;
 
         let PQBCUpdateContract {
@@ -800,19 +902,69 @@ impl<
             &queue_item.contract_leaf,
         )?;
 
-        // reuse the deploy contract code definition temp db storage (keyed by
-        // realm + unique_pending_id + rand_key_id) to keep changes minimal
-        self.temp_db
-            .set_deploy_contract_code_definition_raw(
-                &self.realm_identifier,
-                unique_pending_id,
-                &queue_item.rand_key_id,
-                code_definition.psy_ser_into_bytes_vec()?,
-            )
-            .await?;
-        tracing::info!("Stored update contract code definition raw in temp DB for pending id {} with rand key {:?}", unique_pending_id, &queue_item.rand_key_id);
+        // Edge-side same-round admission (mirrors the end-cap submit status): at most one
+        // update per contract per gathering generation; a rejected attempt never consumes the slot.
+        if !self
+            .temp_db
+            .put_contract_update_submitted_if_absent(&self.realm_identifier, unique_pending_id, contract_id)
+            .await?
+        {
+            anyhow::bail!(
+                "contract {} already has an update pending in the current block (pending id {}); retry after the next checkpoint",
+                contract_id,
+                unique_pending_id
+            );
+        }
 
-        self.contract_queue
+        // Stage 1 — before the publish attempt: a failure here is DEFINITE non-delivery
+        // (nothing was enqueued), so the slot is released for a same-generation retry.
+        let staged = async {
+            // reuse the deploy contract code definition temp db storage (keyed by
+            // realm + unique_pending_id + rand_key_id) to keep changes minimal
+            self.temp_db
+                .set_deploy_contract_code_definition_raw(
+                    &self.realm_identifier,
+                    unique_pending_id,
+                    &queue_item.rand_key_id,
+                    code_definition.psy_ser_into_bytes_vec()?,
+                )
+                .await?;
+            tracing::info!("Stored update contract code definition raw in temp DB for pending id {} with rand key {:?}", unique_pending_id, &queue_item.rand_key_id);
+
+            // A stale ephemeral publish may land in a queue whose gatherer
+            // already handed over.
+            let current_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
+            anyhow::ensure!(
+                current_generation == gathering_generation,
+                "gathering generation changed before update delivery: stored {:?}, current {:?}; nothing was enqueued, retry now",
+                gathering_generation,
+                current_generation,
+            );
+            Ok(())
+        }
+        .await;
+        if let Err(error) = staged {
+            // Best-effort release: nothing was enqueued, so reopening the slot is safe;
+            // the slot is scoped to this pending id, so a flipped generation makes it a no-op.
+            if let Err(clear_error) = self
+                .temp_db
+                .clear_contract_update_submitted(&self.realm_identifier, unique_pending_id, contract_id)
+                .await
+            {
+                tracing::warn!(
+                    "failed to release the update admission slot for contract {} (pending id {}): {}; retries within this block will be rejected until the next checkpoint",
+                    contract_id,
+                    unique_pending_id,
+                    clear_error
+                );
+            }
+            return Err(error);
+        }
+
+        // Stage 2 — the publish attempt and beyond: delivery is UNCERTAIN (ambiguous transport
+        // errors, handover drain across a flip), so the slot is intentionally NOT released.
+        let publish_result = self
+            .contract_queue
             .publish_ephemeral_queue_item_owned_bytes(
                 &queue_key,
                 self.realm_id_u64,
@@ -821,7 +973,20 @@ impl<
                 0,
                 queue_item.psy_ser_into_bytes_vec()?,
             )
-            .await?;
+            .await;
+        if let Err(error) = publish_result {
+            anyhow::bail!(
+                "update queue publish failed; delivery status unknown, do not assume the update was dropped: {}",
+                error
+            );
+        }
+        let delivered_generation = self.temp_db.get_gathering_generation(&self.realm_identifier).await?;
+        anyhow::ensure!(
+            delivered_generation == gathering_generation,
+            "gathering generation changed during update delivery: stored {:?}, current {:?}; delivery status unknown — the item may still have been captured by the retiring gatherer. Updates are idempotent across blocks (the old-leaf binding rejects a stale resubmit), so verify the contract state and only resubmit after the next checkpoint if needed",
+            gathering_generation,
+            delivered_generation,
+        );
 
         Ok(update_content_hash_hex)
     }
@@ -834,6 +999,18 @@ fn validate_external_guta_admission(job_type_u32: u32) -> anyhow::Result<()> {
         "external Realm GUTA admission requires job type 63 (RealmFinalizeGUTA), got {job_type_u32}"
     );
     Ok(())
+}
+
+/// Parses the target checkpoint id from a guard value; any other width is corrupt and fails closed.
+fn deploy_outcome_guard_target(guard_value: &[u8]) -> anyhow::Result<u64> {
+    if guard_value.len() != psy_node_core::psy_temp_db::TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_VALUE_SIZE {
+        anyhow::bail!(
+            "corrupt deploy outcome guard: expected {} bytes, got {}",
+            psy_node_core::psy_temp_db::TEMP_TABLE_DEPLOY_UNCERTAIN_OUTCOME_VALUE_SIZE,
+            guard_value.len()
+        );
+    }
+    Ok(u64::from_le_bytes(guard_value[..8].try_into().unwrap()))
 }
 
 impl<
@@ -1845,6 +2022,237 @@ pub(crate) mod tests {
             .await
             .expect_err("empty contract must be rejected");
         assert!(err.to_string().contains("no functions"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_rejects_same_round_duplicate() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        seed_contracts(&env.db).await?;
+        let handler = &env.handler;
+
+        // first submission of the round is accepted
+        handler.update_contract_internal(valid_update_contract(), &auth_stub()).await?;
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // an identical replay (or double submit) in the same generation is rejected
+        // at the edge instead of an RPC ok that silently disappears at gather time
+        let err = handler
+            .update_contract_internal(valid_update_contract(), &auth_stub())
+            .await
+            .expect_err("same-round duplicate must be rejected");
+        assert!(err.to_string().contains("already has an update pending"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // a rejected attempt does not consume the slot: an update failing authorization
+        // before admission never blocks the contract
+
+        // the admission slot is scoped to the pending id: a new gathering
+        // generation admits the same contract again
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 1,
+                    unique_pending_id: 1,
+                    proc_checkpoint_unique_id: 1,
+                },
+            )
+            .await?;
+        handler.update_contract_internal(valid_update_contract(), &auth_stub()).await?;
+        assert_eq!(env.contract_queue.published_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_contract_keeps_admission_slot_when_delivery_is_uncertain() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        seed_contracts(&env.db).await?;
+
+        // a publish failure AFTER the slot was claimed is UNCERTAIN, so the slot must NOT be
+        // released: reopening it could admit a second update the gatherer would then skip
+        env.contract_queue.fail_next_publish("injected publish failure");
+        let err = env
+            .handler
+            .update_contract_internal(valid_update_contract(), &auth_stub())
+            .await
+            .expect_err("publish failure must fail the submission");
+        assert!(err.to_string().contains("delivery status unknown"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+
+        // the slot stays taken for this generation: a same-generation retry
+        // is rejected instead of racing the uncertain first attempt
+        let err = env
+            .handler
+            .update_contract_internal(valid_update_contract(), &auth_stub())
+            .await
+            .expect_err("same-generation retry must be rejected while delivery is uncertain");
+        assert!(err.to_string().contains("already has an update pending"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+
+        // the next generation starts clean and admits the update
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 1,
+                    unique_pending_id: 1,
+                    proc_checkpoint_unique_id: 1,
+                },
+            )
+            .await?;
+        env.handler.update_contract_internal(valid_update_contract(), &auth_stub()).await?;
+        assert_eq!(env.contract_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_admission_slot_clear_reopens_the_generation() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let rid = QRealmIdentifier::new(1, 2);
+
+        // the stage-1 release primitive: claim, observe the claim, clear, and
+        // observe the generation is reopenable
+        assert!(env.temp_db.put_contract_update_submitted_if_absent(&rid, 7, 42).await?);
+        assert!(!env.temp_db.put_contract_update_submitted_if_absent(&rid, 7, 42).await?);
+        env.temp_db.clear_contract_update_submitted(&rid, 7, 42).await?;
+        assert!(env.temp_db.put_contract_update_submitted_if_absent(&rid, 7, 42).await?);
+
+        // the clear is scoped per (pending id, contract id)
+        assert!(env.temp_db.put_contract_update_submitted_if_absent(&rid, 8, 42).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deploy_contract_refuses_blind_resubmission_while_outcome_is_uncertain() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        // generation 5 gathers into checkpoint 6, so the first claim targets 6
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 5,
+                    unique_pending_id: 0,
+                    proc_checkpoint_unique_id: 0,
+                },
+            )
+            .await?;
+
+        // publish fails after the claim: outcome uncertain
+        env.contract_queue.fail_next_publish("injected publish failure");
+        let err = env
+            .handler
+            .deploy_contract_internal(valid_deploy_contract_v2())
+            .await
+            .expect_err("publish failure must fail the submission");
+        assert!(err.to_string().contains("delivery status unknown"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+
+        // a generation flip does not commit the old block, so the resubmission is still refused
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 6,
+                    unique_pending_id: 1,
+                    proc_checkpoint_unique_id: 1,
+                },
+            )
+            .await?;
+        let err = env
+            .handler
+            .deploy_contract_internal(valid_deploy_contract_v2())
+            .await
+            .expect_err("resubmission across the generation flip must be refused");
+        assert!(err.to_string().contains("unknown delivery outcome until checkpoint 6 commits"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+
+        // the guard resolves when the target checkpoint commits
+        env.db.set_latest_checkpoint_id(6).await?;
+        env.handler.deploy_contract_internal(valid_deploy_contract_v2()).await?;
+        assert_eq!(env.contract_queue.published_count(), 1);
+
+        // the successful submission claimed a fresh guard for checkpoint 7
+        let err = env
+            .handler
+            .deploy_contract_internal(valid_deploy_contract_v2())
+            .await
+            .expect_err("identical deploy before checkpoint 7 commits must be refused");
+        assert!(err.to_string().contains("unknown delivery outcome until checkpoint 7 commits"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deploy_refuses_to_claim_a_guard_whose_target_already_committed() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        // stored generation says 5 (target 6) but checkpoint 6 already committed: a paused request must not enqueue under a resolved guard
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 5,
+                    unique_pending_id: 0,
+                    proc_checkpoint_unique_id: 0,
+                },
+            )
+            .await?;
+        env.db.set_latest_checkpoint_id(6).await?;
+
+        let err = env
+            .handler
+            .deploy_contract_internal(valid_deploy_contract_v2())
+            .await
+            .expect_err("an expired gathering generation must not admit a deploy");
+        assert!(err.to_string().contains("gathering generation expired"), "unexpected error: {err}");
+        assert_eq!(env.contract_queue.published_count(), 0);
+
+        // after the flip the stale claim is recyclable and the same content is admitted
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 6,
+                    unique_pending_id: 1,
+                    proc_checkpoint_unique_id: 1,
+                },
+            )
+            .await?;
+        env.handler.deploy_contract_internal(valid_deploy_contract_v2()).await?;
+        assert_eq!(env.contract_queue.published_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_deploys_enqueue_exactly_once() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        env.temp_db
+            .set_gathering_generation(
+                &QRealmIdentifier::new(1, 2),
+                psy_node_core::psy_temp_db::GatheringGeneration {
+                    checkpoint_id: 5,
+                    unique_pending_id: 0,
+                    proc_checkpoint_unique_id: 0,
+                },
+            )
+            .await?;
+
+        let handler = std::sync::Arc::new(env.handler);
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let handler = std::sync::Arc::clone(&handler);
+            joins.push(tokio::spawn(async move {
+                handler.deploy_contract_internal(valid_deploy_contract_v2()).await
+            }));
+        }
+        let mut successes = 0;
+        for join in joins {
+            if join.await.map_err(|error| anyhow::anyhow!(error.to_string()))?.is_ok() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1, "exactly one concurrent submission may be admitted");
+        assert_eq!(env.contract_queue.published_count(), 1);
         Ok(())
     }
 

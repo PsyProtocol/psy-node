@@ -494,11 +494,17 @@ impl QStandardWorkerQueuePublisher for FakeWorkerQueuePublisher {
 #[derive(Default)]
 pub struct FakeEphemeralQueuePublisher {
     pub published: Mutex<Vec<(u128, Vec<u8>)>>,
+    /// When set, the next publish fails once with this message (consumed on
+    /// use); lets tests exercise failure paths after edge admission.
+    pub fail_next_publish: Mutex<Option<String>>,
 }
 
 impl FakeEphemeralQueuePublisher {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn fail_next_publish(&self, message: &str) {
+        *self.fail_next_publish.lock().unwrap() = Some(message.to_string());
     }
     pub fn published_count(&self) -> usize {
         self.published.lock().unwrap().len()
@@ -545,6 +551,9 @@ impl psy_node_core::queue::ephemeral::QStandardEphemeralQueuePublisher for FakeE
         _task_group: u32,
         item_bytes: &[u8],
     ) -> anyhow::Result<()> {
+        if let Some(message) = self.fail_next_publish.lock().unwrap().take() {
+            return Err(anyhow::anyhow!("{}", message));
+        }
         self.published.lock().unwrap().push((unique_id, item_bytes.to_vec()));
         Ok(())
     }
