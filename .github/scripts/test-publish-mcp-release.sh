@@ -64,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --repo|--dir|--title|--json|--notes) pos+=("_OPT_:$1" "$2"); shift 2 ;;
     -q) pos+=("_OPT_:-q" "$2"); shift 2 ;;
     --verify-tag|--draft|--generate-notes|--clobber) pos+=("_FLAG_:$1"); shift ;;
+    --latest=*) pos+=("_OPT_:--latest" "${1#--latest=}"); shift ;;
     --draft=*) pos+=("_OPT_:--draft" "${1#--draft=}"); shift ;;
     *) pos+=("$1"); shift ;;
   esac
