@@ -409,8 +409,8 @@ known, reviewed ways; a redeploy from this lock changes these units:
 | `psy_node_cli` on the six Realm processors and the coordinator processor | `64a74b01` | `64a74b01` (same) |
 | `psy_node_cli` on the Edges | `64a74b01` | `ea150cc9` (build `fbbc0738`, 2026-11-11: user tree proofs only for committed checkpoints) |
 | `psy_worker_cli` | `a5024735` | `a5024735` (same) |
-| `psy_relayer_cli` on the three Guardians | `03184ab0` | `7abf495c` (build `7c72df70`; the lock adds only relayer-daemon changes, pending-recovery proof wait and claim proof `scan_limit`, which Guardians do not run) |
-| `psy_relayer_cli` on the relayer | `03184ab0` | `03184ab0` (same) |
+| `psy_relayer_cli` on the three Guardians | `03184ab0` | `e442d562` (build `d4df5a31`, 2026-11-11: the observer reads the bridge user leaf only after its committed user tree proof) |
+| `psy_relayer_cli` on the relayer | `03184ab0` | `fe21ff89` (build `460dd5ed`, 2026-11-11: user leaves read after their proofs; pending recovery waits on an unconfirmed EndCap delivery instead of exiting) |
 | `psy_dev_cli`, `psy_user_cli` | `f36e9436`, `f2f4762d` | not installed by this release |
 | Runtime config `coordinator_configs` | three edges (pinned `04d3056c`) | same file on the core hosts |
 | Coordinator clients | `release.json`/topology: ingress `10.148.0.25:15369` | relayer, guardian `rpc.json`, Worker config, Realm processor units, coordinator indexer and Services use the ingress; the x3 user prove-proxy reaches it through the additive gateway forwarder `psy-coordinator-ingress-forward` (`10.250.0.1:15369`); Realm indexers (hash-guarded Services package) still dial the edges, and the gateway edge forwarders `15370`-`15372` remain installed but idle |
