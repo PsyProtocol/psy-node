@@ -38,6 +38,7 @@ Use one verb for one act. Do not invent a synonym.
 | `commit` | Write the durable checkpoint records and marker | `commit_state` |
 | `verify` | Check an untrusted or reconstructed candidate | `verify_history_transition`, `verify_history_proposal` |
 | `validate` | Check untrusted or serialized input | wire/body checks |
+| `validate_contract_state_range` | Check that a contract-state sub-slot range fits its Merkle tree | VM range reads and writes |
 | `ensure` | Enforce an internal invariant; return an error | `ensure_db_matches_coordinator_head` |
 | `check` | Classify state or health | `get_database_check_state` |
 | `sync` | Copy authenticated coordinator metadata locally | `sync_with_coordinator`, `sync_to_coordinator_checkpoint_id` |

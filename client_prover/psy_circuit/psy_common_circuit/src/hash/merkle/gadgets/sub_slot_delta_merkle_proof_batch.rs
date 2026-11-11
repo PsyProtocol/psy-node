@@ -253,11 +253,22 @@ impl SubSlotDeltaMerkleProofBatchGadget {
             // ensure the proof starts at the correct slot index
             builder.connect(start_slot_index, dmp_0.index);
 
+            let mut last_proof_used = builder._false();
+            for offset in 0..4 {
+                if sub_slot_length + offset > 4 {
+                    let offset_target = builder.constant(F::from_canonical_usize(offset));
+                    let matches = builder.is_equal(sub_slot_index_mod_4, offset_target);
+                    last_proof_used = builder.or(last_proof_used, matches);
+                }
+            }
             let one = builder.one();
             let end_index = builder.add(start_slot_index, one);
-
-            // ensure the proof ends at the start_slot_index + 1
-            builder.connect(dmp_1.index, end_index);
+            let sequential = builder.is_equal(dmp_1.index, end_index);
+            let repeated = builder.is_equal(dmp_1.index, start_slot_index);
+            let unused = builder.not(last_proof_used);
+            let unused_repeated = builder.and(unused, repeated);
+            let valid_index = builder.or(sequential, unused_repeated);
+            builder.assert_one(valid_index.target);
 
             let first_gadget = connect_sub_slot_start_mask_4_delta_merkle_proof::<H, F, D>(
                 builder,
@@ -391,10 +402,21 @@ impl SubSlotDeltaMerkleProofBatchGadget {
             // handle last proof edge case
 
             let last_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, height);
+            let mut last_proof_used = builder._false();
+            for offset in 0..4 {
+                if sub_slot_length + offset > 4 * (n_proofs - 1) {
+                    let offset_target = builder.constant(F::from_canonical_usize(offset));
+                    let matches = builder.is_equal(sub_slot_index_mod_4, offset_target);
+                    last_proof_used = builder.or(last_proof_used, matches);
+                }
+            }
             let expected_last_proof_index = builder.add(last_slot_index_target, one);
-
-            // ensure the proofs are for a contiguous portion of the tree
-            builder.connect(last_proof.index, expected_last_proof_index);
+            let sequential = builder.is_equal(last_proof.index, expected_last_proof_index);
+            let repeated = builder.is_equal(last_proof.index, last_slot_index_target);
+            let unused = builder.not(last_proof_used);
+            let unused_repeated = builder.and(unused, repeated);
+            let valid_index = builder.or(sequential, unused_repeated);
+            builder.assert_one(valid_index.target);
 
             // connect old root to previous slot's new root
             builder.connect_hashes(last_proof.old_root, last_slot_new_root);
@@ -484,6 +506,150 @@ mod tests {
             idx >>= 1;
         }
         sibs
+    }
+
+    /// Audit finding (Low): an aligned whole-tree range write demands a
+    /// non-existent extra Merkle leaf. `n_proofs = (len + 6) / 4` sizes the
+    /// batch for the worst-case misaligned start (r <= 3), but
+    /// `force_four_align` asserts r == 0, where only `ceil(len / 4)` proofs
+    /// are needed; whenever len % 4 != 1 the batch still requires one extra
+    /// delta proof at leaf index `start + n_proofs - 1`, one past the end of
+    /// the write window. If the window ends at the tree's last leaf — an
+    /// aligned whole-tree write of len = 4 * 2^height — that leaf index is
+    /// 2^height, which does not exist: `DeltaMerkleProofGadget` does
+    /// `split_le(index, height)`, which cannot represent it, so no honest
+    /// witness can satisfy the circuit. The two controls isolate the extra
+    /// leaf as the only difference: the same write on a tree one level
+    /// taller (the extra leaf exists as a real untouched leaf) proves and
+    /// commits the write, and a write ending on the last real leaf (no leaf
+    /// past the tree is touched) proves as well.
+    #[test]
+    fn aligned_whole_tree_range_write_demands_a_nonexistent_leaf() {
+        // (height, len, expected to prove)
+        let cases: Vec<(usize, usize, bool)> = vec![
+            (4, 64, false), // whole tree, aligned: extra proof needs leaf 16 of a 16-leaf tree
+            (5, 64, true),  // same write, taller tree: leaf 16 exists and stays untouched
+            (4, 60, true),  // ends on the last real leaf: batch fits inside the tree
+        ];
+
+        for &(height, len, should_prove) in &cases {
+            let n_leaves = 1usize << height;
+            let leaves0: Vec<HashOut<F>> = (0..n_leaves as u64).map(|i| leaf(100 + i)).collect();
+            let write: Vec<u64> = (0..len).map(|i| 500 + i as u64).collect();
+            let n_proofs = (len + 6) / 4;
+
+            let mut slots_final = leaves0.clone();
+            for p in 0..n_proofs.min(n_leaves) {
+                for e in 0..4usize {
+                    let g = 4 * p + e;
+                    if g < len {
+                        slots_final[p].elements[e] = F::from_canonical_u64(write[g]);
+                    }
+                }
+            }
+
+            // Cumulative tree states: state s = leaves after applying slots 0..s.
+            let mut states: Vec<Vec<HashOut<F>>> = Vec::with_capacity(n_proofs + 1);
+            states.push(leaves0.clone());
+            for p in 0..n_proofs {
+                let mut st = states[p].clone();
+                if p < n_leaves {
+                    st[p] = slots_final[p];
+                }
+                states.push(st);
+            }
+
+            let config = CircuitConfig::standard_recursion_config();
+            let mut builder = CircuitBuilder::<F, D>::new(config);
+            let sub_slot_index = builder.zero();
+            let values: Vec<_> = (0..len).map(|_| builder.add_virtual_target()).collect();
+            let gadget = SubSlotDeltaMerkleProofBatchGadget::add_virtual_to::<PoseidonHash, F, D>(
+                &mut builder,
+                height,
+                sub_slot_index,
+                values.clone(),
+                true,
+                None,
+            );
+            assert_eq!(gadget.delta_merkle_proof_gadgets.len(), n_proofs, "n_proofs = (len+6)/4");
+            if len == 4 * n_leaves {
+                // the audited over-allocation: one proof more than the tree has leaves
+                assert_eq!(n_proofs, n_leaves + 1, "aligned whole-tree write allocates a proof past the tree");
+            }
+            builder.register_public_inputs(&gadget.old_root.elements);
+            builder.register_public_inputs(&gadget.new_root.elements);
+            let data = builder.build::<PoseidonGoldilocksConfig>();
+
+            let mut pw = PartialWitness::new();
+            for (i, v) in values.iter().enumerate() {
+                pw.set_target(*v, F::from_canonical_u64(write[i])).unwrap();
+            }
+            let q = |h: HashOut<F>| QHashOut(h);
+            for (p, dmp) in gadget.delta_merkle_proof_gadgets.iter().enumerate() {
+                if p < n_leaves {
+                    let sibs: Vec<QHashOut<F>> = siblings_for(&states[p], p).into_iter().map(q).collect();
+                    dmp.set_witness(&mut pw, F::from_canonical_usize(p), q(states[p][p]), q(slots_final[p]), &sibs).unwrap();
+                } else {
+                    // leaf p does not exist; make the best-effort honest attempt —
+                    // its true index with a real leaf's siblings — and let the
+                    // constraint system refute it
+                    let sibs: Vec<QHashOut<F>> = siblings_for(&states[p], 0).into_iter().map(q).collect();
+                    dmp.set_witness(&mut pw, F::from_canonical_usize(p), q(states[p][0]), q(states[p][0]), &sibs).unwrap();
+                }
+            }
+
+            match (data.prove(pw), should_prove) {
+                (Ok(proof), true) => {
+                    assert!(data.verify(proof.clone()).is_ok(), "proved witness must verify (height={height}, len={len})");
+                    let new_root: Vec<GoldilocksField> = proof.public_inputs[4..8].to_vec();
+                    assert_eq!(new_root, tree_root(&states[n_proofs]).elements, "verified new root must commit the final tree (height={height}, len={len})");
+                }
+                (Ok(_), false) => panic!("whole-tree aligned write must be unprovable: the extra proof needs leaf {n_leaves} of a {n_leaves}-leaf tree (height={height}, len={len})"),
+                (Err(_), true) => panic!("honest control witness must prove (height={height}, len={len})"),
+                (Err(_), false) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn whole_tree_write_accepts_repeated_unused_tail() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let index = builder.zero();
+        let values = (0..64).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+        let gadget = SubSlotDeltaMerkleProofBatchGadget::add_virtual_to::<PoseidonHash, F, D>(
+            &mut builder, 4, index, values.clone(), true, None,
+        );
+        builder.register_public_inputs(&gadget.new_root.elements);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        for tamper in [false, true] {
+            let mut leaves: Vec<HashOut<F>> = (0..16).map(|i| leaf(100 + i)).collect();
+            let mut pw = PartialWitness::new();
+            for (i, value) in values.iter().enumerate() {
+                pw.set_target(*value, F::from_canonical_usize(500 + i)).unwrap();
+            }
+            for (i, proof) in gadget.delta_merkle_proof_gadgets.iter().enumerate() {
+                let index = i.min(15);
+                let siblings = siblings_for(&leaves, index).into_iter().map(QHashOut).collect::<Vec<_>>();
+                let old = leaves[index];
+                let mut new = if i < 16 {
+                    HashOut { elements: std::array::from_fn(|j| F::from_canonical_usize(500 + i * 4 + j)) }
+                } else {
+                    old
+                };
+                if tamper && i == 16 {
+                    new.elements[0] = F::from_canonical_u64(9999);
+                }
+                proof.set_witness(&mut pw, F::from_canonical_usize(index), QHashOut(old), QHashOut(new), &siblings).unwrap();
+                leaves[index] = new;
+            }
+            if tamper {
+                assert!(data.prove(pw).is_err(), "unused tail must not change the tree");
+            } else {
+                let proof = data.prove(pw).unwrap();
+                assert_eq!(proof.public_inputs, tree_root(&leaves).elements);
+                data.verify(proof).unwrap();
+            }
+        }
     }
 
     /// Regression for the middle-proof mask fix (audit H1): elements of any

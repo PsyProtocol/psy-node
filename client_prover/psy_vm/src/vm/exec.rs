@@ -138,6 +138,15 @@ fn validate_contract_state_tree_height(height: u64) -> anyhow::Result<u8> {
     Ok(height as u8)
 }
 
+fn validate_contract_state_range(start: u64, length: usize, height: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(height <= 32, "contract state tree height {} exceeds 32", height);
+    anyhow::ensure!(length > 0, "contract state range must not be empty");
+    let end = u128::from(start) + length as u128;
+    let capacity = 4u128 << height;
+    anyhow::ensure!(end <= capacity, "contract state range ends at {} beyond capacity {}", end, capacity);
+    Ok(())
+}
+
 fn validate_imt_slot_index(slot_index: u64, state_slot_base: u64, capacity: u64) -> anyhow::Result<u64> {
     let min_index = state_slot_base
         .checked_add(1)
@@ -402,6 +411,56 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn range_witness_reuses_last_leaf_after_full_tree_write() {
+        use psy_client_data::{config::store_config::ContractLeafTableStore, models::contract::contract_leaf::ContractLeafModelCore, qdata::contract::PsyContractLeaf};
+        let store = KVQSimpleMemoryBackingStore::new();
+        let contract = PsyContractLeaf {
+            state_tree_height: GoldilocksField::from_canonical_u64(4),
+            ..Default::default()
+        };
+        ContractLeafTableStore::<KVQSimpleMemoryBackingStore>::set_contract(&store, 0, 8, contract).unwrap();
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            store,
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session.init_transaction(DPNProvingSessionSimpleMethodCall::new(
+            GoldilocksField::from_canonical_u64(8), GoldilocksField::ONE, vec![],
+        )).await.unwrap();
+        let values = (0..64).map(|i| 100 + i).collect::<Vec<_>>();
+        let write = session.resolve_vec(&DPNStateCmd::set_contract_state_slot_range(1, 0, values.clone())).await.unwrap();
+        let proofs = write.witness.get_delta_merkle_proof_array_ref();
+        assert_eq!(proofs.len(), 17);
+        assert_eq!(proofs[15].index, 15);
+        assert_eq!(proofs[16].index, 15);
+        let error = session.resolve_vec(&DPNStateCmd::set_contract_state_slot_range(1, 63, vec![1, 2])).await.unwrap_err();
+        assert!(error.to_string().contains("beyond capacity"));
+        let read = session.resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(0, 64)).await.unwrap();
+        assert_eq!(read.result, values.iter().map(|v| GoldilocksField::from_canonical_u64(*v)).collect::<Vec<_>>());
+        let read_proofs = read.witness.get_merkle_proof_array_ref();
+        assert_eq!(read_proofs.len(), 17);
+        assert_eq!(read_proofs[15].index, 15);
+        assert_eq!(read_proofs[16].index, 15);
+        assert!(session.resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(63, 2)).await.is_err());
+        for (start, length) in [(60, 4), (61, 3), (58, 6), (55, 9)] {
+            let values = (0..length).map(|i| 1000 + i).collect::<Vec<_>>();
+            session.resolve_vec(&DPNStateCmd::set_contract_state_slot_range(1, start, values.clone())).await.unwrap();
+            let read = session.resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(start, length as u32)).await.unwrap();
+            assert_eq!(read.result, values.iter().map(|v| GoldilocksField::from_canonical_u64(*v)).collect::<Vec<_>>());
+        }
+        let before = session.resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(62, 2)).await.unwrap().result;
+        session.resolve_vec(&DPNStateCmd::set_contract_state_slot_range(0, 62, vec![9000, 9001])).await.unwrap();
+        let after = session.resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(62, 2)).await.unwrap().result;
+        assert_eq!(before, after);
+        assert_eq!(proofs[16].old_root, proofs[15].new_root);
+        assert_eq!(proofs[16].old_root, proofs[16].new_root);
+        assert_eq!(proofs[16].old_value, proofs[16].new_value);
+    }
+
+    #[tokio::test]
     async fn resolve_vec_dispatches_every_state_command_family_on_empty_backend() {
         let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
             KVQSimpleMemoryBackingStore::new(),
@@ -568,6 +627,14 @@ impl<
                 }
             }
             DPNStateCmd::SetContractStateSlotRange(c) => {
+                let height = if current_contract_id == F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64) {
+                    u64::from(psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT)
+                } else {
+                    self.resolve_get_contract_leaf_mut(&QSRCmdGetContractLeafData {
+                        contract_id: current_contract_id.to_canonical_u64(),
+                    }).await?.state_tree_height.to_canonical_u64()
+                };
+                validate_contract_state_range(c.sub_slot_index, c.value.len(), height)?;
                 if c.condition == 0 {
                     let r = self
                         .resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_range(
@@ -613,12 +680,11 @@ impl<
                     let slot_index = F::from_canonical_u64(c.sub_slot_index / 4u64);
                     let n = (c.sub_slot_index & 0b11) as usize;
                     let mut proof_0_elements = self.get_contract_state_slot(current_contract_id, slot_index).await?.value.0.elements;
-                    let mut proof_1_elements = self
-                        .get_contract_state_slot(current_contract_id, slot_index + F::ONE)
-                        .await?
-                        .value
-                        .0
-                        .elements;
+                    let mut proof_1_elements = if n + value_len > 4 {
+                        self.get_contract_state_slot(current_contract_id, slot_index + F::ONE).await?.value.0.elements
+                    } else {
+                        proof_0_elements
+                    };
                     for (i, v) in c.value.iter().enumerate() {
                         let r_ind = n + i;
                         if r_ind < 4 {
@@ -630,160 +696,39 @@ impl<
                     let delta_proof_0 = self
                         .set_contract_state_slot(current_contract_id, slot_index, QHashOut(HashOut { elements: proof_0_elements }))
                         .await?;
-                    let delta_proof_1 = self
-                        .set_contract_state_slot(current_contract_id, slot_index + F::ONE, QHashOut(HashOut { elements: proof_1_elements }))
-                        .await?;
+                    let delta_proof_1 = if n + value_len > 4 {
+                        self.set_contract_state_slot(current_contract_id, slot_index + F::ONE, QHashOut(HashOut { elements: proof_1_elements })).await?
+                    } else {
+                        self.get_contract_state_slot(current_contract_id, slot_index).await?.to_delta_merkle_proof_inplace()
+                    };
                     Ok(PsyCmdWithInputAndWitness {
                         state_cmd: state_cmd.clone(),
                         witness: DPNStateCmdWitness::DeltaMerkleProofArray(vec![delta_proof_0, delta_proof_1]),
                         result: c.value.iter().map(|x| F::from_noncanonical_u64(*x)).collect(),
                     })
                 } else {
-                    let start_slot_index = F::from_canonical_u64(c.sub_slot_index / 4u64);
-                    let n_proofs = ((value_len + 6) / 4) as u64;
-                    let sub_slot_index_mod_4 = c.sub_slot_index % 4;
-                    let len_minus_2_mod_4 = (value_len - 2) % 4;
-                    //let start_slot = c.sub_slot_index / 4;
-                    let mut dmps = Vec::with_capacity(n_proofs as usize);
+                    let start_slot_index = c.sub_slot_index / 4;
+                    let offset = (c.sub_slot_index % 4) as usize;
+                    let actual_proofs = (offset + value_len + 3) / 4;
+                    let n_proofs = (value_len + 6) / 4;
                     let result = c.value.iter().map(|i| F::from_noncanonical_u64(*i)).collect::<Vec<_>>();
-
-                    let slot_mask_type = sub_slot_index_mod_4 as usize + len_minus_2_mod_4;
-
-                    // handle the first proof special case
-                    let main_body_proofs_index_offset = (4 - sub_slot_index_mod_4) as usize;
-                    let first_proof_set_elements = if sub_slot_index_mod_4 == 0 {
-                        [result[0], result[1], result[2], result[3]]
-                    } else {
-                        let first_proof_existing_value = self
-                            .get_contract_state_slot(current_contract_id, start_slot_index)
-                            .await?
-                            .value
-                            .0
-                            .elements;
-                        if sub_slot_index_mod_4 == 1 {
-                            [first_proof_existing_value[0], result[0], result[1], result[2]]
-                        } else if sub_slot_index_mod_4 == 2 {
-                            [first_proof_existing_value[0], first_proof_existing_value[1], result[0], result[1]]
-                        } else {
-                            // }else if sub_slot_index_mod_4 == 3 {
-                            [
-                                first_proof_existing_value[0],
-                                first_proof_existing_value[1],
-                                first_proof_existing_value[2],
-                                result[0],
-                            ]
+                    let mut dmps = Vec::with_capacity(n_proofs);
+                    for i in 0..actual_proofs {
+                        let slot_index = F::from_canonical_u64(start_slot_index + i as u64);
+                        let mut elements = self.get_contract_state_slot(current_contract_id, slot_index).await?.value.0.elements;
+                        for element in 0..4 {
+                            let position = i * 4 + element;
+                            if position >= offset && position - offset < value_len {
+                                elements[element] = result[position - offset];
+                            }
                         }
-                    };
-                    let dmp = self
-                        .set_contract_state_slot(
-                            current_contract_id,
-                            start_slot_index,
-                            QHashOut(HashOut {
-                                elements: first_proof_set_elements,
-                            }),
-                        )
-                        .await?;
-                    dmps.push(dmp);
-
-                    // we don't need to get the old values for main body proofs
-                    for i in 1..(n_proofs - 1) {
-                        let current_value_index = main_body_proofs_index_offset + (i - 1) as usize * 4;
-
-                        let set_value = QHashOut(HashOut {
-                            elements: [
-                                result[current_value_index],
-                                result[current_value_index + 1],
-                                result[current_value_index + 2],
-                                result[current_value_index + 3],
-                            ],
-                        });
-
-                        let dmp = self
-                            .set_contract_state_slot(current_contract_id, start_slot_index + F::from_canonical_u64(i), set_value)
-                            .await?;
-                        dmps.push(dmp);
+                        dmps.push(self.set_contract_state_slot(current_contract_id, slot_index, QHashOut(HashOut { elements })).await?);
                     }
-
-                    // handle the last proof special case
-                    /*
-
-                    const SLOT_MASK_TABLE: [[u8; 4]; 7] = [
-                        [0, 0, 0, 0], // type 0
-                        [0, 0, 0, 0], // type 1
-                        [0, 0, 0, 0], // type 2
-                        [1, 0, 0, 0], // type 3
-                        [1, 1, 0, 0], // type 4
-                        [1, 1, 1, 0], // type 5
-                        [1, 1, 1, 1], // type 6
-                    ];
-
-                    */
-
-                    let last_proof_value_index = main_body_proofs_index_offset + (n_proofs as usize - 2) * 4;
-                    let last_proof_slot_index = start_slot_index + F::from_canonical_u64(n_proofs - 1);
-                    if slot_mask_type == 6 {
-                        // if mask type is 6, we don't need to check the old value
-                        // type 6 => [1, 1, 1, 1],
-
-                        let set_value = QHashOut(HashOut {
-                            elements: [
-                                result[last_proof_value_index],
-                                result[last_proof_value_index + 1],
-                                result[last_proof_value_index + 2],
-                                result[last_proof_value_index + 3],
-                            ],
-                        });
-
-                        let dmp = self
-                            .set_contract_state_slot(current_contract_id, last_proof_slot_index, set_value)
-                            .await?;
-                        dmps.push(dmp);
-                    } else if slot_mask_type < 3 {
-                        let last_proof_existing_mp = self.get_contract_state_slot(current_contract_id, last_proof_slot_index).await?;
-                        // type 0, 1, 2 => [0, 0, 0, 0]
-                        // if slot mask type is < 3, then we are done and can just trasform the existing
-                        // mp into a delta merkle proof
-                        dmps.push(last_proof_existing_mp.to_delta_merkle_proof_inplace());
-                    } else {
-                        // handle types 3, 4, 5
-                        // get the previous value of this slot
-                        let last_proof_existing_value = self
-                            .get_contract_state_slot(current_contract_id, last_proof_slot_index)
-                            .await?
-                            .value
-                            .0
-                            .elements;
-
-                        let new_set_value = if slot_mask_type == 3 {
-                            // type 3 => [1, 0, 0, 0]
-                            [
-                                result[last_proof_value_index],
-                                last_proof_existing_value[1],
-                                last_proof_existing_value[2],
-                                last_proof_existing_value[3],
-                            ]
-                        } else if slot_mask_type == 4 {
-                            [
-                                result[last_proof_value_index],
-                                result[last_proof_value_index + 1],
-                                last_proof_existing_value[2],
-                                last_proof_existing_value[3],
-                            ]
-                        } else {
-                            // if slot_mask_type == 5 {
-                            [
-                                result[last_proof_value_index],
-                                result[last_proof_value_index + 1],
-                                result[last_proof_value_index + 2],
-                                last_proof_existing_value[3],
-                            ]
-                        };
-                        let dmp = self
-                            .set_contract_state_slot(current_contract_id, last_proof_slot_index, QHashOut(HashOut { elements: new_set_value }))
-                            .await?;
-                        dmps.push(dmp);
+                    if actual_proofs < n_proofs {
+                        let slot_index = F::from_canonical_u64(start_slot_index + actual_proofs as u64 - 1);
+                        let proof = self.get_contract_state_slot(current_contract_id, slot_index).await?;
+                        dmps.push(proof.to_delta_merkle_proof_inplace());
                     }
-
                     Ok(PsyCmdWithInputAndWitness {
                         state_cmd: state_cmd.clone(),
                         result,
@@ -871,6 +816,14 @@ impl<
                 })
             }
             DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(c) => {
+                let height = if current_contract_id == F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64) {
+                    u64::from(psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT)
+                } else {
+                    self.resolve_get_contract_leaf_mut(&QSRCmdGetContractLeafData {
+                        contract_id: current_contract_id.to_canonical_u64(),
+                    }).await?.state_tree_height.to_canonical_u64()
+                };
+                validate_contract_state_range(c.sub_slot_index, c.length as usize, height)?;
                 if c.length == 1 {
                     // one merkle proof
                     let slot_index = F::from_canonical_u64(c.sub_slot_index / 4u64);
@@ -888,7 +841,11 @@ impl<
                     let slot_index = F::from_canonical_u64(c.sub_slot_index / 4u64);
                     let n = (c.sub_slot_index & 0b11) as usize;
                     let proof_0 = self.get_contract_state_slot(current_contract_id, slot_index).await?;
-                    let proof_1 = self.get_contract_state_slot(current_contract_id, slot_index + F::ONE).await?;
+                    let proof_1 = if n + c.length as usize > 4 {
+                        self.get_contract_state_slot(current_contract_id, slot_index + F::ONE).await?
+                    } else {
+                        proof_0.clone()
+                    };
 
                     let elements = [proof_0.value.0.elements, proof_1.value.0.elements].concat();
 
@@ -944,15 +901,18 @@ impl<
                     let n_proofs = ((c.length + 6) / 4) as u64;
                     let sub_slot_index_mod_4 = c.sub_slot_index % 4;
                     let start_slot = c.sub_slot_index / 4;
-                    let mut mps = Vec::with_capacity(n_proofs as usize);
+                    let mut mps: Vec<MerkleProofCore<QHashOut<F>>> = Vec::with_capacity(n_proofs as usize);
                     let mut result = Vec::<F>::with_capacity(c.length as usize);
 
                     let len_minus_2_mod_4 = (c.length - 2) % 4;
 
+                    let actual_proofs = (u64::from(c.length) + sub_slot_index_mod_4 + 3) / 4;
                     for i in 0..n_proofs {
-                        let mp = self
-                            .get_contract_state_slot(current_contract_id, F::from_canonical_u64(start_slot + i))
-                            .await?;
+                        let mp = if i < actual_proofs {
+                            self.get_contract_state_slot(current_contract_id, F::from_canonical_u64(start_slot + i)).await?
+                        } else {
+                            mps.last().expect("range contains a real proof").clone()
+                        };
                         if i == 0 {
                             if sub_slot_index_mod_4 == 0 {
                                 result.push(mp.value.0.elements[0]);
@@ -1071,6 +1031,7 @@ impl<
                 })
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotRange(c) => {
+                validate_contract_state_range(c.sub_slot_index, c.length as usize, c.contract_state_tree_height)?;
                 let contract_id = F::from_noncanonical_u64(c.contract_id);
 
                 let uct_witness_upper = self.get_self_user_contract_tree_leaf(contract_id).await?;
@@ -1091,7 +1052,11 @@ impl<
                     let slot_index = F::from_canonical_u64(c.sub_slot_index / 4u64);
                     let n = (c.sub_slot_index & 0b11) as usize;
                     let proof_0 = self.get_contract_state_slot(contract_id, slot_index).await?;
-                    let proof_1 = self.get_contract_state_slot(contract_id, slot_index + F::ONE).await?;
+                    let proof_1 = if n + c.length as usize > 4 {
+                        self.get_contract_state_slot(contract_id, slot_index + F::ONE).await?
+                    } else {
+                        proof_0.clone()
+                    };
 
                     let elements = [proof_0.value.0.elements, proof_1.value.0.elements].concat();
 
@@ -1105,14 +1070,19 @@ impl<
                     let n_proofs = ((c.length + 6) / 4) as u64;
                     let sub_slot_index_mod_4 = c.sub_slot_index % 4;
                     let start_slot = c.sub_slot_index / 4;
-                    let mut mps = Vec::with_capacity(n_proofs as usize + 1);
+                    let mut mps: Vec<MerkleProofCore<QHashOut<F>>> = Vec::with_capacity(n_proofs as usize + 1);
                     let mut result = Vec::<F>::with_capacity(c.length as usize);
                     mps.push(uct_witness_upper);
 
                     let len_minus_2_mod_4 = (c.length - 2) % 4;
 
+                    let actual_proofs = (u64::from(c.length) + sub_slot_index_mod_4 + 3) / 4;
                     for i in 0..n_proofs {
-                        let mp = self.get_contract_state_slot(contract_id, F::from_canonical_u64(start_slot + i)).await?;
+                        let mp = if i < actual_proofs {
+                            self.get_contract_state_slot(contract_id, F::from_canonical_u64(start_slot + i)).await?
+                        } else {
+                            mps.last().expect("range contains a real proof").clone()
+                        };
                         if i == 0 {
                             if sub_slot_index_mod_4 == 0 {
                                 result.push(mp.value.0.elements[0]);
@@ -1229,6 +1199,7 @@ impl<
                 })
             }
             DPNStateCmd::GetOtherUserContractStateSlotRange(c) => {
+                validate_contract_state_range(c.sub_slot_index, c.length as usize, c.contract_state_tree_height)?;
                 let user_id = F::from_noncanonical_u64(c.user_id);
 
                 let user_leaf_witness = self.get_external_user_leaf_proof(user_id).await?;
@@ -1282,8 +1253,10 @@ impl<
                             },
                         ))
                         .await?;
-                    let proof_1 = self
-                        .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
+                    let proof_1 = if n + c.length as usize <= 4 {
+                        proof_0.clone()
+                    } else {
+                        self.resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
                             QSRMerkleCmdGetUserContractStateTreeMerkleProof {
                                 checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                 user_id: c.user_id,
@@ -1292,7 +1265,8 @@ impl<
                                 leaf_id: slot_index + 1,
                             },
                         ))
-                        .await?;
+                        .await?
+                    };
 
                     let elements = [proof_0.value.0.elements, proof_1.value.0.elements].concat();
 
@@ -1311,14 +1285,15 @@ impl<
                     let n_proofs = ((c.length + 6) / 4) as u64;
                     let sub_slot_index_mod_4 = c.sub_slot_index % 4;
                     let start_slot = c.sub_slot_index / 4;
-                    let mut mps = Vec::with_capacity(n_proofs as usize + 1);
+                    let mut mps: Vec<MerkleProofCore<QHashOut<F>>> = Vec::with_capacity(n_proofs as usize + 1);
                     let mut result = Vec::<F>::with_capacity(c.length as usize);
 
                     let len_minus_2_mod_4 = (c.length - 2) % 4;
 
+                    let actual_proofs = (u64::from(c.length) + sub_slot_index_mod_4 + 3) / 4;
                     for i in 0..n_proofs {
-                        let mp = self
-                            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
+                        let mp = if i < actual_proofs {
+                            self.resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
                                 QSRMerkleCmdGetUserContractStateTreeMerkleProof {
                                     checkpoint_id: self.get_current_start_checkpoint_id_u64(),
                                     user_id: c.user_id,
@@ -1327,7 +1302,10 @@ impl<
                                     leaf_id: start_slot + i,
                                 },
                             ))
-                            .await?;
+                            .await?
+                        } else {
+                            mps.last().expect("range contains a real proof").clone()
+                        };
                         if i == 0 {
                             if sub_slot_index_mod_4 == 0 {
                                 result.push(mp.value.0.elements[0]);

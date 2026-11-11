@@ -76,10 +76,23 @@ impl SubSlotMerkleProofBatchGadget {
             // handle last proof edge case
 
             let last_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, height);
+            // An unused tail slot repeats the last real leaf. Its Merkle
+            // path is still verified against the same root.
+            let mut last_proof_used = builder._false();
+            for offset in 0..4 {
+                if sub_slot_length + offset > 4 * (n_proofs - 1) {
+                    let offset_target = builder.constant(F::from_canonical_usize(offset));
+                    let matches = builder.is_equal(sub_slot_index_mod_4, offset_target);
+                    last_proof_used = builder.or(last_proof_used, matches);
+                }
+            }
             let expected_last_proof_index = builder.add(last_slot_index_target, one);
-
-            // ensure the proofs are for a contiguous portion of the tree
-            builder.connect(last_proof.index, expected_last_proof_index);
+            let sequential = builder.is_equal(last_proof.index, expected_last_proof_index);
+            let repeated = builder.is_equal(last_proof.index, last_slot_index_target);
+            let unused = builder.not(last_proof_used);
+            let unused_repeated = builder.and(unused, repeated);
+            let valid_index = builder.or(sequential, unused_repeated);
+            builder.assert_one(valid_index.target);
 
             // connect old root to previous slot's new root
             builder.connect_hashes(last_proof.root, root);
@@ -152,6 +165,112 @@ mod tests {
             idx >>= 1;
         }
         sibs
+    }
+
+    /// Audit finding (Low): an aligned whole-tree range read demands a
+    /// non-existent extra Merkle leaf. Mirroring the write gadget,
+    /// `n_proofs = (len + 6) / 4` sizes the batch for the worst-case
+    /// misaligned start (r <= 3), but `force_four_align` asserts r == 0,
+    /// where only `ceil(len / 4)` proofs are needed; whenever len % 4 != 1
+    /// the batch still requires one extra Merkle proof at leaf index
+    /// `start + n_proofs - 1`, one past the end of the read window. For a
+    /// whole-tree read (len = 4 * 2^height, r = 0) that leaf index is
+    /// 2^height, which does not exist — `MerkleProofGadget` decomposes the
+    /// index into `height` bits, which cannot represent it — so no honest
+    /// witness can satisfy the circuit. Controls: the same read on a tree
+    /// one level taller, and a read ending on the last real leaf, both
+    /// prove and commit the tree root.
+    #[test]
+    fn aligned_whole_tree_range_read_demands_a_nonexistent_leaf() {
+        // (height, len, expected to prove)
+        let cases: Vec<(usize, usize, bool)> = vec![
+            (4, 64, false), // whole tree, aligned: extra proof needs leaf 16 of a 16-leaf tree
+            (5, 64, true),  // same read, taller tree: leaf 16 exists
+            (4, 60, true),  // ends on the last real leaf: batch fits inside the tree
+        ];
+
+        for &(height, len, should_prove) in &cases {
+            let n_leaves = 1usize << height;
+            let leaves: Vec<HashOut<F>> = (0..n_leaves as u64).map(|i| leaf(100 + i)).collect();
+            let n_proofs = (len + 6) / 4;
+            if len == 4 * n_leaves {
+                assert_eq!(n_proofs, n_leaves + 1, "aligned whole-tree read allocates a proof past the tree");
+            }
+
+            let config = CircuitConfig::standard_recursion_config();
+            let mut builder = CircuitBuilder::<F, D>::new(config);
+            let sub_slot_index = builder.zero();
+            let gadget =
+                SubSlotMerkleProofBatchGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, height, len, sub_slot_index, true);
+            assert_eq!(gadget.merkle_proof_gadgets.len(), n_proofs, "n_proofs = (len+6)/4");
+            builder.register_public_inputs(&gadget.root.elements);
+            let data = builder.build::<PoseidonGoldilocksConfig>();
+
+            let mut pw = PartialWitness::new();
+            let q = |h: HashOut<F>| QHashOut(h);
+            for (p, mp) in gadget.merkle_proof_gadgets.iter().enumerate() {
+                if p < n_leaves {
+                    let sibs: Vec<QHashOut<F>> = siblings_for(&leaves, p).into_iter().map(q).collect();
+                    mp.set_witness(&mut pw, F::from_canonical_usize(p), q(leaves[p]), &sibs).unwrap();
+                } else {
+                    // leaf p does not exist; make the best-effort honest attempt —
+                    // its true index with a real leaf's siblings — and let the
+                    // constraint system refute it
+                    let sibs: Vec<QHashOut<F>> = siblings_for(&leaves, 0).into_iter().map(q).collect();
+                    mp.set_witness(&mut pw, F::from_canonical_usize(p), q(leaves[0]), &sibs).unwrap();
+                }
+            }
+
+            let proved = match data.prove(pw) {
+                Ok(proof) => {
+                    assert!(data.verify(proof.clone()).is_ok(), "proved witness must verify (height={height}, len={len})");
+                    let root_pi: Vec<GoldilocksField> = proof.public_inputs;
+                    let mut level = leaves.clone();
+                    while level.len() > 1 {
+                        level = level.chunks(2).map(|c| PoseidonHash::two_to_one(c[0], c[1])).collect();
+                    }
+                    assert_eq!(root_pi, level[0].elements, "read root must commit the tree (height={height}, len={len})");
+                    true
+                }
+                Err(_) => false,
+            };
+            assert_eq!(proved, should_prove, "height={height}, len={len}");
+        }
+    }
+
+    #[test]
+    fn whole_tree_read_accepts_repeated_unused_tail() {
+        let leaves: Vec<HashOut<F>> = (0..16).map(|i| leaf(100 + i)).collect();
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let index = builder.zero();
+        let gadget = SubSlotMerkleProofBatchGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, 4, 64, index, true);
+        builder.register_public_inputs(&gadget.values);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut pw = PartialWitness::new();
+        for (i, proof) in gadget.merkle_proof_gadgets.iter().enumerate() {
+            let index = i.min(15);
+            let siblings = siblings_for(&leaves, index).into_iter().map(QHashOut).collect::<Vec<_>>();
+            proof.set_witness(&mut pw, F::from_canonical_usize(index), QHashOut(leaves[index]), &siblings).unwrap();
+        }
+        let proof = data.prove(pw).unwrap();
+        let expected = leaves.iter().flat_map(|leaf| leaf.elements).collect::<Vec<_>>();
+        assert_eq!(proof.public_inputs, expected);
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn used_tail_cannot_repeat_previous_leaf() {
+        let leaves: Vec<HashOut<F>> = (0..16).map(|i| leaf(100 + i)).collect();
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let index = builder.zero();
+        let gadget = SubSlotMerkleProofBatchGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, 4, 5, index, true);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut pw = PartialWitness::new();
+        let siblings = siblings_for(&leaves, 0).into_iter().map(QHashOut).collect::<Vec<_>>();
+        for proof in &gadget.merkle_proof_gadgets {
+            proof.set_witness(&mut pw, F::ZERO, QHashOut(leaves[0]), &siblings).unwrap();
+        }
+        assert!(data.prove(pw).is_err(), "a required second leaf must not be replaced by an unused tail");
     }
 
     /// force_four_align asserts the read is four-aligned: r == 0 proves and

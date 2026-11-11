@@ -857,8 +857,38 @@ impl StateReaderGadget {
         let one = builder.one();
         for proof_index in 0..proof_count {
             let proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+            // The generic variable-height proof constrains the index to the
+            // maximum height. A range must also fit the selected tree height.
+            let index_bits = builder.split_le(proof.index, 32);
+            let zero = builder.zero();
+            let mut remaining = height;
+            let mut exhausted = builder.is_zero(remaining);
+            for bit in index_bits {
+                builder.connect_if_true(exhausted, bit.target, zero);
+                remaining = builder.sub(remaining, one);
+                let is_zero = builder.is_zero(remaining);
+                exhausted = builder.or(exhausted, is_zero);
+            }
             let expected_index = if proof_index == 0 {
                 start_slot_index
+            } else if proof_index == proof_count - 1 {
+                let mut last_proof_used = builder._false();
+                for offset in 0..4 {
+                    if length + offset > 4 * proof_index {
+                        let offset_target = builder.constant(F::from_canonical_usize(offset));
+                        let matches = builder.is_equal(sub_slot_index_mod_4, offset_target);
+                        last_proof_used = builder.or(last_proof_used, matches);
+                    }
+                }
+                let previous_index = proofs[proof_index - 1].index;
+                let next_index = builder.add(previous_index, one);
+                let sequential = builder.is_equal(proof.index, next_index);
+                let repeated = builder.is_equal(proof.index, previous_index);
+                let unused = builder.not(last_proof_used);
+                let unused_repeated = builder.and(unused, repeated);
+                let valid_index = builder.or(sequential, unused_repeated);
+                builder.assert_one(valid_index.target);
+                proof.index
             } else {
                 builder.add(proofs[proof_index - 1].index, one)
             };
@@ -2593,6 +2623,34 @@ mod tests {
     type Store = KVQSimpleMemoryBackingStore;
     type IMT = psy_client_data::models::imt::IndexedMerkleTree<Store, F, PoseidonHash>;
     const TEST_TREE_HEIGHT: usize = 8;
+
+    #[test]
+    fn variable_height_range_accepts_unused_tail_and_rejects_index_alias() {
+        use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
+        let tree = SimpleMerkleTree::<PoseidonHasher, QHashOut<F>>::new(4);
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let height = builder.constant(F::from_canonical_u64(4));
+        let start = builder.zero();
+        let (values, proofs) = StateReaderGadget::add_variable_height_merkle_proof_batch::<PoseidonHash, F, D>(
+            &mut builder, height, start, 64, true,
+        );
+        builder.register_public_inputs(&values);
+        let data = builder.build::<C>();
+        for alias in [false, true] {
+            let mut pw = PartialWitness::new();
+            for (i, proof) in proofs.iter().enumerate() {
+                let index = if alias && i == 16 { 16 } else { i.min(15) };
+                let leaf = tree.get_leaf(if index == 16 { 0 } else { index as u64 });
+                proof.set_witness_generic(&mut pw, F::from_canonical_usize(index), leaf.value, &leaf.siblings).unwrap();
+            }
+            if alias {
+                assert!(data.prove(pw).is_err(), "index above the selected height must not alias a valid leaf");
+            } else {
+                let proof = data.prove(pw).unwrap();
+                data.verify(proof).unwrap();
+            }
+        }
+    }
 
     fn dummy_hash(builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
         HashOutTarget {
