@@ -556,7 +556,7 @@ impl StateReaderGadget {
                 let read_witness = cmd_witness.witness.get_imt_self_user_external_read_ref();
                 let uct_ck = StateCommandCacheKey::new_read_self_user_external_contract_root(c.contract_id, wb_state.contract_call_epoch);
                 self.set_witness_for_key_mp(witness, &uct_ck, &read_witness.contract_tree_proof)?;
-                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, wb_state.contract_call_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, wb_state.contract_call_epoch);
                 let Some(reader_ref_key) = self.gadget_map.get(&imt_ck).copied() else {
                     anyhow::bail!("missing state reader key for imt external read witness: {:?}", imt_ck);
                 };
@@ -587,7 +587,7 @@ impl StateReaderGadget {
                 let user_tree_ck = StateCommandCacheKey::new_read_other_user_leaf_hash(c.user_id);
                 let user_leaf_ck = StateCommandCacheKey::new_read_other_user_leaf(c.user_id);
                 let uct_ck = StateCommandCacheKey::new_read_other_user_contract_root(c.user_id, c.contract_id);
-                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, wb_state.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, wb_state.write_epoch);
 
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;
@@ -616,7 +616,7 @@ impl StateReaderGadget {
                 let user_tree_ck = StateCommandCacheKey::new_read_other_user_leaf_hash(c.user_id);
                 let user_leaf_ck = StateCommandCacheKey::new_read_other_user_leaf(c.user_id);
                 let uct_ck = StateCommandCacheKey::new_read_other_user_contract_root(c.user_id, c.contract_id);
-                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, wb_state.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, wb_state.write_epoch);
 
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;

@@ -27,6 +27,7 @@ psy_common_circuit = { workspace = true, default-features = false }
 psy_network_circuit = { workspace = true, default-features = false }
 psy_vm = { workspace = true, default-features = false }
 psy_client_data = { workspace = true, default-features = false }
+parth_core = { workspace = true }
 psy_crypto = { workspace = true }
 # psy_store = { workspace = true, default-features = false }
 

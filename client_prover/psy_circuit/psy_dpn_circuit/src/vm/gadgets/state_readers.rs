@@ -421,6 +421,9 @@ pub struct CKReadIMTContainsCurrentContract {
 pub struct CKReadIMTSelfUserExternalContract {
     pub contract_target_id: u64,
     pub key_targets: [u64; 4],
+    pub contract_state_tree_height: u64,
+    pub base_offset: u64,
+    pub capacity: u64,
     pub contract_call_epoch: u32,
 }
 
@@ -429,6 +432,9 @@ pub struct CKReadIMTOtherUserContract {
     pub user_target_id: u64,
     pub contract_target_id: u64,
     pub key_targets: [u64; 4],
+    pub contract_state_tree_height: u64,
+    pub base_offset: u64,
+    pub capacity: u64,
     pub write_epoch: u32,
 }
 
@@ -437,6 +443,9 @@ pub struct CKReadIMTContainsOtherUserContract {
     pub user_target_id: u64,
     pub contract_target_id: u64,
     pub key_targets: [u64; 4],
+    pub contract_state_tree_height: u64,
+    pub base_offset: u64,
+    pub capacity: u64,
     pub write_epoch: u32,
 }
 
@@ -630,26 +639,35 @@ impl StateCommandCacheKey {
     pub fn new_read_imt_contains_current_contract(key_targets: [u64; 4], base_offset: u64, capacity: u64, write_epoch: u32) -> Self {
         Self::ReadIMTContainsCurrentContract(CKReadIMTContainsCurrentContract { key_targets, base_offset, capacity, write_epoch })
     }
-    pub fn new_read_imt_self_user_external_contract(contract_target_id: u64, key_targets: [u64; 4], contract_call_epoch: u32) -> Self {
+    pub fn new_read_imt_self_user_external_contract(contract_target_id: u64, key_targets: [u64; 4], contract_state_tree_height: u64, base_offset: u64, capacity: u64, contract_call_epoch: u32) -> Self {
         Self::ReadIMTSelfUserExternalContract(CKReadIMTSelfUserExternalContract {
             contract_target_id,
             key_targets,
+            contract_state_tree_height,
+            base_offset,
+            capacity,
             contract_call_epoch,
         })
     }
-    pub fn new_read_imt_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], write_epoch: u32) -> Self {
+    pub fn new_read_imt_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], contract_state_tree_height: u64, base_offset: u64, capacity: u64, write_epoch: u32) -> Self {
         Self::ReadIMTOtherUserContract(CKReadIMTOtherUserContract {
             user_target_id,
             contract_target_id,
             key_targets,
+            contract_state_tree_height,
+            base_offset,
+            capacity,
             write_epoch,
         })
     }
-    pub fn new_imt_contains_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], write_epoch: u32) -> Self {
+    pub fn new_imt_contains_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], contract_state_tree_height: u64, base_offset: u64, capacity: u64, write_epoch: u32) -> Self {
         Self::ReadIMTContainsOtherUserContract(CKReadIMTContainsOtherUserContract {
             user_target_id,
             contract_target_id,
             key_targets,
+            contract_state_tree_height,
+            base_offset,
+            capacity,
             write_epoch,
         })
     }
@@ -2368,7 +2386,7 @@ impl StateReaderGadget {
                 };
                 let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
-                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, call_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, call_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     let zero = builder.zero();
                     existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
@@ -2411,7 +2429,7 @@ impl StateReaderGadget {
                     { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
                 let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
-                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     let zero = builder.zero();
                     existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
@@ -2454,7 +2472,7 @@ impl StateReaderGadget {
                     { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
                 let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
-                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, c.contract_state_tree_height, c.base_offset, c.capacity, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     let zero = builder.zero();
                     existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
@@ -2895,6 +2913,34 @@ mod tests {
         assert_eq!(proof.public_inputs[0], F::from_canonical_u64(11));
         assert_eq!(proof.public_inputs[4], F::from_canonical_u64(22));
         data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn state_reader_other_user_imt_two_maps_same_key_use_separate_gadgets() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut dpn = new_test_dpn(&mut builder);
+        for index in 0..6 {
+            let target = builder.constant(F::from_canonical_usize(index + 1));
+            dpn.push_external_target(index, target);
+        }
+        let second_base = builder.constant(F::from_canonical_u64(16));
+        dpn.push_external_target(1002, second_base);
+        let zero = builder.constant_hash(HashOut::ZERO);
+        let stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut reader = StateReaderGadget::new(roots, zero, zero, zero, TEST_TREE_HEIGHT, zero, TEST_TREE_HEIGHT, false, stats, zero);
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let key = [target(2), target(3), target(4), target(5)];
+        for base in [1000, 1002] {
+            let get = DPNStateCmd::get_other_user_imt_contract_state_value(target(0), target(1), target(1001), target(base), target(1001), key);
+            let contains = DPNStateCmd::contains_other_user_imt_contract_state_value(target(0), target(1), target(1001), target(base), target(1001), key);
+            let external = DPNStateCmd::get_self_user_external_imt_contract_state_value(target(1), target(1001), target(base), target(1001), key);
+            reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &get);
+            reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &contains);
+            reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &external);
+        }
+        assert_eq!((reader.imt_other_user_read_requests.len(), reader.imt_contains_other_user_requests.len()), (2, 2));
+        assert_eq!(reader.imt_external_read_requests.len(), 2);
     }
 
     #[test]
