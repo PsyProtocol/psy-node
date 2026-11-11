@@ -1585,6 +1585,14 @@ impl<
     async fn get_user_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
         // Compose local sparse subtree + exact authenticated top spine (aaed92d6 pattern).
         res(async {
+            // The Realm commit writes the top spine before the FFS subtree nodes and
+            // sets the checkpoint marker last, so between those writes the spine of
+            // `checkpoint_id` composes with a partly older subtree and fails to verify.
+            // Answer the not-found error callers already wait on until the commit ends.
+            let last_committed = self.db_reader.get_latest_checkpoint_id().await?;
+            if checkpoint_id > last_committed {
+                anyhow::bail!("User tree proof not found for checkpoint_id {}", checkpoint_id);
+            }
             let (proof, _) =
                 validator_user_tree_proofs::<N, _>(self.db_reader.as_ref(), checkpoint_id, user_id, self.realm_id_u64).await?;
             Ok(proof)
@@ -4046,6 +4054,69 @@ pub(crate) mod tests {
             err.to_string().contains("contract 9 state tree height metadata is not available"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    /// Commits checkpoint 1 with one realm user: leaf, top spine, then marker.
+    async fn seed_committed_checkpoint_one(env: &RealmEdgeTestEnv<N>) -> anyhow::Result<()> {
+        env.db.global_user_tree_set_leaf_hash(1, REALM_USER_ID, PHash::from_values(11, 0, 0, 0)).await?;
+        let top = env.db.global_user_tree_get_merkle_proof_sub_tree(
+            1, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, TEST_REALM_ID).await?;
+        env.db.global_user_tree_set_top_tree_merkle_proof(1, &top).await?;
+        env.db.set_latest_checkpoint_id(1).await?;
+        Ok(())
+    }
+
+    async fn write_checkpoint_two_leaves(env: &RealmEdgeTestEnv<N>, both: bool) -> anyhow::Result<()> {
+        env.db.global_user_tree_set_leaf_hash(2, REALM_USER_ID, PHash::from_values(21, 0, 0, 0)).await?;
+        if both {
+            env.db.global_user_tree_set_leaf_hash(2, REALM_USER_ID + 1, PHash::from_values(22, 0, 0, 0)).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_tree_proof_waits_for_the_checkpoint_commit() -> anyhow::Result<()> {
+        use parth_core::data::hash::merkle_node_key::SimpleMerkleNode;
+        // What a full commit of checkpoint 2 stores.
+        let full = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        seed_committed_checkpoint_one(&full).await?;
+        write_checkpoint_two_leaves(&full, true).await?;
+        let top_two = full.db.global_user_tree_get_merkle_proof_sub_tree(
+            2, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, TEST_REALM_ID).await?;
+
+        // A commit caught midway, as the live Realm commit can be read: the top
+        // spine and the realm root node of checkpoint 2 are stored, one of the
+        // two changed leaves is not, and the marker still names checkpoint 1.
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        seed_committed_checkpoint_one(&env).await?;
+        env.db.global_user_tree_set_top_tree_merkle_proof(2, &top_two).await?;
+        write_checkpoint_two_leaves(&env, false).await?;
+        env.db.global_user_tree_set_nodes(2, &[SimpleMerkleNode {
+            key: SimpleMerkleNodeKey::new(N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, TEST_REALM_ID),
+            value: top_two.value,
+        }]).await?;
+        // This is the live symptom the marker check hides.
+        let torn = validator_user_tree_proofs::<N, _>(env.db.as_ref(), 2, REALM_USER_ID, TEST_REALM_ID)
+            .await
+            .expect_err("a half-written subtree must not compose a valid proof");
+        assert_eq!(torn.to_string(), "Finalizer composed user proof is invalid at checkpoint 2");
+
+        let err = RealmEdgeRpcServer::get_user_tree_merkle_proof(&env.handler, 2, REALM_USER_ID)
+            .await
+            .expect_err("an uncommitted checkpoint must read as not found");
+        assert_eq!(err.message(), "User tree proof not found for checkpoint_id 2");
+
+        // The committed checkpoint keeps serving while the next one is written.
+        let one = RealmEdgeRpcServer::get_user_tree_merkle_proof(&env.handler, 1, REALM_USER_ID).await?;
+        assert!(one.verify::<PoseidonHasher>());
+
+        // Once the commit finishes and the marker moves, checkpoint 2 is served.
+        write_checkpoint_two_leaves(&env, true).await?;
+        env.db.set_latest_checkpoint_id(2).await?;
+        let two = RealmEdgeRpcServer::get_user_tree_merkle_proof(&env.handler, 2, REALM_USER_ID).await?;
+        assert!(two.verify::<PoseidonHasher>());
+        assert_eq!(two.root, top_two.root);
         Ok(())
     }
 }
