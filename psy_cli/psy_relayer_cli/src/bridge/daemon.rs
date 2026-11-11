@@ -982,6 +982,15 @@ fn is_missing_checkpoint_proof(error: &anyhow::Error) -> bool {
     })
 }
 
+/// The Realm edge did not confirm an EndCap delivery: it was busy, or it already holds a copy
+/// that is not included yet. Recovery re-checks the authenticated inclusion before any resend.
+fn is_end_cap_delivery_unconfirmed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<psy_provider::provider::EndCapSubmitBusy>().is_some()
+            || cause.downcast_ref::<psy_provider::provider::EndCapAlreadySubmitted>().is_some()
+    })
+}
+
 async fn run_multichain(
     config: BridgeProposeDaemonConfig,
     chain_configs: Vec<L1Config>,
@@ -1113,6 +1122,11 @@ async fn run_multichain(
                     if state.pending_finalization_range.is_none() {
                         (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
                     }
+                }
+                Err(error) if is_end_cap_delivery_unconfirmed(&error) => {
+                    tracing::warn!(%error, "pending guardian recovery has an unconfirmed EndCap delivery; retrying next round");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
                 }
                 Err(error) if is_missing_checkpoint_proof(&error) => {
                     tracing::warn!(%error, "pending guardian recovery is waiting for a checkpoint proof; retrying next round");
@@ -4295,6 +4309,18 @@ async fn first_nonce_checkpoint(provider: &RpcProvider, config: &guardian_common
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn unconfirmed_end_cap_delivery_is_recognised_through_context_only_when_typed() {
+        let busy: anyhow::Error = psy_provider::provider::EndCapSubmitBusy { rpc_error: "generation changed".into() }.into();
+        let message = busy.to_string();
+        assert!(is_end_cap_delivery_unconfirmed(&busy.context("submit guardian operation")));
+        assert!(!is_end_cap_delivery_unconfirmed(&anyhow::anyhow!(message)));
+        let stored: anyhow::Error = psy_provider::provider::EndCapAlreadySubmitted { user_id: 524288, unique_pending_id: 9 }.into();
+        assert!(is_end_cap_delivery_unconfirmed(&stored.context("submit guardian operation")));
+        assert!(!is_end_cap_delivery_unconfirmed(&psy_provider::lps::MissingCheckpointProof { checkpoint_id: 1 }.into()));
+        assert!(!is_temporary_rpc_error(&psy_provider::provider::EndCapSubmitBusy { rpc_error: String::new() }.into()));
+    }
 
     #[test]
     fn missing_checkpoint_proof_is_recognised_through_context_only_when_typed() {

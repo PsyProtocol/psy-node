@@ -135,6 +135,22 @@ pub struct EndCapAheadOfGathering {
     pub gathering_checkpoint_id: u64,
 }
 
+/// The Realm edge answered SERVER_IS_BUSY for an End Cap, for example because its gathering
+/// generation changed during storage or delivery. Delivery is not confirmed either way, so the
+/// caller must re-check the user leaf before resending. The message is unchanged from the untyped error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("submit_end_cap_proof rpc call failed `{rpc_error}`")]
+pub struct EndCapSubmitBusy {
+    pub rpc_error: String,
+}
+
+const END_CAP_BUSY_ERROR_CODE: i64 = -32009;
+
+fn parse_end_cap_busy(error: &crate::request::RpcError) -> Option<EndCapSubmitBusy> {
+    (error.code == crate::request::ErrorCode::ServerError(END_CAP_BUSY_ERROR_CODE))
+        .then(|| EndCapSubmitBusy { rpc_error: format!("{error:?}") })
+}
+
 fn parse_end_cap_ahead_of_gathering(error: &crate::request::RpcError) -> Option<EndCapAheadOfGathering> {
     if error.code != crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE) || error.data.is_some() {
         return None;
@@ -610,6 +626,9 @@ impl QUserRpcProvider for RpcProvider {
                 }
                 if let Some(ahead) = parse_end_cap_ahead_of_gathering(&e) {
                     return Err(ahead.into());
+                }
+                if let Some(busy) = parse_end_cap_busy(&e) {
+                    return Err(busy.into());
                 }
                 Err(anyhow::format_err!("submit_end_cap_proof rpc call failed `{:?}`", e))
             }
@@ -2384,6 +2403,19 @@ mod tests {
         }
         let wrong_code = rpc_error(crate::request::ErrorCode::InternalError, "EndCap forward rejected by proposer 3 (reason Invalid)");
         assert_eq!(parse_end_cap_forward_rejected(&wrong_code), None);
+    }
+
+    #[test]
+    fn types_a_busy_end_cap_refusal_without_changing_its_message() {
+        let message = "EndCap gathering generation changed during storage/delivery: stored A, current B; delivery is not confirmed; check the user leaf before retrying";
+        let busy = rpc_error(crate::request::ErrorCode::ServerError(END_CAP_BUSY_ERROR_CODE), message);
+        let typed = parse_end_cap_busy(&busy).expect("busy refusal must be typed");
+        assert_eq!(typed.to_string(), format!("submit_end_cap_proof rpc call failed `{:?}`", busy));
+        assert_eq!(parse_end_cap_already_submitted(&busy), None);
+        assert_eq!(parse_end_cap_ahead_of_gathering(&busy), None);
+        for code in [crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE), crate::request::ErrorCode::InternalError] {
+            assert_eq!(parse_end_cap_busy(&rpc_error(code, message)), None);
+        }
     }
 
     #[test]
