@@ -603,6 +603,15 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
         let _: i64 = self.client.del(&bucket).await?;
         Ok(())
     }
+    async fn delete_proofs_for_job_ids<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, unique_pending_id: u64, job_ids: &[J]) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let fields: Vec<Key> = job_ids.iter().map(|job_id| Key::from(&(*job_id).into().to_vec()[..])).collect();
+        let _: i64 = self.client.hdel(&bucket, fields).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

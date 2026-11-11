@@ -90,6 +90,18 @@ impl QParthProofStoreWriter for SimpleMemoryTempStore {
             .remove(&unique_pending_id);
         Ok(())
     }
+    async fn delete_proofs_for_job_ids<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, unique_pending_id: u64, job_ids: &[J]) -> anyhow::Result<()> {
+        let mut guard = self.proof_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Some(bucket) = guard.get_mut(&unique_pending_id) {
+            for job_id in job_ids {
+                bucket.remove(&(*job_id).into().to_vec());
+            }
+            if bucket.is_empty() {
+                guard.remove(&unique_pending_id);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -350,6 +362,30 @@ mod tests {
         assert_eq!(8, store.get_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }).await.unwrap());
         store.set_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }, 42).await.unwrap();
         assert_eq!(42, store.get_temp_database_counter(&counter_table, &TableDefAInnerKey { a: 1, b: 2 }).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_named_proofs_drops_only_them_and_an_emptied_bucket() {
+        use crate::store::traits::proof_store::{
+            QParthProofBucketPresenceReader, QParthProofStoreReader, QParthProofStoreWriter,
+        };
+        use psy_core::job::job_id::QProvingJobDataID;
+
+        let store = SimpleMemoryTempStore::new();
+        let consumed = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(1, 32, 8).unwrap();
+        let deferred = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(2, 32, 8).unwrap();
+        store.put_proof_bytes_for_job_id(consumed, 8, b"consumed").await.unwrap();
+        store.put_proof_bytes_for_job_id(deferred, 8, b"deferred").await.unwrap();
+        store.put_proof_bytes_for_job_id(consumed, 10, b"output").await.unwrap();
+
+        store.delete_proofs_for_job_ids(8, &[consumed]).await.unwrap();
+        store.delete_proofs_for_job_ids(10, &[consumed]).await.unwrap();
+        store.delete_proofs_for_job_ids(11, &[consumed]).await.unwrap();
+
+        assert!(!store.contains_proof_for_job_id(consumed, 8).await.unwrap());
+        assert_eq!(store.get_proof_bytes_by_job_id(deferred, 8).await.unwrap(), Some(b"deferred".to_vec()));
+        assert!(!store.contains_proofs_for_pending_id(10).await.unwrap());
+        assert!(!store.proof_map.read().unwrap().contains_key(&10));
     }
 
     #[tokio::test]

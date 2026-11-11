@@ -40,7 +40,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QParthProofStore, QParthProofStoreWriter},
 };
 
 use crate::{
@@ -91,6 +91,32 @@ where
             }
         }
     }
+}
+
+/// Proofs a committed block consumed, grouped by the pending bucket that holds them: every job
+/// output of the block, and every EndCap it aggregated. An EndCap stays in the bucket of the
+/// pending id that admitted it (its `goal_id`), which can be older than the block. EndCaps
+/// deferred to a later block are not dependencies here, so their proofs survive.
+pub(crate) fn consumed_proof_fields<Hash>(
+    unique_pending_id: u64,
+    jobs: &[Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>],
+) -> std::collections::BTreeMap<u64, Vec<QProvingJobDataID>> {
+    let mut fields = std::collections::BTreeMap::<u64, Vec<QProvingJobDataID>>::new();
+    let mut add = |pending_id: u64, job_id: QProvingJobDataID| {
+        let bucket = fields.entry(pending_id).or_default();
+        if !bucket.contains(&job_id) {
+            bucket.push(job_id);
+        }
+    };
+    for job in jobs.iter().flatten() {
+        add(unique_pending_id, job.job_id.get_output_id());
+        for dependency in &job.metadata.dependencies {
+            if dependency.circuit_type == ProvingJobCircuitType::UserEndCap {
+                add(dependency.goal_id, dependency.get_output_id());
+            }
+        }
+    }
+    fields
 }
 
 impl<
@@ -196,6 +222,21 @@ where
         proving_state.finish();
         self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
         Ok(())
+    }
+
+    /// Best effort: a proof left behind here is only memory, never a correctness problem.
+    async fn reclaim_consumed_proofs(&self, unique_pending_id: u64, guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>]) {
+        for (bucket_pending_id, job_ids) in consumed_proof_fields(unique_pending_id, guta_jobs) {
+            if let Err(error) = self.db.proof_store.delete_proofs_for_job_ids(bucket_pending_id, &job_ids).await {
+                tracing::warn!(
+                    unique_pending_id,
+                    bucket_pending_id,
+                    proofs = job_ids.len(),
+                    error = %format!("{error:#}"),
+                    "Failed to reclaim proofs consumed by the committed realm block"
+                );
+            }
+        }
     }
 
     pub fn get_root_job_id(&self, guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>]) -> anyhow::Result<Option<N::JobId>> {
@@ -737,6 +778,8 @@ where
             )
             .await?;
         timer.lap("commit_state");
+        self.reclaim_consumed_proofs(unique_pending_id, &guta_jobs).await;
+        timer.lap("reclaim_consumed_proofs");
         self.db.run_sanity_check("after commit").await?;
         self.db
             .publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id)
@@ -1057,6 +1100,46 @@ where
 
 #[cfg(test)]
 mod process_block_tests {
+
+    #[test]
+    fn consumed_proof_fields_follow_end_caps_to_their_admission_bucket() {
+        use super::consumed_proof_fields;
+        use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+        use psy_data::worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId;
+        use psy_data::worker::metadata::PsyProvingJobMetadata;
+        let end_cap = |user_id: u64, admitted: u64| {
+            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, 32, admitted).unwrap()
+        };
+        let job = |job_id: QProvingJobDataID, dependencies: Vec<QProvingJobDataID>| PsyProvingJobMetadataWithJobId::<parth_core::PHash, QProvingJobDataID> {
+            job_id,
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: Default::default(),
+                reward_tree_node_index: 0,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: 0,
+                reward_tree_node_children: 0,
+                dependencies,
+            },
+        };
+        let aggregate = job(
+            QProvingJobDataID { circuit_type: ProvingJobCircuitType::GUTATwoEndCap, goal_id: 10, ..end_cap(0, 10) },
+            vec![end_cap(1, 8), end_cap(2, 10)],
+        );
+        let aggregate_output = aggregate.job_id.get_output_id();
+        let finalize = job(
+            QProvingJobDataID { circuit_type: ProvingJobCircuitType::RealmFinalizeGUTA, goal_id: 10, ..end_cap(0, 10) },
+            vec![aggregate_output, aggregate_output],
+        );
+
+        let finalize_output = finalize.job_id.get_output_id();
+        let fields = consumed_proof_fields(10, &[vec![aggregate], vec![finalize]]);
+
+        // A deferred EndCap (user 3, admitted under 8) is no dependency, so bucket 8 keeps it.
+        assert_eq!(fields.keys().copied().collect::<Vec<_>>(), vec![8, 10]);
+        assert_eq!(fields[&8], vec![end_cap(1, 8)]);
+        assert_eq!(fields[&10], vec![aggregate_output, end_cap(2, 10), finalize_output]);
+        assert!(consumed_proof_fields::<parth_core::PHash>(10, &[]).is_empty());
+    }
     use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
     use psy_node_core::psy_core_db::traits::full::{PsyNodeCoreDatabaseUserStoreReader, PsyNodeGlobalUserTreeDatabaseReader};
     use parth_core::{
