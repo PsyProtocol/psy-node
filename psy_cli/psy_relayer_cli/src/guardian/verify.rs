@@ -634,15 +634,24 @@ pub async fn verified_account_nonce(context: &GuardianVerificationContext<'_>, c
     let path = context.provider.get_checkpoint_tree_merkle_proof(id,id).await.map_err(|_|GuardianSignError::CheckpointProofUnavailable)?;
     verify_checkpoint(id,&checkpoint,&roots,&path,context.verified_checkpoint_tree_root)?;
     let account_public_key = config.account_public_key()?;
-    let user = context.provider.get_user_leaf_data(id, config.user_id()).await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
-    let user_path = user_tree_proof(context.provider, id, config.user_id(), deadline).await?;
+    let (user_path, user) = committed_user_leaf(id, config.user_id(), deadline,
+        |checkpoint, user| context.provider.get_user_tree_merkle_proof(checkpoint, user),
+        |checkpoint, user| context.provider.get_user_leaf_data(checkpoint, user)).await?;
     verify_path(&user_path, roots.user_tree_root, config.user_id(), user_path.value, GLOBAL_USER_TREE_HEIGHT as usize)?;
     if user_path.value == Hash4::ZERO { return Ok(0); }
     if user_path.value != user.qfhash::<PsyHasher>() || user.public_key != account_public_key || user.user_id.to_canonical_u64() != config.user_id() { return Err(GuardianSignError::AccountIdentityConflict); }
     Ok(user.nonce.to_canonical_u64())
 }
-async fn user_tree_proof(provider: &RpcProvider, checkpoint_id: u64, user_id: u64, deadline: Option<tokio::time::Instant>) -> Result<MerkleProofCore<Hash4>> {
-    wait_user_tree_proof(checkpoint_id, user_id, deadline, |checkpoint, user| provider.get_user_tree_merkle_proof(checkpoint, user)).await
+// The Edge serves a user tree proof only once the checkpoint is committed, but a user
+// leaf read answers earlier with the newest stored leaf at or below the checkpoint.
+// Read the leaf only after the proof is readable, or a leaf from before the commit is
+// compared with the committed proof.
+async fn committed_user_leaf<ProofFut, LeafFut>(checkpoint_id: u64, user_id: u64, deadline: Option<tokio::time::Instant>,
+    fetch_proof: impl FnMut(u64, u64) -> ProofFut, fetch_leaf: impl FnOnce(u64, u64) -> LeafFut) -> Result<(MerkleProofCore<Hash4>, psy_client_data::qdata::user::PsyUserLeaf<F>)>
+where ProofFut: Future<Output = anyhow::Result<MerkleProofCore<Hash4>>>, LeafFut: Future<Output = anyhow::Result<psy_client_data::qdata::user::PsyUserLeaf<F>>> {
+    let path = wait_user_tree_proof(checkpoint_id, user_id, deadline, fetch_proof).await?;
+    let leaf = fetch_leaf(checkpoint_id, user_id).await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
+    Ok((path, leaf))
 }
 
 enum UserTreeProofFailure {
@@ -710,6 +719,37 @@ mod tests {
 
     fn missing_user_index(checkpoint_id: u64) -> anyhow::Error {
         psy_provider::lps::MissingCheckpointProof { checkpoint_id }.into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observer_reads_the_user_leaf_only_after_the_committed_proof() {
+        let start = tokio::time::Instant::now();
+        let committed = std::cell::Cell::new(false);
+        let leaf_reads = std::cell::Cell::new(0);
+        let (path, leaf) = committed_user_leaf(17, 42, Some(start + std::time::Duration::from_secs(3)), |checkpoint, user| {
+            let ready = tokio::time::Instant::now() - start >= std::time::Duration::from_secs(1);
+            committed.set(ready);
+            std::future::ready(if ready { Ok(MerkleProofCore { root: Hash4::ZERO, index: user, value: Hash4::ZERO, siblings: vec![] }) } else { Err(missing_user_index(checkpoint)) })
+        }, |checkpoint, user| {
+            assert_eq!((checkpoint, user), (17, 42));
+            assert!(committed.get(), "leaf read before the checkpoint was committed");
+            leaf_reads.set(leaf_reads.get() + 1);
+            std::future::ready(Ok(psy_client_data::qdata::user::PsyUserLeaf::<F> { nonce: F::from_canonical_u64(7), ..Default::default() }))
+        }).await.unwrap();
+        assert_eq!((path.index, leaf.nonce.to_canonical_u64(), leaf_reads.get()), (42, 7, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observer_skips_the_user_leaf_when_the_proof_never_commits() {
+        let start = tokio::time::Instant::now();
+        let result = committed_user_leaf(17, 42, Some(start + std::time::Duration::from_secs(2)),
+            |checkpoint, _| std::future::ready(Err(missing_user_index(checkpoint))),
+            |_, _| -> std::future::Ready<anyhow::Result<psy_client_data::qdata::user::PsyUserLeaf<F>>> { panic!("leaf read without a committed proof") }).await;
+        assert!(matches!(result, Err(GuardianSignError::IndexCheckpointTimeout)));
+        let unreadable = committed_user_leaf(17, 42, Some(start + std::time::Duration::from_secs(60)),
+            |_, user| std::future::ready(Ok(MerkleProofCore { root: Hash4::ZERO, index: user, value: Hash4::ZERO, siblings: vec![] })),
+            |_, _| std::future::ready(Err(anyhow::anyhow!("edge down")))).await;
+        assert!(matches!(unreadable, Err(GuardianSignError::CheckpointProofUnavailable)));
     }
 
     #[tokio::test(start_paused = true)]

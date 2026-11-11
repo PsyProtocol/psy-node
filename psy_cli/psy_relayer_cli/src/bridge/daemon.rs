@@ -4282,8 +4282,8 @@ async fn authenticated_account(provider: &RpcProvider, config: &guardian_common:
     let roots = provider.get_checkpoint_global_state_roots(checkpoint).await?;
     let path = provider.get_checkpoint_tree_merkle_proof(head, checkpoint).await?;
     crate::guardian::verify::verify_checkpoint(checkpoint, &leaf, &roots, &path, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let user = provider.get_user_leaf_data(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
     let user_path = provider.get_user_tree_merkle_proof(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
+    let user = provider.get_user_leaf_data(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
     crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, guardian_common::protocol::BRIDGE_USER_ID, user_path.value, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     if user_path.value == QHashOut::ZERO { return Ok((user_path.value, 0)); }
     ensure!(user_path.value == user.qfhash::<PsyHasher>() && user.public_key == config.account_public_key().map_err(|error| anyhow::anyhow!(error))? && user.user_id.to_canonical_u64() == guardian_common::protocol::BRIDGE_USER_ID, "authenticated account identity mismatch");
