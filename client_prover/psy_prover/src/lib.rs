@@ -134,6 +134,10 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     Ok(())
 }
 
+// A batched claim holds its connection until its End Cap departs, so this also bounds the claim queue.
+#[cfg(not(target_arch = "wasm32"))]
+const FAUCET_MAX_CONNECTIONS: u32 = 1024;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn run_psy_faucet_server(args: psy_client_common::args::PsyFaucetServerArgs) -> anyhow::Result<()> {
     use std::net::SocketAddr;
@@ -160,6 +164,7 @@ pub async fn run_psy_faucet_server(args: psy_client_common::args::PsyFaucetServe
             ServerConfig::builder()
                 .max_request_body_size(512 * 1024 * 1024)
                 .max_response_body_size(512 * 1024 * 1024)
+                .max_connections(FAUCET_MAX_CONNECTIONS)
                 .build(),
         )
         .set_http_middleware(cors)
