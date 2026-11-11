@@ -35,6 +35,12 @@ pub trait QParthProofStoreWriter {
         proof: &P,
     ) -> anyhow::Result<()>;
     async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()>;
+    /// Removes only the named proofs from one pending bucket; an emptied bucket disappears.
+    async fn delete_proofs_for_job_ids<J: Into<QJobIdSerialized> + Copy + Send + Sync>(
+        &self,
+        unique_pending_id: u64,
+        job_ids: &[J],
+    ) -> anyhow::Result<()>;
 }
 
 pub trait QParthProofStore: QParthProofStoreReader + QParthProofStoreWriter {}

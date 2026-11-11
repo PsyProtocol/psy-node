@@ -41,3 +41,32 @@ async fn proofs_remain_until_explicit_pending_id_cleanup() -> anyhow::Result<()>
     store.client.quit().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated Redis 7.4+ instance at REDIS_INTEGRATION_URL"]
+async fn deleting_consumed_proofs_keeps_the_rest_of_the_bucket() -> anyhow::Result<()> {
+    let url = std::env::var("REDIS_INTEGRATION_URL")?;
+    let prefix = format!("proof_reclaim_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos());
+    let pool = new_redis_async_pool(&url, 2).await?;
+    let store = StandardFredRedisStore::new(pool, prefix.clone(), 0, 1);
+    let consumed: QJobIdSerialized = [3; QJOB_ID_SERIALIZED_SIZE];
+    let deferred: QJobIdSerialized = [4; QJOB_ID_SERIALIZED_SIZE];
+    let output: QJobIdSerialized = [5; QJOB_ID_SERIALIZED_SIZE];
+    store.put_proof_bytes_for_job_id(consumed, 8, b"consumed-end-cap").await?;
+    store.put_proof_bytes_for_job_id(deferred, 8, b"deferred-end-cap").await?;
+    store.put_proof_bytes_for_job_id(output, 10, b"block-output").await?;
+
+    store.delete_proofs_for_job_ids(8, &[consumed]).await?;
+    store.delete_proofs_for_job_ids(10, &[output, consumed]).await?;
+    // Idempotent, and a missing bucket or an empty list is not an error.
+    store.delete_proofs_for_job_ids(10, &[output]).await?;
+    store.delete_proofs_for_job_ids::<QJobIdSerialized>(8, &[]).await?;
+
+    assert!(!store.contains_proof_for_job_id(consumed, 8).await?);
+    assert_eq!(store.get_proof_bytes_by_job_id(deferred, 8).await?, Some(b"deferred-end-cap".to_vec()));
+    let emptied: i64 = store.client.exists(format!("TMPPSV1-{prefix}-0-1-10")).await?;
+    assert_eq!(emptied, 0, "an emptied bucket must not remain as a key");
+    store.delete_all_proofs_for_pending_id(8).await?;
+    store.client.quit().await?;
+    Ok(())
+}

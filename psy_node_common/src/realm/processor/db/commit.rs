@@ -304,27 +304,9 @@ where
         )
         .await?;
         tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
-        let previous_checkpoint_id = self.state.last_committed_checkpoint_id;
-        if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
-            if let Some((previous_pending_id, _)) = self
-                .db
-                .get_unique_pending_id_for_checkpoint_id(previous_checkpoint_id)
-                .await?
-            {
-                if let Err(err) = self
-                    .proof_store
-                    .delete_all_proofs_for_pending_id(previous_pending_id)
-                    .await
-                {
-                    tracing::warn!(
-                        "Failed to delete realm proofs for previous checkpoint {} (pending_id={}): {}",
-                        previous_checkpoint_id,
-                        previous_pending_id,
-                        err
-                    );
-                }
-            }
-        }
+        // Proofs are not reclaimed per bucket here: an earlier bucket can still hold a deferred
+        // EndCap that a later block aggregates. process_block reclaims exactly the proofs the
+        // committed block consumed.
         tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
         self.state.processing_checkpoint_id = checkpoint_id;
@@ -394,8 +376,14 @@ mod commit_tests {
         PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreDatabaseBasicContractInfoStoreReader,
     };
     use psy_node_core::psy_temp_db::QTempDBPendingIdReader;
+    use psy_node_core::store::traits::proof_store::{QParthProofStoreReader, QParthProofStoreWriter};
+    use psy_core::job::job_id::QProvingJobDataID;
 
     use crate::realm::processor::db::realm_db_test_env::*;
+
+    fn deferred_end_cap_proof_id() -> QProvingJobDataID {
+        QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(9, 32, 0).unwrap()
+    }
 
     #[tokio::test]
     async fn set_new_unique_ids_rotates_state_and_ensures_queue_consumers() -> anyhow::Result<()> {
@@ -598,7 +586,7 @@ mod commit_tests {
     }
 
     #[tokio::test]
-    async fn commit_state_cleans_up_proofs_of_previous_pending_id() -> anyhow::Result<()> {
+    async fn commit_state_keeps_earlier_proof_buckets() -> anyhow::Result<()> {
         let mut env = RealmDbTestEnv::create().await?;
         env.commit_genesis().await?;
         let local_root = env.seed_consistent_coordinator_head().await?;
@@ -625,12 +613,16 @@ mod commit_tests {
             update_user_leaves_ffs: vec![],
             update_contract_state_imt_leaves_ffs: vec![],
         };
+        // A deferred EndCap admitted under pending id 0 must outlive this commit.
+        env.processor.proof_store.put_proof_bytes_for_job_id(deferred_end_cap_proof_id(), 0, b"deferred").await?;
         env.processor
             .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
             .await?;
-        // the previous checkpoint's proofs (pending id 0) were dropped; the
-        // commit itself still reports checkpoint 1 fully persisted
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(
+            env.processor.proof_store.get_proof_bytes_by_job_id(deferred_end_cap_proof_id(), 0).await?.as_deref(),
+            Some(&b"deferred"[..])
+        );
         Ok(())
     }
 
