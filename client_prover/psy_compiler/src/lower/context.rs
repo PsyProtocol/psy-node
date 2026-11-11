@@ -45,19 +45,19 @@ pub enum SymValue {
 }
 
 impl SymValue {
-    /// Get as a single felt ref. Panics if not a single-felt type.
-    pub fn as_felt(&self) -> SymFeltRef {
+    /// Get as a single felt ref. Returns an error if not a single-felt type.
+    pub fn as_felt(&self) -> Result<SymFeltRef> {
         match self {
-            SymValue::Felt(r) | SymValue::Bool(r) | SymValue::U32(r) => *r,
-            _ => panic!("Expected single felt, got {:?}", self),
+            SymValue::Felt(r) | SymValue::Bool(r) | SymValue::U32(r) => Ok(*r),
+            _ => bail!("Expected single felt, got {:?}", self),
         }
     }
 
-    /// Get as a 4-felt hash ref. Panics if not a Hash type.
-    pub fn as_hash(&self) -> [SymFeltRef; 4] {
+    /// Get as a 4-felt hash ref. Returns an error if not a Hash type.
+    pub fn as_hash(&self) -> Result<[SymFeltRef; 4]> {
         match self {
-            SymValue::Hash(h) => *h,
-            _ => panic!("Expected Hash, got {:?}", self),
+            SymValue::Hash(h) => Ok(*h),
+            _ => bail!("Expected Hash, got {:?}", self),
         }
     }
 
@@ -65,11 +65,11 @@ impl SymValue {
     /// This handles Hash, [Felt; 4], [Bool; 4], and [U32; 4] values
     /// transparently. All conversions are free (Bool/U32 → Felt requires no
     /// constraints).
-    pub fn as_hash_coerce(&self) -> [SymFeltRef; 4] {
+    pub fn as_hash_coerce(&self) -> Result<[SymFeltRef; 4]> {
         match self {
-            SymValue::Hash(h) => *h,
-            SymValue::Array(elems) if elems.len() == 4 => [elems[0].as_felt(), elems[1].as_felt(), elems[2].as_felt(), elems[3].as_felt()],
-            _ => panic!("Expected Hash or 4-element array, got {:?}", self),
+            SymValue::Hash(h) => Ok(*h),
+            SymValue::Array(elems) if elems.len() == 4 => Ok([elems[0].as_felt()?, elems[1].as_felt()?, elems[2].as_felt()?, elems[3].as_felt()?]),
+            _ => bail!("Expected Hash or 4-element array, got {:?}", self),
         }
     }
 
@@ -77,7 +77,9 @@ impl SymValue {
     pub fn try_as_hash_coerce(&self) -> Option<[SymFeltRef; 4]> {
         match self {
             SymValue::Hash(h) => Some(*h),
-            SymValue::Array(elems) if elems.len() == 4 => Some([elems[0].as_felt(), elems[1].as_felt(), elems[2].as_felt(), elems[3].as_felt()]),
+            SymValue::Array(elems) if elems.len() == 4 => {
+                Some([elems[0].as_felt().ok()?, elems[1].as_felt().ok()?, elems[2].as_felt().ok()?, elems[3].as_felt().ok()?])
+            }
             _ => None,
         }
     }
@@ -92,6 +94,41 @@ impl SymValue {
             SymValue::Void => vec![],
             SymValue::IMTMapRef { .. } => vec![],
             SymValue::OtherUserIMTMapRef { .. } => vec![],
+        }
+    }
+
+    /// Index into an Array or Hash value with a compile-time-known index.
+    pub fn index_into(self, idx_val: &SymValue) -> Result<SymValue> {
+        match self {
+            SymValue::Array(elements) => {
+                // For compile-time-known indices
+                if let SymValue::Felt(idx_ref) = idx_val {
+                    if idx_ref.is_constant_type() {
+                        let i = idx_ref.get_constant_value() as usize;
+                        if i < elements.len() {
+                            return Ok(elements[i].clone());
+                        } else {
+                            bail!("Array index {} out of bounds (len {})", i, elements.len());
+                        }
+                    }
+                }
+                bail!("Dynamic indexing into local arrays is not supported")
+            }
+            SymValue::Hash(h) => {
+                // Hash values can be indexed like [Felt; 4] — free at compile time
+                if let SymValue::Felt(idx_ref) = idx_val {
+                    if idx_ref.is_constant_type() {
+                        let i = idx_ref.get_constant_value() as usize;
+                        if i < 4 {
+                            return Ok(SymValue::Felt(h[i]));
+                        } else {
+                            bail!("Hash index {} out of bounds (Hash has 4 elements)", i);
+                        }
+                    }
+                }
+                bail!("Dynamic indexing into Hash values is not supported")
+            }
+            _ => bail!("Cannot index into non-array value"),
         }
     }
 }
@@ -307,7 +344,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 ..
             } => {
                 let cond = self.compile_expr(condition)?;
-                self.exec.start_if_block(cond.as_felt());
+                self.exec.start_if_block(cond.as_felt()?);
 
                 for s in then_block {
                     self.compile_stmt(s)?;
@@ -315,7 +352,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
                 for (elif_cond, elif_body) in else_if_blocks {
                     let c = self.compile_expr(elif_cond)?;
-                    self.exec.start_else_if_block(c.as_felt());
+                    self.exec.start_else_if_block(c.as_felt()?);
                     for s in elif_body {
                         self.compile_stmt(s)?;
                     }
@@ -354,7 +391,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 for _ in 0..MAX_WHILE_ITERATIONS {
                     // Evaluate the condition
                     let cond = self.compile_expr(condition)?;
-                    let cond_ref = cond.as_felt();
+                    let cond_ref = cond.as_felt()?;
 
                     // Check if condition is a compile-time false
                     if cond_ref.is_constant_type() && cond_ref.get_constant_value() == 0 {
@@ -483,8 +520,8 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             Expr::UnaryOp(op, inner, _) => {
                 let val = self.compile_expr(inner)?;
                 match op {
-                    UnaryOp::Not => Ok(SymValue::Bool(self.exec.op_bool_not(val.as_felt()))),
-                    UnaryOp::Neg => Ok(SymValue::Felt(self.exec.op_neg(val.as_felt()))),
+                    UnaryOp::Not => Ok(SymValue::Bool(self.exec.op_bool_not(val.as_felt()?))),
+                    UnaryOp::Neg => Ok(SymValue::Felt(self.exec.op_neg(val.as_felt()?))),
                 }
             }
             Expr::MethodCall { receiver, method, args, .. } => self.compile_method_call(receiver, method, args),
@@ -518,8 +555,8 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
     }
 
     fn compile_binop(&mut self, op: BinOp, left: &SymValue, right: &SymValue) -> Result<SymValue> {
-        let l = left.as_felt();
-        let r = right.as_felt();
+        let l = left.as_felt()?;
+        let r = right.as_felt()?;
         match op {
             BinOp::Add => Ok(SymValue::Felt(self.exec.op_add(l, r))),
             BinOp::Sub => Ok(SymValue::Felt(self.exec.op_sub(l, r))),
@@ -562,7 +599,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         if let Expr::IndexAccess(arr_expr, idx_expr, _) = receiver {
             if let Expr::FieldAccess(self_expr, arr_field, _) = arr_expr.as_ref() {
                 if let Expr::Ident(self_name, _) = self_expr.as_ref() {
-                    if self_name == "self" {
+                    if self_name == "self" && self.layout.get_field(arr_field).is_some_and(|field| field.is_array) {
                         return self.compile_array_element_field_read(arr_field, idx_expr, field);
                     }
                 }
@@ -660,7 +697,19 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         if let Expr::FieldAccess(self_expr, field, _) = arr_expr {
             if let Expr::Ident(self_name, _) = self_expr.as_ref() {
                 if self_name == "self" {
-                    return self.compile_array_element_read(field, idx_expr);
+                    match self.layout.get_field(field) {
+                        Some(contract_field) if contract_field.is_array => {
+                            return self.compile_array_element_read(field, idx_expr);
+                        }
+                        Some(_) => {
+                            // Inline field (plain Array or Hash): read the
+                            // whole field, then index into the value.
+                            let arr_val = self.compile_self_field_read(field)?;
+                            let idx_val = self.compile_expr(idx_expr)?;
+                            return arr_val.index_into(&idx_val);
+                        }
+                        None => bail!("Unknown contract field: {}", field),
+                    }
                 }
             }
         }
@@ -682,38 +731,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         // Local array/struct array indexing
         let arr_val = self.compile_expr(arr_expr)?;
         let idx_val = self.compile_expr(idx_expr)?;
-
-        match arr_val {
-            SymValue::Array(elements) => {
-                // For compile-time-known indices
-                if let SymValue::Felt(idx_ref) = &idx_val {
-                    if idx_ref.is_constant_type() {
-                        let i = idx_ref.get_constant_value() as usize;
-                        if i < elements.len() {
-                            return Ok(elements[i].clone());
-                        } else {
-                            bail!("Array index {} out of bounds (len {})", i, elements.len());
-                        }
-                    }
-                }
-                bail!("Dynamic indexing into local arrays is not supported")
-            }
-            SymValue::Hash(h) => {
-                // Hash values can be indexed like [Felt; 4] — free at compile time
-                if let SymValue::Felt(idx_ref) = &idx_val {
-                    if idx_ref.is_constant_type() {
-                        let i = idx_ref.get_constant_value() as usize;
-                        if i < 4 {
-                            return Ok(SymValue::Felt(h[i]));
-                        } else {
-                            bail!("Hash index {} out of bounds (Hash has 4 elements)", i);
-                        }
-                    }
-                }
-                bail!("Dynamic indexing into Hash values is not supported")
-            }
-            _ => bail!("Cannot index into non-array value"),
-        }
+        arr_val.index_into(&idx_val)
     }
 
     /// Read self.array_field[idx] → full struct element
@@ -734,7 +752,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         // Compute offset: base_offset + idx * element_stride
         let base = self.exec.op_const(contract_field.base_offset as u64);
         let stride = self.exec.op_const(elem_size as u64);
-        let idx_times_stride = self.exec.op_mul(idx.as_felt(), stride);
+        let idx_times_stride = self.exec.op_mul(idx.as_felt()?, stride);
         let offset = self.exec.op_add(base, idx_times_stride);
 
         // Read the range
@@ -775,30 +793,27 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             bail!("Expected ContractStateArray type")
         };
 
-        // Get field offset within the struct
-        let field_offset = self
-            .layout
-            .get_struct_field_offset(&elem_type_name, sub_field)
-            .or_else(|| {
-                self.struct_layouts
-                    .get(&elem_type_name)
-                    .and_then(|sl| sl.fields.iter().find(|f| f.name == sub_field))
-                    .map(|f| f.offset)
-            })
-            .ok_or_else(|| anyhow::anyhow!("Unknown field {} in struct {}", sub_field, elem_type_name))?;
+        // Get the sub-field layout (offset, size, and type) within the struct
+        let field_layout = self
+            .struct_layouts
+            .get(&elem_type_name)
+            .and_then(|sl| sl.fields.iter().find(|f| f.name == sub_field))
+            .ok_or_else(|| anyhow::anyhow!("Unknown field {} in struct {}", sub_field, elem_type_name))?
+            .clone();
 
         // Compute offset: base + idx * stride + field_offset
         let base = self.exec.op_const(contract_field.base_offset as u64);
         let stride = self.exec.op_const(elem_size as u64);
-        let f_off = self.exec.op_const(field_offset as u64);
-        let idx_times_stride = self.exec.op_mul(idx.as_felt(), stride);
+        let f_off = self.exec.op_const(field_layout.offset as u64);
+        let idx_times_stride = self.exec.op_mul(idx.as_felt()?, stride);
         let base_plus_idx = self.exec.op_add(base, idx_times_stride);
         let offset = self.exec.op_add(base_plus_idx, f_off);
 
-        // Read single felt
-        let len = self.exec.op_const(1);
+        // Read the whole sub-field (a sub-field may itself be a multi-felt
+        // array or struct) and reconstruct it as its declared type
+        let len = self.exec.op_const(field_layout.felt_size as u64);
         let result = self.exec.get_state_range_at(offset, len);
-        Ok(SymValue::Felt(result[0]))
+        self.reconstruct_value_from_felts(&field_layout.ty, &result)
     }
 
     // ─── State writes ────────────────────────────────────────────────────
@@ -956,7 +971,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 .ok_or_else(|| anyhow::anyhow!("Unknown field {} in struct {}", sub_field_name, elem_type_name))?;
 
             let f_off = self.exec.op_const(field_offset as u64);
-            let idx_times_stride = self.exec.op_mul(idx.as_felt(), stride);
+            let idx_times_stride = self.exec.op_mul(idx.as_felt()?, stride);
             let base_plus_idx = self.exec.op_add(base, idx_times_stride);
             let offset = self.exec.op_add(base_plus_idx, f_off);
 
@@ -964,7 +979,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             self.exec.cset_state_range_at(offset, &refs);
         } else {
             // Write entire element
-            let idx_times_stride = self.exec.op_mul(idx.as_felt(), stride);
+            let idx_times_stride = self.exec.op_mul(idx.as_felt()?, stride);
             let offset = self.exec.op_add(base, idx_times_stride);
             let refs = value.to_felt_refs();
             self.exec.cset_state_range_at(offset, &refs);
@@ -1006,7 +1021,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             .ok_or_else(|| anyhow::anyhow!("Unknown field '{}' in struct '{}'", struct_field, element_type))?;
         let field_type = field_layout.ty.clone();
         let mut offset = self.exec.op_const(contract_field.base_offset as u64);
-        let element_index = self.compile_expr(element_index_expr)?.as_felt();
+        let element_index = self.compile_expr(element_index_expr)?.as_felt()?;
         let element_stride = self.exec.op_const(contract_field.element_felt_size.unwrap_or(0) as u64);
         let element_offset = self.exec.op_mul(element_index, element_stride);
         offset = self.exec.op_add(offset, element_offset);
@@ -1018,7 +1033,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 ResolvedType::Array { element, .. } => element.as_ref(),
                 _ => bail!("Field '{}' in struct '{}' is not an array", struct_field, element_type),
             };
-            let nested_index = self.compile_expr(nested_index_expr)?.as_felt();
+            let nested_index = self.compile_expr(nested_index_expr)?.as_felt()?;
             let stride = self.exec.op_const(nested_element.felt_size(self.struct_layouts)? as u64);
             let nested_offset = self.exec.op_mul(nested_index, stride);
             offset = self.exec.op_add(offset, nested_offset);
@@ -1066,8 +1081,9 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             SymValue::Struct { name, fields } if name == "__UserAccessor" => fields
                 .iter()
                 .find(|(n, _)| n == "user_id")
-                .map(|(_, v)| v.as_felt())
-                .ok_or_else(|| anyhow::anyhow!("Invalid user accessor"))?,
+                .ok_or_else(|| anyhow::anyhow!("Invalid user accessor"))?
+                .1
+                .as_felt()?,
             _ => bail!("Expected ctx.users[user_id] for typed contract access"),
         };
 
@@ -1100,7 +1116,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                             .ok_or_else(|| anyhow::anyhow!("IMT map field '{}' missing capacity in layout", field_name))?;
                         return Ok(SymValue::OtherUserIMTMapRef {
                             user_id,
-                            contract_id: contract_id.as_felt(),
+                            contract_id: contract_id.as_felt()?,
                             contract_state_tree_height: self.exec.op_const(self.layout.state_tree_height as u64),
                             base_offset: self.exec.op_const(field.base_offset as u64),
                             capacity: self.exec.op_const(capacity as u64),
@@ -1120,7 +1136,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
         let result = self
             .exec
-            .get_other_user_contract_state_range_at(height_ref, user_id, contract_id.as_felt(), offset, len_const);
+            .get_other_user_contract_state_range_at(height_ref, user_id, contract_id.as_felt()?, offset, len_const);
 
         if read_size == 1 {
             Ok(SymValue::Felt(result[0]))
@@ -1190,7 +1206,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                     if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
                         let elem_size = element.felt_size(self.struct_layouts)?;
                         let stride = self.exec.op_const(elem_size as u64);
-                        let idx_offset = self.exec.op_mul(idx.as_felt(), stride);
+                        let idx_offset = self.exec.op_mul(idx.as_felt()?, stride);
                         offset = self.exec.op_add(offset, idx_offset);
                         current_type = Some(element);
                         read_size = elem_size;
@@ -1252,7 +1268,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             if args.len() != 1 {
                 bail!("Cross-user ContractHashMap.{}() expects exactly 1 argument (key)", method);
             }
-            let key = self.compile_expr(&args[0])?.as_hash_coerce();
+            let key = self.compile_expr(&args[0])?.as_hash_coerce()?;
             return match method {
                 "get" => Ok(SymValue::Hash(self.exec.imt_get_other_user_value(
                     *contract_state_tree_height, *user_id, *contract_id, key, *base_offset, *capacity,
@@ -1359,7 +1375,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                     SymValue::U32(r) => Ok(SymValue::Felt(r)),
                     SymValue::Array(ref elems) if elems.len() == 4 => {
                         // Try to coerce to Hash
-                        let h = recv_val.as_hash_coerce();
+                        let h = recv_val.as_hash_coerce()?;
                         Ok(SymValue::Hash(h))
                     }
                     SymValue::Array(elems) => {
@@ -1500,7 +1516,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                     "assertion failed".to_string()
                 };
                 let msg_static = self.leak_str(&msg);
-                self.exec.assert_true(cond.as_felt(), msg_static);
+                self.exec.assert_true(cond.as_felt()?, msg_static);
                 Ok(SymValue::Void)
             }
             "psystd::poseidon_hash" => {
@@ -1591,8 +1607,8 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 if args.len() != 2 {
                     bail!("psystd::exp() expects exactly 2 arguments: base, power");
                 }
-                let base = self.compile_expr(&args[0])?.as_felt();
-                let power = self.compile_expr(&args[1])?.as_felt();
+                let base = self.compile_expr(&args[0])?.as_felt()?;
+                let power = self.compile_expr(&args[1])?.as_felt()?;
                 let result = self.exec.op_exp(base, power);
                 Ok(SymValue::Felt(result))
             }
@@ -1603,7 +1619,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 if args.len() != 1 {
                     bail!("psystd::field_inverse() expects exactly 1 argument");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let one = self.exec.op_const(1);
                 let result = self.exec.op_div(one, val);
                 Ok(SymValue::Felt(result))
@@ -1616,7 +1632,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 if args.len() != 2 {
                     bail!("psystd::split_bits() expects exactly 2 arguments: value, num_bits");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let num_bits_val = self.compile_expr(&args[1])?;
                 let num_bits = match &num_bits_val {
                     SymValue::Felt(r) | SymValue::U32(r) if r.is_constant_type() => r.get_constant_value(),
@@ -1659,7 +1675,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 if args.len() != 1 {
                     bail!("psystd::cast_bool() expects exactly 1 argument");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let result = self.exec.op_cast_bool(val);
                 Ok(SymValue::Bool(result))
             }
@@ -1670,7 +1686,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 if args.len() != 1 {
                     bail!("psystd::cast_u32() expects exactly 1 argument");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let result = self.exec.op_cast_u32(val);
                 Ok(SymValue::U32(result))
             }
@@ -1703,7 +1719,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                     bail!("ContractHashMap.get() expects exactly 1 argument (key)");
                 }
                 let key_val = self.compile_expr(&args[0])?;
-                let key = key_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
                 let result = self.exec.imt_get_value(key, base_offset, capacity);
                 Ok(SymValue::Hash(result))
             }
@@ -1712,7 +1728,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                     bail!("ContractHashMap.contains() expects exactly 1 argument (key)");
                 }
                 let key_val = self.compile_expr(&args[0])?;
-                let key = key_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
                 let result = self.exec.imt_contains(key, base_offset, capacity);
                 Ok(SymValue::Bool(result))
             }
@@ -1723,8 +1739,8 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 }
                 let key_val = self.compile_expr(&args[0])?;
                 let value_val = self.compile_expr(&args[1])?;
-                let key = key_val.as_hash_coerce();
-                let value = value_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
+                let value = value_val.as_hash_coerce()?;
                 let old_value = self.exec.imt_insert(key, value, base_offset, capacity);
                 Ok(SymValue::Hash(old_value))
             }
@@ -1735,8 +1751,8 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 }
                 let key_val = self.compile_expr(&args[0])?;
                 let new_value_val = self.compile_expr(&args[1])?;
-                let key = key_val.as_hash_coerce();
-                let new_value = new_value_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
+                let new_value = new_value_val.as_hash_coerce()?;
                 let old_value = self.exec.imt_update(key, new_value, base_offset, capacity);
                 Ok(SymValue::Hash(old_value))
             }
@@ -1838,5 +1854,207 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 bail!("Cannot reconstruct ContractHashMap from felts")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use psy_vm::dpn::eval::executor::{ExecutionContext, ExecutionResult, InMemoryStateBackend, VmExecutor};
+
+    fn execute_method(source: &str, method_name: &str, inputs: &[u64]) -> ExecutionResult {
+        let output = crate::compile(source).expect("compilation should succeed");
+        let method = output
+            .abi
+            .contract
+            .methods
+            .iter()
+            .find(|m| m.name == method_name)
+            .unwrap_or_else(|| panic!("method '{}' not found in ABI", method_name));
+        let circuit = output
+            .circuit_definitions
+            .iter()
+            .find(|d| d.method_id == method.method_id)
+            .unwrap_or_else(|| panic!("circuit for method '{}' not found", method_name))
+            .clone();
+        let ctx = ExecutionContext {
+            user_id: 1,
+            contract_id: 1,
+            caller_contract_id: 0,
+            checkpoint_id: 42,
+            nonce: 0,
+            user_public_key_hash: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
+        };
+        let state = InMemoryStateBackend::new();
+        let mut executor = VmExecutor::new(state);
+        executor.execute(&circuit, &ctx, inputs).expect("vm execution should complete")
+    }
+
+    fn written_slot(result: &ExecutionResult, slot_index: u64) -> Option<Vec<u64>> {
+        result
+            .state_writes
+            .iter()
+            .rev()
+            .find(|w| w.condition && w.slot_index == slot_index)
+            .map(|w| w.new_value.clone())
+    }
+
+    #[test]
+    fn nested_array_value_in_felt_position_is_compile_error_not_panic() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct TestContract {
+                pub out: Felt,
+                pub m: [[Felt; 2]; 2],
+            }
+
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn misuse(&mut self, ctx: &ChainContext) {
+                    let m = self.m;
+                    self.out = m[1] + 1;
+                }
+            }
+        "#;
+
+        let result = std::panic::catch_unwind(|| crate::compile(source));
+        let compile_result = result.unwrap_or_else(|e| panic!("compile panicked: {:?}", e.downcast_ref::<String>()));
+        assert!(compile_result.is_err(), "array in felt position must be a compile error");
+    }
+
+    #[test]
+    fn inline_nested_array_field_supports_indexed_read() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct TestContract {
+                pub out: Felt,
+                pub m: [[Felt; 2]; 2],
+            }
+
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn read_indexed(&mut self, ctx: &ChainContext) {
+                    self.m = [[1, 2], [3, 4]];
+                    self.out = self.m[1][0];
+                }
+            }
+        "#;
+
+        let result = execute_method(source, "read_indexed", &[]);
+        assert!(result.success, "failure={:?}", result.failure);
+        assert_eq!(written_slot(&result, 0), Some(vec![3]));
+    }
+
+    #[test]
+    fn inline_array_struct_field_supports_indexed_read() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[derive(FeltSized)]
+            pub struct Bucket {
+                pub value: Felt,
+                pub tag: Felt,
+            }
+
+            #[contract]
+            pub struct TestContract {
+                pub out: Felt,
+                pub items: [Bucket; 2],
+            }
+
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn read_indexed(&mut self, ctx: &ChainContext) {
+                    self.items = [Bucket { value: 1, tag: 2 }, Bucket { value: 3, tag: 4 }];
+                    self.out = self.items[1].value;
+                }
+            }
+        "#;
+
+        let result = execute_method(source, "read_indexed", &[]);
+        assert!(result.success, "failure={:?}", result.failure);
+        assert_eq!(written_slot(&result, 0), Some(vec![3]));
+    }
+
+    #[test]
+    fn state_array_struct_array_subfield_reads_all_felts() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[derive(FeltSized)]
+            pub struct Bucket {
+                pub vals: [Felt; 2],
+                pub tag: Felt,
+            }
+
+            #[contract]
+            pub struct TestContract {
+                pub out: Felt,
+                pub users: ContractStateArray<PSY_TOTAL_USERS, Bucket>,
+            }
+
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn read_vals(&mut self, ctx: &ChainContext, a: Felt, b: Felt) {
+                    let uid = ctx.user_id;
+                    self.users[uid].vals[0] = a;
+                    self.users[uid].vals[1] = b;
+                    let v = self.users[uid].vals;
+                    self.out = v[0] + v[1];
+                }
+            }
+        "#;
+
+        let result = execute_method(source, "read_vals", &[3, 4]);
+        assert!(result.success, "failure={:?}", result.failure);
+        assert_eq!(written_slot(&result, 0), Some(vec![7]));
+    }
+
+    #[test]
+    fn state_array_struct_array_subfield_direct_index_read() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[derive(FeltSized)]
+            pub struct Bucket {
+                pub vals: [Felt; 2],
+                pub tag: Felt,
+            }
+
+            #[contract]
+            pub struct TestContract {
+                pub out: Felt,
+                pub users: ContractStateArray<PSY_TOTAL_USERS, Bucket>,
+            }
+
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn read_vals_idx(&mut self, ctx: &ChainContext, x: Felt) {
+                    let uid = ctx.user_id;
+                    self.users[uid].vals[1] = x;
+                    self.out = self.users[uid].vals[1];
+                }
+            }
+        "#;
+
+        let result = execute_method(source, "read_vals_idx", &[9]);
+        assert!(result.success, "failure={:?}", result.failure);
+        assert_eq!(written_slot(&result, 0), Some(vec![9]));
     }
 }

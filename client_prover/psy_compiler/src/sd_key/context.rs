@@ -255,7 +255,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 ..
             } => {
                 let cond = self.compile_expr(condition)?;
-                self.exec.start_if_block(cond.as_felt());
+                self.exec.start_if_block(cond.as_felt()?);
 
                 for s in then_block {
                     self.compile_stmt(s)?;
@@ -263,7 +263,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
 
                 for (elif_cond, elif_body) in else_if_blocks {
                     let c = self.compile_expr(elif_cond)?;
-                    self.exec.start_else_if_block(c.as_felt());
+                    self.exec.start_else_if_block(c.as_felt()?);
                     for s in elif_body {
                         self.compile_stmt(s)?;
                     }
@@ -294,7 +294,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
             Stmt::While { condition, body, .. } => {
                 // While loops in SD keys are treated like guarded blocks
                 let cond = self.compile_expr(condition)?;
-                let cond_ref = cond.as_felt();
+                let cond_ref = cond.as_felt()?;
                 if cond_ref.is_constant_type() && cond_ref.get_constant_value() == 0 {
                     return Ok(());
                 }
@@ -372,8 +372,8 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
             Expr::UnaryOp(op, inner, _) => {
                 let val = self.compile_expr(inner)?;
                 match op {
-                    UnaryOp::Not => Ok(SymValue::Bool(self.exec.op_bool_not(val.as_felt()))),
-                    UnaryOp::Neg => Ok(SymValue::Felt(self.exec.op_neg(val.as_felt()))),
+                    UnaryOp::Not => Ok(SymValue::Bool(self.exec.op_bool_not(val.as_felt()?))),
+                    UnaryOp::Neg => Ok(SymValue::Felt(self.exec.op_neg(val.as_felt()?))),
                 }
             }
             Expr::MethodCall { receiver, method, args, .. } => self.compile_method_call(receiver, method, args),
@@ -407,8 +407,8 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
     }
 
     fn compile_binop(&mut self, op: BinOp, left: &SymValue, right: &SymValue) -> Result<SymValue> {
-        let l = left.as_felt();
-        let r = right.as_felt();
+        let l = left.as_felt()?;
+        let r = right.as_felt()?;
         match op {
             BinOp::Add => Ok(SymValue::Felt(self.exec.op_add(l, r))),
             BinOp::Sub => Ok(SymValue::Felt(self.exec.op_sub(l, r))),
@@ -689,7 +689,19 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
             if let Expr::Ident(self_name, _) = self_expr.as_ref() {
                 if self_name == "self" {
                     *self.state_reading_used = true;
-                    return self.compile_array_element_read(field, idx_expr);
+                    match self.layout.get_field(field) {
+                        Some(contract_field) if contract_field.is_array => {
+                            return self.compile_array_element_read(field, idx_expr);
+                        }
+                        Some(_) => {
+                            // Inline field (plain Array or Hash): read the
+                            // whole field, then index into the value.
+                            let arr_val = self.compile_self_field_read(field)?;
+                            let idx_val = self.compile_expr(idx_expr)?;
+                            return arr_val.index_into(&idx_val);
+                        }
+                        None => bail!("Unknown contract field: {}", field),
+                    }
                 }
             }
         }
@@ -710,34 +722,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
         // Local array indexing
         let arr_val = self.compile_expr(arr_expr)?;
         let idx_val = self.compile_expr(idx_expr)?;
-
-        match arr_val {
-            SymValue::Array(elements) => {
-                if let SymValue::Felt(idx_ref) = &idx_val {
-                    if idx_ref.is_constant_type() {
-                        let i = idx_ref.get_constant_value() as usize;
-                        if i < elements.len() {
-                            return Ok(elements[i].clone());
-                        } else {
-                            bail!("Array index {} out of bounds (len {})", i, elements.len());
-                        }
-                    }
-                }
-                bail!("Dynamic indexing into local arrays is not supported")
-            }
-            SymValue::Hash(h) => {
-                if let SymValue::Felt(idx_ref) = &idx_val {
-                    if idx_ref.is_constant_type() {
-                        let i = idx_ref.get_constant_value() as usize;
-                        if i < 4 {
-                            return Ok(SymValue::Felt(h[i]));
-                        }
-                    }
-                }
-                bail!("Dynamic indexing into Hash values is not supported")
-            }
-            _ => bail!("Cannot index into non-array value"),
-        }
+        arr_val.index_into(&idx_val)
     }
 
     fn compile_array_element_read(&mut self, array_field: &str, idx_expr: &Expr) -> Result<SymValue> {
@@ -756,7 +741,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
 
         let base = self.exec.op_const(contract_field.base_offset as u64);
         let stride = self.exec.op_const(elem_size as u64);
-        let idx_times_stride = self.exec.op_mul(idx.as_felt(), stride);
+        let idx_times_stride = self.exec.op_mul(idx.as_felt()?, stride);
         let offset = self.exec.op_add(base, idx_times_stride);
 
         let len = self.exec.op_const(elem_size as u64);
@@ -785,8 +770,9 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
             SymValue::Struct { name, fields } if name == "__UserAccessor" => fields
                 .iter()
                 .find(|(n, _)| n == "user_id")
-                .map(|(_, v)| v.as_felt())
-                .ok_or_else(|| anyhow::anyhow!("Invalid user accessor"))?,
+                .ok_or_else(|| anyhow::anyhow!("Invalid user accessor"))?
+                .1
+                .as_felt()?,
             _ => bail!("Expected ctx.users[user_id] for typed contract access"),
         };
 
@@ -800,7 +786,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
 
         let result = self
             .exec
-            .get_other_user_contract_state_range_at(height_ref, user_id, contract_id.as_felt(), offset, len_const);
+            .get_other_user_contract_state_range_at(height_ref, user_id, contract_id.as_felt()?, offset, len_const);
 
         if read_size == 1 {
             Ok(SymValue::Felt(result[0]))
@@ -863,7 +849,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                     if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
                         let elem_size = element.felt_size(self.struct_layouts)?;
                         let stride = self.exec.op_const(elem_size as u64);
-                        let idx_offset = self.exec.op_mul(idx.as_felt(), stride);
+                        let idx_offset = self.exec.op_mul(idx.as_felt()?, stride);
                         offset = self.exec.op_add(offset, idx_offset);
                         current_type = Some(element);
                         read_size = elem_size;
@@ -921,7 +907,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 SymValue::Bool(r) => Ok(SymValue::Felt(r)),
                 SymValue::U32(r) => Ok(SymValue::Felt(r)),
                 SymValue::Array(ref elems) if elems.len() == 4 => {
-                    let h = recv_val.as_hash_coerce();
+                    let h = recv_val.as_hash_coerce()?;
                     Ok(SymValue::Hash(h))
                 }
                 SymValue::Hash(h) => Ok(SymValue::Array(h.iter().map(|r| SymValue::Felt(*r)).collect())),
@@ -983,7 +969,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                     "assertion failed".to_string()
                 };
                 let msg_static = self.leak_str(&msg);
-                self.exec.assert_true(cond.as_felt(), msg_static);
+                self.exec.assert_true(cond.as_felt()?, msg_static);
                 Ok(SymValue::Void)
             }
             "psystd::poseidon_hash" => {
@@ -1068,8 +1054,8 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 if args.len() != 2 {
                     bail!("psystd::exp() expects exactly 2 arguments");
                 }
-                let base = self.compile_expr(&args[0])?.as_felt();
-                let power = self.compile_expr(&args[1])?.as_felt();
+                let base = self.compile_expr(&args[0])?.as_felt()?;
+                let power = self.compile_expr(&args[1])?.as_felt()?;
                 let result = self.exec.op_exp(base, power);
                 Ok(SymValue::Felt(result))
             }
@@ -1077,7 +1063,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 if args.len() != 2 {
                     bail!("psystd::split_bits() expects 2 arguments");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let num_bits_val = self.compile_expr(&args[1])?;
                 let num_bits = match &num_bits_val {
                     SymValue::Felt(r) | SymValue::U32(r) if r.is_constant_type() => r.get_constant_value(),
@@ -1099,7 +1085,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 if args.len() != 1 {
                     bail!("psystd::cast_bool() expects 1 argument");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let result = self.exec.op_cast_bool(val);
                 Ok(SymValue::Bool(result))
             }
@@ -1107,7 +1093,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 if args.len() != 1 {
                     bail!("psystd::cast_u32() expects 1 argument");
                 }
-                let val = self.compile_expr(&args[0])?.as_felt();
+                let val = self.compile_expr(&args[0])?.as_felt()?;
                 let result = self.exec.op_cast_u32(val);
                 Ok(SymValue::U32(result))
             }
@@ -1136,7 +1122,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                     bail!("ContractHashMap.get() expects 1 argument (key)");
                 }
                 let key_val = self.compile_expr(&args[0])?;
-                let key = key_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
                 let result = self.exec.imt_get_value(key, base_offset, capacity);
                 Ok(SymValue::Hash(result))
             }
@@ -1145,7 +1131,7 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                     bail!("ContractHashMap.contains() expects 1 argument (key)");
                 }
                 let key_val = self.compile_expr(&args[0])?;
-                let key = key_val.as_hash_coerce();
+                let key = key_val.as_hash_coerce()?;
                 let result = self.exec.imt_contains(key, base_offset, capacity);
                 Ok(SymValue::Bool(result))
             }
