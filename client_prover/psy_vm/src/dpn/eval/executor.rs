@@ -3,7 +3,7 @@
 //! Interprets compiled DPN circuits against concrete state, producing
 //! execution results with state deltas, events, and assertion outcomes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use plonky2::{
     field::{
@@ -346,6 +346,9 @@ pub struct VmExecutor<S: StateBackend> {
     write_overlay: HashMap<(u64, u64, u64), u64>,
     /// IMT write overlay: subsequent IMT reads see previously written values
     imt_write_overlay: HashMap<(u64, u64, [u64; 4]), [u64; 4]>,
+    /// Contracts whose state tree was cleared this transaction: reads that
+    /// miss the write overlay resolve to zero instead of the backend state.
+    cleared_contracts: HashSet<(u64, u64)>,
 }
 
 impl<S: StateBackend> VmExecutor<S> {
@@ -354,12 +357,12 @@ impl<S: StateBackend> VmExecutor<S> {
             state,
             write_overlay: HashMap::new(),
             imt_write_overlay: HashMap::new(),
+            cleared_contracts: HashSet::new(),
         }
     }
 
-    /// Consume the executor and return the underlying state backend.
-    /// The write overlay is NOT merged — call `apply_writes_to_state` first
-    /// if you need the overlay applied (only works for InMemoryStateBackend).
+    /// Consume the executor and return the underlying state backend without applying writes.
+    /// Use `apply_writes_to_state` instead for an InMemoryStateBackend.
     pub fn into_inner(self) -> S {
         self.state
     }
@@ -378,6 +381,8 @@ impl<S: StateBackend> VmExecutor<S> {
     fn read_slot(&self, user_id: u64, contract_id: u64, slot_index: u64) -> anyhow::Result<u64> {
         if let Some(v) = self.write_overlay.get(&(user_id, contract_id, slot_index)) {
             Ok(*v)
+        } else if self.cleared_contracts.contains(&(user_id, contract_id)) {
+            Ok(0)
         } else {
             self.state.get_contract_slot(user_id, contract_id, slot_index)
         }
@@ -407,6 +412,8 @@ impl<S: StateBackend> VmExecutor<S> {
     fn read_imt_value(&self, user_id: u64, contract_id: u64, key: &[u64; 4]) -> [u64; 4] {
         if let Some(v) = self.imt_write_overlay.get(&(user_id, contract_id, *key)) {
             *v
+        } else if self.cleared_contracts.contains(&(user_id, contract_id)) {
+            [0; 4]
         } else {
             self.state.get_imt_value(user_id, contract_id, key)
         }
@@ -418,6 +425,7 @@ impl<S: StateBackend> VmExecutor<S> {
         // Clear write overlays for fresh execution
         self.write_overlay.clear();
         self.imt_write_overlay.clear();
+        self.cleared_contracts.clear();
 
         let mut registers = Registers::new();
         let mut state_reads = Vec::new();
@@ -1216,8 +1224,13 @@ impl<S: StateBackend> VmExecutor<S> {
                 op_counts.state_write_ops += 1;
                 let condition = resolve(c.condition) != 0;
                 if condition {
-                    // Clear all slots for this contract
+                    // Clear all slots for this contract: drop this
+                    // transaction's writes and hide the pre-transaction
+                    // backend state (cleared reads resolve to zero).
+                    self.cleared_contracts.insert((context.user_id, context.contract_id));
                     self.write_overlay
+                        .retain(|&(uid, cid, _), _| !(uid == context.user_id && cid == context.contract_id));
+                    self.imt_write_overlay
                         .retain(|&(uid, cid, _), _| !(uid == context.user_id && cid == context.contract_id));
                 }
                 state_writes.push(StateWrite {
@@ -1718,6 +1731,18 @@ impl<S: StateBackend> VmExecutor<S> {
                 new_value,
             })
             .collect()
+    }
+}
+
+impl VmExecutor<InMemoryStateBackend> {
+    /// Apply the current execution's clear operations and writes to the backend.
+    /// Call only after a successful execution; a failed execution may leave partial writes.
+    pub fn apply_writes_to_state(mut self) -> InMemoryStateBackend {
+        self.state.slots.retain(|&(user_id, contract_id, _), _| !self.cleared_contracts.contains(&(user_id, contract_id)));
+        self.state.imt_store.retain(|&(user_id, contract_id, _), _| !self.cleared_contracts.contains(&(user_id, contract_id)));
+        self.state.apply_overlay(&self.write_overlay);
+        self.state.apply_imt_overlay(&self.imt_write_overlay);
+        self.state
     }
 }
 
@@ -2397,6 +2422,107 @@ mod tests {
         assert!(!executor.write_overlay.contains_key(&(7, 8, 1)));
         assert_eq!(executor.write_overlay.get(&(7, 9, 1)), Some(&22));
         assert_eq!(writes[0].condition, true);
+    }
+
+    #[test]
+    fn clear_entire_tree_does_not_hide_base_state_slots() {
+        // Reproduction: ClearEntireTree only removes this transaction's write
+        // overlay entries; a slot present in the pre-transaction backend
+        // state remains readable afterwards.
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_slot(7, 8, 5, 42);
+        let mut executor = VmExecutor::new(backend);
+        executor.write_overlay.insert((7, 8, 5), 100);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 1);
+        let command = DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: target(0) });
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut counts = OpCounts::default();
+        let mut user_balance = None;
+        executor.process_state_command(&command, 0, &context(), &registers, &mut reads, &mut writes, &mut user_balance, &mut counts).unwrap();
+        let value = executor.read_slot(7, 8, 5).unwrap();
+        assert_eq!(value, 0, "cleared contract must not expose the pre-transaction base state");
+    }
+
+    #[test]
+    fn clear_entire_tree_hides_imt_values() {
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_imt(7, 8, [1; 4], [11; 4]);
+        backend.set_imt(7, 9, [1; 4], [33; 4]);
+        let mut executor = VmExecutor::new(backend);
+        executor.imt_write_overlay.insert((7, 8, [2; 4]), [22; 4]);
+        executor.imt_write_overlay.insert((7, 9, [2; 4]), [44; 4]);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 1);
+        let command = DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+        });
+        executor.process_state_command(&command, 0, &context(), &registers, &mut Vec::new(), &mut Vec::new(), &mut None, &mut OpCounts::default()).unwrap();
+        assert_eq!(executor.read_imt_value(7, 8, &[1; 4]), [0; 4], "backend IMT value survives clear");
+        assert_eq!(executor.read_imt_value(7, 8, &[2; 4]), [0; 4], "overlay IMT value survives clear");
+        assert_eq!(executor.read_imt_value(7, 9, &[1; 4]), [33; 4]);
+        assert_eq!(executor.read_imt_value(7, 9, &[2; 4]), [44; 4]);
+        executor.imt_write_overlay.insert((7, 8, [1; 4]), [55; 4]);
+        assert_eq!(executor.read_imt_value(7, 8, &[1; 4]), [55; 4]);
+    }
+
+    #[test]
+    fn clear_entire_tree_applies_to_backend_before_new_writes() {
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_slot(7, 8, 1, 11);
+        backend.set_slot(7, 8, 2, 22);
+        backend.set_imt(7, 8, [1; 4], [11; 4]);
+        backend.set_imt(7, 8, [2; 4], [22; 4]);
+        backend.set_slot(7, 9, 1, 33);
+        backend.set_imt(7, 9, [1; 4], [33; 4]);
+        let mut executor = VmExecutor::new(backend);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 1);
+        let command = DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+        });
+        executor.process_state_command(&command, 0, &context(), &registers, &mut Vec::new(), &mut Vec::new(), &mut None, &mut OpCounts::default()).unwrap();
+        executor.write_overlay.insert((7, 8, 2), 44);
+        executor.imt_write_overlay.insert((7, 8, [2; 4]), [44; 4]);
+
+        let executor = VmExecutor::new(executor.apply_writes_to_state());
+        assert_eq!(executor.read_slot(7, 8, 1).unwrap(), 0);
+        assert_eq!(executor.read_slot(7, 8, 2).unwrap(), 44);
+        assert_eq!(executor.read_imt_value(7, 8, &[1; 4]), [0; 4]);
+        assert_eq!(executor.read_imt_value(7, 8, &[2; 4]), [44; 4]);
+        assert_eq!(executor.read_slot(7, 9, 1).unwrap(), 33);
+        assert_eq!(executor.read_imt_value(7, 9, &[1; 4]), [33; 4]);
+    }
+
+    #[test]
+    fn clear_entire_tree_keeps_new_writes_and_other_contracts() {
+        use crate::dpn::ops::state_cmd::data::DPNStateCmdClearEntireTree;
+
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let mut backend = InMemoryStateBackend::new();
+        backend.set_slot(7, 8, 5, 42);
+        backend.set_slot(7, 9, 5, 77);
+        let mut executor = VmExecutor::new(backend);
+        let mut registers = Registers::new();
+        registers.set(DPNBuiltInDataType::Target, 0, 1);
+        let command = DPNStateCmd::ClearEntireTree(DPNStateCmdClearEntireTree { condition: target(0) });
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut counts = OpCounts::default();
+        let mut user_balance = None;
+        executor.process_state_command(&command, 0, &context(), &registers, &mut reads, &mut writes, &mut user_balance, &mut counts).unwrap();
+        assert_eq!(executor.read_slot(7, 8, 5).unwrap(), 0, "cleared contract base state must read as zero");
+        executor.write_overlay.insert((7, 8, 5), 100);
+        assert_eq!(executor.read_slot(7, 8, 5).unwrap(), 100, "writes after clear must be readable");
+        assert_eq!(executor.read_slot(7, 9, 5).unwrap(), 77, "clear must not touch other contracts");
     }
 
     #[test]
