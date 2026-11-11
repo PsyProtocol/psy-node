@@ -300,6 +300,74 @@ fn is_stale_state_error(e: &anyhow::Error) -> bool {
     s.contains("Invalid start_user_leaf_hash") || s.contains("stale nonce")
 }
 
+/// Only this provider type is raised while fetching a proving witness. The
+/// submission RPC wraps its errors separately, so an unknown send result (or a
+/// similar error string) never enters this retry. Restart from a clean session
+/// on every retry; keep the caller's policy authorization outside this loop.
+async fn retry_missing_checkpoint_proof<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 0..3 {
+        match operation(attempt).await {
+            Err(error) if attempt < 2 && error.downcast_ref::<psy_provider::lps::MissingCheckpointProof>().is_some() => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            outcome => return outcome,
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
+#[cfg(test)]
+mod checkpoint_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn missing_witness_retries_before_one_successful_submission() {
+        let calls = AtomicUsize::new(0);
+        let submitted = AtomicUsize::new(0);
+        let result = retry_missing_checkpoint_proof(|attempt| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let submitted = &submitted;
+            async move {
+                if attempt == 0 { return Err(psy_provider::lps::MissingCheckpointProof { checkpoint_id: 7 }.into()); }
+                submitted.fetch_add(1, Ordering::SeqCst);
+                Ok("submitted-once")
+            }
+        }).await.unwrap();
+        assert_eq!(result, "submitted-once");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(submitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_submission_and_lookalike_text_are_never_retried() {
+        for message in ["submission timed out", "User tree proof not found for checkpoint_id 7", "invalid proof"] {
+            let calls = AtomicUsize::new(0);
+            let error = retry_missing_checkpoint_proof::<(), _, _>(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Err(anyhow!(message)) }
+            }).await.unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_persistent_typed_gap_is_bounded_and_keeps_its_type() {
+        let calls = AtomicUsize::new(0);
+        let error = retry_missing_checkpoint_proof::<(), _, _>(|_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow::Error::from(psy_provider::lps::MissingCheckpointProof { checkpoint_id: 7 }).context("preparing witness")) }
+        }).await.unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(error.downcast_ref::<psy_provider::lps::MissingCheckpointProof>().unwrap().checkpoint_id, 7);
+    }
+}
+
 /// Token contract ids on the current chain (config-independent constants used
 /// for the convenience transfer/balance helpers). Generic calls can target any
 /// contract id directly.
@@ -429,10 +497,14 @@ impl NetworkWallet {
             method_name: method_name.to_string(),
             inputs,
         };
-        let first = self
-            .session
-            .exec_contract_call(user.pk_hash, ContractCallData::new(vec![call.clone()]))
-            .await;
+        let first = retry_missing_checkpoint_proof(|attempt| {
+            let session = &self.session;
+            let call = call.clone();
+            async move {
+                if attempt > 0 { session.update_circuit_mgr(user.pk_hash).await?; }
+                session.exec_contract_call(user.pk_hash, ContractCallData::new(vec![call])).await
+            }
+        }).await;
         match first {
             Ok(leaf) => Ok(leaf.to_string()),
             Err(e) if is_stale_state_error(&e) => {
@@ -454,7 +526,14 @@ impl NetworkWallet {
 
     async fn claim_batch(&mut self, claims: Vec<ClaimBatchItem>) -> Result<String> {
         let user = self.require_user()?;
-        let first = self.session.claim_batch(user.pk_hash, claims.clone()).await;
+        let first = retry_missing_checkpoint_proof(|attempt| {
+            let session = &self.session;
+            let claims = claims.clone();
+            async move {
+                if attempt > 0 { session.update_circuit_mgr(user.pk_hash).await?; }
+                session.claim_batch(user.pk_hash, claims).await
+            }
+        }).await;
         match first {
             Ok(leaf) => Ok(leaf.to_string()),
             Err(e) if is_stale_state_error(&e) => {
