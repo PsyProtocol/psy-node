@@ -338,6 +338,74 @@ mod ucon_leaf_prove_tests {
         circuit.prove_base(&input).expect("initialized-UCON-leaf fn_circuit must prove");
     }
 
+    fn imt_contains_zero_key_definition() -> DPNFunctionCircuitDefinition {
+        use psy_vm::dpn::ops::{
+            op_types::{encode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType},
+            state_cmd::data::DPNStateCmd,
+        };
+        let target_id = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let constant = |index, value| DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index,
+            op_type: DPNOpType::Constant,
+            inputs: vec![value],
+        };
+        DPNFunctionCircuitDefinition {
+            name: "imt_contains_zero_key".to_string(),
+            method_id: 3375543263,
+            circuit_inputs: Vec::new(),
+            circuit_outputs: Vec::new(),
+            state_commands: vec![DPNStateCmd::contains_self_user_current_imt_contract_state_value(
+                target_id(0),
+                target_id(1),
+                [target_id(2), target_id(3), target_id(4), target_id(5)],
+            )],
+            state_command_resolution_indices: vec![6],
+            assertions: Vec::new(),
+            definitions: vec![constant(0, 0), constant(1, 2), constant(2, 0), constant(3, 0), constant(4, 0), constant(5, 0)],
+            events: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cfc_contains_zero_key_proves_with_vm_sentinel_absence_witness() {
+        use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+        use psy_client_data::{
+            config::store_config::ContractLeafTableStore,
+            dpn::proving_session::DPNProvingSessionSimpleMethodCall,
+            models::contract::contract_leaf::ContractLeafModelCore,
+            qdata::contract::PsyContractLeaf,
+            qstore::controllers::proving_session::PsyLocalProvingSessionStore,
+        };
+        use psy_vm::{dpn::ops::state_cmd::data::DPNStateCmd, vm::exec::PsyCmdInputWitnessResolver};
+
+        // Generate the witness through the real VM resolution path on a virgin map.
+        let store = KVQSimpleMemoryBackingStore::new();
+        let contract = PsyContractLeaf {
+            state_tree_height: F::from_canonical_u64(4),
+            ..Default::default()
+        };
+        ContractLeafTableStore::<KVQSimpleMemoryBackingStore>::set_contract(&store, 0, UCON_LEAF_INDEX, contract).unwrap();
+        let mut session: PsyLocalProvingSessionStore<F, KVQSimpleMemoryBackingStore, PoseidonHash> =
+            PsyLocalProvingSessionStore::new_at(store, F::ZERO, F::from_canonical_u64(7), F::ZERO, F::ZERO, 4);
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(F::from_canonical_u64(UCON_LEAF_INDEX), F::ONE, vec![]))
+            .await
+            .unwrap();
+        let witness = session
+            .resolve_vec(&DPNStateCmd::contains_self_user_current_imt_contract_state_value(0, 2, [0, 0, 0, 0]))
+            .await
+            .unwrap();
+        assert_eq!(witness.result, vec![F::ZERO]);
+
+        let fn_def = imt_contains_zero_key_definition();
+        let circuit = DapenContractFunctionCircuit::<C, D>::new(&fn_def, 4, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false);
+        let mut input = prove_input(QHashOut::ZERO, QHashOut(PoseidonHash::get_zero_hash(4)));
+        input.cmd_witnesses = vec![witness];
+        let proof = circuit.prove_base(&input).expect("zero-key contains transaction must prove via sentinel absence");
+        circuit.minifier_chain.verify(proof).expect("zero-key contains proof must verify");
+    }
+
 }
 
 #[cfg(test)]

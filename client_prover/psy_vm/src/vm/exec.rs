@@ -461,6 +461,108 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn contains_zero_key_witnesses_sentinel_absence_on_virgin_and_written_maps() {
+        use psy_client_data::{config::store_config::ContractLeafTableStore, models::contract::contract_leaf::ContractLeafModelCore, qdata::contract::PsyContractLeaf};
+        let store = KVQSimpleMemoryBackingStore::new();
+        let contract = PsyContractLeaf {
+            state_tree_height: GoldilocksField::from_canonical_u64(4),
+            ..Default::default()
+        };
+        ContractLeafTableStore::<KVQSimpleMemoryBackingStore>::set_contract(&store, 0, 8, contract).unwrap();
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            store,
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let zero_key = [0, 0, 0, 0];
+
+        // Virgin map: the base slot is zero, witnessed by the default sentinel leaf.
+        let virgin = session
+            .resolve_vec(&DPNStateCmd::contains_self_user_current_imt_contract_state_value(0, 2, zero_key))
+            .await
+            .unwrap();
+        assert_eq!(virgin.result, vec![GoldilocksField::ZERO]);
+        let DPNStateCmdWitness::IMTContains(virgin_witness) = &virgin.witness else {
+            panic!("zero-key contains must produce an IMTContains witness")
+        };
+        assert!(!virgin_witness.exists);
+        assert_eq!(virgin_witness.leaf_preimage.key, QHashOut::ZERO);
+        assert_eq!(virgin_witness.merkle_proof.index, 0);
+        assert_eq!(virgin_witness.merkle_proof.value, QHashOut::ZERO);
+
+        // Written map: the materialized sentinel leaf witnesses the zero key's absence.
+        session
+            .resolve_vec(&DPNStateCmd::set_imt_contract_state_value(1, 0, 2, [1, 0, 0, 0], [5, 6, 7, 8]))
+            .await
+            .unwrap();
+        let written = session
+            .resolve_vec(&DPNStateCmd::contains_self_user_current_imt_contract_state_value(0, 2, zero_key))
+            .await
+            .unwrap();
+        assert_eq!(written.result, vec![GoldilocksField::ZERO]);
+        let DPNStateCmdWitness::IMTContains(written_witness) = &written.witness else {
+            panic!("zero-key contains must produce an IMTContains witness")
+        };
+        assert!(!written_witness.exists);
+        assert_eq!(written_witness.leaf_preimage.key, QHashOut::ZERO);
+        assert_eq!(written_witness.leaf_preimage.next_key, QHashOut::from_values(1, 0, 0, 0));
+        assert_ne!(written_witness.merkle_proof.value, QHashOut::ZERO);
+    }
+
+    #[tokio::test]
+    async fn contains_other_user_zero_key_witnesses_sentinel_absence() {
+        use psy_client_data::{config::store_config::{ContractLeafTableStore, UserLeafTableStore}, models::{contract::contract_leaf::ContractLeafModelCore, user::user_leaf::UserLeafModelCore}, qdata::{contract::PsyContractLeaf, user::PsyUserLeaf}};
+        let store = KVQSimpleMemoryBackingStore::new();
+        let contract = PsyContractLeaf {
+            state_tree_height: GoldilocksField::from_canonical_u64(4),
+            ..Default::default()
+        };
+        ContractLeafTableStore::<KVQSimpleMemoryBackingStore>::set_contract(&store, 0, 8, contract).unwrap();
+        UserLeafTableStore::<KVQSimpleMemoryBackingStore>::set_user(&store, 0, PsyUserLeaf::new_user_default(GoldilocksField::from_canonical_u64(7), QHashOut::ZERO, QHashOut::ZERO)).unwrap();
+        let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
+            store,
+            GoldilocksField::ZERO,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::ZERO,
+            GoldilocksField::ZERO,
+            4,
+        );
+        session
+            .init_transaction(DPNProvingSessionSimpleMethodCall::new(
+                GoldilocksField::from_canonical_u64(8),
+                GoldilocksField::ONE,
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let read = session
+            .resolve_vec(&DPNStateCmd::contains_other_user_imt_contract_state_value(7, 8, 4, 0, 2, [0, 0, 0, 0]))
+            .await
+            .unwrap();
+        assert_eq!(read.result, vec![GoldilocksField::ZERO]);
+        let DPNStateCmdWitness::IMTContainsOtherUser(witness) = &read.witness else {
+            panic!("zero-key other-user contains must produce an IMTContainsOtherUser witness")
+        };
+        assert!(!witness.exists);
+        assert_eq!(witness.leaf_preimage.key, QHashOut::ZERO);
+        assert_eq!(witness.state_slot_proof.index, 0);
+        assert_eq!(witness.state_slot_proof.value, QHashOut::ZERO);
+    }
+
+    #[tokio::test]
     async fn resolve_vec_dispatches_every_state_command_family_on_empty_backend() {
         let mut session: PsyLocalProvingSessionStore<GoldilocksField, KVQSimpleMemoryBackingStore, PoseidonHash> = PsyLocalProvingSessionStore::new_at(
             KVQSimpleMemoryBackingStore::new(),
@@ -2044,6 +2146,43 @@ impl<
                     key = %key_hash,
                     "IMT contains lookup params"
                 );
+                if key_hash == QHashOut::ZERO {
+                    // The zero key is the reserved IMT sentinel and is never a
+                    // member; witness its absence with the sentinel leaf at the
+                    // map base slot.
+                    let merkle_proof = self
+                        .get_contract_state_slot(current_contract_id, F::from_canonical_u64(state_slot_base))
+                        .await?;
+                    let witness_leaf = if merkle_proof.value == QHashOut::ZERO {
+                        psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default()
+                    } else {
+                        let sentinel_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
+                            checkpoint_id,
+                            user_id,
+                            contract_id: contract_id_u32,
+                            leaf_index: state_slot_base,
+                        };
+                        let sentinel_leaf = self
+                            .resolve_contract_state_imt_get_leaf_preimage_mut(&sentinel_lookup)
+                            .await
+                            .and_then(|leaf| validate_imt_preimage(leaf, state_slot_base, capacity))?;
+                        anyhow::ensure!(
+                            sentinel_leaf.key == QHashOut::ZERO,
+                            "IMT sentinel preimage at slot {} has nonzero key",
+                            state_slot_base
+                        );
+                        sentinel_leaf
+                    };
+                    return Ok(PsyCmdWithInputAndWitness {
+                        state_cmd: state_cmd.clone(),
+                        result: vec![F::ZERO],
+                        witness: DPNStateCmdWitness::IMTContains(DPNIMTContainsWitness {
+                            exists: false,
+                            leaf_preimage: witness_leaf,
+                            merkle_proof,
+                        }),
+                    });
+                }
                 let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
                     key: c.key,
                     checkpoint_id,
@@ -2245,6 +2384,54 @@ impl<
                         },
                     ))
                     .await?;
+
+                if key_hash == QHashOut::ZERO {
+                    // The zero key is the reserved IMT sentinel and is never a
+                    // member; witness its absence with the sentinel leaf at the
+                    // map base slot.
+                    let state_slot_merkle_proof = self
+                        .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
+                            QSRMerkleCmdGetUserContractStateTreeMerkleProof {
+                                checkpoint_id,
+                                user_id: c.user_id,
+                                contract_id: other_contract_id_u32,
+                                height: validate_contract_state_tree_height(c.contract_state_tree_height)?,
+                                leaf_id: state_slot_base,
+                            },
+                        ))
+                        .await?;
+                    let witness_leaf = if state_slot_merkle_proof.value == QHashOut::ZERO {
+                        psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default()
+                    } else {
+                        let sentinel_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
+                            checkpoint_id,
+                            user_id: c.user_id,
+                            contract_id: other_contract_id_u32,
+                            leaf_index: state_slot_base,
+                        };
+                        let sentinel_leaf = self
+                            .resolve_contract_state_imt_get_leaf_preimage_mut(&sentinel_lookup)
+                            .await
+                            .and_then(|leaf| validate_imt_preimage(leaf, state_slot_base, capacity))?;
+                        anyhow::ensure!(
+                            sentinel_leaf.key == QHashOut::ZERO,
+                            "IMT sentinel preimage at slot {} has nonzero key",
+                            state_slot_base
+                        );
+                        sentinel_leaf
+                    };
+                    return Ok(PsyCmdWithInputAndWitness {
+                        state_cmd: state_cmd.clone(),
+                        result: vec![F::ZERO],
+                        witness: DPNStateCmdWitness::IMTContainsOtherUser(DPNIMTContainsOtherUserWitness {
+                            exists: false,
+                            user_leaf_witness,
+                            contract_state_proof: contract_tree_merkle_proof,
+                            state_slot_proof: state_slot_merkle_proof,
+                            leaf_preimage: witness_leaf,
+                        }),
+                    });
+                }
 
                 match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
                     Ok(found_index) => {

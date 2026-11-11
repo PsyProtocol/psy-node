@@ -2367,13 +2367,21 @@ impl StateReaderGadget {
                     // Membership branch: leaf.key == query_key
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
 
+                    // The zero key is reserved for the sentinel and is never a
+                    // member; its absence is witnessed by the sentinel leaf itself.
+                    let query_key_zero = builder.is_zero_hash(query_key);
+                    let zero_key_membership = builder.and(exists, query_key_zero);
+                    builder.assert_zero(zero_key_membership.target);
+
                     // Non-membership requires a bracketing predecessor or a fully terminated tail.
                     let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
                     let next_key_zero = builder.is_zero_hash(leaf.next_key);
                     let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
                     let is_last = builder.and(next_key_zero, leaf_next_index_zero);
                     let next_ok = builder.or(is_last, query_lt_next);
-                    let non_member = builder.and(pred_lt_query, next_ok);
+                    let sentinel_absence = builder.and(leaf_key_zero, query_key_zero);
+                    let predecessor_ok = builder.or(pred_lt_query, sentinel_absence);
+                    let non_member = builder.and(predecessor_ok, next_ok);
 
                     let one = builder._true();
                     let not_exists = builder.not(exists);
@@ -2537,13 +2545,21 @@ impl StateReaderGadget {
                     // Membership branch: leaf.key == query_key
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
 
+                    // The zero key is reserved for the sentinel and is never a
+                    // member; its absence is witnessed by the sentinel leaf itself.
+                    let query_key_zero = builder.is_zero_hash(query_key);
+                    let zero_key_membership = builder.and(exists, query_key_zero);
+                    builder.assert_zero(zero_key_membership.target);
+
                     // Non-membership requires a bracketing predecessor or a fully terminated tail.
                     let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
                     let next_key_zero = builder.is_zero_hash(leaf.next_key);
                     let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
                     let is_last = builder.and(next_key_zero, leaf_next_index_zero);
                     let next_ok = builder.or(is_last, query_lt_next);
-                    let non_member = builder.and(pred_lt_query, next_ok);
+                    let sentinel_absence = builder.and(leaf_key_zero, query_key_zero);
+                    let predecessor_ok = builder.or(pred_lt_query, sentinel_absence);
+                    let non_member = builder.and(predecessor_ok, next_ok);
 
                     let one = builder._true();
                     let not_exists = builder.not(exists);
@@ -2999,6 +3015,118 @@ mod tests {
         }
         assert_eq!((reader.imt_other_user_read_requests.len(), reader.imt_contains_other_user_requests.len()), (2, 2));
         assert_eq!(reader.imt_external_read_requests.len(), 2);
+    }
+
+    #[test]
+    fn state_reader_imt_contains_zero_key_sentinel_membership_rejected() {
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        imt.insert(&store, key, key).unwrap();
+        let sentinel = imt.get_membership_proof(&store, &QHashOut::ZERO).unwrap();
+        assert_eq!(sentinel.merkle_proof.index, 0);
+        assert_eq!(sentinel.leaf.key, QHashOut::ZERO);
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut dpn = new_test_dpn(&mut builder);
+        for i in 0..4 {
+            let zero = builder.zero();
+            dpn.push_external_target(i, zero);
+        }
+        let root = builder.constant_hash(sentinel.merkle_proof.root.0);
+        let zero = builder.constant_hash(HashOut::ZERO);
+        let stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut reader = StateReaderGadget::new(roots, zero, zero, root, TEST_TREE_HEIGHT, zero, TEST_TREE_HEIGHT, false, stats, zero);
+        let cmd = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue {
+            base_offset: encode_indexed_op_id(DPNBuiltInDataType::Target, 1000),
+            capacity: encode_indexed_op_id(DPNBuiltInDataType::Target, 1001),
+            key: core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)),
+        });
+        let result = reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&result);
+        let data = builder.build::<C>();
+
+        let witness = |exists: F| {
+            let mut pw = PartialWitness::new();
+            reader.imt_contains_leaf_requests[0].set_witness(&mut pw, &sentinel.leaf).unwrap();
+            reader.imt_contains_proofs[0].set_witness_core_proof_q(&mut pw, &sentinel.merkle_proof).unwrap();
+            pw.set_target(reader.imt_contains_exists_targets[0], exists).unwrap();
+            pw
+        };
+
+        // The reserved zero key must never prove as a member via the sentinel leaf.
+        assert!(data.prove(witness(F::ONE)).is_err());
+
+        // Its absence is witnessed by the sentinel leaf itself.
+        let proof = data.prove(witness(F::ZERO)).unwrap();
+        assert_eq!(proof.public_inputs, vec![F::ZERO]);
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn state_reader_other_user_imt_contains_zero_key_sentinel_membership_rejected() {
+        use psy_client_data::qdata::user::PsyUserLeaf;
+        use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
+
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        imt.insert(&store, key, key).unwrap();
+        let sentinel = imt.get_membership_proof(&store, &QHashOut::ZERO).unwrap();
+        assert_eq!(sentinel.merkle_proof.index, 0);
+        assert_eq!(sentinel.leaf.key, QHashOut::ZERO);
+
+        let contract_state_root = sentinel.merkle_proof.root;
+        let mut uct = SimpleMerkleTree::<PoseidonHasher, QHashOut<F>>::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        uct.set_leaf(1, contract_state_root);
+        let uct_proof = uct.get_leaf(1);
+
+        let user_leaf = PsyUserLeaf::new_user_default(F::from_canonical_u64(1), QHashOut::from_values(7, 0, 0, 0), uct.get_root());
+        let mut user_tree = SimpleMerkleTree::<PoseidonHasher, QHashOut<F>>::new(GLOBAL_USER_TREE_HEIGHT);
+        user_tree.set_leaf(1, user_leaf.qfhash::<PoseidonHasher>());
+        let user_proof = user_tree.get_leaf(1);
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut dpn = new_test_dpn(&mut builder);
+        dpn.push_external_target(0, builder.constant(F::from_canonical_u64(1)));
+        dpn.push_external_target(1, builder.constant(F::from_canonical_u64(1)));
+        dpn.push_external_target(2, builder.constant(F::from_canonical_u64(TEST_TREE_HEIGHT as u64)));
+        for i in 3..7 {
+            let zero = builder.zero();
+            dpn.push_external_target(i, zero);
+        }
+        let zero = builder.constant_hash(HashOut::ZERO);
+        let stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut reader = StateReaderGadget::new(roots, zero, zero, zero, TEST_TREE_HEIGHT, zero, TEST_TREE_HEIGHT, false, stats, zero);
+        let target = |index| encode_indexed_op_id(DPNBuiltInDataType::Target, index);
+        let key = [target(3), target(4), target(5), target(6)];
+        let cmd = DPNStateCmd::contains_other_user_imt_contract_state_value(target(0), target(1), target(2), target(1000), target(1001), key);
+        let result = reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&result);
+        let data = builder.build::<C>();
+
+        let witness = |exists: F| {
+            let mut pw = PartialWitness::new();
+            pw.set_hash_target(reader.chain_state_roots.user_tree_root, user_proof.root.0).unwrap();
+            reader.merkle_proofs[0].set_witness_core_proof_q(&mut pw, &user_proof).unwrap();
+            reader.merkle_proofs[1].set_witness_core_proof_q(&mut pw, &uct_proof).unwrap();
+            reader.user_leaves[0].set_witness(&mut pw, &user_leaf).unwrap();
+            let gadget = &reader.imt_contains_other_user_requests[0];
+            gadget.state_slot_proof.set_witness_core_proof_q(&mut pw, &sentinel.merkle_proof).unwrap();
+            gadget.leaf.set_witness(&mut pw, &sentinel.leaf).unwrap();
+            pw.set_target(gadget.exists, exists).unwrap();
+            pw
+        };
+
+        // The reserved zero key must never prove as a member via the sentinel leaf.
+        assert!(data.prove(witness(F::ONE)).is_err());
+
+        // Its absence is witnessed by the sentinel leaf itself.
+        let proof = data.prove(witness(F::ZERO)).unwrap();
+        assert_eq!(proof.public_inputs, vec![F::ZERO]);
+        data.verify(proof).unwrap();
     }
 
     #[test]
