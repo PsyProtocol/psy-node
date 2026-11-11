@@ -101,6 +101,9 @@ impl SymValue {
     pub fn index_into(self, idx_val: &SymValue) -> Result<SymValue> {
         match self {
             SymValue::Array(elements) => {
+                if elements.is_empty() {
+                    bail!("Array index out of bounds (len 0)");
+                }
                 // For compile-time-known indices
                 if let SymValue::Felt(idx_ref) = idx_val {
                     if idx_ref.is_constant_type() {
@@ -746,6 +749,10 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             bail!("Field '{}' is not a ContractStateArray", array_field);
         }
 
+        if contract_field.array_count == Some(0) {
+            bail!("Array index out of bounds (len 0)");
+        }
+
         let elem_size = contract_field.element_felt_size.unwrap();
         let idx = self.compile_expr(idx_expr)?;
 
@@ -777,6 +784,10 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
         if !contract_field.is_array {
             bail!("Field '{}' is not a ContractStateArray", array_field);
+        }
+
+        if contract_field.array_count == Some(0) {
+            bail!("Array index out of bounds (len 0)");
         }
 
         let elem_size = contract_field.element_felt_size.unwrap();
@@ -945,6 +956,10 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             bail!("Field '{}' is not a ContractStateArray", array_field);
         }
 
+        if contract_field.array_count == Some(0) {
+            bail!("Array index out of bounds (len 0)");
+        }
+
         let elem_size = contract_field.element_felt_size.unwrap();
         let idx = self.compile_expr(idx_expr)?;
 
@@ -1003,6 +1018,9 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             .get_field(array_field)
             .ok_or_else(|| anyhow::anyhow!("Unknown contract field: {}", array_field))?
             .clone();
+        if contract_field.array_count == Some(0) {
+            bail!("Array index out of bounds (len 0)");
+        }
         let element_type = match &contract_field.ty {
             ResolvedType::ContractStateArray { element, .. } => match element.as_ref() {
                 ResolvedType::Struct(name) => name.clone(),
@@ -1030,6 +1048,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
         let refs = if let Some(nested_index_expr) = nested_index_expr {
             let nested_element = match &field_type {
+                ResolvedType::Array { count: 0, .. } => bail!("Array index out of bounds (len 0)"),
                 ResolvedType::Array { element, .. } => element.as_ref(),
                 _ => bail!("Field '{}' in struct '{}' is not an array", struct_field, element_type),
             };
@@ -1203,7 +1222,9 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 AccessStep::Index(idx_expr) => {
                     let idx = self.compile_expr(idx_expr)?;
                     // Index into ContractStateArray
-                    if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
+                    if let Some(ResolvedType::ContractStateArray { count: 0, .. }) = current_type {
+                        bail!("Array index out of bounds (len 0)");
+                    } else if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
                         let elem_size = element.felt_size(self.struct_layouts)?;
                         let stride = self.exec.op_const(elem_size as u64);
                         let idx_offset = self.exec.op_mul(idx.as_felt()?, stride);
@@ -1926,6 +1947,61 @@ mod tests {
         let result = std::panic::catch_unwind(|| crate::compile(source));
         let compile_result = result.unwrap_or_else(|e| panic!("compile panicked: {:?}", e.downcast_ref::<String>()));
         assert!(compile_result.is_err(), "array in felt position must be a compile error");
+    }
+
+    #[test]
+    fn empty_array_symbolic_index_is_out_of_bounds() {
+        use super::SymValue;
+        use psy_vm::dpn::ops::{context_trait::DPNContext, exec_context::QExecContext};
+
+        let mut exec = QExecContext::new();
+        let index = SymValue::Felt(exec.add_input());
+        let error = SymValue::Array(vec![]).index_into(&index).unwrap_err();
+        assert!(error.to_string().contains("out of bounds"), "{error}");
+        let error = SymValue::Array(vec![SymValue::Felt(exec.add_input())]).index_into(&index).unwrap_err();
+        assert!(error.to_string().contains("Dynamic indexing"), "{error}");
+    }
+
+    #[test]
+    fn empty_state_array_index_is_out_of_bounds() {
+        for operation in ["self.out = self.items[i];", "self.items[i] = 7;"] {
+            let source = format!(r#"
+                const PSY_TOTAL_USERS: usize = 4;
+                const PSY_TOTAL_CONTRACTS: usize = 4;
+                #[contract]
+                pub struct TestContract {{ pub out: Felt, pub items: ContractStateArray<0, Felt> }}
+                #[contract_implementation]
+                impl TestContract {{
+                    #[contract_method]
+                    pub fn access(&mut self, ctx: &ChainContext, i: Felt) {{ {operation} }}
+                }}
+            "#);
+            let result = std::panic::catch_unwind(|| crate::compile(&source));
+            let error = result.expect("compilation must not panic").expect_err("indexing an empty array must fail");
+            assert!(error.to_string().contains("out of bounds"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn empty_nested_state_array_field_index_is_out_of_bounds() {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+            #[derive(FeltSized)]
+            pub struct Bucket { pub values: [Felt; 0] }
+            #[contract]
+            pub struct TestContract { pub items: ContractStateArray<4, Bucket> }
+            #[contract_implementation]
+            impl TestContract {
+                #[contract_method]
+                pub fn access(&mut self, ctx: &ChainContext, i: Felt) {
+                    self.items[0].values[i] = 7;
+                }
+            }
+        "#;
+        let result = std::panic::catch_unwind(|| crate::compile(source));
+        let error = result.expect("compilation must not panic").expect_err("indexing an empty array must fail");
+        assert!(error.to_string().contains("out of bounds"), "{error:#}");
     }
 
     #[test]

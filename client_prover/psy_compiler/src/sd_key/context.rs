@@ -736,6 +736,10 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
             bail!("Field '{}' is not a ContractStateArray", array_field);
         }
 
+        if contract_field.array_count == Some(0) {
+            bail!("Array index out of bounds (len 0)");
+        }
+
         let elem_size = contract_field.element_felt_size.unwrap();
         let idx = self.compile_expr(idx_expr)?;
 
@@ -846,7 +850,9 @@ impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
                 }
                 AccessStep::Index(idx_expr) => {
                     let idx = self.compile_expr(idx_expr)?;
-                    if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
+                    if let Some(ResolvedType::ContractStateArray { count: 0, .. }) = current_type {
+                        bail!("Array index out of bounds (len 0)");
+                    } else if let Some(ResolvedType::ContractStateArray { element, .. }) = current_type {
                         let elem_size = element.felt_size(self.struct_layouts)?;
                         let stride = self.exec.op_const(elem_size as u64);
                         let idx_offset = self.exec.op_mul(idx.as_felt()?, stride);
