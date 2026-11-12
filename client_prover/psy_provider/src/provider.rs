@@ -191,6 +191,24 @@ fn deadline_after(timeout_secs: Option<u64>) -> Option<WaitDeadline> {
     timeout_secs.map(|secs| js_sys::Date::now() + (secs as f64 * 1000.0))
 }
 
+/// Upper bound for one JSON-RPC exchange. A GPU prove proxy answers in seconds;
+/// a call that exceeds it fails instead of holding its caller for minutes.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Native RPC client with bounded requests and TCP keepalive probes (30 s idle,
+/// then every 10 s, 3 retries). A peer that vanished without a FIN or RST is
+/// then detected within about a minute instead of at the request timeout.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn native_rpc_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(RPC_REQUEST_TIMEOUT)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_keepalive_interval(Duration::from_secs(10))
+        .tcp_keepalive_retries(3u32)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn deadline_expired(deadline: Option<WaitDeadline>) -> bool {
     deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -355,12 +373,9 @@ impl RpcProvider {
         // Configure HTTP client with connection timeout and connection pool settings
         // to handle high-concurrency scenarios better
         #[cfg(not(target_arch = "wasm32"))]
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(360))
+        let client = native_rpc_client_builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(500)
-            .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
             .http1_only() // Force HTTP/1.1 to avoid potential HTTP/2 connection issues
             .build()
@@ -432,7 +447,7 @@ macro_rules! psy_rpc_call_back {
             let request_builder = if $instance.has_endpoint_clients() {
                 client.post(url_str.clone())
             } else {
-                client.post(url_str.clone()).timeout(std::time::Duration::from_secs(360))
+                client.post(url_str.clone()).timeout($crate::provider::RPC_REQUEST_TIMEOUT)
             };
             #[cfg(target_arch = "wasm32")]
             let request_builder = client.post(url_str.clone());
@@ -1393,6 +1408,11 @@ where
     C::Hasher: AlgebraicHasher<C::F>,
 {
     pub async fn new_with_config(proof_proxy_url: String) -> anyhow::Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = native_rpc_client_builder()
+            .build()
+            .map_err(|e| anyhow::format_err!("Failed to create HTTP client: {}", e))?;
+        #[cfg(target_arch = "wasm32")]
         let client = Client::new();
 
         let response = client
@@ -1433,7 +1453,7 @@ where
 {
     pub fn new_with_config(proof_proxy_url: String) -> anyhow::Result<Self> {
         let blocking_client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(360))
+            .timeout(RPC_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| anyhow::format_err!("Failed to create blocking client: {}", e))?;
 
@@ -1457,6 +1477,11 @@ where
             ResponseResult::Error(e) => return Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = native_rpc_client_builder()
+            .build()
+            .map_err(|e| anyhow::format_err!("Failed to create HTTP client: {}", e))?;
+        #[cfg(target_arch = "wasm32")]
         let client = Client::new();
         Ok(Self {
             client: Arc::new(client),
