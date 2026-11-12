@@ -193,6 +193,11 @@ impl ProveProxyClient {
         Self {
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600)) // proof generation can be slow
+                // Probe an idle connection so a peer that vanished without a FIN or
+                // RST fails the call within about a minute, not at the timeout.
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_keepalive_interval(Duration::from_secs(10))
+                .tcp_keepalive_retries(3u32)
                 .build()
                 .expect("failed to build reqwest client"),
             base_url: base_url.trim_end_matches('/').to_string(),
