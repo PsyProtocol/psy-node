@@ -35,9 +35,18 @@ impl LoadedGuardianConfig {
 
     pub fn config(&self) -> &guardian_common::protocol::GuardianConfig { &self.root }
 
+    /// Serves Guardian history from its own task: the caller selects this
+    /// against work that can hold its task for minutes (trace proving), and the
+    /// listener must keep accepting meanwhile. Dropping the future stops it.
     pub async fn serve_history(&self) -> anyhow::Result<()> {
+        struct AbortOnDrop(tokio::task::JoinHandle<Result<(), GuardianSignError>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) { self.0.abort(); }
+        }
         let listen = self.root.network.guardian_history.as_ref().context("guardian history missing")?.listen_address.to_string();
-        crate::guardian::service::serve_relayer_history(&listen, self.db.clone()).await.map_err(Into::into)
+        let db = self.db.clone();
+        let mut task = AbortOnDrop(tokio::spawn(async move { crate::guardian::service::serve_relayer_history(&listen, db).await }));
+        (&mut task.0).await.context("guardian history task failed")?.map_err(Into::into)
     }
 }
 
@@ -1370,6 +1379,52 @@ fn fresh_account(session: &GuardianSession, identity: protocol::Hash4, checkpoin
     }
 }
 
+/// Remote trace proofs in flight at once. Each CFC job is one Prove Proxy call.
+const TRACE_PROOF_CONCURRENCY: usize = 4;
+
+/// Proves the UPS start, every CFC step and the ZkSign of a trace; the EndCap
+/// aggregates them afterwards. Every CFC seed carries its own proof-tree
+/// snapshot, so the steps do not depend on each other and are proved
+/// concurrently. The multisig ZkSign proves locally and blocks its thread, so
+/// on a multi-threaded runtime it runs on a scoped thread while this thread
+/// drives the remote jobs.
+async fn prove_trace_jobs(
+    wallet: &psy_prover::session::WalletSession,
+    trace: &psy_prover::trace::TxTrace,
+    schedule: &psy_prover::trace::proof_schedule::TraceProofSchedule,
+) -> anyhow::Result<Vec<psy_prover::session::TraceProofJobOutput>> {
+    use futures::TryStreamExt;
+    let public_key = trace.meta.public_key;
+    let started = std::time::Instant::now();
+    let remote = async {
+        let steps = futures::stream::iter(schedule.seeds.iter())
+            .map(|seed| wallet.prove_cfc_job_with_seed(public_key, trace, seed))
+            .buffer_unordered(TRACE_PROOF_CONCURRENCY)
+            .try_collect::<Vec<_>>();
+        let (start, steps) = futures::try_join!(wallet.prove_ups_start_job(public_key, trace), steps)?;
+        anyhow::Ok(std::iter::once(start).chain(steps).collect::<Vec<_>>())
+    };
+    let runtime = tokio::runtime::Handle::try_current().ok()
+        .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let (remote, zksign) = match runtime {
+        Some(handle) => tokio::task::block_in_place(|| std::thread::scope(|scope| {
+            let zksign = scope.spawn(|| handle.block_on(wallet.prove_zksign_job(public_key, trace)));
+            let remote = handle.block_on(remote);
+            let zksign = zksign.join().unwrap_or_else(|_| Err(anyhow::anyhow!("ZkSign proving thread panicked")));
+            (remote, zksign)
+        })),
+        None => {
+            let remote = remote.await;
+            (remote, wallet.prove_zksign_job(public_key, trace).await)
+        }
+    };
+    let mut outputs = remote?;
+    outputs.push(zksign?);
+    tracing::info!(cfc_steps = schedule.seeds.len(), concurrency = TRACE_PROOF_CONCURRENCY,
+        elapsed_ms = started.elapsed().as_millis() as u64, "trace step proofs finished");
+    Ok(outputs)
+}
+
 pub(crate) async fn prove_pending_request(
     wallet: &mut psy_prover::session::WalletSession,
     client: &GuardianClient,
@@ -1406,11 +1461,7 @@ pub(crate) async fn prove_pending_request(
     }
     trace.contract_codes = crate::guardian::verify::load_trace_contract_codes(&wallet.st_provider, &trace).await?;
     let schedule = wallet.prepare_trace_proof_schedule(&trace).await?;
-    let mut outputs = vec![wallet.prove_ups_start_job(trace.meta.public_key, &trace).await?];
-    for seed in &schedule.seeds {
-        outputs.push(wallet.prove_cfc_job_with_seed(trace.meta.public_key, &trace, seed).await?);
-    }
-    outputs.push(wallet.prove_zksign_job(trace.meta.public_key, &trace).await?);
+    let outputs = prove_trace_jobs(wallet, &trace, &schedule).await?;
     let output = wallet.prove_endcap_job_from_outputs(trace.meta.public_key, &trace, &schedule, outputs).await?;
     let proof = match output {
         psy_prover::session::TraceProofJobOutput::EndCap { proof, .. } => proof,
