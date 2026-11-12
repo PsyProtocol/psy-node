@@ -403,6 +403,15 @@ impl QParthProofStoreWriter for InMemoryTempStore {
         self.proof_store.remove(&unique_pending_id);
         Ok(())
     }
+    async fn delete_proofs_for_job_ids<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, unique_pending_id: u64, job_ids: &[J]) -> anyhow::Result<()> {
+        // An emptied bucket stays: dropping it could race a concurrent put that already holds it.
+        if let Some(bucket) = self.proof_store.get(&unique_pending_id).map(|bucket| bucket.clone()) {
+            for job_id in job_ids {
+                bucket.remove(&(*job_id).into().to_vec());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
