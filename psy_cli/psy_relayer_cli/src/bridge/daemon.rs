@@ -972,6 +972,25 @@ fn is_temporary_rpc_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.downcast_ref::<guardian_common::protocol::GuardianSignError>() == Some(&guardian_common::protocol::GuardianSignError::L2RpcUnavailable))
 }
 
+/// The Realm has not stored that checkpoint's proof yet; it appears once the Realm catches up.
+/// Session verification reports the same race as `CheckpointProofUnavailable`.
+fn is_missing_checkpoint_proof(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<psy_provider::lps::MissingCheckpointProof>().is_some()
+            || cause.downcast_ref::<guardian_common::protocol::GuardianSignError>()
+                == Some(&guardian_common::protocol::GuardianSignError::CheckpointProofUnavailable)
+    })
+}
+
+/// The Realm edge did not confirm an EndCap delivery: it was busy, or it already holds a copy
+/// that is not included yet. Recovery re-checks the authenticated inclusion before any resend.
+fn is_end_cap_delivery_unconfirmed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<psy_provider::provider::EndCapSubmitBusy>().is_some()
+            || cause.downcast_ref::<psy_provider::provider::EndCapAlreadySubmitted>().is_some()
+    })
+}
+
 async fn run_multichain(
     config: BridgeProposeDaemonConfig,
     chain_configs: Vec<L1Config>,
@@ -1103,6 +1122,16 @@ async fn run_multichain(
                     if state.pending_finalization_range.is_none() {
                         (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
                     }
+                }
+                Err(error) if is_end_cap_delivery_unconfirmed(&error) => {
+                    tracing::warn!(%error, "pending guardian recovery has an unconfirmed EndCap delivery; retrying next round");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                Err(error) if is_missing_checkpoint_proof(&error) => {
+                    tracing::warn!(%error, "pending guardian recovery is waiting for a checkpoint proof; retrying next round");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
                 }
                 Err(error) if is_temporary_rpc_error(&error) => {
                     tracing::warn!(%error, error_category = transport_error_category(&error), "pending guardian recovery hit temporary RPC unavailability; retrying next round");
@@ -3229,6 +3258,38 @@ async fn build_l2_call_plan(
     })
 }
 
+const SNAPSHOT_NOT_READY_ATTEMPTS: u32 = 3;
+const SNAPSHOT_NOT_READY_RETRY_SECS: u64 = 3;
+/// psy-services reason for a snapshot count its indexer has not reached yet.
+const SNAPSHOT_REASON_INDEXER_NOT_READY: &str = "indexer_not_ready";
+
+fn deposit_snapshot_not_ready(snapshot: &crate::bridge::api_client::DepositTreeRootState) -> bool {
+    !snapshot.found && snapshot.reason.as_deref() == Some(SNAPSHOT_REASON_INDEXER_NOT_READY)
+}
+
+/// Builds the set_chain_root call for an exact Services snapshot. A snapshot the
+/// indexer has not reached yet defers only this chain (`None`). Any other missing
+/// snapshot (for example a missing tree node), a count mismatch or a missing root
+/// is an error, because it does not clear by waiting.
+fn exact_deposit_snapshot_call(
+    chain_index: u8,
+    deposit_append_target: u32,
+    snapshot: &crate::bridge::api_client::DepositTreeRootState,
+) -> anyhow::Result<Option<ContractCallArgs>> {
+    if deposit_snapshot_not_ready(snapshot) {
+        return Ok(None);
+    }
+    ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}: {}",
+        chain_index, deposit_append_target, snapshot.reason.as_deref().unwrap_or("no reason given"));
+    let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
+    ensure!(snapshot_count == u64::from(deposit_append_target), "deposit snapshot count mismatch for chain {}", chain_index);
+    Ok(Some(build_set_chain_root_call(
+        u64::from(chain_index),
+        snapshot_count,
+        snapshot.deposit_root.as_deref().context("deposit snapshot missing root")?,
+    )?))
+}
+
 fn finalized_deposit_append_target(l2_count: u32, pending: u32, finalized_pending: u32) -> u32 {
     pending.min(finalized_pending).min(l2_count.saturating_add(MAX_DEPOSITS_PER_L2_ROUND))
 }
@@ -3301,20 +3362,28 @@ async fn build_multichain_l2_plan(
                     "finalized deposit admission limited for bounded L1 verification");
             }
             if deposit_append_target > l2_count {
-                let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
-                    &http,
-                    &base.services_url,
-                    u64::from(chain.chain_index),
-                    u64::from(deposit_append_target),
-                ).await?;
-                ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, deposit_append_target);
-                let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
-                ensure!(snapshot_count == u64::from(deposit_append_target), "deposit snapshot count mismatch for chain {}", chain.chain_index);
-                calls.push(build_set_chain_root_call(
-                    u64::from(chain.chain_index),
-                    snapshot_count,
-                    snapshot.deposit_root.as_deref().context("deposit snapshot missing root")?,
-                )?);
+                // The Services indexer usually trails a just-finalized deposit by
+                // seconds; retry briefly before deferring the chain to a later round.
+                let mut attempt = 1;
+                let snapshot = loop {
+                    let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
+                        &http,
+                        &base.services_url,
+                        u64::from(chain.chain_index),
+                        u64::from(deposit_append_target),
+                    ).await?;
+                    if !deposit_snapshot_not_ready(&snapshot) || attempt == SNAPSHOT_NOT_READY_ATTEMPTS {
+                        break snapshot;
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(SNAPSHOT_NOT_READY_RETRY_SECS)).await;
+                };
+                match exact_deposit_snapshot_call(chain.chain_index, deposit_append_target, &snapshot)? {
+                    Some(call) => calls.push(call),
+                    None => tracing::warn!(chain_index=chain.chain_index, l2_count, finalized_pending,
+                        deposit_append_target, reason=snapshot.reason.as_deref().unwrap_or("none"),
+                        "deposit snapshot not indexed yet; chain deferred, other chains remain eligible"),
+                }
             }
             if finalized_pending < pending {
                 tracing::info!(chain_index=chain.chain_index, pending, finalized_pending, l2_count,
@@ -4206,8 +4275,8 @@ async fn authenticated_account(provider: &RpcProvider, config: &guardian_common:
     let roots = provider.get_checkpoint_global_state_roots(checkpoint).await?;
     let path = provider.get_checkpoint_tree_merkle_proof(head, checkpoint).await?;
     crate::guardian::verify::verify_checkpoint(checkpoint, &leaf, &roots, &path, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let user = provider.get_user_leaf_data(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
     let user_path = provider.get_user_tree_merkle_proof(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
+    let user = provider.get_user_leaf_data(checkpoint, guardian_common::protocol::BRIDGE_USER_ID).await?;
     crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, guardian_common::protocol::BRIDGE_USER_ID, user_path.value, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     if user_path.value == QHashOut::ZERO { return Ok((user_path.value, 0)); }
     ensure!(user_path.value == user.qfhash::<PsyHasher>() && user.public_key == config.account_public_key().map_err(|error| anyhow::anyhow!(error))? && user.user_id.to_canonical_u64() == guardian_common::protocol::BRIDGE_USER_ID, "authenticated account identity mismatch");
@@ -4240,6 +4309,30 @@ async fn first_nonce_checkpoint(provider: &RpcProvider, config: &guardian_common
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn unconfirmed_end_cap_delivery_is_recognised_through_context_only_when_typed() {
+        let busy: anyhow::Error = psy_provider::provider::EndCapSubmitBusy { rpc_error: "generation changed".into() }.into();
+        let message = busy.to_string();
+        assert!(is_end_cap_delivery_unconfirmed(&busy.context("submit guardian operation")));
+        assert!(!is_end_cap_delivery_unconfirmed(&anyhow::anyhow!(message)));
+        let stored: anyhow::Error = psy_provider::provider::EndCapAlreadySubmitted { user_id: 524288, unique_pending_id: 9 }.into();
+        assert!(is_end_cap_delivery_unconfirmed(&stored.context("submit guardian operation")));
+        assert!(!is_end_cap_delivery_unconfirmed(&psy_provider::lps::MissingCheckpointProof { checkpoint_id: 1 }.into()));
+        assert!(!is_temporary_rpc_error(&psy_provider::provider::EndCapSubmitBusy { rpc_error: String::new() }.into()));
+    }
+
+    #[test]
+    fn missing_checkpoint_proof_is_recognised_through_context_only_when_typed() {
+        let typed: anyhow::Error = psy_provider::lps::MissingCheckpointProof { checkpoint_id: 84987 }.into();
+        assert!(is_missing_checkpoint_proof(&typed));
+        assert!(is_missing_checkpoint_proof(&typed.context("submit guardian operation")));
+        assert!(!is_missing_checkpoint_proof(&anyhow::anyhow!("User tree proof not found for checkpoint_id 84987")));
+        assert!(!is_temporary_rpc_error(&psy_provider::lps::MissingCheckpointProof { checkpoint_id: 1 }.into()));
+        let unavailable: anyhow::Error = guardian_common::protocol::GuardianSignError::CheckpointProofUnavailable.into();
+        assert!(is_missing_checkpoint_proof(&unavailable.context("verify session")));
+        assert!(!is_missing_checkpoint_proof(&guardian_common::protocol::GuardianSignError::StateMismatch.into()));
+    }
 
     fn deposit_append_call(tag: u8, size: usize) -> Call3 {
         Call3 { target: Address::repeat_byte(tag), allowFailure: false, callData: Bytes::from(vec![tag; size]) }
@@ -4399,6 +4492,54 @@ mod tests {
 
     fn test_l1() -> Vec<guardian_common::protocol::ChainEndpoint> {
         vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }]
+    }
+
+    fn deposit_snapshot(found: bool, count: Option<u64>, root: Option<String>) -> crate::bridge::api_client::DepositTreeRootState {
+        snapshot_with_reason(found, (!found).then(|| "indexer_not_ready".to_string()), count, root)
+    }
+
+    fn snapshot_with_reason(found: bool, reason: Option<String>, count: Option<u64>, root: Option<String>) -> crate::bridge::api_client::DepositTreeRootState {
+        crate::bridge::api_client::DepositTreeRootState {
+            found,
+            reason,
+            source_chain_index: Some(1),
+            snapshot_deposit_count: count,
+            target_deposit_count: None,
+            tree_count: None,
+            deposit_root: root,
+        }
+    }
+
+    #[test]
+    fn exact_deposit_snapshot_call_defers_an_unindexed_chain() {
+        // Services reports the requested count without a root while its indexer trails.
+        let call = exact_deposit_snapshot_call(1, 2625, &deposit_snapshot(false, Some(2625), None)).unwrap();
+        assert!(call.is_none());
+    }
+
+    #[test]
+    fn exact_deposit_snapshot_call_fails_on_a_snapshot_that_waiting_cannot_fix() {
+        for reason in [Some("indexer_node_missing".to_string()), None] {
+            let snapshot = snapshot_with_reason(false, reason, Some(2625), None);
+            assert!(!deposit_snapshot_not_ready(&snapshot));
+            assert!(exact_deposit_snapshot_call(1, 2625, &snapshot).is_err());
+        }
+        assert!(exact_deposit_snapshot_call(1, 2625, &snapshot_with_reason(true, None, None, Some(format!("0x{}", "ab".repeat(32))))).is_err());
+    }
+
+    #[test]
+    fn exact_deposit_snapshot_call_builds_the_exact_root() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let call = exact_deposit_snapshot_call(1, 2625, &deposit_snapshot(true, Some(2625), Some(root.clone()))).unwrap();
+        let (call, expected) = (call.unwrap(), build_set_chain_root_call(1, 2625, &root).unwrap());
+        assert_eq!((call.contract_id, call.method_name, call.inputs), (expected.contract_id, expected.method_name, expected.inputs));
+    }
+
+    #[test]
+    fn exact_deposit_snapshot_call_rejects_a_wrong_count_or_missing_root() {
+        let root = format!("0x{}", "ab".repeat(32));
+        assert!(exact_deposit_snapshot_call(1, 2625, &deposit_snapshot(true, Some(2624), Some(root))).is_err());
+        assert!(exact_deposit_snapshot_call(1, 2625, &deposit_snapshot(true, Some(2625), None)).is_err());
     }
 
     #[test]

@@ -217,8 +217,8 @@ async fn fetch_tree_root_witness(
     let contract_proof = provider
         .get_user_contract_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id)
         .await?;
-    let user_leaf = provider.get_user_leaf_data(checkpoint_id, owner_user_id).await?;
     let user_tree_proof = provider.get_user_tree_merkle_proof(checkpoint_id, owner_user_id).await?;
+    let user_leaf = provider.get_user_leaf_data(checkpoint_id, owner_user_id).await?;
 
     Ok(TreeRootInContractStateWitnessInput {
         owner_user_id,
@@ -1494,8 +1494,8 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         let contract_proof = provider
             .get_user_contract_tree_merkle_proof(cp, uid, contract_id)
             .await?;
-        let user_leaf = provider.get_user_leaf_data(cp, uid).await?;
         let user_tree_proof = provider.get_user_tree_merkle_proof(cp, uid).await?;
+        let user_leaf = provider.get_user_leaf_data(cp, uid).await?;
 
         Ok(BridgeAggSlotWitness {
             owner_user_id: uid,
