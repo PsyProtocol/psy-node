@@ -328,6 +328,17 @@ impl MultisigSignatureCircuit {
         Ok(pw)
     }
 
+    /// Accepts a proof produced elsewhere (a prove proxy) only if it verifies
+    /// against this circuit and its public input binds this sighash to this
+    /// account's public key parameter, as `prove` would.
+    pub fn verify(&self, proof: &PsyProof, input: &MultisigSignatureInput, sighash: QHashOut<F>) -> anyhow::Result<()> {
+        use plonky2::plonk::config::Hasher;
+        let param = input.witness.account.public_key_param()?;
+        let expected = PoseidonHash::two_to_one(sighash.0, param.0);
+        anyhow::ensure!(proof.public_inputs == expected.elements, "multisig proof public input mismatch");
+        self.minifier_chain.verify(proof.clone())
+    }
+
     pub fn get_fingerprint(&self) -> QHashOut<F> {
         QHashOut(self.minifier_chain.get_fingerprint())
     }
@@ -604,6 +615,21 @@ mod tests {
             witness: MultisigSignatureWitness { account, start_state, end_state, sig_data, sign_context, start_session_user_leaf, nonce },
             signatures: MultisigSignatures { member_indices: vec![0, 2], signatures: signatures.to_vec() },
         }, sighash)
+    }
+
+    #[test]
+    fn verify_accepts_own_proof_and_rejects_other_sighash_or_tampering() {
+        let circuit = MultisigSignatureCircuit::new().unwrap();
+        let (input, sighash) = full_input(&circuit, true, false);
+        // The prove proxy receives the input as JSON-RPC params.
+        let input: MultisigSignatureInput = serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+        let proof = circuit.prove(&input, sighash).unwrap();
+        circuit.verify(&proof, &input, sighash).unwrap();
+        // A valid proof for another sighash must not be accepted for this one.
+        assert!(circuit.verify(&proof, &input, QHashOut::from_values(1, 2, 3, 4)).is_err());
+        let mut tampered = proof.clone();
+        tampered.public_inputs[0] += F::ONE;
+        assert!(circuit.verify(&tampered, &input, sighash).is_err());
     }
 
     #[test]
