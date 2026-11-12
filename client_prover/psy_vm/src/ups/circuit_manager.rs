@@ -1,6 +1,7 @@
 use anyhow;
 use maybe_async::maybe_async;
 use plonky2::{
+    field::goldilocks_field::GoldilocksField,
     hash::hash_types::HashOut,
     plonk::{
         circuit_data::VerifierOnlyCircuitData,
@@ -33,7 +34,7 @@ use psy_crypto::{
 
 use crate::{
     dpn::vm::def::DPNFunctionCircuitDefinition,
-    ups::{sd_key::SDKeyDpnCircuitWitnessInput, signature::SDKeyPlonky2CircuitWitnessInput},
+    ups::{multisig::MultisigSignatureInput, sd_key::SDKeyDpnCircuitWitnessInput, signature::SDKeyPlonky2CircuitWitnessInput},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
 use psy_client_data::dpn::sd_key::SDKeyConfig;
@@ -140,6 +141,16 @@ where
         input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
+    /// Proves a multisig account's signature remotely. `Ok(None)` means this
+    /// manager has no remote prover and the caller proves locally.
+    async fn prove_multisig_sign(
+        &self,
+        _input: &MultisigSignatureInput,
+        _sig_hash: QHashOut<GoldilocksField>,
+    ) -> anyhow::Result<Option<ProofWithPublicInputs<C::F, C, D>>> {
+        Ok(None)
+    }
 
     async fn prove_ups_end_cap(
         &self,
@@ -324,6 +335,14 @@ where
         (**self)
             .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
+    }
+
+    async fn prove_multisig_sign(
+        &self,
+        input: &MultisigSignatureInput,
+        sig_hash: QHashOut<GoldilocksField>,
+    ) -> anyhow::Result<Option<ProofWithPublicInputs<C::F, C, D>>> {
+        (**self).prove_multisig_sign(input, sig_hash).await
     }
 
     async fn prove_ups_end_cap(
@@ -543,6 +562,14 @@ where
         (**self)
             .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
+    }
+
+    async fn prove_multisig_sign(
+        &self,
+        input: &MultisigSignatureInput,
+        sig_hash: QHashOut<GoldilocksField>,
+    ) -> anyhow::Result<Option<ProofWithPublicInputs<C::F, C, D>>> {
+        (**self).prove_multisig_sign(input, sig_hash).await
     }
 
     async fn prove_ups_end_cap(

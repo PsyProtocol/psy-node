@@ -2011,6 +2011,27 @@ where
         Err(anyhow::format_err!("plonky2 software defined sign not yet implemented over RPC"))
     }
 
+    async fn prove_multisig_sign(
+        &self,
+        input: &psy_vm::ups::multisig::MultisigSignatureInput,
+        sig_hash: QHashOut<GoldilocksField>,
+    ) -> anyhow::Result<Option<ProofWithPublicInputs<C::F, C, D>>> {
+        tracing::info!("prove multisig sign");
+        let response = psy_rpc_call_back!(
+            self,
+            &self.proof_proxy_url,
+            RequestParams::<C::F>::MultisigSignatureProof(crate::request::MultisigSignatureProofRPCRequest {
+                input: input.clone(),
+                sig_hash,
+            }),
+            ProofWithPublicInputs<C::F, C, D>
+        );
+        match response.result {
+            ResponseResult::Success(proof) => Ok(Some(proof)),
+            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
+    }
+
     async fn prove_ups_end_cap(
         &self,
         _circuit_info: &SessionCircuitInfoStore<C::F>,

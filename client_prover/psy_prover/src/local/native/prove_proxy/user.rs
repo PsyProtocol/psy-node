@@ -30,9 +30,9 @@ use psy_provider::{
     provider::{LocalCommonCircuitsData, QCommonCircuitData, RpcProvider},
     request::{QRegisterSDKeyDPNCircuitRPCRequest, QRegisterSDKeyPlonky2CircuitRPCRequest},
 };
-use psy_ups_circuit::circuit_manager::core::PsyUPSStepCircuitManager;
+use psy_ups_circuit::{circuit_manager::core::PsyUPSStepCircuitManager, signature::multisig::MultisigSignatureCircuit};
 use psy_vm::{
-    ups::{circuit_manager::UPSCircuitManager, signature::SDKeyPlonky2CircuitWitnessInput},
+    ups::{circuit_manager::UPSCircuitManager, multisig::MultisigSignatureInput, signature::SDKeyPlonky2CircuitWitnessInput},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -143,6 +143,13 @@ pub trait ProveProxyUserRpc {
         sig_hash: QHashOut<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
 
+    #[method(name = "prove_multisig_sign")]
+    async fn prove_multisig_sign(
+        &self,
+        input: MultisigSignatureInput,
+        sig_hash: QHashOut<F>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
+
     // #[method(name = "finalize_tree")]
     // async fn finalize_tree(&self) -> Result<ProofWithPublicInputs<F, C, D>,
     // ErrorObjectOwned>;
@@ -229,10 +236,35 @@ pub struct UserProveProvider {
     pub circuit_manager: Arc<PsyUPSStepCircuitManager<C, D>>,
     pub circuit_info: Arc<SessionCircuitInfoStore<F>>,
     pub circuits_data: LocalCommonCircuitsData<F>,
+    /// Built on the first multisig request (two secp256k1 verifications),
+    /// then reused.
+    pub multisig_circuit: Arc<std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>>,
+}
 
+/// The cached multisig circuit, built on first use. A panic during a build
+/// leaves the slot empty, so the next caller builds again.
+fn multisig_circuit(cell: &std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>) -> anyhow::Result<Arc<MultisigSignatureCircuit>> {
+    let mut slot = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(circuit) = slot.as_ref() {
+        return Ok(circuit.clone());
+    }
+    let circuit = Arc::new(MultisigSignatureCircuit::new()?);
+    *slot = Some(circuit.clone());
+    Ok(circuit)
 }
 
 impl UserProveProvider {
+    /// Builds the multisig circuit in the background so the first request
+    /// does not pay for it inside the client's request timeout.
+    pub fn warm_multisig_circuit(&self) {
+        let cell = self.multisig_circuit.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = multisig_circuit(&cell) {
+                tracing::warn!(%error, "multisig circuit warm-up failed; building on first request");
+            }
+        });
+    }
+
     pub async fn new_with_config(rpc_config: psy_config::NetworkConfigGoldilocks, network_magic: u64) -> anyhow::Result<Self> {
         let rpc_provider = RpcProvider::new_with_config(&rpc_config)?;
 
@@ -364,7 +396,7 @@ impl UserProveProvider {
             circuit_manager: Arc::new(circuit_manager),
             circuit_info: Arc::new(circuit_info),
             circuits_data,
-
+            multisig_circuit: Default::default(),
         })
     }
 
@@ -785,6 +817,19 @@ impl ProveProxyUserRpcServer for UserProveProvider {
             .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
             .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn prove_multisig_sign(
+        &self,
+        input: MultisigSignatureInput,
+        sig_hash: QHashOut<F>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
+        tracing::debug!("prove_multisig_sign");
+        let cell = self.multisig_circuit.clone();
+        tokio::task::spawn_blocking(move || multisig_circuit(&cell)?.prove(&input, sig_hash))
+        .await
+        .map_err(|e| ErrorObject::owned(1, format!("multisig proving task failed: {e}"), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
     async fn prove_ups_end_cap(

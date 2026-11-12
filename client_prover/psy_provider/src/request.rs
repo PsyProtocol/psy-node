@@ -307,6 +307,8 @@ pub enum RequestParams<F: RichField> {
     RegisterSDKeyPlonky2Circuit(QRegisterSDKeyPlonky2CircuitRPCRequest),
     #[serde(rename = "psy_prove_sd_key_plonky2_sign", alias = "psy_prove_plonky2_software_defined_sign")]
     SDKeyPlonky2SignatureProof(SDKeyPlonky2SignatureProofRPCRequest<F>),
+    #[serde(rename = "psy_prove_multisig_sign")]
+    MultisigSignatureProof(MultisigSignatureProofRPCRequest),
     // #[serde(rename = "psy_finalize_tree")]
     // FinalizeTree,
     // #[serde(rename = "psy_prove_ups_end_cap")]
@@ -1409,6 +1411,14 @@ pub struct QRegisterSDKeyDPNCircuitRPCRequest {
 pub struct QRegisterSDKeyPlonky2CircuitRPCRequest {
     pub contract_state_tree_height: u8,
     pub input_len: usize,
+}
+
+/// A multisig account's two signatures and witness; the proxy proves them
+/// with the multisig signature circuit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultisigSignatureProofRPCRequest {
+    pub input: psy_vm::ups::multisig::MultisigSignatureInput,
+    pub sig_hash: QHashOut<GoldilocksField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

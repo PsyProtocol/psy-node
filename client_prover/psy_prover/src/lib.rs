@@ -89,7 +89,9 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     // User circuits are built before assembly because the constructor is
     // async; assemble_rpc_module only decides whether to *use* it.
     let user = if role.serves_user() {
-        Some(UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?)
+        let user = UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?;
+        user.warm_multisig_circuit();
+        Some(user)
     } else {
         None
     };

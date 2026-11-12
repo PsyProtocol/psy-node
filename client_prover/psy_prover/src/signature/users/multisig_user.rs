@@ -86,7 +86,7 @@ impl SignatureUser for MultisigUser {
         })
     }
 
-    async fn sign(&self, wallet: &PsyMemoryWallet, _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync), context: &SignContext, sighash: QHashOut<GoldilocksField>) -> Result<PsyProof> {
+    async fn sign(&self, wallet: &PsyMemoryWallet, circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync), context: &SignContext, sighash: QHashOut<GoldilocksField>) -> Result<PsyProof> {
         let witness = context.multisig_signature_witness.as_ref().context("multisig signature witness missing")?;
         ensure!(context.sd_key_signature_input.is_none(), "multisig cannot use another signature scheme's witness");
         let input = self.signature_input(witness, sighash)?;
@@ -95,6 +95,17 @@ impl SignatureUser for MultisigUser {
         let info = ZKPublicKeyInfo { fingerprint: circuit.get_fingerprint(), public_key_param: self.account.public_key_param()? };
         ensure!(witness.start_session_user_leaf.public_key == info.qfhash::<PsyHasher>(), "multisig starting user identity mismatch");
         ensure!(witness.sign_context.user_leaf.public_key == info.qfhash::<PsyHasher>(), "multisig ending user identity mismatch");
+        // Two in-circuit secp256k1 verifications take minutes on a small CPU;
+        // a prove proxy answers in seconds. Its proof is used only after it
+        // verifies here; any remote failure falls back to local proving.
+        match circuit_manager.prove_multisig_sign(&input, sighash).await {
+            Ok(Some(proof)) => match circuit.verify(&proof, &input, sighash) {
+                Ok(()) => return Ok(proof),
+                Err(error) => tracing::warn!(%error, "remote multisig signature proof rejected; proving locally"),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "remote multisig signature proving failed; proving locally"),
+        }
         circuit.prove(&input, sighash)
     }
 
