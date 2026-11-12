@@ -191,10 +191,12 @@ fn deadline_after(timeout_secs: Option<u64>) -> Option<WaitDeadline> {
     timeout_secs.map(|secs| js_sys::Date::now() + (secs as f64 * 1000.0))
 }
 
-/// Upper bound for one JSON-RPC exchange. A GPU prove proxy answers in seconds;
-/// a call that exceeds it fails instead of holding its caller for minutes.
+/// Upper bound for one JSON-RPC exchange. Some requests carry a whole contract
+/// definition (about 80 MB for the bridge contracts), which takes over 200 s
+/// on the slow offsite link to the prove proxies; keepalive, not this bound,
+/// detects a vanished peer.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Native RPC client with bounded requests and TCP keepalive probes (30 s idle,
 /// then every 10 s, 3 retries). A peer that vanished without a FIN or RST is
