@@ -406,7 +406,8 @@ known, reviewed ways; a redeploy from this lock changes these units:
 
 | Component | Lock | Live |
 |---|---|---|
-| `psy_node_cli` on the six Realm processors and the coordinator processor | `64a74b01` | `64a74b01` (same) |
+| `psy_node_cli` on the coordinator processor | `64a74b01` | `64a74b01` (same) |
+| `psy_node_cli` on the six Realm processors | `64a74b01` | `bcd70e3d` (build `9adac1e5`, 2026-11-12 01:18-01:33 UTC, Realm0 v1 canary 2026-11-11 14:17: reclaim the proofs a committed block consumed; previous binary kept as `psy_node_cli.bak-64a74b01455f`) |
 | `psy_node_cli` on the Edges | `64a74b01` | `ea150cc9` (build `fbbc0738`, 2026-11-11: user tree proofs only for committed checkpoints) |
 | `psy_worker_cli` | `a5024735` | `a5024735` (same) |
 | `psy_relayer_cli` on the three Guardians | `03184ab0` | `e442d562` (build `d4df5a31`, 2026-11-11: the observer reads the bridge user leaf only after its committed user tree proof) |
