@@ -310,28 +310,37 @@ class FiveWithdrawalTests(World):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_five_withdrawals_requires_batch_size_5_on_chain(self):
-        with self.assertRaisesRegex(ValueError, "never resolved batch_append_withdrawals_5"):
+    def test_five_withdrawals_requires_a_pair_batch_on_chain(self):
+        with self.assertRaisesRegex(ValueError, "never resolved batch_append_withdrawals_2 or _5"):
             steps.five_apply(self.ctx)
         self.assertEqual([event for event in self.events if event[0] == "deposit"], [("deposit", f"five-{name}") for name in steps.FIVE_USERS])
-        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "resolve method batch_append_withdrawals_5 of contract 3\n"
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "resolve method `batch_append_withdrawals_2` of contract 3\n" * 2
         self.events.clear()
         steps.five_apply(self.ctx)
         self.assertEqual(self.events and [e for e in self.events if e[0] == "deposit"], [], "the five deposits are not repeated")
-        self.assertEqual(steps.five_verify(self.ctx)["batch_5_lines"], 1)
+        self.assertEqual(steps.five_verify(self.ctx)["batch_lines"], 2)
+
+    def test_five_withdrawals_still_accept_the_five_row_batch(self):
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "resolve method `batch_append_withdrawals_5` of contract 3\n"
+        steps.five_apply(self.ctx)
+        self.assertEqual(steps.five_verify(self.ctx)["batch_lines"], 1)
+        self.assertRegex("batch_append_withdrawals_5", steps.WITHDRAWAL_BATCH_METHODS)
+        self.assertRegex("batch_append_withdrawals_2", steps.WITHDRAWAL_BATCH_METHODS)
+        self.put_state("accept_five_withdrawals", settled={"batch_5_lines": 1, "quarantine_lines": 0})
+        steps.five_verify(self.ctx)
 
     def test_any_quarantine_line_fails_the_five_withdrawals_and_the_record_never_passes(self):
-        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "x\n"
         self.remote.journals[("relayer.service", "quarantining withdrawal")] = "quarantining withdrawal event 9\n"
         with self.assertRaisesRegex(ValueError, "1 quarantining withdrawal line"):
             steps.five_apply(self.ctx)
         self.assertNotIn("settled", json.loads((self.state / "accept_five_withdrawals.json").read_text()))
-        self.put_state("accept_five_withdrawals", settled={"batch_5_lines": 1, "quarantine_lines": 3})
+        self.put_state("accept_five_withdrawals", settled={"batch_lines": 1, "quarantine_lines": 3})
         with self.assertRaisesRegex(ValueError, "quarantine line was recorded"):
             steps.five_verify(self.ctx)
 
     def test_a_rerun_after_a_settle_timeout_reuses_the_recorded_withdrawals_and_baseline(self):
-        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "x\n"
         sent, balances = [], iter([1000, 9999, 9999, 9999])
         self.patch(withdraw_one=lambda *a, **k: sent.append((a[5], k["nonce"])))
         waits = iter([TimeoutError("not settled"), None])
@@ -348,7 +357,7 @@ class FiveWithdrawalTests(World):
         self.assertEqual(len({nonce for _, nonce in first}), 5)
 
     def test_a_failed_withdrawal_is_resent_with_its_own_nonce_and_the_others_are_not(self):
-        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "x\n"
         sent, fail = [], {"five-u03"}
 
         def withdraw(*a, **k):
@@ -371,7 +380,7 @@ class FiveWithdrawalTests(World):
             raise outcome
 
     def test_the_five_users_are_claimed_at_consecutive_deposit_indexes(self):
-        self.remote.journals[("relayer.service", "batch_append_withdrawals_5")] = "x\n"
+        self.remote.journals[("relayer.service", steps.WITHDRAWAL_BATCH_METHODS)] = "x\n"
         steps.five_apply(self.ctx)
         self.assertEqual([event for event in self.events if event[0] == "proved"], [("proved", 14)])
         self.assertEqual(len([event for event in self.events if event[0] == "withdraw"]), 5)
