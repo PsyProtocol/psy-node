@@ -1307,7 +1307,7 @@ mod tests {
     /// these tests would fail the round loudly instead of passing silently.
     fn quarantinable_guardian(root: std::path::PathBuf, db: super::super::guardian_client::RelayerDb) -> super::super::guardian_client::LoadedGuardianConfig {
         let mut config = crate::guardian::test_fixture::codec_guardian_config();
-        config.l1_chains[0].rpc_url = "http://127.0.0.1:1".to_owned();
+        config.l1_chains[0].rpc_providers = vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: "http://127.0.0.1:1".to_owned(), operator: None }];
         super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) }
     }
 
@@ -1460,7 +1460,7 @@ mod tests {
         for unencodable in [false, true] {
             let (path, db) = super::super::guardian_client::tests_db();
             let mut config = crate::guardian::test_fixture::codec_guardian_config();
-            config.l1_chains[0].rpc_url = url.clone();
+            config.l1_chains[0].rpc_providers = vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: url.clone(), operator: None }];
             let guardian = super::super::guardian_client::LoadedGuardianConfig {
                 root: config.clone(), db: std::sync::Arc::new(db),
             };
@@ -1503,7 +1503,7 @@ mod tests {
         let url = serve_mapping_l1().await;
         let (path, db) = super::super::guardian_client::tests_db();
         let mut config = crate::guardian::test_fixture::codec_guardian_config();
-        config.l1_chains[0].rpc_url = url;
+        config.l1_chains[0].rpc_providers = vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: url, operator: None }];
         let guardian = super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) };
         // GOOD is the PSY pair: token -> bytes32(0) forward, reverse resolves
         // back to the token, and the burn claims contract id 0.
@@ -1544,7 +1544,7 @@ mod tests {
         let url = serve_mapping_l1().await;
         let (path, db) = super::super::guardian_client::tests_db();
         let mut config = crate::guardian::test_fixture::codec_guardian_config();
-        config.l1_chains[0].rpc_url = url;
+        config.l1_chains[0].rpc_providers = vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: url, operator: None }];
         let guardian = super::super::guardian_client::LoadedGuardianConfig { root: config, db: std::sync::Arc::new(db) };
         let withdrawal = |token: [u8; 20], contract: u64, event: i64| {
             let mut sample = sample_withdrawal(0, 7, contract, [9, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], event);

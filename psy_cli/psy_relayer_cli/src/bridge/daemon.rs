@@ -220,6 +220,17 @@ fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
     rpc_urls
 }
 
+/// The deployment document's L1 providers, used when the relayer config names none.
+fn deployment_rpc_providers(endpoint: &guardian_common::protocol::ChainEndpoint) -> Vec<crate::bridge::rpc_providers::RpcProviderConfig> {
+    endpoint.rpc_providers.iter().map(|provider| crate::bridge::rpc_providers::RpcProviderConfig {
+        name: provider.name.clone(),
+        url: provider.url.clone(),
+        priority_weight: crate::bridge::rpc_providers::DEFAULT_PRIORITY_WEIGHT,
+        operator: provider.operator.clone().unwrap_or_default(),
+        quota_group: String::new(),
+    }).collect()
+}
+
 fn configured_chains(config: &BridgeProposeDaemonConfig, l1_chains: &[guardian_common::protocol::ChainEndpoint]) -> anyhow::Result<Vec<L1Config>> {
     ensure!(config.chains.is_empty() || config.finalize.fee_policy.is_none(),
         "with [[chains]], configure fees in [chains.fee_policy], not [finalize.fee_policy]");
@@ -237,13 +248,14 @@ fn configured_chains(config: &BridgeProposeDaemonConfig, l1_chains: &[guardian_c
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
         let endpoint = l1_chains.iter().find(|endpoint| endpoint.chain_index == chain_index)
             .context("canonical L1 endpoint missing for deployment chain")?;
+        let has_legacy_urls = config.finalize.l1_rpc_url.is_some() || config.finalize.l1_rpc_fallback_url.is_some();
         vec![L1Config {
             fee_policy: config.finalize.fee_policy.clone(),
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
-            rpc_urls: if config.finalize.l1_rpc_url.is_some() || config.finalize.l1_rpc_fallback_url.is_some() { legacy_rpc_urls(&config.finalize) } else { vec![endpoint.rpc_url.clone()] },
-            rpc_providers: config.finalize.l1_rpc_providers.clone(),
+            rpc_urls: if has_legacy_urls { legacy_rpc_urls(&config.finalize) } else { Vec::new() },
+            rpc_providers: if has_legacy_urls || !config.finalize.l1_rpc_providers.is_empty() { config.finalize.l1_rpc_providers.clone() } else { deployment_rpc_providers(endpoint) },
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
             bridge_address: config.finalize.bridge_address.clone(),
@@ -257,7 +269,7 @@ fn configured_chains(config: &BridgeProposeDaemonConfig, l1_chains: &[guardian_c
             if chain.rpc_urls.is_empty() && chain.rpc_providers.is_empty() {
                 let endpoint = l1_chains.iter().find(|endpoint| endpoint.chain_index == chain.chain_index)
                     .with_context(|| format!("selected deployment document missing chain {}", chain.chain_index))?;
-                chain.rpc_urls = vec![endpoint.rpc_url.clone()];
+                chain.rpc_providers = deployment_rpc_providers(endpoint);
             }
         }
         chains
@@ -4598,7 +4610,7 @@ mod tests {
     }
 
     fn test_l1() -> Vec<guardian_common::protocol::ChainEndpoint> {
-        vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }]
+        vec![guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: guardian_common::protocol::Hex([0x11; 20]), deployment_block: 0, rpc_providers: vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: "http://127.0.0.1:8545".into(), operator: None }] }]
     }
 
     fn deposit_snapshot(found: bool, count: Option<u64>, root: Option<String>) -> crate::bridge::api_client::DepositTreeRootState {
@@ -4800,6 +4812,15 @@ mod tests {
         let (ready, _) = finalized_deposit_fixture(2, 1, true).await.unwrap();
         let targets = [(0, waiting), (1, ready)].into_iter().filter(|(_, target)| *target > 0).collect::<Vec<_>>();
         assert_eq!(targets, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn deployment_providers_seed_relayer_providers_in_order() {
+        let mut endpoint = test_l1().remove(0);
+        endpoint.rpc_providers.push(guardian_common::protocol::GuardianRpcProvider { name: "node".into(), url: "https://node.example/rpc".into(), operator: Some("local".into()) });
+        let providers = deployment_rpc_providers(&endpoint);
+        assert_eq!(providers.iter().map(|p| (p.name.as_str(), p.url.as_str(), p.operator.as_str(), p.priority_weight)).collect::<Vec<_>>(),
+            vec![("primary", "http://127.0.0.1:8545", "", crate::bridge::rpc_providers::DEFAULT_PRIORITY_WEIGHT), ("node", "https://node.example/rpc", "local", crate::bridge::rpc_providers::DEFAULT_PRIORITY_WEIGHT)]);
     }
 
     #[tokio::test]

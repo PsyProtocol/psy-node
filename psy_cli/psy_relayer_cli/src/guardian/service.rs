@@ -1469,7 +1469,7 @@ mod tests {
         let reorg_hash = [0x0c; 32];
         let chain_id = config.chain(0).unwrap().chain_id.try_into().unwrap_or(1);
         let (url, server) = serve_header_l1(chain_id, [2; 32], 100, saved_hash, reorg_hash, true).await;
-        config.l1_chains.iter_mut().find(|chain| chain.chain_index == 0).unwrap().rpc_url = url;
+        config.l1_chains.iter_mut().find(|chain| chain.chain_index == 0).unwrap().rpc_providers = vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: url, operator: None }];
         let config = Arc::new(config);
         let chain = config.chain(0).unwrap();
         let mut request = crate::guardian::test_fixture::codec_request_fixture();

@@ -246,7 +246,7 @@ impl Fixture {
                 *limit = Duration::from_secs(seconds);
             }
         }
-        let mut fixture = Self { root, manifest, rpc_config, guardian_root, l1_configs, config, relayer_db, ready, session, flow: Flow { l2_contract_id: 0, state_manager: alloy_primitives::Address::ZERO, l1: guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::ZERO, bridge: guardian_common::protocol::Hex([0; 20]), deployment_block: 0, rpc_url: String::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
+        let mut fixture = Self { root, manifest, rpc_config, guardian_root, l1_configs, config, relayer_db, ready, session, flow: Flow { l2_contract_id: 0, state_manager: alloy_primitives::Address::ZERO, l1: guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::ZERO, bridge: guardian_common::protocol::Hex([0; 20]), deployment_block: 0, rpc_providers: Vec::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
         ensure!(fixture.manifest["network_magic"].as_u64() == Some(fixture.config.network_magic()?), "manifest/network magic mismatch");
         ensure!(fixture.manifest["db_files"].as_array().is_some_and(|values| values.len() == 3), "fixture requires exactly three databases");
         let mut databases = Vec::new();
@@ -295,12 +295,12 @@ impl Fixture {
         let token = hex20(self.manifest["token"].as_str().context("token missing")?)?;
         let endpoint = self.config.chain(chain_index).map_err(|_| anyhow::anyhow!("configured chain missing"))?.clone();
         let bridge = format!("{:?}", endpoint.bridge);
-        let provider = l1_call(&endpoint.rpc_url, &bridge, addressesProviderCall {}).await?;
-        let manager_id = l1_call(&endpoint.rpc_url, &provider.to_string(), STATE_MANAGER_IDCall {}).await?;
-        let state_manager = l1_call(&endpoint.rpc_url, &provider.to_string(), getAddressCall { id: manager_id }).await?;
+        let provider = l1_call(&endpoint.rpc_providers[0].url, &bridge, addressesProviderCall {}).await?;
+        let manager_id = l1_call(&endpoint.rpc_providers[0].url, &provider.to_string(), STATE_MANAGER_IDCall {}).await?;
+        let state_manager = l1_call(&endpoint.rpc_providers[0].url, &provider.to_string(), getAddressCall { id: manager_id }).await?;
         ensure!(state_manager != alloy_primitives::Address::ZERO, "configured bridge resolved no StateManager");
         let router = self.manifest["router_address"].as_str().filter(|value| !value.is_empty()).context("router missing")?;
-        let mapped = l1_call(&endpoint.rpc_url, router, l1ToL2TokenCall { l1Token: alloy_primitives::Address::from(token.0) }).await?;
+        let mapped = l1_call(&endpoint.rpc_providers[0].url, router, l1ToL2TokenCall { l1Token: alloy_primitives::Address::from(token.0) }).await?;
         ensure!(mapped.0[..28] == [0; 28], "router token mapping is not a contract id");
         let l2_contract_id = u32::from_be_bytes(mapped.0[28..].try_into().unwrap());
         ensure!(l2_contract_id == psy_config::TOKEN_CONTRACT_ID, "router token mapping is not the compiled token contract");
@@ -742,7 +742,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let expected = expected_burn(fixture)?;
     let before_claimant = token_balance(&provider, fixture, latest, fixture.claimant()?, fixture.flow.l2_contract_id).await?;
     let claimant_nonce = provider.get_user_leaf_data(latest, fixture.claimant()?).await.map_err(|_| anyhow::anyhow!("initial claimant unavailable"))?.nonce.to_canonical_u64();
-    let before_erc20 = erc20_balance(&fixture.flow.l1.rpc_url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().context("recipient missing")?).await?;
+    let before_erc20 = erc20_balance(&fixture.flow.l1.rpc_providers[0].url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().context("recipient missing")?).await?;
     let sessions = Sessions::load(fixture)?;
     let mut databases = Vec::new();
     let mut guardians = Vec::new();
@@ -883,9 +883,9 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let claim_l1 = user_operation(fixture, children, "claim-withdrawal").await?;
     ensure!(claim_l1["status"] == "confirmed" && claim_l1["transaction_hash"].as_str().is_some(), "L1 claim was not confirmed");
     let claim_hash = claim_l1["transaction_hash"].as_str().context("claim hash missing")?;
-    let receipt: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&json!({"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[claim_hash]})).send().await?.json().await?;
+    let receipt: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_providers[0].url).json(&json!({"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[claim_hash]})).send().await?.json().await?;
     ensure!(receipt["result"]["status"] == "0x1" && receipt["result"]["transactionHash"].as_str().is_some_and(|hash| hash.eq_ignore_ascii_case(claim_hash)) && receipt["result"]["blockHash"].as_str().is_some(), "L1 claim lacks a successful mined receipt");
-    let after_erc20 = erc20_balance(&fixture.flow.l1.rpc_url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().unwrap()).await?;
+    let after_erc20 = erc20_balance(&fixture.flow.l1.rpc_providers[0].url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().unwrap()).await?;
     ensure!(after_erc20 == before_erc20 + u128::from(amount), "recipient ERC20 delta is not +amount");
     children.stop(burn_daemon).await?;
     children.stop(guardians[0]).await?;
@@ -1107,7 +1107,7 @@ fn burn_matches(value: &Value, expected: &guardian_common::protocol::WithdrawalB
 
 async fn verify_deposit_event(fixture: &Fixture, tx_hash: &str) -> anyhow::Result<u32> {
     let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[tx_hash]});
-    let response = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await.map_err(|_| anyhow::anyhow!("deposit receipt unavailable"))?;
+    let response = reqwest::Client::new().post(&fixture.flow.l1.rpc_providers[0].url).json(&body).send().await.map_err(|_| anyhow::anyhow!("deposit receipt unavailable"))?;
     let receipt: Value = response.json().await.map_err(|_| anyhow::anyhow!("deposit receipt rejected"))?;
     ensure!(receipt["result"]["status"] == "0x1" && receipt["result"]["transactionHash"].as_str().is_some_and(|hash| hash.eq_ignore_ascii_case(tx_hash)), "deposit receipt identity/status differs");
     let bridge = configured_bridge(fixture)?;
@@ -1263,7 +1263,7 @@ async fn wait_indexed_claim(fixture: &Fixture, provider: &RpcProvider) -> anyhow
 
 async fn l1_view<Call: SolCall>(fixture: &Fixture, call: Call) -> anyhow::Result<Call::Return> {
     let body = json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to": fixture.flow.state_manager.to_string(), "data": format!("0x{}", hex::encode(call.abi_encode()))}, "latest"]});
-    let value: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await?.json().await?;
+    let value: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_providers[0].url).json(&body).send().await?.json().await?;
     ensure!(value.get("error").is_none(), "StateManager call failed");
     let bytes = hex::decode(value["result"].as_str().context("StateManager result missing")?.trim_start_matches("0x"))?;
     Call::abi_decode_returns(&bytes).map_err(|_| anyhow::anyhow!("StateManager ABI return rejected"))
@@ -1319,7 +1319,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
     match operation {
         "deposit" => {
             let result = psy_user_cli::subcommand::deposit::run(psy_user_cli::subcommand::args::DepositArgs {
-                l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: Some(l1.private_key_hex()), router_address: fixture.flow.router.clone(), token: fixture.text("token")?, amount: amount.to_string(), shield_address: String::new(), r0: fixture.manifest["r0"].as_u64(), r1: fixture.manifest["r1"].as_u64(), user_id: Some(claimant), note_commitment: None, note_secret: Some(note), nullifier_secret: Some(nullifier), recipient_npub: None, nostr_relay: "wss://relay.nostr.band".to_string(), l2_token_contract_id: fixture.flow.l2_contract_id.to_string(), source_chain_index: u32::from(fixture.flow.l1.chain_index), rpc_config: rpc.display().to_string(), deposit_proof_output: Some(fixture.path("deposit_proof_path")?.display().to_string()), resume_deposit_index: None, resume_tx_hash: None, resume_chain_id: None,
+                l1_rpc_url: fixture.flow.l1.rpc_providers[0].url.clone(), private_key: Some(l1.private_key_hex()), router_address: fixture.flow.router.clone(), token: fixture.text("token")?, amount: amount.to_string(), shield_address: String::new(), r0: fixture.manifest["r0"].as_u64(), r1: fixture.manifest["r1"].as_u64(), user_id: Some(claimant), note_commitment: None, note_secret: Some(note), nullifier_secret: Some(nullifier), recipient_npub: None, nostr_relay: "wss://relay.nostr.band".to_string(), l2_token_contract_id: fixture.flow.l2_contract_id.to_string(), source_chain_index: u32::from(fixture.flow.l1.chain_index), rpc_config: rpc.display().to_string(), deposit_proof_output: Some(fixture.path("deposit_proof_path")?.display().to_string()), resume_deposit_index: None, resume_tx_hash: None, resume_chain_id: None,
             }).await?;
             l1_status(result)
         }
@@ -1327,19 +1327,19 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
             let proof = json_value(&read(&fixture.path("deposit_proof_path")?)?)?;
             let deposit_index = proof["deposit_index"].as_str().context("deposit index missing")?.parse::<u64>().map_err(|_| anyhow::anyhow!("deposit index rejected"))?;
             let result = psy_user_cli::subcommand::claim_deposit::run(psy_user_cli::subcommand::args::ClaimDepositArgs {
-                rpc_config: rpc.display().to_string(), wallet, l1_rpc_url: fixture.flow.l1.rpc_url.clone(), token_l1_address: fixture.text("token")?, amount, source_chain_index: u32::from(fixture.flow.l1.chain_index), user_id: claimant, deposit_index, checkpoint_id: None, r0: fixture.manifest["r0"].as_u64().context("r0 missing")?, r1: fixture.manifest["r1"].as_u64().context("r1 missing")?, note_secret: None, nullifier_secret: None, deposit_proof: fixture.path("deposit_proof_path")?.display().to_string(),
+                rpc_config: rpc.display().to_string(), wallet, l1_rpc_url: fixture.flow.l1.rpc_providers[0].url.clone(), token_l1_address: fixture.text("token")?, amount, source_chain_index: u32::from(fixture.flow.l1.chain_index), user_id: claimant, deposit_index, checkpoint_id: None, r0: fixture.manifest["r0"].as_u64().context("r0 missing")?, r1: fixture.manifest["r1"].as_u64().context("r1 missing")?, note_secret: None, nullifier_secret: None, deposit_proof: fixture.path("deposit_proof_path")?.display().to_string(),
             }).await?;
             included_status(result)
         }
         "withdraw" => {
             let result = psy_user_cli::subcommand::withdraw::run(psy_user_cli::subcommand::args::WithdrawArgs {
-                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, l1_rpc_url: fixture.flow.l1.rpc_url.clone(), contract_id: Some(u64::from(fixture.flow.l2_contract_id)),
+                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, l1_rpc_url: fixture.flow.l1.rpc_providers[0].url.clone(), contract_id: Some(u64::from(fixture.flow.l2_contract_id)),
             }).await?;
             included_status(result)
         }
         "claim-withdrawal" => {
             let result = psy_user_cli::subcommand::claim_withdrawal::run(psy_user_cli::subcommand::args::ClaimWithdrawalArgs {
-                rpc_config: rpc.display().to_string(), services_url: fixture.flow.services_url.clone(), l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: l1.private_key_hex(), recipient: fixture.text("recipient")?, token_address: fixture.text("token")?, amount: amount.to_string(), nonce: fixture.text("withdrawal_nonce")?, destination_chain_index: u64::from(fixture.flow.l1.chain_index), sender_user_id: claimant, token_contract_id: u64::from(fixture.flow.l2_contract_id), prove_proxy_url: Some(fixture.flow.prove_proxy_url.clone()), prove_proxy_token: None,
+                rpc_config: rpc.display().to_string(), services_url: fixture.flow.services_url.clone(), l1_rpc_url: fixture.flow.l1.rpc_providers[0].url.clone(), private_key: l1.private_key_hex(), recipient: fixture.text("recipient")?, token_address: fixture.text("token")?, amount: amount.to_string(), nonce: fixture.text("withdrawal_nonce")?, destination_chain_index: u64::from(fixture.flow.l1.chain_index), sender_user_id: claimant, token_contract_id: u64::from(fixture.flow.l2_contract_id), prove_proxy_url: Some(fixture.flow.prove_proxy_url.clone()), prove_proxy_token: None,
             }).await?;
             confirmed_claim(result)
         }

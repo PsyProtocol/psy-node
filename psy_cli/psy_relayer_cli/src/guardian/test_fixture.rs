@@ -28,7 +28,7 @@ pub(crate) fn codec_network() -> psy_config::NetworkConfigGoldilocks {
 }
 
 pub(crate) fn codec_guardian_config() -> GuardianConfig {
-    GuardianConfig { network: codec_network(), guardian_root: "guardians-root".into(), endpoints: [String::new(), String::new(), String::new()], history_url: String::new(), l1_chains: vec![ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }] }
+    GuardianConfig { network: codec_network(), guardian_root: "guardians-root".into(), endpoints: [String::new(), String::new(), String::new()], history_url: String::new(), l1_chains: vec![ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_providers: vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: "http://127.0.0.1:8545".into(), operator: None }] }] }
 }
 
 pub(crate) fn codec_request_fixture() -> GuardianSignRequest {
