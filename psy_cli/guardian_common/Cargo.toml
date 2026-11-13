@@ -23,6 +23,7 @@ psy_plonky2_basic_helpers = { workspace = true }
 psy_plonky2_common_circuits = { workspace = true }
 psy_provider = { workspace = true }
 psy_prover = { workspace = true }
+psy_rpc_pool = { path = "../../psy_rpc_pool" }
 psy_vm = { workspace = true }
 redb = { workspace = true }
 reqwest = { workspace = true }

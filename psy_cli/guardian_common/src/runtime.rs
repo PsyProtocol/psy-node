@@ -281,11 +281,10 @@ fn parse_l1_chains(document: &serde_json::Value) -> Result<Vec<ChainEndpoint>> {
             entry.get("chain_index").ok_or(GuardianSignError::MalformedRequest)?,
             entry.get("chain_id").ok_or(GuardianSignError::MalformedRequest)?,
         )?;
-        let rpc_url = entry.get("rpc_url").and_then(serde_json::Value::as_str).ok_or(GuardianSignError::MalformedRequest)?;
-        validate_endpoint(rpc_url, false, false)?;
+        let rpc_providers = rpc_providers_from(entry.get("rpc_providers"), entry.get("rpc_url"))?;
         let bridge = entry.get("contracts").and_then(|contracts| contracts.get("Bridge")).and_then(serde_json::Value::as_str).ok_or(GuardianSignError::MalformedRequest)?;
         let deployment_block = deployment_block(entry.get("deployment_block").ok_or(GuardianSignError::MalformedRequest)?)?;
-        chains.push(ChainEndpoint { chain_index, chain_id, bridge: bridge_from(bridge)?, deployment_block, rpc_url: rpc_url.to_owned() });
+        chains.push(ChainEndpoint { chain_index, chain_id, bridge: bridge_from(bridge)?, deployment_block, rpc_providers });
     }
     Ok(chains)
 }
@@ -300,8 +299,7 @@ fn parse_deployment(document: &serde_json::Value, proxy: &serde_json::Value) -> 
     if let Some(exported) = document.get("chainId") {
         if chain_identity(&serde_json::json!(0), exported)?.1 != chain_id { return Err(GuardianSignError::AuthorizationMismatch); }
     }
-    let rpc_url = chain.get("defaultRpcUrl").and_then(serde_json::Value::as_str).ok_or(GuardianSignError::MalformedRequest)?;
-    validate_endpoint(rpc_url, false, false)?;
+    let rpc_providers = rpc_providers_from(chain.get("rpcProviders"), chain.get("defaultRpcUrl"))?;
     let core_text = document.pointer("/core/Bridge").and_then(serde_json::Value::as_str);
     let contracts_text = document.pointer("/contracts/Bridge").and_then(serde_json::Value::as_str);
     let bridge = core_text.or(contracts_text).ok_or(GuardianSignError::MalformedRequest)?;
@@ -311,7 +309,22 @@ fn parse_deployment(document: &serde_json::Value, proxy: &serde_json::Value) -> 
     json_text(document, "/network")?;
     let bridge = bridge_from(bridge)?;
     let deployment_block = proxy_deployment_block(proxy, bridge)?;
-    Ok(ChainEndpoint { chain_index, chain_id, bridge, deployment_block, rpc_url: rpc_url.to_owned() })
+    Ok(ChainEndpoint { chain_index, chain_id, bridge, deployment_block, rpc_providers })
+}
+
+/// A present provider list is the whole list; otherwise the single URL is a one-provider list named `default`.
+fn rpc_providers_from(providers: Option<&serde_json::Value>, single_url: Option<&serde_json::Value>) -> Result<Vec<GuardianRpcProvider>> {
+    let text = |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_str).map(str::to_owned).ok_or(GuardianSignError::MalformedRequest);
+    let parsed = match providers {
+        Some(list) => list.as_array().ok_or(GuardianSignError::MalformedRequest)?.iter().map(|entry| Ok(GuardianRpcProvider {
+            name: text(entry.get("name"))?,
+            url: text(entry.get("url"))?,
+            operator: entry.get("operator").map(|operator| text(Some(operator))).transpose()?,
+        })).collect::<Result<Vec<_>>>()?,
+        None => vec![GuardianRpcProvider { name: "default".into(), url: text(single_url)?, operator: None }],
+    };
+    validate_rpc_providers(&parsed)?;
+    Ok(parsed)
 }
 
 
@@ -693,6 +706,43 @@ mod tests {
         let second = serde_json::json!({"network": "localhostBsc", "chainId": "8", "protocol": {"chain": {"l1ChainIndex": 8, "l1ChainId": 8, "defaultRpcUrl": "https://chain2.example/rpc"}}, "core": {"Bridge": "0x2222222222222222222222222222222222222222"}});
         assert_eq!(loaded(network(), vec![deployment, second.clone()]).unwrap().l1_chains.len(), 2);
         assert!(loaded(network(), vec![second.clone(), second]).is_err());
+    }
+
+    #[test]
+    fn rpc_providers_replace_the_single_url_and_fail_closed() {
+        let provider = |name: &str, url: &str, operator: Option<&str>| GuardianRpcProvider { name: name.into(), url: url.into(), operator: operator.map(str::to_owned) };
+        let deployment = |chain: serde_json::Value| serde_json::json!({"network": "localhost", "chainId": "7", "protocol": {"chain": chain}, "core": {"Bridge": "0x1111111111111111111111111111111111111111"}});
+        let providers = serde_json::json!([{"name": "gateway", "url": "http://127.0.0.1:18545", "operator": "alchemy"}, {"name": "node", "url": "https://node.example/rpc"}]);
+        let listed = loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7, "defaultRpcUrl": "https://ignored.example/rpc", "rpcProviders": providers}))]).unwrap();
+        assert_eq!(listed.l1_chains[0].rpc_providers, vec![provider("gateway", "http://127.0.0.1:18545", Some("alchemy")), provider("node", "https://node.example/rpc", None)]);
+        let without_default = loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7, "rpcProviders": providers}))]).unwrap();
+        assert_eq!(without_default.l1_chains, listed.l1_chains);
+        let single = loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7, "defaultRpcUrl": "https://chain.example/rpc"}))]).unwrap();
+        assert_eq!(single.l1_chains[0].rpc_providers, vec![provider("default", "https://chain.example/rpc", None)]);
+        let mut registry = chains();
+        registry[0]["l1_chains"][0]["rpc_providers"] = providers.clone();
+        assert_eq!(loaded(network(), registry).unwrap().l1_chains[0].rpc_providers, listed.l1_chains[0].rpc_providers);
+        assert_eq!(loaded(network(), chains()).unwrap().l1_chains[0].rpc_providers, vec![provider("default", "https://chain.example/rpc", None)]);
+
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!({"name": "gateway", "url": "https://a.example/rpc"}),
+            serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc"}, {"name": "gateway", "url": "https://b.example/rpc"}]),
+            serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc"}, {"name": "node", "url": "https://a.example/rpc"}]),
+            serde_json::json!([{"name": "", "url": "https://a.example/rpc"}]),
+            serde_json::json!([{"url": "https://a.example/rpc"}]),
+            serde_json::json!([{"name": "gateway"}]),
+            serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc", "operator": 1}]),
+            serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc"}, {"name": "remote", "url": "http://10.0.0.1:8545"}]),
+            serde_json::json!([{"name": "gateway", "url": "https://user:key@a.example/rpc"}]),
+        ] {
+            assert!(loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7, "defaultRpcUrl": "https://chain.example/rpc", "rpcProviders": invalid}))]).is_err(), "{invalid}");
+            let mut registry = chains();
+            registry[0]["l1_chains"][0]["rpc_providers"] = invalid.clone();
+            assert!(loaded(network(), registry).is_err(), "{invalid}");
+        }
+        assert!(loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7, "defaultRpcUrl": "http://10.0.0.1:8545"}))]).is_err());
+        assert!(loaded(network(), vec![deployment(serde_json::json!({"l1ChainIndex": 7, "l1ChainId": 7}))]).is_err());
     }
 
 

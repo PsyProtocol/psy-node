@@ -10,7 +10,7 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::DepositLe
 use psy_crypto::hash::traits::hasher::{FieldQHasher, MerkleZeroHasher};
 use serde_json::{json, Value};
 
-use crate::protocol::*;
+use crate::{l1_rpc_pool::L1RpcPool, protocol::*};
 
 alloy_sol_types::sol! {
     event DepositRecorded(
@@ -45,25 +45,12 @@ type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
 // DepositTreeState lives in guardian_common::protocol; this module only stages it.
 
-struct CustodyRpc<'a> { endpoint: &'a ChainEndpoint, client: reqwest::Client }
+struct CustodyRpc<'a> { endpoint: &'a ChainEndpoint, pool: L1RpcPool }
 impl<'a> CustodyRpc<'a> {
     fn new(endpoint: &'a ChainEndpoint) -> Result<Self> {
-        validate_endpoint(&endpoint.rpc_url, false, false)?;
-        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(30)).build().map_err(|_| GuardianSignError::L1RpcUnavailable)?;
-        Ok(Self { endpoint, client })
+        Ok(Self { endpoint, pool: L1RpcPool::for_chain(endpoint)? })
     }
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let mut response = self.client.post(&self.endpoint.rpc_url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await.map_err(|_| GuardianSignError::L1RpcUnavailable)?;
-        if !response.status().is_success() { return Err(GuardianSignError::L1RpcUnavailable); }
-        let mut body=Vec::new();
-        while let Some(chunk)=response.chunk().await.map_err(|_|GuardianSignError::L1RpcUnavailable)? {
-            body.try_reserve(chunk.len()).map_err(|_|GuardianSignError::L1RpcUnavailable)?;
-            body.extend_from_slice(&chunk);
-        }
-        let value: Value = serde_json::from_slice(&body).map_err(|_| GuardianSignError::L1ResponseMismatch)?;
-        if value.get("error").is_some() || value.get("id") != Some(&json!(1)) { return Err(GuardianSignError::L1ResponseMismatch); }
-        value.get("result").filter(|value| !value.is_null()).cloned().ok_or(GuardianSignError::L1ResponseMismatch)
-    }
+    async fn call(&self, method: &str, params: Value) -> Result<Value> { self.pool.call(method, params).await }
     async fn block(&self, number: Value) -> Result<Value> { self.call("eth_getBlockByNumber", json!([number,false])).await }
     /// The newest header deposits may be admitted against: `finalized`, or on a
     /// testnet `deposit_confirmation_blocks` below `latest`.
@@ -91,7 +78,7 @@ mod custody_url_parity {
     use super::*;
 
     fn admits(rpc_url: &str) -> bool {
-        CustodyRpc::new(&ChainEndpoint { chain_index: 0, chain_id: U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_url: rpc_url.to_owned() }).is_ok()
+        CustodyRpc::new(&ChainEndpoint { chain_index: 0, chain_id: U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_providers: vec![GuardianRpcProvider { name: "primary".into(), url: rpc_url.to_owned(), operator: None }] }).is_ok()
     }
 
     /// Config admits the whole 127.0.0.0/8 range; the custody guard must not narrow it.
@@ -848,7 +835,7 @@ mod tests {
         DepositAnchor { block_number: HEIGHT_B, block_hash: Hex(HASH_B), old_count: SAVED_COUNT, new_count: NEW_COUNT, ..saved.clone() }
     }
     fn chain() -> ChainEndpoint {
-        ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_url: "http://127.0.0.1:1".into() }
+        ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_providers: vec![GuardianRpcProvider { name: "primary".into(), url: "http://127.0.0.1:1".into(), operator: None }] }
     }
 
     #[tokio::test]
@@ -990,6 +977,7 @@ mod tests {
         tamper_leaf: Arc<AtomicBool>,
         router: Arc<Mutex<RouterState>>,
         router_zero: Arc<AtomicBool>,
+        pruned: Arc<AtomicBool>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for L1Fixture {
@@ -1000,7 +988,7 @@ mod tests {
         fn clear(&self) { self.calls.lock().unwrap().clear(); }
         fn router(&self) -> std::sync::MutexGuard<'_, RouterState> { self.router.lock().unwrap() }
         fn set_router_zero(&self, zero: bool) { self.router_zero.store(zero, Ordering::Relaxed); }
-        fn endpoint(&self) -> ChainEndpoint { ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_url: self.url.clone() } }
+        fn endpoint(&self) -> ChainEndpoint { ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_providers: vec![GuardianRpcProvider { name: "primary".into(), url: self.url.clone(), operator: None }] } }
     }
 
     fn word_arg(data: &str) -> Option<[u8; 32]> {
@@ -1081,6 +1069,8 @@ mod tests {
         let router_zero_flag = Arc::new(AtomicBool::new(false));
         let router_handle = router_state.clone();
         let router_zero_handle = router_zero_flag.clone();
+        let pruned = Arc::new(AtomicBool::new(false));
+        let pruned_flag = pruned.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { break };
@@ -1095,11 +1085,17 @@ mod tests {
                         if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap(); }
                     }
                 }
+                // A pooled client may open a connection it never uses; it carries no request.
+                if length == 0 { continue; }
                 let mut body = vec![0; length];
-                if length > 0 { socket.read_exact(&mut body).await.unwrap(); }
+                socket.read_exact(&mut body).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 recorded.lock().unwrap().push(request.clone());
-                let response = {
+                let response = if pruned_flag.load(Ordering::Relaxed) && matches!(request["method"].as_str(), Some("eth_call" | "eth_getLogs")) {
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"historical state 0x0b is not available"}})
+                } else if pruned_flag.load(Ordering::Relaxed) && request["method"] == "eth_getTransactionReceipt" {
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"result":null})
+                } else {
                     let router_state = router_handle.lock().unwrap();
                     match dispatch(&request, &batch, reorg_flag.load(Ordering::Relaxed), tamper_flag.load(Ordering::Relaxed), &router_state, router_zero_handle.load(Ordering::Relaxed)) {
                         Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
@@ -1111,7 +1107,7 @@ mod tests {
                 socket.into_inner().write_all(response.as_bytes()).await.unwrap();
             }
         });
-        L1Fixture { url, calls, reorg, tamper_leaf, router: router_state, router_zero: router_zero_flag, server }
+        L1Fixture { url, calls, reorg, tamper_leaf, router: router_state, router_zero: router_zero_flag, pruned, server }
     }
 
     #[tokio::test]
@@ -1235,6 +1231,39 @@ mod tests {
         assert!(calls.iter().any(|call| method(call) == "eth_call" && call["params"][0]["data"].as_str().unwrap_or("").starts_with(&selector("depositLeafHashes(uint256)"))));
         assert!(calls.iter().any(|call| method(call) == "eth_getTransactionReceipt"));
         assert!(calls.iter().all(|call| !is_historical(call)));
+    }
+
+    #[tokio::test]
+    async fn verification_fails_over_from_a_refused_provider_and_keeps_typed_verdicts() {
+        let fixture = serve_l1(prepare_new_batch().server).await;
+        let state = saved_deposit_tree_state();
+        let mut endpoint = fixture.endpoint();
+        endpoint.rpc_providers.insert(0, GuardianRpcProvider { name: "refused".into(), url: "http://127.0.0.1:1".into(), operator: None });
+        verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap();
+        fixture.tamper_leaf.store(true, Ordering::Relaxed);
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn pruned_first_provider_falls_back_for_bodies_and_the_full_answer_is_still_verified() {
+        let pruned = serve_l1(prepare_new_batch().server).await;
+        pruned.pruned.store(true, Ordering::Relaxed);
+        let full = serve_l1(prepare_new_batch().server).await;
+        let state = saved_deposit_tree_state();
+        let mut endpoint = pruned.endpoint();
+        endpoint.rpc_providers = vec![
+            GuardianRpcProvider { name: "node".into(), url: pruned.url.clone(), operator: None },
+            GuardianRpcProvider { name: "gateway".into(), url: full.url.clone(), operator: None },
+        ];
+        verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap();
+        assert!(full.calls().iter().any(|call| method(call) == "eth_getTransactionReceipt"));
+        full.tamper_leaf.store(true, Ordering::Relaxed);
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+        full.pruned.store(true, Ordering::Relaxed);
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::L1ResponseMismatch)), "{error:?}");
     }
 
     #[tokio::test]

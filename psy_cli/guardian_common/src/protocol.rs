@@ -250,7 +250,25 @@ pub struct ChainEndpoint {
     pub bridge: Hex20,
     /// Inclusive cold-scan bound from the selected Bridge deployment metadata, never configuration.
     pub deployment_block: u64,
-    pub rpc_url: String,
+    /// Ordered L1 read routes; the first healthy one serves each read.
+    pub rpc_providers: Vec<GuardianRpcProvider>,
+}
+/// One L1 read route. `name` and `operator` are log labels; `url` is never logged because it may carry an API key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuardianRpcProvider {
+    pub name: String,
+    pub url: String,
+    pub operator: Option<String>,
+}
+/// Every URL keeps the L1 endpoint rule; an empty list, a blank name, or a repeated name or URL is a configuration error.
+pub fn validate_rpc_providers(providers: &[GuardianRpcProvider]) -> Result<(), GuardianSignError> {
+    if providers.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
+    let (mut names, mut urls) = (BTreeSet::new(), BTreeSet::new());
+    for provider in providers {
+        if provider.name.trim().is_empty() || !names.insert(provider.name.as_str()) || !urls.insert(provider.url.as_str()) { return Err(GuardianSignError::AuthorizationMismatch); }
+        validate_endpoint(&provider.url, false, false)?;
+    }
+    Ok(())
 }
 /// Derived startup fields for one selected guardian. Not serialized.
 #[derive(Debug, Clone)]
@@ -634,7 +652,7 @@ impl GuardianRuntimeConfig {
         for endpoint in &self.l1_rpc_urls {
             config.chain(endpoint.chain_index)?;
             if !chains.insert(endpoint.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
-            validate_endpoint(&endpoint.rpc_url, false, false)?;
+            validate_rpc_providers(&endpoint.rpc_providers)?;
         }
         Ok(())
     }
@@ -1143,7 +1161,8 @@ pub(crate) fn codec_config_fixture(magic: u64) -> GuardianConfig {
         "guardian_configs": [], "guardian_history": {"listen_address": "127.0.0.1:15450"}
     })).unwrap();
     let chain = |index: u8, id: u64, bridge: u8| ChainEndpoint {
-        chain_index: index, chain_id: U256::from(id), bridge: Hex([bridge; 20]), deployment_block: 0, rpc_url: format!("https://chain{index}.example/rpc"),
+        chain_index: index, chain_id: U256::from(id), bridge: Hex([bridge; 20]), deployment_block: 0,
+        rpc_providers: vec![GuardianRpcProvider { name: "primary".into(), url: format!("https://chain{index}.example/rpc"), operator: None }],
     };
     GuardianConfig { network, guardian_root: PathBuf::new(), endpoints: std::array::from_fn(|_| "http://127.0.0.1/".into()), history_url: "http://127.0.0.1/".into(), l1_chains: vec![chain(0, 7, 0x11), chain(1, 8, 0x22)] }
 }

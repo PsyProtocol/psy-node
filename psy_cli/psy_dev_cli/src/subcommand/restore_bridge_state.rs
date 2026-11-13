@@ -379,7 +379,7 @@ fn operation_id(config: &GuardianConfig, inventory_digest: &str, digest: &str, d
     hash.update(inventory_digest);
     hash.update(Sha256::digest(serde_json::to_vec(&config.network)?));
     for chain in &config.l1_chains {
-        hash.update(Sha256::digest(serde_json::to_vec(&(chain.chain_index,chain.chain_id,chain.bridge,chain.deployment_block,&chain.rpc_url))?));
+        hash.update(Sha256::digest(serde_json::to_vec(&(chain.chain_index,chain.chain_id,chain.bridge,chain.deployment_block,chain.rpc_providers.iter().map(|provider| (&provider.name,&provider.url,&provider.operator)).collect::<Vec<_>>()))?));
     }
     for file in [directory, proofs] { let metadata = file.metadata()?; hash.update(metadata.dev().to_le_bytes()); hash.update(metadata.ino().to_le_bytes()); }
     Ok(hex::encode(hash.finalize()))
@@ -805,8 +805,8 @@ mod tests {
         let hashes = members.map(|bytes| hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&bytes)));
         config.network.guardian_initial_member_hashes = Some(hashes);
         config.l1_chains = vec![
-            guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: U256::from(7u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_url: "https://chain0.example/rpc".into() },
-            guardian_common::protocol::ChainEndpoint { chain_index: 1, chain_id: U256::from(8u8), bridge: Hex([0x22; 20]), deployment_block: 0, rpc_url: "https://chain1.example/rpc".into() },
+            guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: U256::from(7u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_providers: vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: "https://chain0.example/rpc".into(), operator: None }] },
+            guardian_common::protocol::ChainEndpoint { chain_index: 1, chain_id: U256::from(8u8), bridge: Hex([0x22; 20]), deployment_block: 0, rpc_providers: vec![guardian_common::protocol::GuardianRpcProvider { name: "primary".into(), url: "https://chain1.example/rpc".into(), operator: None }] },
         ];
         config
     }
