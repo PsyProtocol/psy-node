@@ -76,6 +76,22 @@ pub trait ProveProxyUserRpc {
         method_name: String,
     ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned>;
 
+    #[method(name = "resolve_contract_function_by_method_name_hashed")]
+    async fn resolve_contract_function_by_method_name_hashed(
+        &self,
+        contract_id: u64,
+        code_hash: String,
+        method_name: String,
+    ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned>;
+
+    #[method(name = "resolve_contract_function_by_method_id_hashed")]
+    async fn resolve_contract_function_by_method_id_hashed(
+        &self,
+        contract_id: u64,
+        code_hash: String,
+        method_id: u32,
+    ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned>;
+
     #[method(name = "resolve_contract_function_by_method_id")]
     async fn resolve_contract_function_by_method_id(
         &self,
@@ -239,6 +255,132 @@ pub struct UserProveProvider {
     /// Built on the first multisig request (two secp256k1 verifications),
     /// then reused.
     pub multisig_circuit: Arc<std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>>,
+    pub contract_codes: Arc<ContractCodeStore>,
+}
+
+/// Contract code this proxy loaded from the coordinator, so a client can name
+/// code by hash instead of sending it (bridge contracts are ~80 MB of JSON per
+/// request over a slow link). Kept in memory and, when
+/// `PSY_CONTRACT_CODE_CACHE_DIR` is set, on disk as `contract-<id>-<hash>.bin`
+/// so a restart does not refetch.
+pub struct ContractCodeStore {
+    dir: Option<std::path::PathBuf>,
+    entries: std::sync::Mutex<std::collections::HashMap<u64, ContractCodeEntry>>,
+    /// One coordinator fetch at a time: each is about 80 MB of JSON.
+    fetch_lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone)]
+struct ContractCodeEntry {
+    hash: String,
+    code: Arc<ContractCodeDefinition>,
+    loaded: web_time::Instant,
+}
+
+/// Code fetched without a requested hash is refetched after this long, so a
+/// contract update reaches registration.
+const LATEST_CONTRACT_CODE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// No contract starts warming after this; the proxy does not listen until warm-up ends.
+const CONTRACT_WARM_UP_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl ContractCodeStore {
+    pub fn from_env() -> Self {
+        let dir = std::env::var_os("PSY_CONTRACT_CODE_CACHE_DIR").map(std::path::PathBuf::from);
+        if let Some(dir) = &dir {
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                tracing::warn!(dir = %dir.display(), %error, "contract code cache directory unavailable; memory only");
+            }
+        }
+        Self { dir, entries: Default::default(), fetch_lock: Default::default() }
+    }
+
+    fn cached(&self, contract_id: u64) -> Option<ContractCodeEntry> {
+        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&contract_id).cloned()
+    }
+
+    fn file(&self, contract_id: u64, hash: &str) -> Option<std::path::PathBuf> {
+        self.dir.as_ref().map(|dir| dir.join(format!("contract-{contract_id}-{hash}.bin")))
+    }
+
+    fn remember(&self, contract_id: u64, hash: String, code: Arc<ContractCodeDefinition>, loaded: web_time::Instant) {
+        if let Some(path) = self.file(contract_id, &hash) {
+            if !path.exists() {
+                let written = bincode::serialize(code.as_ref()).map_err(anyhow::Error::from).and_then(|bytes| {
+                    static PARTIAL_FILE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let partial = path.with_extension(format!("partial-{}", PARTIAL_FILE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                    std::fs::write(&partial, bytes)?;
+                    std::fs::rename(&partial, &path)?;
+                    Ok(())
+                });
+                if let Err(error) = written {
+                    tracing::warn!(contract_id, %error, "contract code not written to the disk cache");
+                }
+            }
+        }
+        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(contract_id, ContractCodeEntry { hash, code, loaded });
+    }
+
+    async fn fetch(&self, rpc_provider: &RpcProvider, contract_id: u64) -> anyhow::Result<ContractCodeEntry> {
+        let started = web_time::Instant::now();
+        let code = rpc_provider.resolve_get_contract_code(&QSRCmdGetContractCodeDefinition { contract_id }).await?;
+        let hash = psy_provider::request::contract_code_hash(&code)?;
+        tracing::info!(contract_id, hash = %hash, elapsed_ms = started.elapsed().as_millis() as u64, "fetched contract code");
+        let code = Arc::new(code);
+        let loaded = web_time::Instant::now();
+        self.remember(contract_id, hash.clone(), code.clone(), loaded);
+        Ok(ContractCodeEntry { hash, code, loaded })
+    }
+
+    /// The coordinator's current code, cached for `LATEST_CONTRACT_CODE_TTL`.
+    pub async fn latest(&self, rpc_provider: &RpcProvider, contract_id: u64) -> anyhow::Result<Arc<ContractCodeDefinition>> {
+        let fresh = || self.cached(contract_id).filter(|entry| entry.loaded.elapsed() < LATEST_CONTRACT_CODE_TTL);
+        if let Some(entry) = fresh() {
+            return Ok(entry.code);
+        }
+        let _fetching = self.fetch_lock.lock().await;
+        if let Some(entry) = fresh() {
+            return Ok(entry.code);
+        }
+        Ok(self.fetch(rpc_provider, contract_id).await?.code)
+    }
+
+    /// The code whose `contract_code_hash` is `hash`: from memory, the disk
+    /// cache, or the coordinator. Fails if the coordinator serves other code.
+    pub async fn by_hash(&self, rpc_provider: &RpcProvider, contract_id: u64, hash: &str) -> anyhow::Result<Arc<ContractCodeDefinition>> {
+        anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "invalid contract code hash");
+        if let Some(entry) = self.cached(contract_id).filter(|entry| entry.hash == hash) {
+            return Ok(entry.code);
+        }
+        if let Some(path) = self.file(contract_id, hash) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                match bincode::deserialize::<ContractCodeDefinition>(&bytes) {
+                    Ok(code) if psy_provider::request::contract_code_hash(&code)? == hash => {
+                        let code = Arc::new(code);
+                        // Disk code may be stale: keep it only for hash lookups, never as `latest()`.
+                        let expired = web_time::Instant::now().checked_sub(LATEST_CONTRACT_CODE_TTL).unwrap_or_else(web_time::Instant::now);
+                        if self.cached(contract_id).is_none() { self.remember(contract_id, hash.to_string(), code.clone(), expired); }
+                        return Ok(code);
+                    }
+                    _ => {
+                        tracing::warn!(contract_id, path = %path.display(), "removing a corrupt contract code cache file");
+                        if let Err(error) = std::fs::remove_file(&path) {
+                            tracing::warn!(contract_id, %error, "corrupt contract code cache file not removed");
+                        }
+                    }
+                }
+            }
+        }
+        let _fetching = self.fetch_lock.lock().await;
+        let entry = match self.cached(contract_id) {
+            Some(entry) if entry.hash == hash => return Ok(entry.code),
+            // The coordinator served other code moments ago; do not refetch for every unknown hash.
+            Some(entry) if entry.loaded.elapsed() < LATEST_CONTRACT_CODE_TTL => entry,
+            _ => self.fetch(rpc_provider, contract_id).await?,
+        };
+        anyhow::ensure!(entry.hash == hash, "contract {} code hash mismatch: proxy loaded {}, request names {}", contract_id, entry.hash, hash);
+        Ok(entry.code)
+    }
 }
 
 /// Requests currently being served, for the periodic memory log.
@@ -345,6 +487,33 @@ impl UserProveProvider {
                 );
             }
         });
+    }
+
+    /// Registers (compiles) every function of the contracts listed in
+    /// `PSY_PROVE_PROXY_WARM_CONTRACTS` (comma separated ids) before the proxy
+    /// listens, so a restarted proxy does not answer its first requests with
+    /// multi-minute compiles. A contract that fails to warm is logged and
+    /// compiled on first use instead.
+    pub async fn warm_contracts_from_env(&self) {
+        let Some(list) = std::env::var("PSY_PROVE_PROXY_WARM_CONTRACTS").ok() else { return };
+        let started = web_time::Instant::now();
+        for id in list.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            let Ok(contract_id) = id.parse::<u64>() else {
+                tracing::warn!(id, "PSY_PROVE_PROXY_WARM_CONTRACTS names an invalid contract id; skipping it");
+                continue;
+            };
+            if started.elapsed() >= CONTRACT_WARM_UP_LIMIT {
+                tracing::warn!(contract_id, limit_secs = CONTRACT_WARM_UP_LIMIT.as_secs(), "contract warm-up time limit reached; compiling on first use");
+                continue;
+            }
+            let contract_started = web_time::Instant::now();
+            match self.register_contract_circuits_inner(contract_id).await {
+                Ok(()) => tracing::info!(contract_id, elapsed_ms = contract_started.elapsed().as_millis() as u64, "warmed contract circuits"),
+                Err(error) => tracing::warn!(contract_id, %error, "contract warm-up failed; compiling on first use"),
+            }
+        }
+        let memory = psy_ups_circuit::circuit_manager::core::process_memory_mib();
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, rss_mib = memory.rss, "contract warm-up finished");
     }
 
     /// Builds the multisig circuit in the background so the first request
@@ -490,15 +659,13 @@ impl UserProveProvider {
             circuit_info: Arc::new(circuit_info),
             circuits_data,
             multisig_circuit: Default::default(),
+            contract_codes: Arc::new(ContractCodeStore::from_env()),
         })
     }
 
-    async fn register_contract_circuits_inner(&self, contract_id: u64) -> anyhow::Result<()> {
+    pub async fn register_contract_circuits_inner(&self, contract_id: u64) -> anyhow::Result<()> {
         tracing::debug!("register_contract_circuits contract_id: {}", contract_id);
-        let contract_code = self
-            .rpc_provider
-            .resolve_get_contract_code(&QSRCmdGetContractCodeDefinition { contract_id })
-            .await?;
+        let contract_code = self.contract_codes.latest(&self.rpc_provider, contract_id).await?;
         self.circuit_manager
             .register_contract_circuits(contract_id, &contract_code)
             .await
@@ -593,6 +760,36 @@ impl ProveProxyUserRpcServer for UserProveProvider {
             .map_err(|err| ErrorObjectOwned::owned(1, "resolve contract function by method id error", Some(err.to_string())))
     }
 
+    async fn resolve_contract_function_by_method_name_hashed(
+        &self,
+        contract_id: u64,
+        code_hash: String,
+        method_name: String,
+    ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned> {
+        let contract_code = self.contract_codes.by_hash(&self.rpc_provider, contract_id, &code_hash)
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(psy_provider::request::CONTRACT_CODE_HASH_UNRESOLVED_ERROR_CODE, "contract code by hash error", Some(err.to_string())))?;
+        self.circuit_manager
+            .resolve_contract_function_by_method_name(contract_id, &contract_code, method_name)
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(1, "resolve contract function by method name error", Some(err.to_string())))
+    }
+
+    async fn resolve_contract_function_by_method_id_hashed(
+        &self,
+        contract_id: u64,
+        code_hash: String,
+        method_id: u32,
+    ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned> {
+        let contract_code = self.contract_codes.by_hash(&self.rpc_provider, contract_id, &code_hash)
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(psy_provider::request::CONTRACT_CODE_HASH_UNRESOLVED_ERROR_CODE, "contract code by hash error", Some(err.to_string())))?;
+        self.circuit_manager
+            .resolve_contract_function_by_method_id(contract_id, &contract_code, method_id)
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(1, "resolve contract function by method id error", Some(err.to_string())))
+    }
+
     async fn get_circuits_data(&self) -> Result<String, ErrorObjectOwned> {
         tracing::debug!("get_circuits_data");
 
@@ -610,9 +807,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         method_name: String,
     ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned> {
         tracing::debug!("get_fn_id contract_id: {}, method_name: {}", contract_id, method_name);
-        let contract_code = self
-            .rpc_provider
-            .resolve_get_contract_code(&QSRCmdGetContractCodeDefinition { contract_id })
+        let contract_code = self.contract_codes.latest(&self.rpc_provider, contract_id)
             .await
             .map_err(|err| ErrorObjectOwned::owned(1, "get contract code error", Some(err.to_string())))?;
         self.circuit_manager

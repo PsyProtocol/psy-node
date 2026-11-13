@@ -309,6 +309,10 @@ pub enum RequestParams<F: RichField> {
     SDKeyPlonky2SignatureProof(SDKeyPlonky2SignatureProofRPCRequest<F>),
     #[serde(rename = "psy_prove_multisig_sign")]
     MultisigSignatureProof(MultisigSignatureProofRPCRequest),
+    #[serde(rename = "psy_resolve_contract_function_by_method_name_hashed")]
+    ResolveContractFunctionByMethodNameHashed(QResolveContractFunctionByMethodNameHashedRPCRequest),
+    #[serde(rename = "psy_resolve_contract_function_by_method_id_hashed")]
+    ResolveContractFunctionByMethodIdHashed(QResolveContractFunctionByMethodIdHashedRPCRequest),
     // #[serde(rename = "psy_finalize_tree")]
     // FinalizeTree,
     // #[serde(rename = "psy_prove_ups_end_cap")]
@@ -1413,6 +1417,38 @@ pub struct QRegisterSDKeyPlonky2CircuitRPCRequest {
     pub input_len: usize,
 }
 
+/// SHA-256 (hex) of a contract code definition's bincode encoding. Lets a
+/// client name the code it means instead of sending it: bridge contracts
+/// are about 80 MB of JSON per request.
+pub const CONTRACT_CODE_HASH_UNRESOLVED_ERROR_CODE: i32 = 4041;
+
+/// The proxy cannot serve a hashed resolve: it predates the hashed methods,
+/// or it cannot load code with that hash. Only then does resending the code help.
+pub fn is_contract_code_hash_unresolved(error: &RpcError) -> bool {
+    error.code.code() == -32601 || error.code.code() == i64::from(CONTRACT_CODE_HASH_UNRESOLVED_ERROR_CODE)
+}
+
+pub fn contract_code_hash(code: &ContractCodeDefinition) -> anyhow::Result<String> {
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(bincode::serialize(code)?)))
+}
+
+/// Resolve a method of the contract code whose `contract_code_hash` is
+/// `code_hash`; the prove proxy loads that code itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QResolveContractFunctionByMethodNameHashedRPCRequest {
+    pub contract_id: u64,
+    pub code_hash: String,
+    pub method_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QResolveContractFunctionByMethodIdHashedRPCRequest {
+    pub contract_id: u64,
+    pub code_hash: String,
+    pub method_id: u32,
+}
+
 /// A multisig account's two signatures and witness; the proxy proves them
 /// with the multisig signature circuit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1852,5 +1888,34 @@ mod tests {
         request.capacity = u64::MAX;
         request.state_slot_base = 2;
         assert!(request.validate_indices(3, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod contract_code_hash_tests {
+    use super::*;
+    use psy_client_data::qdata::contract::ContractFunctionCodeDefinition;
+
+    #[test]
+    fn only_an_unservable_hash_resends_the_code() {
+        let error = |code: i64| RpcError { code: code.into(), message: "".into(), data: None };
+        let wire = |code: i64| serde_json::from_value::<RpcError>(serde_json::json!({ "code": code, "message": "m" })).unwrap();
+        assert!(is_contract_code_hash_unresolved(&wire(-32601)));
+        assert!(is_contract_code_hash_unresolved(&wire(i64::from(CONTRACT_CODE_HASH_UNRESOLVED_ERROR_CODE))));
+        assert!(!is_contract_code_hash_unresolved(&wire(-32010)));
+        assert!(!is_contract_code_hash_unresolved(&error(1)));
+        assert!(!is_contract_code_hash_unresolved(&error(-32603)));
+    }
+
+    #[test]
+    fn hash_names_the_code_and_changes_with_it() {
+        let function = ContractFunctionCodeDefinition { method_id: 7, num_inputs: 1, num_outputs: 0, vm_type: 1, code: vec![1, 2, 3] };
+        let code = ContractCodeDefinition { state_tree_height: 32, functions: vec![function.clone()] };
+        let hash = contract_code_hash(&code).unwrap();
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash, contract_code_hash(&code.clone()).unwrap());
+        let mut changed = code.clone();
+        changed.functions[0].code.push(4);
+        assert_ne!(hash, contract_code_hash(&changed).unwrap());
     }
 }

@@ -323,13 +323,25 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     let (verified, expected, historical_root, deposit_tree_states) = verify_sign_request_trace(context, config, request, &context.history, false).await?;
     let checkpoint = verified.trace.anchor.start_checkpoint_id;
     let account_public_key = config.account_public_key()?;
-    let mut builder = context.wallet.begin_trace_build_at_checkpoint(account_public_key, BRIDGE_USER_ID, checkpoint, request.session_nonce, historical_root).await.map_err(|_| GuardianSignError::TraceMismatch)?;
-    for call in &expected.contract_calls { builder.trace_call(call.clone()).await.map_err(|_| GuardianSignError::TraceMismatch)?; }
+    let mut builder = context.wallet.begin_trace_build_at_checkpoint(account_public_key, BRIDGE_USER_ID, checkpoint, request.session_nonce, historical_root).await.map_err(replay_failure)?;
+    for call in &expected.contract_calls { builder.trace_call(call.clone()).await.map_err(replay_failure)?; }
     let fee = builder.required_fee().map_err(|_| GuardianSignError::TraceMismatch)?;
     if fee >= GOLDILOCKS_MODULUS { return Err(GuardianSignError::UnsupportedCall.into()); }
-    let replayed = builder.finalize_tx_trace(expected.software_defined_call.clone()).await.map_err(|_| GuardianSignError::TraceMismatch)?;
+    let replayed = builder.finalize_tx_trace(expected.software_defined_call.clone()).await.map_err(replay_failure)?;
     if !traces_equal(&verified.trace, &replayed)? { return Err(GuardianSignError::TraceMismatch.into()); }
     Ok((VerifiedGuardianSession { trace: replayed, ..verified }, deposit_tree_states))
+}
+
+/// A trace replay that could not reach an L2 RPC or the prove proxy (timeout,
+/// refused connection, 502-504) says nothing about the trace: report it as
+/// `L2RpcUnavailable` so the caller retries. Anything else is a mismatch.
+fn replay_failure(error: anyhow::Error) -> GuardianSignError {
+    if matches!(crate::bridge::daemon::transport_error_category(&error), "timeout" | "unavailable") {
+        tracing::warn!(%error, "trace replay could not reach an RPC; reporting it as unavailable");
+        GuardianSignError::L2RpcUnavailable
+    } else {
+        GuardianSignError::TraceMismatch
+    }
 }
 
 fn contract_code_root(contract_id: u64, code: &[u8]) -> Result<Hash4> {
@@ -716,6 +728,15 @@ fn decode_endcap_proof(bytes: &[u8]) -> Result<plonky2::plonk::proof::ProofWithP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_failure_separates_unreachable_rpc_from_mismatch() {
+        let unavailable = anyhow::Error::new(psy_provider::provider::RpcHttpStatusError { status: 502 }).context("prove proxy");
+        assert_eq!(replay_failure(unavailable), GuardianSignError::L2RpcUnavailable);
+        assert_eq!(replay_failure(anyhow::anyhow!("contract call reverted")), GuardianSignError::TraceMismatch);
+        let rejected = anyhow::Error::new(psy_provider::provider::RpcHttpStatusError { status: 400 });
+        assert_eq!(replay_failure(rejected), GuardianSignError::TraceMismatch);
+    }
 
     fn missing_user_index(checkpoint_id: u64) -> anyhow::Error {
         psy_provider::lps::MissingCheckpointProof { checkpoint_id }.into()

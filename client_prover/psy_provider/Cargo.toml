@@ -34,6 +34,8 @@ k256 = { workspace = true }
 rand = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 psy_data = { workspace = true }
@@ -48,7 +50,6 @@ jsonrpsee = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 sodalite = { workspace = true }
 secp256k1 = { workspace = true }
-bincode = { workspace = true }
 dirs = { workspace = true }
 rpassword = { workspace = true }
 rayon = { workspace = true }
