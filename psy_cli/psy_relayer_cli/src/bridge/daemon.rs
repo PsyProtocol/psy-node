@@ -400,8 +400,6 @@ impl L2CallPlan {
 
 // ── Batch packing utilities ──────────────────────────────────────────────────
 
-/// Compute optimal batch sizes for N items using sizes 1, 2, 5.
-/// Minimizes total batch count while keeping x<2, y<5.
 /// Withdrawal batch sizes: one single for an odd count, then pairs. The
 /// five-row batch is not used: on the GPU prove proxy it proves in ~21 s
 /// against ~3.8 s for a pair (2.3x slower per withdrawal), and both need the
@@ -409,6 +407,18 @@ impl L2CallPlan {
 fn optimal_batch_sizes(n: usize) -> Vec<usize> {
     let mut sizes = vec![1; n % 2];
     sizes.extend(std::iter::repeat_n(2, n / 2));
+    sizes
+}
+
+/// The packing sessions used before pairs only: fewest batches of sizes
+/// 1, 2 and 5 with at most one single. Landed sessions keep this layout, so
+/// Guardian verification and history replay must still recognise it.
+fn five_row_batch_sizes(n: usize) -> Vec<usize> {
+    let fives = (0..=n / 5).min_by_key(|fives| fives + (n - fives * 5).div_ceil(2)).unwrap_or(0);
+    let rest = n - fives * 5;
+    let mut sizes = vec![1; rest % 2];
+    sizes.extend(std::iter::repeat_n(2, rest / 2));
+    sizes.extend(std::iter::repeat_n(5, fives));
     sizes
 }
 
@@ -428,11 +438,20 @@ fn optimal_batch_sizes(n: usize) -> Vec<usize> {
 pub(crate) fn build_withdrawal_batch_calls(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
 ) -> Vec<ContractCallArgs> {
-    if withdrawals.is_empty() {
-        return Vec::new();
-    }
+    build_withdrawal_calls(withdrawals, optimal_batch_sizes(withdrawals.len()))
+}
 
-    let sizes = optimal_batch_sizes(withdrawals.len());
+/// The same withdrawals in the layout of a session packed with five-row batches.
+pub(crate) fn build_withdrawal_batch_calls_with_five_row(
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+) -> Vec<ContractCallArgs> {
+    build_withdrawal_calls(withdrawals, five_row_batch_sizes(withdrawals.len()))
+}
+
+fn build_withdrawal_calls(
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+    sizes: Vec<usize>,
+) -> Vec<ContractCallArgs> {
     let mut calls = Vec::with_capacity(sizes.len());
     let mut pos = 0;
     for &chunk_size in &sizes {
@@ -454,8 +473,8 @@ pub(crate) fn build_withdrawal_batch_calls(
                     inputs,
                 });
             }
-            2 => {
-                let method = "batch_append_withdrawals_2";
+            2 | 5 => {
+                let method = if chunk_size == 2 { "batch_append_withdrawals_2" } else { "batch_append_withdrawals_5" };
                 let mut inputs = vec![chunk_size as u64];
                 for k in 0..chunk_size {
                     inputs.push(withdrawals[pos + k].sender_user_id);
@@ -6405,6 +6424,20 @@ mod tests {
         assert_eq!(&calls[0].inputs[5..7], &ws.iter().map(|w| w.destination_chain_index).collect::<Vec<_>>());
         let token: Vec<u64> = ws.iter().flat_map(|w| w.token_address.iter().map(|&v| v as u64)).collect();
         assert_eq!(&calls[0].inputs[7..23], &token);
+    }
+
+    #[test]
+    fn five_row_layout_matches_sessions_packed_before_pairs_only() {
+        let cases: &[(usize, &[usize])] = &[(0, &[]), (4, &[2, 2]), (5, &[5]), (7, &[2, 5]), (8, &[1, 2, 5]), (12, &[2, 5, 5])];
+        for (n, expected) in cases {
+            assert_eq!(&five_row_batch_sizes(*n), expected, "n={n}");
+        }
+        let ws: Vec<_> = (1..=7).map(sample_withdrawal).collect();
+        let calls = build_withdrawal_batch_calls_with_five_row(&ws);
+        let methods: Vec<_> = calls.iter().map(|call| call.method_name.as_str()).collect();
+        assert_eq!(methods, ["batch_append_withdrawals_2", "batch_append_withdrawals_5"]);
+        assert_eq!(calls[1].inputs.len(), 176);
+        assert_eq!(calls[1].inputs[1], ws[2].sender_user_id);
     }
 
     #[test]
