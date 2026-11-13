@@ -577,6 +577,8 @@ enum SignRoute {
 }
 
 /// Everything before the service lock: media, body, schema-3 parse, and policy refusal.
+const SIGN_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn sign_route(request: Request<Incoming>) -> SignRoute {
     if request.method() != hyper::Method::POST || request.uri().path() != "/v1/sign-session" || request.uri().query().is_some() {
         return SignRoute::Refused(error_response(None, GuardianSignError::MalformedRequest));
@@ -588,7 +590,8 @@ async fn sign_route(request: Request<Incoming>) -> SignRoute {
         Ok(permit) => permit,
         Err(_) => return SignRoute::Refused(error_response(None, GuardianSignError::SigningBusy)),
     };
-    let body = match tokio::time::timeout(Duration::from_secs(30), read_body(request.into_body())).await {
+    // A bridge sign request reaches tens of MB and three Guardians receive it at once.
+    let body = match tokio::time::timeout(SIGN_REQUEST_BODY_TIMEOUT, read_body(request.into_body())).await {
         Ok(Ok(body)) => body,
         _ => return SignRoute::Refused(error_response(None, GuardianSignError::MalformedRequest)),
     };
