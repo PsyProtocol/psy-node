@@ -402,36 +402,13 @@ impl L2CallPlan {
 
 /// Compute optimal batch sizes for N items using sizes 1, 2, 5.
 /// Minimizes total batch count while keeping x<2, y<5.
+/// Withdrawal batch sizes: one single for an odd count, then pairs. The
+/// five-row batch is not used: on the GPU prove proxy it proves in ~21 s
+/// against ~3.8 s for a pair (2.3x slower per withdrawal), and both need the
+/// serialized large-proof slot.
 fn optimal_batch_sizes(n: usize) -> Vec<usize> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut best_total = usize::MAX;
-    let mut best = (0usize, 0usize, 0usize);
-    for fives in 0..=n / 5 {
-        let rem = n - fives * 5;
-        for twos in 0..=rem / 2 {
-            let singles = rem - twos * 2;
-            if singles < 2 {
-                let total = singles + twos + fives;
-                if total < best_total {
-                    best_total = total;
-                    best = (singles, twos, fives);
-                }
-            }
-        }
-    }
-    let (singles, twos, fives) = best;
-    let mut sizes = Vec::with_capacity(singles + twos + fives);
-    for _ in 0..singles {
-        sizes.push(1);
-    }
-    for _ in 0..twos {
-        sizes.push(2);
-    }
-    for _ in 0..fives {
-        sizes.push(5);
-    }
+    let mut sizes = vec![1; n % 2];
+    sizes.extend(std::iter::repeat_n(2, n / 2));
     sizes
 }
 
@@ -477,12 +454,8 @@ pub(crate) fn build_withdrawal_batch_calls(
                     inputs,
                 });
             }
-            2 | 5 => {
-                let method = if chunk_size == 2 {
-                    "batch_append_withdrawals_2"
-                } else {
-                    "batch_append_withdrawals_5"
-                };
+            2 => {
+                let method = "batch_append_withdrawals_2";
                 let mut inputs = vec![chunk_size as u64];
                 for k in 0..chunk_size {
                     inputs.push(withdrawals[pos + k].sender_user_id);
@@ -5144,32 +5117,6 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_batch_calls_seven_items_split_into_two_then_five_in_order() {
-        let withdrawals = (1..=7).map(sample_withdrawal).collect::<Vec<_>>();
-        let calls = build_withdrawal_batch_calls(&withdrawals);
-
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].method_name, "batch_append_withdrawals_2");
-        assert_eq!(calls[0].inputs[0], 2);
-        assert_eq!(calls[0].inputs.len(), 71);
-        assert_eq!(calls[0].inputs[1], withdrawals[0].sender_user_id);
-        assert_eq!(calls[0].inputs[2], withdrawals[1].sender_user_id);
-
-        assert_eq!(calls[1].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[1].inputs[0], 5);
-        assert_eq!(calls[1].inputs.len(), 176);
-        assert_eq!(calls[1].inputs[1], withdrawals[2].sender_user_id);
-        assert_eq!(calls[1].inputs[5], withdrawals[6].sender_user_id);
-        assert_eq!(
-            &calls[1].inputs[16..56],
-            &withdrawals[2..]
-                .iter()
-                .flat_map(|w| w.token_address.iter().map(|&v| v as u64))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn select_relayer_window_catchup_batch_spans_sixty_four_checkpoints() {
         for latest_checkpoint in [104, 204, 1_004] {
             let window = select_relayer_window(1, latest_checkpoint, 3, 64);
@@ -6398,22 +6345,15 @@ mod tests {
 
     #[test]
     fn optimal_batch_sizes_maps_small_counts_to_minimal_packs() {
-        // The packing primitive that batch-call builders depend on. Each row is
-        // the unique minimal-batch-count decomposition using sizes {1,2,5} with
-        // singles < 2.
+        // Sizes {1,2}: one leading single for an odd count, then pairs.
         let cases: &[(usize, &[usize])] = &[
             (0, &[]),
             (1, &[1]),
             (2, &[2]),
             (3, &[1, 2]),
             (4, &[2, 2]),
-            (5, &[5]),
-            (6, &[1, 5]),
-            (7, &[2, 5]),
-            (8, &[1, 2, 5]),
-            (9, &[2, 2, 5]),
-            (10, &[5, 5]),
-            (12, &[2, 5, 5]),
+            (5, &[1, 2, 2]),
+            (6, &[2, 2, 2]),
         ];
         for (n, expected) in cases {
             assert_eq!(&optimal_batch_sizes(*n), expected, "n={n}");
@@ -6432,33 +6372,12 @@ mod tests {
 
     #[test]
     fn optimal_batch_sizes_satisfies_invariants_for_all_counts_up_to_two_hundred() {
-        // Property: for every n in 0..=200 the decomposition sums to n, uses only
-        // {1,2,5}, keeps singles < 2, and is no worse than the greedy 5s-then-2s
-        // packing (so it really minimises batch count).
         for n in 0..=200usize {
             let sizes = optimal_batch_sizes(n);
             assert_eq!(sizes.iter().sum::<usize>(), n, "sum != n at n={n}");
-            assert!(
-                sizes.iter().all(|&s| matches!(s, 1 | 2 | 5)),
-                "illegal size at n={n}: {sizes:?}"
-            );
-            let singles = sizes.iter().filter(|&&s| s == 1).count();
-            assert!(singles < 2, "singles>=2 at n={n}: {sizes:?}");
-            // Independent minimality check: the minimum batch count is the
-            // minimum over f in 0..=n/5 of (f + ceil((n - 5*f) / 2)) — after placing
-            // f five-batches the remainder is filled most efficiently by twos (one
-            // single at most for an odd remainder, staying < 2). This closed-form
-            // derivation is independent of the function's nested brute-force loop.
-            let theoretical_min = (0..=n / 5)
-                .map(|f| f + (n - 5 * f + 1) / 2)
-                .min()
-                .unwrap_or(0);
-            assert_eq!(
-                sizes.len(),
-                theoretical_min,
-                "not minimal at n={n}: got {got} batches vs theoretical {theoretical_min} ({sizes:?})",
-                got = sizes.len(),
-            );
+            assert!(sizes.iter().all(|&s| matches!(s, 1 | 2)), "illegal size at n={n}: {sizes:?}");
+            assert_eq!(sizes.len(), n.div_ceil(2), "not minimal at n={n}: {sizes:?}");
+            assert!(sizes.iter().skip(1).all(|&s| s == 2), "single not leading at n={n}: {sizes:?}");
         }
     }
 
@@ -6471,55 +6390,33 @@ mod tests {
     }
 
     #[test]
-    fn build_withdrawal_batch_calls_five_uses_batch_append_withdrawals_5_layout() {
-        // batch_append_withdrawals_5(count, senders[5], contracts[5], dests[5],
-        //   token_addr[5*8], amount[5*8], recipient[5*8], nonce[5*8]) → 176 inputs.
-        let ws: Vec<_> = (1..=5).map(sample_withdrawal).collect();
+    fn build_withdrawal_batch_calls_pair_uses_batch_append_withdrawals_2_layout() {
+        // batch_append_withdrawals_2(count, senders[2], contracts[2], dests[2],
+        //   token_addr[2*8], amount[2*8], recipient[2*8], nonce[2*8]) → 71 inputs.
+        let ws: Vec<_> = (1..=2).map(sample_withdrawal).collect();
         let calls = build_withdrawal_batch_calls(&ws);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].method_name, "batch_append_withdrawals_5");
+        assert_eq!(calls[0].method_name, "batch_append_withdrawals_2");
         assert_eq!(calls[0].contract_id, WITHDRAWAL_TREE_CONTRACT_ID as u64);
-        assert_eq!(calls[0].inputs.len(), 176);
-        assert_eq!(calls[0].inputs[0], 5);
-        // senders block [1..6], contracts block [6..11], dests block [11..16].
-        assert_eq!(
-            &calls[0].inputs[1..6],
-            &ws.iter().map(|w| w.sender_user_id).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &calls[0].inputs[6..11],
-            &ws.iter().map(|w| w.contract_id).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &calls[0].inputs[11..16],
-            &ws.iter().map(|w| w.destination_chain_index).collect::<Vec<_>>()
-        );
-        // token_address block [16..56], grouped per-withdrawal in original order.
-        let mut token = Vec::new();
-        for w in &ws {
-            token.extend(w.token_address.iter().map(|&v| v as u64));
-        }
-        assert_eq!(&calls[0].inputs[16..56], &token);
+        assert_eq!(calls[0].inputs.len(), 71);
+        assert_eq!(calls[0].inputs[0], 2);
+        assert_eq!(&calls[0].inputs[1..3], &ws.iter().map(|w| w.sender_user_id).collect::<Vec<_>>());
+        assert_eq!(&calls[0].inputs[3..5], &ws.iter().map(|w| w.contract_id).collect::<Vec<_>>());
+        assert_eq!(&calls[0].inputs[5..7], &ws.iter().map(|w| w.destination_chain_index).collect::<Vec<_>>());
+        let token: Vec<u64> = ws.iter().flat_map(|w| w.token_address.iter().map(|&v| v as u64)).collect();
+        assert_eq!(&calls[0].inputs[7..23], &token);
     }
 
     #[test]
-    fn build_withdrawal_batch_calls_twelve_splits_two_five_five_in_order() {
-        // 12 withdrawals → [2, 5, 5]. Original order is preserved across batches:
-        // first 2 → batch_2, next 5 → batch_5, last 5 → batch_5.
-        let ws: Vec<_> = (1..=12).map(sample_withdrawal).collect();
+    fn build_withdrawal_batch_calls_never_uses_the_five_row_batch() {
+        // 7 withdrawals → [1, 2, 2, 2] in original order.
+        let ws: Vec<_> = (1..=7).map(sample_withdrawal).collect();
         let calls = build_withdrawal_batch_calls(&ws);
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].method_name, "batch_append_withdrawals_2");
-        assert_eq!(calls[0].inputs[0], 2);
-        assert_eq!(calls[1].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[1].inputs[0], 5);
-        assert_eq!(calls[2].method_name, "batch_append_withdrawals_5");
-        assert_eq!(calls[2].inputs[0], 5);
-        // First batch's senders are ws[0..2]; third batch's senders are ws[7..12].
-        assert_eq!(calls[0].inputs[1], ws[0].sender_user_id);
-        assert_eq!(calls[0].inputs[2], ws[1].sender_user_id);
-        assert_eq!(calls[2].inputs[1], ws[7].sender_user_id);
-        assert_eq!(calls[2].inputs[5], ws[11].sender_user_id);
+        let methods: Vec<_> = calls.iter().map(|call| call.method_name.as_str()).collect();
+        assert_eq!(methods, ["append_withdrawal", "batch_append_withdrawals_2", "batch_append_withdrawals_2", "batch_append_withdrawals_2"]);
+        assert_eq!(calls[0].inputs[0], ws[0].sender_user_id);
+        assert_eq!(calls[1].inputs[1], ws[1].sender_user_id);
+        assert_eq!(calls[3].inputs[2], ws[6].sender_user_id);
     }
 
     // ── apply_claim_report: additional double-claim-defence edges ──────────

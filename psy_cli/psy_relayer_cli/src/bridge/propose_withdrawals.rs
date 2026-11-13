@@ -53,10 +53,10 @@ pub struct ProposeWithdrawalsArgs {
 // ── constants ────────────────────────────────────────────────────────────────
 
 /// One L2 session holds at most `MAX_INTROSPECTABLE_TRANSACTIONS` (64) calls, and the
-/// Guardian sign request grows with every withdrawal (about 100 MB for 240). Forty per
-/// chain keeps three chains plus their deposit roots in one session and the request
-/// near half that size; the rest wait for the next round.
-pub(crate) const MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND: usize = 40;
+/// Guardian sign request grows with every withdrawal (about 100 MB for 240). Withdrawals
+/// pack in pairs, so 36 per chain is 18 calls; three chains plus their deposit roots
+/// make 57. The rest wait for the next round.
+pub(crate) const MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND: usize = 36;
 
 const UNKNOWN_WITHDRAWAL_TREE_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
