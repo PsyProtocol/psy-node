@@ -91,6 +91,7 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     let user = if role.serves_user() {
         let user = UserProveProvider::new_with_config(rpc_config.clone(), PSY_NETWORK_MAGIC).await?;
         user.warm_multisig_circuit();
+        user.spawn_memory_log();
         Some(user)
     } else {
         None
