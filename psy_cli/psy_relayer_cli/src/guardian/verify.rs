@@ -333,12 +333,15 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let mut staged_deposit_tree_states = Vec::with_capacity(request.deposit_anchors.len());
     let start_hash = supplied.finalization.submit_end_cap_input.core.state_transition.start_user_leaf_hash;
     if pending.nonce.checked_add(1) != Some(request.session_nonce) || pending.ending_leaf.is_some_and(|leaf| leaf != start_hash) { return Err(GuardianSignError::TraceMismatch.into()); }
+    let checkpoint_ms = trace_started.elapsed().as_millis() as u64;
     for chain in &config.l1_chains {
         let (count, root) = withdrawal_opening(pending, chain.chain_index)?;
         verify_chain_state(context, &supplied, 3, chain.chain_index, count, root).await?;
         let (count, root) = pending.deposits.get(&chain.chain_index).copied().unwrap_or((0, <PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(32)));
         verify_chain_state(context, &supplied, 2, chain.chain_index, count, root).await?;
     }
+    let chain_state_ms = trace_started.elapsed().as_millis() as u64;
+    let (mut deposits_ms, mut withdrawals_ms) = (chain_state_ms, chain_state_ms);
     if request.operation == GuardianOperation::Bridge {
         if current_policy != ending_policy { return Err(GuardianSignError::PolicyMismatch.into()); }
         let mut anchor_verifications = Vec::with_capacity(request.deposit_anchors.len());
@@ -356,6 +359,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
             calls.push(ContractCallArgs { contract_id: 2, method_name: "set_chain_root".into(), inputs });
             staged_deposit_tree_states.push(state);
         }
+        deposits_ms = trace_started.elapsed().as_millis() as u64;
         let reads = WithdrawalProofReads::new(checkpoint, checkpoint_path.clone());
         let token_checks: BTreeMap<WithdrawalTokenKey, tokio::sync::OnceCell<()>> = if historical { BTreeMap::new() } else { request.withdrawal_records.iter().map(|burn| (withdrawal_token_key(burn), Default::default())).collect() };
         let mut verifications = Vec::with_capacity(request.withdrawal_records.len());
@@ -363,6 +367,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
             verifications.push(verify_withdrawal_record(context, config, &reads, &token_checks, historical, burn));
         }
         appends = stage_withdrawal_appends(verifications, pending).await?;
+        withdrawals_ms = trace_started.elapsed().as_millis() as u64;
         let withdrawals: Vec<_> = appends.iter().map(|append| { let burn = &append.burn; crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf_hex(withdrawal_leaf(burn)) } }).collect();
         let mut five_row_calls = calls.clone();
         five_row_calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls_with_five_row(&withdrawals));
@@ -377,7 +382,9 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     if fees.len() != 1 || fees[0].contract_id != 0 || fees[0].method_id != TOKEN_BURN_METHOD_ID || fees[0].method_name != "burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
     let message = Hash256::from(supplied.finalization.sig_hash).0;
     let ending_leaf_hash = supplied.finalization.submit_end_cap_input.core.new_user_leaf.qfhash::<PsyHasher>();
-    tracing::debug!(session_nonce = request.session_nonce, historical, trace_ms = trace_started.elapsed().as_millis() as u64, "[verify_sign_request_trace] trace verified");
+    // Cumulative milliseconds since the request was decoded, one line per verification.
+    tracing::info!(session_nonce = request.session_nonce, historical, deposits = request.deposit_anchors.len(), withdrawals = request.withdrawal_records.len(),
+        checkpoint_ms, chain_state_ms, deposits_ms, withdrawals_ms, total_ms = trace_started.elapsed().as_millis() as u64, "guardian trace verification phases");
     Ok((VerifiedGuardianSession { trace: supplied, current_policy, ending_policy, starting_leaf_hash: start_hash, ending_leaf_hash, message, withdrawal_appends: appends }, expected, historical_checkpoint_root(&checkpoint_path), staged_deposit_tree_states))
 }
 
@@ -397,12 +404,14 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     let (verified, expected, historical_root, deposit_tree_states) = verify_sign_request_trace(context, config, request, &context.history, false).await?;
     let checkpoint = verified.trace.anchor.start_checkpoint_id;
     let account_public_key = config.account_public_key()?;
+    let replay_started = std::time::Instant::now();
     let mut builder = context.wallet.begin_trace_build_at_checkpoint(account_public_key, BRIDGE_USER_ID, checkpoint, request.session_nonce, historical_root).await.map_err(replay_failure)?;
     for call in &expected.contract_calls { builder.trace_call(call.clone()).await.map_err(replay_failure)?; }
     let fee = builder.required_fee().map_err(|_| GuardianSignError::TraceMismatch)?;
     if fee >= GOLDILOCKS_MODULUS { return Err(GuardianSignError::UnsupportedCall.into()); }
     let replayed = builder.finalize_tx_trace(expected.software_defined_call.clone()).await.map_err(replay_failure)?;
     if !traces_equal(&verified.trace, &replayed)? { return Err(GuardianSignError::TraceMismatch.into()); }
+    tracing::info!(session_nonce = request.session_nonce, calls = expected.contract_calls.len(), replay_ms = replay_started.elapsed().as_millis() as u64, "guardian trace replay finished");
     Ok((VerifiedGuardianSession { trace: replayed, ..verified }, deposit_tree_states))
 }
 

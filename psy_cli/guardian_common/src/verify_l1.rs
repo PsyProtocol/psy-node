@@ -302,8 +302,11 @@ fn saved_deposit_tree_state_candidate(state: &DepositTreeState, anchor: &Deposit
 /// `matches_opening` compares the tip `(chain_index, count, root)` and, with
 /// `count == anchor.new_count` on an exact replay, can never certify the opening
 /// at `old_count`.
+/// A round may admit 384 deposits per chain; leave room for a slow L1 route.
+const DEPOSIT_VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub async fn verify_deposit_anchor(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState), GuardianAccountError> {
-    tokio::time::timeout(std::time::Duration::from_secs(120),verify_deposit_interval(reserved,chain,anchor)).await.map_err(|_|GuardianSignError::L1RpcUnavailable)?
+    tokio::time::timeout(DEPOSIT_VERIFICATION_TIMEOUT,verify_deposit_interval(reserved,chain,anchor)).await.map_err(|_|GuardianSignError::L1RpcUnavailable)?
 }
 
 async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState), GuardianAccountError> {
