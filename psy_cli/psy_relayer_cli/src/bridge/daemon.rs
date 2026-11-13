@@ -951,7 +951,7 @@ async fn initialize_relayer_account(config: &super::guardian_client::LoadedGuard
 /// alloy transport error at the bottom of the anyhow chain is classified via the
 /// pool's redaction-aware mapper. The result is a static name only: no URLs,
 /// request parameters or response bodies.
-fn transport_error_category(error: &anyhow::Error) -> &'static str {
+pub(crate) fn transport_error_category(error: &anyhow::Error) -> &'static str {
     error
         .chain()
         .find_map(|cause| {
@@ -4369,6 +4369,16 @@ mod tests {
         let unavailable: anyhow::Error = guardian_common::protocol::GuardianSignError::CheckpointProofUnavailable.into();
         assert!(is_missing_checkpoint_proof(&unavailable.context("verify session")));
         assert!(!is_missing_checkpoint_proof(&guardian_common::protocol::GuardianSignError::StateMismatch.into()));
+    }
+
+    #[test]
+    fn session_verification_errors_keep_their_retry_class() {
+        use guardian_common::{protocol::{GuardianSignError, HaltReason}, verify_l1::GuardianAccountError};
+        let wrap = |error: GuardianAccountError| anyhow::Error::from(error).context("verify guardian session");
+        assert!(is_temporary_rpc_error(&wrap(GuardianSignError::L2RpcUnavailable.into())));
+        assert!(is_missing_checkpoint_proof(&wrap(GuardianSignError::CheckpointProofUnavailable.into())));
+        assert!(!is_temporary_rpc_error(&wrap(GuardianSignError::TraceMismatch.into())));
+        assert!(!is_temporary_rpc_error(&wrap(GuardianAccountError::Conflict(HaltReason::FinalityConflict))));
     }
 
     fn serve_once(status_line: &'static str, body: &'static str) -> String {

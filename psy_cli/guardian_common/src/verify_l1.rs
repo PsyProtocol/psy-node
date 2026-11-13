@@ -33,7 +33,13 @@ impl From<GuardianSignError> for GuardianAccountError {
 impl std::fmt::Display for GuardianAccountError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(formatter, "{self:?}") }
 }
-impl std::error::Error for GuardianAccountError {}
+impl std::error::Error for GuardianAccountError {
+    // Expose the sign error so callers that walk an error chain (the relayer's retry
+    // classification) see an unavailable RPC instead of an opaque account error.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Unavailable(error) => Some(error), Self::Conflict(_) => None }
+    }
+}
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 

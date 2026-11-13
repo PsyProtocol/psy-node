@@ -1650,9 +1650,11 @@ where
         let response = psy_rpc_call_back!(
             self,
             &self.proof_proxy_url,
+            // The proxy registers from the code it loads itself and ignores
+            // this field, so send none of the (up to 80 MB) definition.
             RequestParams::<C::F>::RegisterCircuits(QRegisterCircuitsRPCRequest {
                 contract_id,
-                contract_code: contract_code.clone(),
+                contract_code: ContractCodeDefinition { state_tree_height: contract_code.state_tree_height, functions: Vec::new() },
             }),
             ()
         );
@@ -1692,6 +1694,25 @@ where
             Err(generation) => generation,
         };
         tracing::info!("resolve method `{}` of contract {}", method_name, contract_id);
+        // Name the code by hash first; the proxy loads it itself. An older
+        // proxy, or one that sees other code for this contract, falls back
+        // to sending the whole definition.
+        let hashed_request = RequestParams::<C::F>::ResolveContractFunctionByMethodNameHashed(crate::request::QResolveContractFunctionByMethodNameHashedRPCRequest {
+            contract_id,
+            code_hash: crate::request::contract_code_hash(contract_code)?,
+            method_name: method_name.clone(),
+        });
+        let hashed = psy_rpc_call_back!(self, &self.proof_proxy_url, hashed_request, (u64, DPNFunctionCircuitDefinition));
+        match hashed.result {
+            ResponseResult::Success((fn_id, circuit_def)) => {
+                tracing::info!("get fn id `{}` of contract {} by code hash", fn_id, contract_id);
+                self.contract_fn_cache
+                    .store_resolved(contract_id, generation, cache_key, (fn_id, circuit_def.clone()));
+                return Ok((fn_id, circuit_def));
+            }
+            ResponseResult::Error(e) if crate::request::is_contract_code_hash_unresolved(&e) => tracing::info!(contract_id, error = ?e, "resolve by code hash unavailable; sending the contract code"),
+            ResponseResult::Error(e) => return Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
         let response = psy_rpc_call_back!(
             self,
             &self.proof_proxy_url,
@@ -1725,6 +1746,22 @@ where
             Err(generation) => generation,
         };
         tracing::info!("resolve method `{}` of contract {}", method_id, contract_id);
+        let hashed_request = RequestParams::<C::F>::ResolveContractFunctionByMethodIdHashed(crate::request::QResolveContractFunctionByMethodIdHashedRPCRequest {
+            contract_id,
+            code_hash: crate::request::contract_code_hash(contract_code)?,
+            method_id,
+        });
+        let hashed = psy_rpc_call_back!(self, &self.proof_proxy_url, hashed_request, (u64, DPNFunctionCircuitDefinition));
+        match hashed.result {
+            ResponseResult::Success((fn_id, circuit_def)) => {
+                tracing::info!("get fn id `{}` of contract {} by code hash", fn_id, contract_id);
+                self.contract_fn_cache
+                    .store_resolved(contract_id, generation, cache_key, (fn_id, circuit_def.clone()));
+                return Ok((fn_id, circuit_def));
+            }
+            ResponseResult::Error(e) if crate::request::is_contract_code_hash_unresolved(&e) => tracing::info!(contract_id, error = ?e, "resolve by code hash unavailable; sending the contract code"),
+            ResponseResult::Error(e) => return Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
         let response = psy_rpc_call_back!(
             self,
             &self.proof_proxy_url,

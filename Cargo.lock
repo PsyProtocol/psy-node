@@ -8513,6 +8513,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with 3.16.1",
+ "sha2",
  "sodalite",
  "tempfile",
  "thiserror 2.0.17",
