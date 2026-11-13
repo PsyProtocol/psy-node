@@ -61,6 +61,19 @@ pub struct L1Client {
     /// Scope identity: the first configured provider URL, not a routing preference.
     primary: url::Url,
     rpc: alloy_rpc_client::RpcClient,
+    /// What the claim hold recheck carries from one round to the next.
+    claim_holds: std::sync::Arc<std::sync::Mutex<ClaimHoldMemory>>,
+}
+
+/// Claim hold recheck state that outlives one round. A restart forgets it,
+/// which only restarts the confirmation count and reloads the signer.
+#[derive(Clone, Default)]
+struct ClaimHoldMemory {
+    /// The claim signer address, derived once on first successful load.
+    signer: Option<Address>,
+    /// Recorded transactions that reached the never-lands verdict in the
+    /// previous round. A second consecutive verdict releases them.
+    never_lands_once: std::collections::HashSet<alloy_primitives::B256>,
 }
 
 impl std::fmt::Debug for L1Client {
@@ -76,7 +89,7 @@ impl L1Client {
             .url
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid L1 RPC URL for provider {}", providers[0].name))?;
-        Ok(Self { rpc: build_pool_client(label, &providers)?, primary })
+        Ok(Self { rpc: build_pool_client(label, &providers)?, primary, claim_holds: Default::default() })
     }
 
     /// Run business logic once. Individual RPC packets own failover internally.
@@ -251,31 +264,55 @@ impl L1Client {
     /// Clear holds whose condition no longer applies, before a round sends.
     ///
     /// An operator hold is re-read from the bridge. A receipt hold is resolved
-    /// only by that transaction's own receipt: success removes the leaf, a
-    /// revert spends one attempt. A missing hash, a still-pending transaction,
-    /// or a nonce that moved without the receipt stays held. None of those is
-    /// a reason to send again.
+    /// by that transaction's own receipt: success removes the leaf, a revert
+    /// spends one attempt. Without a receipt, the hold is released (no attempt
+    /// spent) only when the transaction provably can never land; see
+    /// [`claim_tx_can_never_land`]. A missing hash, a still-pending
+    /// transaction, or any unread fact stays held.
     pub async fn release_claim_holds(
         &self,
         pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
         claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
         config: &BridgeProposeDaemonConfig,
         chain: Option<u8>,
-    ) -> anyhow::Result<Vec<HoldResolution>> {
+    ) -> anyhow::Result<ClaimHoldRecheck> {
         let bridge = resolve_bridge_address(config)?;
         let network = config.finalize.deployments_network.as_deref().unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
         let scan_start = claim_withdrawals::bridge_deployment_block(network);
-        self.with_rpc_failover("release_claim_holds", |url| {
+        // The lock is never held across an await: the memory is copied out,
+        // updated by this round, and written back.
+        let mut memory = self.claim_holds.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let never_lands_once = &mut memory.never_lands_once;
+        let signer = &mut memory.signer;
+        // The claim signer is the same one the send path loads. It is derived
+        // once, on the first round that needs it; a failed load is retried on
+        // a later round and keeps the hold meanwhile.
+        let mut sender = || -> anyhow::Result<Address> {
+            if let Some(address) = *signer { return Ok(address); }
+            let wallet = crate::bridge::l1_signer::load_l1_wallet(
+                config.finalize.private_key.as_deref(),
+                config.finalize.keystore_path.as_deref().map(Path::new),
+                Some(config.finalize.password_env.as_deref().unwrap_or("WALLET_PASSWORD")),
+                None,
+                "L1 claim signer",
+            )?;
+            let address = alloy_network::NetworkWallet::<alloy_network::Ethereum>::default_signer_address(&wallet);
+            *signer = Some(address);
+            Ok(address)
+        };
+        let result = self.with_rpc_failover("release_claim_holds", |url| {
             let owned = url.to_string();
             let bridge = bridge.clone();
             async move {
                 let provider = connect_l1_readonly(
                     owned.parse().with_context(|| format!("invalid L1 rpc url: {owned}"))?,
                 )?;
-                release_claim_holds(&provider, &bridge, pending, claim_retry, scan_start, chain).await
+                release_claim_holds(&provider, &bridge, pending, claim_retry, scan_start, chain, &mut sender, never_lands_once).await
             }
         })
-        .await
+        .await;
+        *self.claim_holds.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = memory;
+        result
     }
 
 
@@ -438,6 +475,14 @@ async fn load_or_build_proof_impl(
     Ok(prove_result)
 }
 
+/// What one hold recheck did. `released` names the recorded transactions
+/// proved unable to land, whose holds were dropped this round; the caller must
+/// not re-adopt a persisted hold on any of them.
+pub(crate) struct ClaimHoldRecheck {
+    pub resolutions: Vec<HoldResolution>,
+    pub released: std::collections::HashSet<alloy_primitives::B256>,
+}
+
 /// A recorded claim transaction whose receipt came back, grouped with every
 /// pending leaf held on that one transaction. The daemon accounts the whole
 /// group from this single read; this client never sends a replacement for it.
@@ -482,6 +527,67 @@ async fn recorded_claim_batch<P: alloy_provider::Provider>(
     claim_withdrawals::recorded_claim_batch(ConsensusTransaction::input(&transaction), pending)
 }
 
+/// Blocks below the head at which the relayer account nonce is read. A nonce
+/// consumed this deep is not undone by an ordinary reorg.
+const CLAIM_NONCE_CONFIRMATIONS: u64 = 32;
+
+/// Why a held transaction without a receipt can never land, or why it stays
+/// held. `Landed` is a receipt that appeared during the check.
+enum NoReceiptCheck {
+    NeverLands,
+    StillHeld(&'static str),
+    Landed(RecordedClaimTx),
+}
+
+/// Decide whether a recorded claim transaction that has no receipt can never
+/// land. Every fact is read before the receipt is read again, so a
+/// transaction that lands during the check is accounted, not released.
+///
+/// With the signed nonce `n`: the sender's nonce at `latest - 32` is above
+/// `n`, so some transaction with nonce `n` is buried at least 32 blocks deep,
+/// and it is not this one; the provider also does not know the transaction.
+///
+/// Without a nonce (holds written before it was recorded): the provider does
+/// not know the transaction, and the sender has nothing in flight (`latest`
+/// nonce equals `pending` nonce). This is weaker than the nonce rule.
+async fn claim_tx_can_never_land<P: alloy_provider::Provider>(
+    provider: &P,
+    tx_hash: alloy_primitives::B256,
+    tx_nonce: Option<u64>,
+    sender: Address,
+) -> anyhow::Result<NoReceiptCheck> {
+    match tx_nonce {
+        Some(tx_nonce) => {
+            let head = provider.get_block_number().await?;
+            let at = head.saturating_sub(CLAIM_NONCE_CONFIRMATIONS);
+            let account_nonce = provider
+                .get_transaction_count(sender)
+                .block_id(alloy_rpc_types_eth::BlockId::number(at))
+                .await?;
+            if account_nonce <= tx_nonce {
+                return Ok(NoReceiptCheck::StillHeld("account nonce not yet consumed past the recorded nonce"));
+            }
+            if provider.get_transaction_by_hash(tx_hash).await?.is_some() {
+                return Ok(NoReceiptCheck::StillHeld("provider still knows the recorded transaction"));
+            }
+        }
+        None => {
+            if provider.get_transaction_by_hash(tx_hash).await?.is_some() {
+                return Ok(NoReceiptCheck::StillHeld("provider still knows the recorded transaction"));
+            }
+            let latest = provider.get_transaction_count(sender).latest().await?;
+            let pending = provider.get_transaction_count(sender).pending().await?;
+            if latest != pending {
+                return Ok(NoReceiptCheck::StillHeld("sender has transactions in flight"));
+            }
+        }
+    }
+    Ok(match recorded_claim_tx(provider, tx_hash).await? {
+        Some(recorded) => NoReceiptCheck::Landed(recorded),
+        None => NoReceiptCheck::NeverLands,
+    })
+}
+
 fn held_pending(
     pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
     leaf: &str,
@@ -500,16 +606,23 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
     claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     scan_start: u64,
     chain: Option<u8>,
-) -> anyhow::Result<Vec<HoldResolution>> {
+    sender: &mut (dyn FnMut() -> anyhow::Result<Address> + Send),
+    never_lands_once: &mut std::collections::HashSet<alloy_primitives::B256>,
+) -> anyhow::Result<ClaimHoldRecheck> {
+    let mut sender_address: Option<Address> = None;
     let bridge_address = Address::from_str(bridge).context("invalid bridge address")?;
     let mut resolved = Vec::new();
+    let mut released = std::collections::HashSet::new();
     let mut held: Vec<String> = claim_retry
         .iter()
         .filter(|(_, state)| !matches!(state.hold, claim_attempts::ClaimHold::None))
         .map(|(leaf, _)| leaf.clone())
         .collect();
     held.sort();
-    let mut held_by_tx: BTreeMap<alloy_primitives::B256, Vec<String>> = BTreeMap::new();
+    // Leaves held on one transaction, and the nonce recorded with it. Every
+    // leaf on one hash carries the same nonce; disagreeing records are kept
+    // held rather than guessed between.
+    let mut held_by_tx: BTreeMap<alloy_primitives::B256, (Vec<String>, Vec<Option<u64>>)> = BTreeMap::new();
     for leaf in held {
         let hold = claim_retry.get(&leaf).map(|state| state.hold.clone()).unwrap_or_default();
         match hold {
@@ -546,7 +659,7 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
                     }
                 }
             }
-            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None } => {
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None, .. } => {
                 let Some(withdrawal) = held_pending(pending, &leaf, chain) else { continue };
                 tracing::error!(
                     leaf_hash = %leaf,
@@ -555,8 +668,10 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
                     "claim send produced no transaction hash; held for manual reconciliation, no retry"
                 );
             }
-            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(tx_hash) } => {
-                held_by_tx.entry(tx_hash).or_default().push(leaf);
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(tx_hash), tx_nonce } => {
+                let (leaves, nonces) = held_by_tx.entry(tx_hash).or_default();
+                leaves.push(leaf);
+                if !nonces.contains(&tx_nonce) { nonces.push(tx_nonce); }
             }
             claim_attempts::ClaimHold::None => {}
         }
@@ -565,20 +680,98 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
     // accounted from that single read: receipt, pin, and decoded batch are
     // shared, so a full batch is applied once for all its leaves instead of
     // one re-apply per leaf.
-    for (tx_hash, leaves) in held_by_tx {
+    // The pool answers each read from whichever provider it picks, so one
+    // round can mix a stale view with a fresh one. A never-lands verdict
+    // releases only when the previous round reached it too; any other result
+    // for that hash, or the hash no longer being held, resets the count.
+    let previous_verdicts = std::mem::take(never_lands_once);
+    for (tx_hash, (leaves, nonces)) in held_by_tx {
         let group: Vec<propose_withdrawals::PendingWithdrawal> =
             leaves.iter().filter_map(|leaf| held_pending(pending, leaf, chain)).collect();
         if group.is_empty() { continue; }
         let recorded = match recorded_claim_tx(provider, tx_hash).await {
             Ok(Some(recorded)) => recorded,
             Ok(None) => {
-                tracing::warn!(
-                    tx_hash = %format!("{tx_hash:#x}"),
-                    leaves = group.len(),
-                    action = "held",
-                    "recorded claim transaction has no receipt; held, no new send"
-                );
-                continue;
+                let recorded_nonces: Vec<u64> = nonces.iter().flatten().copied().collect();
+                if recorded_nonces.len() > 1 {
+                    tracing::error!(
+                        tx_hash = %format!("{tx_hash:#x}"),
+                        leaves = group.len(),
+                        tx_nonces = ?recorded_nonces,
+                        action = "held",
+                        "recorded claim transaction has conflicting nonces on record; held for manual reconciliation"
+                    );
+                    continue;
+                }
+                // A leaf recorded without a nonce shares the hash, so the
+                // signed transaction is the same and its nonce applies.
+                let tx_nonce = recorded_nonces.first().copied();
+                let check = match sender_address {
+                    Some(address) => Ok(address),
+                    None => sender().inspect(|address| sender_address = Some(*address)),
+                };
+                let check = match check {
+                    Ok(address) => claim_tx_can_never_land(provider, tx_hash, tx_nonce, address).await,
+                    Err(error) => Err(error.context("claim signer address unavailable")),
+                };
+                match check {
+                    Ok(NoReceiptCheck::NeverLands) if !previous_verdicts.contains(&tx_hash) => {
+                        never_lands_once.insert(tx_hash);
+                        tracing::info!(
+                            tx_hash = %format!("{tx_hash:#x}"),
+                            tx_nonce = ?tx_nonce,
+                            leaves = group.len(),
+                            action = "held",
+                            "recorded claim transaction can never land; confirming next round"
+                        );
+                        continue;
+                    }
+                    Ok(NoReceiptCheck::NeverLands) => {
+                        for withdrawal in &group {
+                            claim_attempts::release_hold(claim_retry, &withdrawal.leaf_hash);
+                        }
+                        released.insert(tx_hash);
+                        match tx_nonce {
+                            Some(tx_nonce) => tracing::warn!(
+                                tx_hash = %format!("{tx_hash:#x}"),
+                                tx_nonce,
+                                leaves = group.len(),
+                                action = "released",
+                                "recorded claim transaction can never land (account nonce consumed); released for a new send"
+                            ),
+                            None => tracing::warn!(
+                                tx_hash = %format!("{tx_hash:#x}"),
+                                leaves = group.len(),
+                                action = "released",
+                                "legacy hold without a nonce: recorded claim transaction is unknown to the provider and the sender has nothing in flight; released for a new send"
+                            ),
+                        }
+                        continue;
+                    }
+                    Ok(NoReceiptCheck::Landed(recorded)) => recorded,
+                    Ok(NoReceiptCheck::StillHeld(reason)) => {
+                        tracing::warn!(
+                            tx_hash = %format!("{tx_hash:#x}"),
+                            tx_nonce = ?tx_nonce,
+                            leaves = group.len(),
+                            reason,
+                            action = "held",
+                            "recorded claim transaction has no receipt; held, no new send"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            tx_hash = %format!("{tx_hash:#x}"),
+                            tx_nonce = ?tx_nonce,
+                            leaves = group.len(),
+                            error = %error,
+                            action = "held",
+                            "recorded claim transaction has no receipt and its liveness read failed; held, no new send"
+                        );
+                        continue;
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -655,7 +848,7 @@ async fn release_claim_holds<P: alloy_provider::Provider>(
         );
         resolved.push(HoldResolution { withdrawals: accounted, report });
     }
-    Ok(resolved)
+    Ok(ClaimHoldRecheck { resolutions: resolved, released })
 }
 
 async fn claim_withdrawal_chunks(
@@ -727,7 +920,7 @@ mod tests {
                 operator: String::new(), quota_group: String::new(),
             },
         ];
-        let client = L1Client { rpc: build_pool_client("test", &providers).unwrap(), primary };
+        let client = L1Client { rpc: build_pool_client("test", &providers).unwrap(), primary, claim_holds: Default::default() };
         let mut calls = 0;
         let result: anyhow::Result<()> = client.with_rpc_failover("test", |_| {
             calls += 1;
@@ -791,12 +984,418 @@ mod tests {
         let withdrawal = held_withdrawal("inflight");
         let pending = HashMap::from([("inflight".to_string(), withdrawal)]);
         let mut retry = HashMap::new();
-        claim_attempts::hold_for_receipt(&mut retry, "inflight", Some(alloy_primitives::B256::repeat_byte(0x11)));
+        claim_attempts::hold_for_receipt(&mut retry, "inflight", Some(alloy_primitives::B256::repeat_byte(0x11)), None);
 
-        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None, &mut test_sender, &mut Seen::new()).await.unwrap();
 
-        assert!(resolved.is_empty(), "no receipt means nothing to account");
-        assert!(matches!(retry["inflight"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(_) }));
+        assert!(resolved.resolutions.is_empty(), "no receipt means nothing to account");
+        assert!(resolved.released.is_empty());
+        assert!(matches!(retry["inflight"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(_), .. }));
+    }
+
+    fn test_sender() -> anyhow::Result<Address> { Ok(Address::repeat_byte(0xaa)) }
+
+    const HOLD_BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
+
+    type RpcCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// One JSON-RPC responder that answers by method and records every call
+    /// in order. `Err` becomes a JSON-RPC error object.
+    async fn serve_rpc(
+        answer: impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
+    ) -> (String, RpcCalls) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls: RpcCalls = Default::default();
+        let seen = calls.clone();
+        let answer = std::sync::Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let (read, mut write) = socket.split();
+                let mut reader = tokio::io::BufReader::new(read);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 { break; }
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap_or(0); }
+                    }
+                }
+                let mut body = vec![0; length];
+                if length > 0 { reader.read_exact(&mut body).await.unwrap(); }
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                seen.lock().unwrap().push((method.clone(), request["params"].clone()));
+                let response = match answer(&method, &request["params"]) {
+                    Ok(result) => serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+                    Err(message) => serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": message}}),
+                }.to_string();
+                let _ = AsyncWriteExt::write_all(&mut write, format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len(),
+                ).as_bytes()).await;
+            }
+        });
+        (url, calls)
+    }
+
+    fn methods(calls: &RpcCalls) -> Vec<String> {
+        calls.lock().unwrap().iter().map(|(method, _)| method.clone()).collect()
+    }
+
+    /// Two leaves held on one recorded transaction, one with a spent attempt.
+    fn held_on(tx_hash: alloy_primitives::B256, tx_nonce: Option<u64>) -> (HashMap<String, propose_withdrawals::PendingWithdrawal>, HashMap<String, claim_attempts::ClaimAttempts>) {
+        let pending = HashMap::from([
+            ("a".to_string(), held_withdrawal("a")),
+            ("b".to_string(), held_withdrawal("b")),
+        ]);
+        let mut retry = HashMap::new();
+        claim_attempts::record_failure(&mut retry, "a", "earlier failure");
+        claim_attempts::hold_for_receipt(&mut retry, "a", Some(tx_hash), tx_nonce);
+        claim_attempts::hold_for_receipt(&mut retry, "b", Some(tx_hash), tx_nonce);
+        (pending, retry)
+    }
+
+    type Seen = std::collections::HashSet<alloy_primitives::B256>;
+
+    /// One recheck round with the default test signer.
+    async fn recheck_round<P: alloy_provider::Provider>(
+        provider: &P,
+        pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
+        retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+        seen: &mut Seen,
+    ) -> ClaimHoldRecheck {
+        release_claim_holds(provider, HOLD_BRIDGE, pending, retry, 1, None, &mut test_sender, seen).await.unwrap()
+    }
+
+    /// Answers for a dead transaction under the nonce rule: no receipt, head
+    /// 0x100, nonce 6 at head-32, unknown by hash.
+    fn dead_under_nonce_rule(method: &str) -> Result<serde_json::Value, String> {
+        match method {
+            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => Ok(serde_json::Value::Null),
+            "eth_blockNumber" => Ok(serde_json::json!("0x100")),
+            "eth_getTransactionCount" => Ok(serde_json::json!("0x6")),
+            other => Err(format!("unexpected {other}")),
+        }
+    }
+
+    fn assert_held(retry: &HashMap<String, claim_attempts::ClaimAttempts>, context: &str) {
+        for leaf in ["a", "b"] {
+            assert!(!claim_attempts::is_retriable(retry.get(leaf)), "{context}: {leaf} must stay held");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consumed_account_nonce_releases_the_dead_transaction_on_the_second_round() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let (url, calls) = serve_rpc(|method, _| dead_under_nonce_rule(method)).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        let mut seen = Seen::new();
+
+        let first = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+        assert!(first.released.is_empty(), "the first never-lands verdict only arms the confirmation");
+        assert_held(&retry, "first round");
+        assert_eq!(seen, Seen::from([hash]));
+        assert_eq!(
+            methods(&calls),
+            ["eth_getTransactionReceipt", "eth_blockNumber", "eth_getTransactionCount", "eth_getTransactionByHash", "eth_getTransactionReceipt"],
+            "the receipt is read again after the nonce and hash reads"
+        );
+        let count = calls.lock().unwrap()[2].1.clone();
+        assert_eq!(count[0], serde_json::json!(format!("{:#x}", Address::repeat_byte(0xaa))));
+        assert_eq!(count[1], serde_json::json!("0xe0"), "nonce is read 32 blocks below the head");
+
+        let second = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+        assert!(second.resolutions.is_empty());
+        assert_eq!(second.released, Seen::from([hash]));
+        for leaf in ["a", "b"] {
+            assert!(claim_attempts::is_retriable(retry.get(leaf)), "{leaf} returns to the normal round");
+        }
+        assert_eq!(retry["a"].attempts, 1, "the release spends no attempt");
+        assert!(seen.is_empty(), "a released hash leaves the confirmation set");
+    }
+
+    #[tokio::test]
+    async fn a_round_without_the_verdict_resets_the_confirmation() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let round = rounds.clone();
+        // Rounds 0, 2, 3 see a dead transaction; round 1 sees the nonce at
+        // depth not yet consumed.
+        let (url, _) = serve_rpc(move |method, _| {
+            if method == "eth_getTransactionCount" && round.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                return Ok(serde_json::json!("0x5"));
+            }
+            dead_under_nonce_rule(method)
+        }).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        let mut seen = Seen::new();
+
+        let mut released = Vec::new();
+        for n in 0..4 {
+            rounds.store(n, std::sync::atomic::Ordering::SeqCst);
+            released.push(!recheck_round(&provider, &pending, &mut retry, &mut seen).await.released.is_empty());
+        }
+        assert_eq!(released, [false, false, false, true], "round 1 resets the count, so rounds 2 and 3 confirm");
+        assert!(claim_attempts::is_retriable(retry.get("a")));
+
+        // A hash no longer held is dropped from the confirmation set.
+        let mut stale = Seen::from([alloy_primitives::B256::repeat_byte(0x99)]);
+        let (pending, mut retry) = held_on(hash, Some(5));
+        recheck_round(&provider, &pending, &mut retry, &mut stale).await;
+        assert!(!stale.contains(&alloy_primitives::B256::repeat_byte(0x99)));
+    }
+
+    #[tokio::test]
+    async fn an_unconsumed_account_nonce_keeps_the_hold() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        // (head, nonce at head-32, expected block tag). The nonce read equals
+        // the signed nonce 5, so nonce 5 is not yet used that deep and the
+        // recorded transaction may still land.
+        for (head, nonce, tag) in [("0x10", "0x5", "0x0"), ("0x100000", "0x5", "0xfffe0")] {
+            let (url, calls) = serve_rpc(move |method, _| match method {
+                "eth_getTransactionCount" => Ok(serde_json::json!(nonce)),
+                "eth_blockNumber" => Ok(serde_json::json!(head)),
+                other => dead_under_nonce_rule(other),
+            }).await;
+            let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+            let (pending, mut retry) = held_on(hash, Some(5));
+            let mut seen = Seen::new();
+            for _ in 0..2 {
+                let recheck = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+                assert!(recheck.released.is_empty());
+            }
+            assert!(seen.is_empty());
+            for leaf in ["a", "b"] {
+                assert_eq!(retry[leaf].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), tx_nonce: Some(5) });
+            }
+            let count = calls.lock().unwrap()[2].1.clone();
+            assert_eq!(count[1], serde_json::json!(tag), "head {head}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_known_by_hash_keeps_the_hold_under_the_nonce_rule() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let known = known_transaction().await;
+        let (url, calls) = serve_rpc(move |method, _| match method {
+            "eth_getTransactionByHash" => Ok(known.clone()),
+            other => dead_under_nonce_rule(other),
+        }).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        let mut seen = Seen::new();
+        for _ in 0..2 {
+            assert!(recheck_round(&provider, &pending, &mut retry, &mut seen).await.released.is_empty());
+        }
+        assert_held(&retry, "known by hash");
+        assert!(seen.is_empty());
+        assert_eq!(
+            methods(&calls)[..4],
+            ["eth_getTransactionReceipt", "eth_blockNumber", "eth_getTransactionCount", "eth_getTransactionByHash"],
+            "a known transaction stops the check before the receipt is read again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receipt_that_appears_during_the_check_is_accounted_not_released() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let block_hash = alloy_primitives::B256::repeat_byte(0x77);
+        let receipt = serde_json::json!({
+            "type": "0x0", "status": "0x0", "cumulativeGasUsed": "0x0",
+            "logs": [], "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": block_hash, "blockNumber": "0xf0",
+            "gasUsed": "0x0", "effectiveGasPrice": "0x0",
+            "from": Address::repeat_byte(0xaa), "to": HOLD_BRIDGE, "contractAddress": null,
+        });
+        let mut block: alloy_rpc_types_eth::Block = Default::default();
+        block.header.hash = block_hash;
+        block.header.inner.number = 0xf0;
+        block.transactions = alloy_rpc_types_eth::BlockTransactions::Hashes(vec![hash]);
+        let block = serde_json::to_value(block).unwrap();
+        let receipts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads = receipts.clone();
+        let (url, _) = serve_rpc(move |method, _| match method {
+            // The first read misses; the read after the liveness checks finds it.
+            "eth_getTransactionReceipt" => Ok(if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { serde_json::Value::Null } else { receipt.clone() }),
+            "eth_getBlockByNumber" | "eth_getBlockByHash" => Ok(block.clone()),
+            other => dead_under_nonce_rule(other),
+        }).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        let mut seen = Seen::from([hash]);
+
+        let recheck = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+
+        assert!(recheck.released.is_empty(), "a landed transaction is never released, even when armed");
+        assert_eq!(recheck.resolutions.len(), 2, "each held leaf is accounted from the reverted receipt");
+        assert!(recheck.resolutions.iter().all(|resolution| resolution.report.outcomes.iter().all(|outcome| outcome.kind == claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::BatchReverted))));
+        assert!(seen.is_empty(), "the landed verdict resets the confirmation");
+    }
+
+    #[tokio::test]
+    async fn conflicting_nonces_on_one_hash_stay_held() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let (url, calls) = serve_rpc(|method, _| dead_under_nonce_rule(method)).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        claim_attempts::release_hold(&mut retry, "b");
+        claim_attempts::hold_for_receipt(&mut retry, "b", Some(hash), Some(6));
+        let mut seen = Seen::new();
+        for _ in 0..2 {
+            assert!(recheck_round(&provider, &pending, &mut retry, &mut seen).await.released.is_empty());
+        }
+        assert_held(&retry, "conflicting nonces");
+        assert!(seen.is_empty());
+        assert!(methods(&calls).iter().all(|method| method == "eth_getTransactionReceipt"), "no liveness read is made for a conflicted record");
+    }
+
+    #[tokio::test]
+    async fn a_failed_liveness_read_keeps_the_hold() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        for failing in ["eth_blockNumber", "eth_getTransactionCount", "eth_getTransactionByHash", "second_receipt"] {
+            let receipts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reads = receipts.clone();
+            let (url, _) = serve_rpc(move |method, _| {
+                if method == "eth_getTransactionReceipt" {
+                    let n = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return if failing == "second_receipt" && n % 2 == 1 { Err("receipt unavailable".into()) } else { Ok(serde_json::Value::Null) };
+                }
+                if method == failing { return Err("unavailable".into()); }
+                dead_under_nonce_rule(method)
+            }).await;
+            let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+            let (pending, mut retry) = held_on(hash, Some(5));
+            // Armed by an earlier verdict: a failed read must still not release.
+            let mut seen = Seen::from([hash]);
+
+            let recheck = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+
+            assert!(recheck.released.is_empty(), "{failing} failure must not release");
+            assert_held(&retry, failing);
+            assert!(seen.is_empty(), "{failing} failure resets the confirmation");
+        }
+        // An unavailable signer address is also an unread fact.
+        let (url, _) = serve_rpc(|method, _| dead_under_nonce_rule(method)).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+        let mut seen = Seen::from([hash]);
+        let recheck = release_claim_holds(&provider, HOLD_BRIDGE, &pending, &mut retry, 1, None, &mut || anyhow::bail!("no key"), &mut seen).await.unwrap();
+        assert!(recheck.released.is_empty());
+        assert_held(&retry, "signer unavailable");
+    }
+
+    #[tokio::test]
+    async fn the_signer_address_is_derived_once_and_a_failed_load_keeps_the_hold() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let (url, _) = serve_rpc(|method, _| dead_under_nonce_rule(method)).await;
+        let providers = vec![RpcProviderConfig {
+            name: "p0".into(), url: url.clone(), priority_weight: 10,
+            operator: String::new(), quota_group: String::new(),
+        }];
+        let client = L1Client { rpc: build_pool_client("test", &providers).unwrap(), primary: url.parse().unwrap(), claim_holds: Default::default() };
+        let mut config: BridgeProposeDaemonConfig = toml::from_str(&format!(
+            "rpc_config = \"unused\"\nguardian_root = \"unused\"\nservices_url = \"http://127.0.0.1:1\"\nwithdraw_method_id = 0\n[finalize]\nbridge_address = \"{HOLD_BRIDGE}\"\n",
+        )).unwrap();
+        let (pending, mut retry) = held_on(hash, Some(5));
+
+        // No key configured: the load fails, the hold stays, nothing is cached.
+        let recheck = client.release_claim_holds(&pending, &mut retry, &config, None).await.unwrap();
+        assert!(recheck.released.is_empty());
+        assert_held(&retry, "no signer");
+        assert!(client.claim_holds.lock().unwrap().signer.is_none());
+
+        config.finalize.private_key = Some("0x4646464646464646464646464646464646464646464646464646464646464646".into());
+        client.release_claim_holds(&pending, &mut retry, &config, None).await.unwrap();
+        let derived = client.claim_holds.lock().unwrap().signer.expect("signer derived on first successful load");
+        assert_eq!(client.claim_holds.lock().unwrap().never_lands_once, Seen::from([hash]), "the verdict is remembered across rounds");
+
+        // A later round uses the cached address, not the (now broken) key.
+        config.finalize.private_key = Some("not a key".into());
+        let recheck = client.release_claim_holds(&pending, &mut retry, &config, None).await.unwrap();
+        assert_eq!(recheck.released, Seen::from([hash]), "the second consecutive verdict releases with the cached signer");
+        assert_eq!(client.claim_holds.lock().unwrap().signer, Some(derived));
+    }
+
+    async fn known_transaction() -> serde_json::Value {
+        use alloy_network::TransactionBuilder;
+        let signer: alloy_signer_local::PrivateKeySigner =
+            "0x4646464646464646464646464646464646464646464646464646464646464646".parse().unwrap();
+        let wallet = alloy_network::EthereumWallet::from(signer.clone());
+        let envelope = alloy_rpc_types_eth::TransactionRequest::default()
+            .with_to(Address::repeat_byte(0xb1))
+            .with_nonce(5)
+            .with_chain_id(1)
+            .with_gas_limit(21_000)
+            .with_gas_price(1)
+            .build(&wallet)
+            .await
+            .unwrap();
+        let transaction = alloy_rpc_types_eth::Transaction {
+            inner: alloy_consensus::transaction::Recovered::new_unchecked(envelope, signer.address()),
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        };
+        serde_json::to_value(transaction).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_legacy_hold_without_a_nonce_releases_only_when_unknown_and_idle() {
+        let hash = alloy_primitives::B256::repeat_byte(0x11);
+        let known = known_transaction().await;
+        // (provider knows the transaction, latest nonce, pending nonce, released?)
+        for (tx_known, latest, pending_nonce, released) in [
+            (false, "0x9", "0x9", true),
+            (false, "0x9", "0xa", false),
+            (true, "0x9", "0x9", false),
+        ] {
+            let known = known.clone();
+            let (url, calls) = serve_rpc(move |method, params| match method {
+                "eth_getTransactionReceipt" => Ok(serde_json::Value::Null),
+                "eth_getTransactionByHash" => Ok(if tx_known { known.clone() } else { serde_json::Value::Null }),
+                "eth_getTransactionCount" if params[1] == "latest" => Ok(serde_json::json!(latest)),
+                "eth_getTransactionCount" if params[1] == "pending" => Ok(serde_json::json!(pending_nonce)),
+                other => Err(format!("unexpected {other} {params}")),
+            }).await;
+            let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+            let (pending, mut retry) = held_on(hash, None);
+            let mut seen = Seen::new();
+
+            let first = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+            assert!(first.released.is_empty(), "the legacy rule also needs a second consecutive verdict");
+            assert_eq!(seen.contains(&hash), released);
+            calls.lock().unwrap().clear();
+            let recheck = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+
+            assert_eq!(!recheck.released.is_empty(), released, "known={tx_known} latest={latest} pending={pending_nonce}");
+            assert_eq!(claim_attempts::is_retriable(retry.get("a")), released);
+            assert_eq!(claim_attempts::is_retriable(retry.get("b")), released);
+            let expected: &[&str] = match (tx_known, released) {
+                // A known transaction stops the check before any nonce read.
+                (true, _) => &["eth_getTransactionReceipt", "eth_getTransactionByHash"],
+                (false, false) => &["eth_getTransactionReceipt", "eth_getTransactionByHash", "eth_getTransactionCount", "eth_getTransactionCount"],
+                (false, true) => &["eth_getTransactionReceipt", "eth_getTransactionByHash", "eth_getTransactionCount", "eth_getTransactionCount", "eth_getTransactionReceipt"],
+            };
+            assert_eq!(methods(&calls), expected);
+        }
+        // A failed read on the legacy path keeps the hold too.
+        let (url, _) = serve_rpc(|method, _| match method {
+            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => Ok(serde_json::Value::Null),
+            _ => Err("unavailable".into()),
+        }).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let (pending, mut retry) = held_on(hash, None);
+        let mut seen = Seen::from([hash]);
+        let recheck = recheck_round(&provider, &pending, &mut retry, &mut seen).await;
+        assert!(recheck.released.is_empty());
+        assert!(!claim_attempts::is_retriable(retry.get("a")));
     }
 
     #[tokio::test]
@@ -805,12 +1404,12 @@ mod tests {
         let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
         let pending = HashMap::from([("lost".to_string(), held_withdrawal("lost"))]);
         let mut retry = HashMap::new();
-        claim_attempts::hold_for_receipt(&mut retry, "lost", None);
+        claim_attempts::hold_for_receipt(&mut retry, "lost", None, None);
 
-        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None, &mut test_sender, &mut Seen::new()).await.unwrap();
 
-        assert!(resolved.is_empty());
-        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None }));
+        assert!(resolved.resolutions.is_empty() && resolved.released.is_empty());
+        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None, .. }));
     }
 
     #[tokio::test]
@@ -823,13 +1422,13 @@ mod tests {
         let mut retry = HashMap::new();
         claim_attempts::hold_for_operator(&mut retry, "paused", claim_withdrawals::ClaimCode::RegistrationPaused);
 
-        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None, &mut test_sender, &mut Seen::new()).await.unwrap();
         assert!(matches!(retry["paused"].hold, claim_attempts::ClaimHold::OperatorPending(_)), "flag 2 still set");
 
         let clear_flags = "\"0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"";
         let url = serve_receipt(None, clear_flags).await;
         let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
-        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None, &mut test_sender, &mut Seen::new()).await.unwrap();
         assert!(matches!(retry["paused"].hold, claim_attempts::ClaimHold::None), "a cleared flag releases the hold and keeps its reason");
     }
 

@@ -146,6 +146,10 @@ pub struct ClaimOutcome {
     /// [`ClaimOutcomeKind::Failed`]([`ClaimCode::ReceiptUnknown`]), `None`
     /// for everything else.
     pub tx_hash: Option<B256>,
+    /// The relayer account nonce `tx_hash` was signed with, when this send
+    /// signed it. `None` when the hash came from a record that had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_nonce: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -333,7 +337,7 @@ fn fail_row(outcomes: &mut OutcomeSlots, index: usize, leaf_hash: &str, code: Cl
     outcomes[index] = Some(ClaimOutcome {
         leaf_hash: leaf_hash.to_string(),
         kind: ClaimOutcomeKind::Failed(code),
-        tx_hash: None,
+        tx_hash: None, tx_nonce: None,
     });
 }
 
@@ -938,7 +942,7 @@ fn fail_chunk(chunk: &[PendingProof], outcomes: &mut OutcomeSlots, code: ClaimCo
         outcomes[claim.index] = Some(ClaimOutcome {
             leaf_hash: claim.withdrawal.leaf_hash.clone(),
             kind: ClaimOutcomeKind::Failed(code),
-            tx_hash: None,
+            tx_hash: None, tx_nonce: None,
         });
     }
 }
@@ -963,7 +967,7 @@ fn apply_confirmed_claim_receipt(
             .map(|claim| ClaimOutcome {
                 leaf_hash: claim.withdrawal.leaf_hash.clone(),
                 kind: ClaimOutcomeKind::Failed(code),
-                tx_hash: None,
+                tx_hash: None, tx_nonce: None,
             })
             .collect::<Vec<_>>()
     };
@@ -1016,7 +1020,7 @@ fn apply_confirmed_claim_receipt(
                 }
                 ClaimSlotOutcome::Failed { reason } => ClaimOutcomeKind::Failed(contract_reason(reason)),
             };
-            ClaimOutcome { leaf_hash, kind, tx_hash: None }
+            ClaimOutcome { leaf_hash, kind, tx_hash: None, tx_nonce: None }
         })
         .collect()
 }
@@ -1095,7 +1099,7 @@ fn single_leaf_report(
     BatchWithdrawalsReport {
         requested: 1,
         submitted_count: usize::from(kind == ClaimOutcomeKind::Registered),
-        outcomes: vec![ClaimOutcome { leaf_hash: withdrawal.leaf_hash.clone(), kind, tx_hash }],
+        outcomes: vec![ClaimOutcome { leaf_hash: withdrawal.leaf_hash.clone(), kind, tx_hash, tx_nonce: None }],
     }
 }
 
@@ -1138,7 +1142,7 @@ pub(crate) async fn apply_recorded_claim_receipt<P: Provider>(
         outcomes.push(ClaimOutcome {
             leaf_hash: withdrawal.leaf_hash.clone(),
             kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
-            tx_hash: None,
+            tx_hash: None, tx_nonce: None,
         });
     }
     for outcome in &mut outcomes {
@@ -1489,21 +1493,24 @@ async fn sign_claim(provider: &crate::bridge::l1_provider::ClaimWalletProvider, 
 }
 
 /// A chunk whose broadcast landing is unknown: every member carries the same
-/// signed hash — that one transaction's outcome is unknown for all of them —
-/// and the hash is recorded so no later chunk re-signs any of these leaves.
+/// signed hash and account nonce — that one transaction's outcome is unknown
+/// for all of them — and both are recorded so no later chunk re-signs any of
+/// these leaves.
 fn hold_unknown(
     chunk: &[PendingProof],
     outcomes: &mut OutcomeSlots,
-    hashes: &mut HashMap<String, B256>,
+    hashes: &mut HashMap<String, (B256, u64)>,
     tx_hash: B256,
+    tx_nonce: u64,
 ) {
     for claim in chunk {
         outcomes[claim.index] = Some(ClaimOutcome {
             leaf_hash: claim.withdrawal.leaf_hash.clone(),
             kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
             tx_hash: Some(tx_hash),
+            tx_nonce: Some(tx_nonce),
         });
-        hashes.entry(claim.withdrawal.leaf_hash.clone()).or_insert(tx_hash);
+        hashes.entry(claim.withdrawal.leaf_hash.clone()).or_insert((tx_hash, tx_nonce));
     }
 }
 
@@ -1514,8 +1521,10 @@ async fn canonical_receipt<P: Provider>(provider: &P, pin: &ReadPin, tx_hash: B2
     let again = provider.get_block(BlockId::Number(BlockNumberOrTag::Number(pin.block_number))).await?.context("receipt block number missing")?;
     Ok(again.header.hash == pin.block_hash)
 }
+/// Persists the signed claim before it is broadcast: the leaves it carries,
+/// its hash, and the relayer account nonce it was signed with.
 pub(crate) type BeforeBroadcast = Arc<
-    dyn Fn(&[PendingWithdrawal], B256) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+    dyn Fn(&[PendingWithdrawal], B256, u64) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
 pub async fn submit_batch(
@@ -1589,7 +1598,7 @@ pub async fn submit_batch_with_hook(
                 .map(|w| ClaimOutcome {
                     leaf_hash: w.leaf_hash.clone(),
                     kind: ClaimOutcomeKind::Failed(ClaimCode::FeeRefused),
-                    tx_hash: None,
+                    tx_hash: None, tx_nonce: None,
                 })
                 .collect(),
         });
@@ -1597,7 +1606,7 @@ pub async fn submit_batch_with_hook(
     let http = build_default_http_client()?;
     // One outcome slot per requested row, in request order.
     let mut outcomes: OutcomeSlots = vec![None; withdrawals.len()];
-    let mut unknown_tx_hashes: HashMap<String, B256> = HashMap::new();
+    let mut unknown_tx_hashes: HashMap<String, (B256, u64)> = HashMap::new();
     if multicall3_address.is_some() || !deployments_network.is_empty() {
         let _ = (multicall3_address, deployments_network);
     }
@@ -1830,17 +1839,18 @@ async fn submit_chunks(
     fee_policy: Option<&super::l1_fees::BscFeePolicy>,
     before_broadcast: Option<&BeforeBroadcast>,
     outcomes: &mut OutcomeSlots,
-    unknown_tx_hashes: &mut HashMap<String, B256>,
+    unknown_tx_hashes: &mut HashMap<String, (B256, u64)>,
 ) {
     for ReadyChunk { root_hex, chunk, call_data } in chunks {
         if chunk.iter().any(|claim| unknown_tx_hashes.contains_key(&claim.withdrawal.leaf_hash)) {
             for claim in chunk {
                 match unknown_tx_hashes.get(&claim.withdrawal.leaf_hash) {
-                    Some(&hash) => {
+                    Some(&(hash, nonce)) => {
                         outcomes[claim.index] = Some(ClaimOutcome {
                             leaf_hash: claim.withdrawal.leaf_hash.clone(),
                             kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
                             tx_hash: Some(hash),
+                            tx_nonce: Some(nonce),
                         });
                     }
                     None => {
@@ -1895,9 +1905,10 @@ async fn submit_chunks(
             }
         };
         let tx_hash = *signed.tx_hash();
+        let tx_nonce = alloy_consensus::Transaction::nonce(&signed);
         let leaves: Vec<PendingWithdrawal> = chunk.iter().map(|claim| claim.withdrawal.clone()).collect();
         if let Some(hook) = before_broadcast {
-            if let Err(error) = hook(&leaves, tx_hash).await {
+            if let Err(error) = hook(&leaves, tx_hash, tx_nonce).await {
                 fail_chunk(chunk, outcomes, ClaimCode::RpcUnavailable);
                 tracing::error!(root = %root_hex, error = %error, "signed claim was not persisted; broadcast aborted");
                 continue;
@@ -1912,12 +1923,12 @@ async fn submit_chunks(
                 continue;
             }
             Ok(Err(error)) => {
-                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                 tracing::error!(root = %root_hex, tx_hash = %tx_hash, error = %error, "signed claim broadcast outcome is unknown");
                 continue;
             }
             Err(_) => {
-                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                 tracing::error!(root = %root_hex, tx_hash = %tx_hash, "signed claim broadcast timed out");
                 continue;
             }
@@ -1926,7 +1937,7 @@ async fn submit_chunks(
         match timeout(Duration::from_secs(L1_TX_RECEIPT_TIMEOUT_SECS), pending.get_receipt()).await {
             Ok(Ok(receipt)) => {
                 if receipt.transaction_hash != tx_hash {
-                    hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                    hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                     tracing::error!(root = %root_hex, tx_hash = %tx_hash, "receipt names a different transaction");
                     continue;
                 }
@@ -1935,13 +1946,13 @@ async fn submit_chunks(
                         Ok(pin) => match canonical_receipt(provider, &pin, tx_hash).await {
                             Ok(true) => Some(pin),
                             Ok(false) | Err(_) => {
-                                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                                 continue;
                             }
                         },
-                        Err(_) => { hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash); continue; }
+                        Err(_) => { hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce); continue; }
                     },
-                    _ => { hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash); continue; }
+                    _ => { hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce); continue; }
                 };
                 if receipt.status() {
                     for (slot, outcome) in
@@ -1956,11 +1967,11 @@ async fn submit_chunks(
                 }
             }
             Ok(Err(error)) => {
-                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                 tracing::error!(tx_hash = %tx_hash, root = %root_hex, error = %error, "batchClaimWithdrawal receipt read failed");
             }
             Err(_) => {
-                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash);
+                hold_unknown(chunk, outcomes, unknown_tx_hashes, tx_hash, tx_nonce);
                 tracing::error!(tx_hash = %tx_hash, root = %root_hex, "batchClaimWithdrawal receipt timed out");
             }
         }
@@ -3048,7 +3059,7 @@ mod tests {
         assert_eq!(report.outcomes, vec![ClaimOutcome {
             leaf_hash: withdrawal.leaf_hash,
             kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
-            tx_hash: Some(known_tx),
+            tx_hash: Some(known_tx), tx_nonce: None,
         }]);
     }
 
@@ -3222,7 +3233,7 @@ mod tests {
                 ClaimOutcome {
                     leaf_hash: format!("leaf-{}", slot + 1),
                     kind: ClaimOutcomeKind::Failed(*code),
-                    tx_hash: None,
+                    tx_hash: None, tx_nonce: None,
                 }
             );
         }
@@ -3251,13 +3262,13 @@ mod tests {
             ReadyChunk { root_hex: "0xb".into(), chunk: chunk_b, call_data: call_data_b },
         ];
 
-        let hook_hashes: Arc<std::sync::Mutex<Vec<B256>>> =
+        let hook_hashes: Arc<std::sync::Mutex<Vec<(B256, u64)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&hook_hashes);
-        let hook: BeforeBroadcast = Arc::new(move |_leaves: &[PendingWithdrawal], tx_hash: B256| {
+        let hook: BeforeBroadcast = Arc::new(move |_leaves: &[PendingWithdrawal], tx_hash: B256, tx_nonce: u64| {
             let sink = Arc::clone(&sink);
             Box::pin(async move {
-                sink.lock().unwrap().push(tx_hash);
+                sink.lock().unwrap().push((tx_hash, tx_nonce));
                 Ok(())
             })
         });
@@ -3275,7 +3286,7 @@ mod tests {
                 let provider = connect_l1_with_wallet(url.parse().unwrap(), wallet)
                     .expect("provider connects");
                 let mut outcomes: OutcomeSlots = vec![None; 3];
-                let mut unknown_tx_hashes: HashMap<String, B256> = HashMap::new();
+                let mut unknown_tx_hashes: HashMap<String, (B256, u64)> = HashMap::new();
                 submit_chunks(
                     &provider,
                     RECEIPT_BRIDGE,
@@ -3315,13 +3326,14 @@ mod tests {
             1,
             "chunk B must be gated before signing: the hook never sees a second hash"
         );
-        let hash_a = hashes[0];
+        let (hash_a, nonce_a) = hashes[0];
         assert_eq!(
             outcomes[0].as_ref().unwrap(),
             &ClaimOutcome {
                 leaf_hash: "leaf-a".to_string(),
                 kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
                 tx_hash: Some(hash_a),
+                tx_nonce: Some(nonce_a),
             }
         );
         assert_eq!(
@@ -3330,6 +3342,7 @@ mod tests {
                 leaf_hash: "leaf-a".to_string(),
                 kind: ClaimOutcomeKind::Failed(ClaimCode::ReceiptUnknown),
                 tx_hash: Some(hash_a),
+                tx_nonce: Some(nonce_a),
             },
             "the affected leaf stays held on the recorded hash of A"
         );
@@ -3338,7 +3351,7 @@ mod tests {
             &ClaimOutcome {
                 leaf_hash: "leaf-b".to_string(),
                 kind: ClaimOutcomeKind::Failed(ClaimCode::RpcUnavailable),
-                tx_hash: None,
+                tx_hash: None, tx_nonce: None,
             },
             "the safe chunk-mate is deferred retryable, not faked unknown"
         );

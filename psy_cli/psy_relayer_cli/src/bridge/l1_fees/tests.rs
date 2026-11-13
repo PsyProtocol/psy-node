@@ -519,7 +519,7 @@ async fn withdrawal_policy_refusal_precedes_proof_and_does_not_fail_claims() {
     assert_eq!(report.submitted_count, 0);
     assert!(matches!(
         report.outcomes.as_slice(),
-        [super::super::claim_withdrawals::ClaimOutcome { leaf_hash, kind, tx_hash: None }]
+        [super::super::claim_withdrawals::ClaimOutcome { leaf_hash, kind, tx_hash: None, tx_nonce: None }]
             if leaf_hash == "test-only-leaf"
                 && *kind == super::super::claim_withdrawals::ClaimOutcomeKind::Failed(
                     super::super::claim_withdrawals::ClaimCode::FeeRefused,

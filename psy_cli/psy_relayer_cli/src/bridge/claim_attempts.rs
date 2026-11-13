@@ -57,11 +57,18 @@ pub const CLAIM_MAX_ATTEMPTS: u32 = 3;
 /// `None` is a leaf with no hold. `OperatorPending` names the chain condition
 /// that has to clear. `ReceiptUnknown` names the one transaction whose landing
 /// is unresolved; `tx_hash: None` means the send never produced a hash.
+/// `tx_nonce` is that signed transaction's relayer account nonce. Rows written
+/// before it was recorded decode as `None` and re-encode byte-identically, so
+/// the canonical progress-row check still accepts them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaimHold {
     None,
     OperatorPending(ClaimCode),
-    ReceiptUnknown { tx_hash: Option<B256> },
+    ReceiptUnknown {
+        tx_hash: Option<B256>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx_nonce: Option<u64>,
+    },
 }
 
 impl Default for ClaimHold {
@@ -145,18 +152,26 @@ pub fn hold_for_operator(
 ///
 /// `tx_hash: None` is a send that produced no hash. That leaf stays held and
 /// is never retried: there is no transaction to reconcile. A later report that
-/// also has no hash must not erase one already recorded.
+/// also has no hash must not erase one already recorded, and a later report of
+/// the same hash without a nonce must not erase the recorded nonce. A different
+/// hash replaces both: the nonce always belongs to the hash beside it.
 pub fn hold_for_receipt(
     attempts: &mut HashMap<String, ClaimAttempts>,
     leaf_hash: &str,
     tx_hash: Option<B256>,
+    tx_nonce: Option<u64>,
 ) {
     let entry = attempts.entry(leaf_hash.to_string()).or_default();
-    let kept = tx_hash.or(match entry.hold {
-        ClaimHold::ReceiptUnknown { tx_hash } => tx_hash,
-        _ => None,
-    });
-    entry.hold = ClaimHold::ReceiptUnknown { tx_hash: kept };
+    let (recorded_hash, recorded_nonce) = match entry.hold {
+        ClaimHold::ReceiptUnknown { tx_hash, tx_nonce } => (tx_hash, tx_nonce),
+        _ => (None, None),
+    };
+    let (kept_hash, kept_nonce) = match tx_hash {
+        None => (recorded_hash, recorded_nonce),
+        Some(hash) if recorded_hash == Some(hash) => (Some(hash), tx_nonce.or(recorded_nonce)),
+        Some(hash) => (Some(hash), tx_nonce),
+    };
+    entry.hold = ClaimHold::ReceiptUnknown { tx_hash: kept_hash, tx_nonce: kept_nonce };
     entry.last_reason = ClaimCode::ReceiptUnknown.label().to_string();
 }
 
@@ -236,7 +251,7 @@ mod tests {
     #[test]
     fn a_receipt_hold_without_a_hash_is_not_due() {
         let mut attempts = HashMap::new();
-        hold_for_receipt(&mut attempts, "leaf", None);
+        hold_for_receipt(&mut attempts, "leaf", None, None);
         assert!(!is_retriable(attempts.get("leaf")));
         assert_eq!(attempts["leaf"].attempts, 0);
     }
@@ -245,12 +260,36 @@ mod tests {
     fn a_later_hashless_hold_keeps_the_recorded_hash() {
         let mut attempts = HashMap::new();
         let hash = B256::repeat_byte(0x11);
-        hold_for_receipt(&mut attempts, "leaf", Some(hash));
-        hold_for_receipt(&mut attempts, "leaf", None);
-        assert!(matches!(
-            attempts["leaf"].hold,
-            ClaimHold::ReceiptUnknown { tx_hash: Some(kept) } if kept == hash
-        ));
+        hold_for_receipt(&mut attempts, "leaf", Some(hash), Some(7));
+        hold_for_receipt(&mut attempts, "leaf", None, None);
+        assert_eq!(attempts["leaf"].hold, ClaimHold::ReceiptUnknown { tx_hash: Some(hash), tx_nonce: Some(7) });
+        hold_for_receipt(&mut attempts, "leaf", Some(hash), None);
+        assert_eq!(attempts["leaf"].hold, ClaimHold::ReceiptUnknown { tx_hash: Some(hash), tx_nonce: Some(7) }, "same hash without a nonce keeps the recorded nonce");
+    }
+
+    #[test]
+    fn a_different_hash_replaces_the_recorded_nonce() {
+        let mut attempts = HashMap::new();
+        hold_for_receipt(&mut attempts, "leaf", Some(B256::repeat_byte(0x11)), Some(7));
+        hold_for_receipt(&mut attempts, "leaf", Some(B256::repeat_byte(0x22)), None);
+        assert_eq!(attempts["leaf"].hold, ClaimHold::ReceiptUnknown { tx_hash: Some(B256::repeat_byte(0x22)), tx_nonce: None });
+    }
+
+    #[test]
+    fn a_receipt_hold_written_before_nonces_decodes_and_reencodes_identically() {
+        let old = format!(
+            r#"{{"attempts":0,"last_reason":"receipt_unknown","hold":{{"ReceiptUnknown":{{"tx_hash":"{:#x}"}}}}}}"#,
+            B256::repeat_byte(0x11)
+        );
+        let state: ClaimAttempts = serde_json::from_str(&old).unwrap();
+        assert_eq!(state.hold, ClaimHold::ReceiptUnknown { tx_hash: Some(B256::repeat_byte(0x11)), tx_nonce: None });
+        assert_eq!(serde_json::to_string(&state).unwrap(), old, "the canonical progress-row check re-encodes old rows");
+
+        let mut with_nonce = state.clone();
+        with_nonce.hold = ClaimHold::ReceiptUnknown { tx_hash: Some(B256::repeat_byte(0x11)), tx_nonce: Some(42) };
+        let encoded = serde_json::to_string(&with_nonce).unwrap();
+        assert!(encoded.contains(r#""tx_nonce":42"#));
+        assert_eq!(serde_json::from_str::<ClaimAttempts>(&encoded).unwrap(), with_nonce);
     }
 
     #[test]

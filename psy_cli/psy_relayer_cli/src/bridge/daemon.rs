@@ -1319,14 +1319,14 @@ async fn run_multichain(
             tokio::time::sleep(Duration::from_secs(2)).await;
             for chain in &chains {
                 let now_unix = claim_attempts::now_unix();
-                let resolutions = match chain.l1.release_claim_holds(&state.pending_claim_withdrawals, &mut state.claim_retry, &chain.config, Some(chain.chain_index)).await {
-                    Ok(resolutions) => resolutions,
+                let recheck = match chain.l1.release_claim_holds(&state.pending_claim_withdrawals, &mut state.claim_retry, &chain.config, Some(chain.chain_index)).await {
+                    Ok(recheck) => recheck,
                     Err(error) => {
                         tracing::warn!(chain_index = chain.chain_index, error = %error, "claim hold recheck failed; held leaves stay held");
                         continue;
                     }
                 };
-                for resolution in &resolutions {
+                for resolution in &recheck.resolutions {
                     record_claim_outcome(&resolution.withdrawals, &resolution.report, &mut state.pending_claim_withdrawals, &mut state.claim_retry, &mut state.retired_claim_withdrawals, now_unix);
                 }
                 save_multichain_state(&guardian.root, &guardian.db, &state)?;
@@ -1342,7 +1342,7 @@ async fn run_multichain(
                 *start = next_claim_readiness_start(&claims, &result);
                 if result.is_err() {
                     match persisted_claim_retry(&guardian.root, &guardian.db) {
-                        Ok(persisted) => adopt_persisted_receipt_holds(&claims, &mut state.claim_retry, &persisted),
+                        Ok(persisted) => adopt_persisted_receipt_holds(&claims, &mut state.claim_retry, &persisted, &recheck.released),
                         Err(error) => tracing::warn!(error = %error, "cannot re-read persisted claim holds; recording the failure without them"),
                     }
                 }
@@ -2237,7 +2237,7 @@ fn claim_broadcast_hook(
 ) -> claim_withdrawals::BeforeBroadcast {
     let config = config.clone();
     let db = db.clone();
-    std::sync::Arc::new(move |leaves, tx_hash| {
+    std::sync::Arc::new(move |leaves, tx_hash, tx_nonce| {
         let config = config.clone();
         let db = db.clone();
         let leaves = leaves.to_vec();
@@ -2254,7 +2254,7 @@ fn claim_broadcast_hook(
                     }),
                     "signed claim is not the stored pending row"
                 );
-                claim_attempts::hold_for_receipt(&mut state.claim_retry, &leaf.leaf_hash, Some(tx_hash));
+                claim_attempts::hold_for_receipt(&mut state.claim_retry, &leaf.leaf_hash, Some(tx_hash), Some(tx_nonce));
             }
             save_multichain_state(&config, &db, &state)?;
             Ok(())
@@ -2723,11 +2723,12 @@ fn apply_leaf_outcome(
             }
             claim_withdrawals::ClaimAction::Held => {
                 if matches!(code, claim_withdrawals::ClaimCode::ReceiptUnknown) {
-                    claim_attempts::hold_for_receipt(claim_retry, leaf_hash, outcome.tx_hash);
+                    claim_attempts::hold_for_receipt(claim_retry, leaf_hash, outcome.tx_hash, outcome.tx_nonce);
                     tracing::warn!(
                         leaf_hash,
                         nonce = %nonce,
                         tx_hash = outcome.tx_hash.map(|hash| format!("{hash:#x}")).unwrap_or_default(),
+                        tx_nonce = ?outcome.tx_nonce,
                         action = "held",
                         "claim transaction landing unknown; no new send until it resolves"
                     );
@@ -2918,16 +2919,24 @@ fn persisted_claim_retry(
 /// The caller state stays the single authoritative copy: a persisted hold is
 /// adopted monotonically and never overwritten by a stale absence, and a leaf
 /// the caller already holds is left alone.
+///
+/// `released` names the transactions this round's hold recheck proved can
+/// never land. A caller that has not saved since that release still has the
+/// dead hold in the database; adopting it would undo the release and park the
+/// leaf on a transaction that does not exist. Only the hook's new hash for the
+/// leaf, never the released one, is adopted.
 fn adopt_persisted_receipt_holds(
     attempted: &[propose_withdrawals::PendingWithdrawal],
     claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     persisted: &HashMap<String, claim_attempts::ClaimAttempts>,
+    released: &HashSet<alloy_primitives::B256>,
 ) {
     for withdrawal in attempted {
         let leaf = withdrawal.leaf_hash.as_str();
         if claim_retry.get(leaf).is_some_and(|state| !matches!(state.hold, claim_attempts::ClaimHold::None)) { continue; }
-        if let Some(claim_attempts::ClaimHold::ReceiptUnknown { tx_hash }) = persisted.get(leaf).map(|state| &state.hold) {
-            claim_attempts::hold_for_receipt(claim_retry, leaf, *tx_hash);
+        if let Some(claim_attempts::ClaimHold::ReceiptUnknown { tx_hash, tx_nonce }) = persisted.get(leaf).map(|state| &state.hold) {
+            if tx_hash.is_some_and(|hash| released.contains(&hash)) { continue; }
+            claim_attempts::hold_for_receipt(claim_retry, leaf, *tx_hash, *tx_nonce);
         }
     }
 }
@@ -2957,9 +2966,11 @@ async fn settle_pending_claim_withdrawals(
     max_checkpoint_batch: u64,
 ) -> bool {
     let now_unix = claim_attempts::now_unix();
+    let mut released = HashSet::new();
     match l1.release_claim_holds(pending_claim_withdrawals, claim_retry, config, None).await {
-        Ok(resolutions) => {
-            for resolution in &resolutions {
+        Ok(recheck) => {
+            released = recheck.released;
+            for resolution in &recheck.resolutions {
                 record_claim_outcome(
                     &resolution.withdrawals,
                     &resolution.report,
@@ -3027,7 +3038,7 @@ async fn settle_pending_claim_withdrawals(
         .await;
     if result.is_err() {
         match persisted_claim_retry(guardian_config, db) {
-            Ok(persisted) => adopt_persisted_receipt_holds(&to_claim, claim_retry, &persisted),
+            Ok(persisted) => adopt_persisted_receipt_holds(&to_claim, claim_retry, &persisted, &released),
             Err(error) => tracing::warn!(error = %error, "cannot re-read persisted claim holds; recording the failure without them"),
         }
     }
@@ -5480,7 +5491,7 @@ mod tests {
                 .map(|(leaf, kind)| claim_withdrawals::ClaimOutcome {
                     leaf_hash: (*leaf).to_string(),
                     kind: *kind,
-                    tx_hash: None,
+                    tx_hash: None, tx_nonce: None,
                 })
                 .collect(),
         }
@@ -5654,8 +5665,8 @@ mod tests {
         let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: "not-found".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: "root-mismatch".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RootUnauthorized), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "not-found".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "root-mismatch".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RootUnauthorized), tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -5741,7 +5752,7 @@ mod tests {
 
         assert!(pending.contains_key("lost"));
         assert_eq!(retry["lost"].attempts, 0, "an unknown landing spends nothing");
-        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None }));
+        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None, .. }));
         assert!(claims_to_attempt(&pending, &retry).is_empty(), "no hash means no new send");
         assert!(retired.is_empty());
     }
@@ -5761,7 +5772,7 @@ mod tests {
         assert_eq!(retry["inflight"].attempts, 0);
         assert!(matches!(
             retry["inflight"].hold,
-            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == alloy_primitives::B256::repeat_byte(0x11)
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == alloy_primitives::B256::repeat_byte(0x11)
         ));
         assert!(claims_to_attempt(&pending, &retry).is_empty(), "a recorded hash is reconciled, not resent");
     }
@@ -5772,7 +5783,7 @@ mod tests {
         let mut pending = HashMap::from([("reverted".to_string(), withdrawal.clone())]);
         let mut retry = HashMap::new();
         let mut retired = HashMap::new();
-        claim_attempts::hold_for_receipt(&mut retry, "reverted", Some(alloy_primitives::B256::repeat_byte(0x22)));
+        claim_attempts::hold_for_receipt(&mut retry, "reverted", Some(alloy_primitives::B256::repeat_byte(0x22)), None);
         assert!(claims_to_attempt(&pending, &retry).is_empty());
 
         let report = claim_withdrawals::reverted_claim_report(&withdrawal);
@@ -5796,8 +5807,8 @@ mod tests {
         let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: "good".into(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: "bad".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RegistrationPaused), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "good".into(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "bad".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RegistrationPaused), tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -5938,11 +5949,13 @@ mod tests {
         let hook = claim_broadcast_hook(&crate::guardian::test_fixture::codec_guardian_config(), &db);
         let first_hash = alloy_primitives::B256::repeat_byte(0x11);
         let second_hash = alloy_primitives::B256::repeat_byte(0x22);
-        futures::executor::block_on(hook(std::slice::from_ref(&first), first_hash)).unwrap();
-        futures::executor::block_on(hook(std::slice::from_ref(&second), second_hash)).unwrap();
+        futures::executor::block_on(hook(std::slice::from_ref(&first), first_hash, 7)).unwrap();
+        futures::executor::block_on(hook(std::slice::from_ref(&second), second_hash, 8)).unwrap();
         let saved = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
-        assert!(matches!(saved.claim_retry["first"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == first_hash));
-        assert!(matches!(saved.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == second_hash));
+        assert!(matches!(saved.claim_retry["first"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == first_hash));
+        assert!(matches!(saved.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == second_hash));
+        assert_eq!(saved.claim_retry["first"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(first_hash), tx_nonce: Some(7) }, "the hook persists the signed nonce");
+        assert_eq!(saved.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(second_hash), tx_nonce: Some(8) });
         assert!(claims_to_attempt(&saved.pending_claim_withdrawals, &saved.claim_retry).is_empty());
         // A resolved leaf is removed from the real queue on the next save even
         // though its hook hold was persisted first; the other chunk stays held.
@@ -5959,7 +5972,7 @@ mod tests {
         let reloaded = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
         assert!(!reloaded.pending_claim_withdrawals.contains_key("first"));
         assert!(!reloaded.claim_retry.contains_key("first"));
-        assert!(matches!(reloaded.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == second_hash));
+        assert!(matches!(reloaded.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == second_hash));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5986,6 +5999,50 @@ mod tests {
     }
 
     #[test]
+    fn a_hold_released_this_round_is_not_re_adopted_from_the_database() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let config = crate::guardian::test_fixture::codec_guardian_config();
+        let dead = withdrawal_for_chain("dead", 0);
+        let mate = withdrawal_for_chain("mate", 0);
+        let mut state = MultichainDaemonState::default();
+        insert_pending_claims(&[dead.clone(), mate.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        save_multichain_state(&config, &db, &state).unwrap();
+        let dead_hash = alloy_primitives::B256::repeat_byte(0x44);
+        futures::executor::block_on(claim_broadcast_hook(&config, &db)(&[dead.clone(), mate.clone()], dead_hash, 3)).unwrap();
+        let mut state = load_multichain_state(&config, &db).unwrap();
+
+        // The hold recheck proved dead_hash can never land and released both
+        // leaves in memory; the single-chain round has not saved since, so the
+        // database still carries the dead hold.
+        claim_attempts::release_hold(&mut state.claim_retry, &dead.leaf_hash);
+        claim_attempts::release_hold(&mut state.claim_retry, &mate.leaf_hash);
+        let released = HashSet::from([dead_hash]);
+        assert_eq!(claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry).len(), 2, "released leaves are due again");
+
+        // The new send signs `mate` alone (hook writes a fresh hash), then the
+        // batch dies before `dead` was ever signed.
+        let new_hash = alloy_primitives::B256::repeat_byte(0x55);
+        futures::executor::block_on(claim_broadcast_hook(&config, &db)(std::slice::from_ref(&mate), new_hash, 4)).unwrap();
+        let persisted = persisted_claim_retry(&config, &db).unwrap();
+        assert!(matches!(persisted[&dead.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == dead_hash));
+        adopt_persisted_receipt_holds(&[dead.clone(), mate.clone()], &mut state.claim_retry, &persisted, &released);
+
+        assert!(claim_attempts::is_retriable(state.claim_retry.get(&dead.leaf_hash)), "the dead hold must not come back");
+        assert_eq!(state.claim_retry[&mate.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(new_hash), tx_nonce: Some(4) }, "the new send's hold is adopted");
+        save_multichain_state(&config, &db, &state).unwrap();
+        let reloaded = load_multichain_state(&config, &db).unwrap();
+        assert!(claim_attempts::is_retriable(reloaded.claim_retry.get(&dead.leaf_hash)));
+        assert!(matches!(reloaded.claim_retry[&mate.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), .. } if hash == new_hash));
+
+        // Without the released set the dead hold would have been adopted.
+        let mut unguarded = HashMap::new();
+        adopt_persisted_receipt_holds(std::slice::from_ref(&dead), &mut unguarded, &persisted, &HashSet::new());
+        assert!(!claim_attempts::is_retriable(unguarded.get(&dead.leaf_hash)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_batch_error_keeps_the_hook_persisted_unknown_hold() {
         let (root, db) = super::super::guardian_client::tests_db();
         bind_progress_to_fixture(&db);
@@ -5995,14 +6052,14 @@ mod tests {
         save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
         let hook = claim_broadcast_hook(&crate::guardian::test_fixture::codec_guardian_config(), &db);
         let hash = alloy_primitives::B256::repeat_byte(0x33);
-        futures::executor::block_on(hook(std::slice::from_ref(&inflight), hash)).unwrap();
+        futures::executor::block_on(hook(std::slice::from_ref(&inflight), hash, 9)).unwrap();
 
         // The batch dies after the hook persisted the signed hash. The
         // persisted hold is adopted into the caller state before the error is
         // recorded, so the hold wins: no attempt is spent, and the round's
         // save does not overwrite the durable hold.
         let persisted = persisted_claim_retry(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
-        adopt_persisted_receipt_holds(&[inflight.clone()], &mut state.claim_retry, &persisted);
+        adopt_persisted_receipt_holds(&[inflight.clone()], &mut state.claim_retry, &persisted, &HashSet::new());
         record_claim_result(
             &[inflight.clone()],
             &Err(anyhow::anyhow!("RPC unavailable")),
@@ -6013,7 +6070,7 @@ mod tests {
         );
         save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
         let reloaded = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
-        assert!(matches!(reloaded.claim_retry[&inflight.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(kept) } if kept == hash));
+        assert_eq!(reloaded.claim_retry[&inflight.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash), tx_nonce: Some(9) });
         assert_eq!(reloaded.claim_retry[&inflight.leaf_hash].attempts, 0);
         assert!(claims_to_attempt(&reloaded.pending_claim_withdrawals, &reloaded.claim_retry).is_empty());
         let _ = std::fs::remove_dir_all(root);
@@ -6115,9 +6172,9 @@ mod tests {
         let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -6134,8 +6191,8 @@ mod tests {
     fn claim_readiness_cursor_resumes_after_checked_prefix() {
         let report = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: "slow".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RpcUnavailable), tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: "unread".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "slow".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RpcUnavailable), tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "unread".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred), tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -6164,7 +6221,7 @@ mod tests {
             outcomes: vec![claim_withdrawals::ClaimOutcome {
                 leaf_hash: withdrawal.leaf_hash.clone(),
                 kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReadinessDeferred),
-                tx_hash: None,
+                tx_hash: None, tx_nonce: None,
             }],
             ..empty_report()
         };
@@ -6534,8 +6591,8 @@ mod tests {
         let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -6676,9 +6733,9 @@ mod tests {
         let mut retired = HashMap::new();
         let report1 = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
@@ -6705,8 +6762,8 @@ mod tests {
 
         let report2 = claim_withdrawals::BatchWithdrawalsReport {
             outcomes: vec![
-                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
-                claim_withdrawals::ClaimOutcome { leaf_hash: w4.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w4.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None, tx_nonce: None },
             ],
             ..empty_report()
         };
