@@ -977,6 +977,7 @@ mod tests {
         tamper_leaf: Arc<AtomicBool>,
         router: Arc<Mutex<RouterState>>,
         router_zero: Arc<AtomicBool>,
+        pruned: Arc<AtomicBool>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for L1Fixture {
@@ -1068,6 +1069,8 @@ mod tests {
         let router_zero_flag = Arc::new(AtomicBool::new(false));
         let router_handle = router_state.clone();
         let router_zero_handle = router_zero_flag.clone();
+        let pruned = Arc::new(AtomicBool::new(false));
+        let pruned_flag = pruned.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { break };
@@ -1082,11 +1085,17 @@ mod tests {
                         if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap(); }
                     }
                 }
+                // A pooled client may open a connection it never uses; it carries no request.
+                if length == 0 { continue; }
                 let mut body = vec![0; length];
-                if length > 0 { socket.read_exact(&mut body).await.unwrap(); }
+                socket.read_exact(&mut body).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 recorded.lock().unwrap().push(request.clone());
-                let response = {
+                let response = if pruned_flag.load(Ordering::Relaxed) && matches!(request["method"].as_str(), Some("eth_call" | "eth_getLogs")) {
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"historical state 0x0b is not available"}})
+                } else if pruned_flag.load(Ordering::Relaxed) && request["method"] == "eth_getTransactionReceipt" {
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"result":null})
+                } else {
                     let router_state = router_handle.lock().unwrap();
                     match dispatch(&request, &batch, reorg_flag.load(Ordering::Relaxed), tamper_flag.load(Ordering::Relaxed), &router_state, router_zero_handle.load(Ordering::Relaxed)) {
                         Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}),
@@ -1098,7 +1107,7 @@ mod tests {
                 socket.into_inner().write_all(response.as_bytes()).await.unwrap();
             }
         });
-        L1Fixture { url, calls, reorg, tamper_leaf, router: router_state, router_zero: router_zero_flag, server }
+        L1Fixture { url, calls, reorg, tamper_leaf, router: router_state, router_zero: router_zero_flag, pruned, server }
     }
 
     #[tokio::test]
@@ -1234,6 +1243,27 @@ mod tests {
         fixture.tamper_leaf.store(true, Ordering::Relaxed);
         let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
         assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn pruned_first_provider_falls_back_for_bodies_and_the_full_answer_is_still_verified() {
+        let pruned = serve_l1(prepare_new_batch().server).await;
+        pruned.pruned.store(true, Ordering::Relaxed);
+        let full = serve_l1(prepare_new_batch().server).await;
+        let state = saved_deposit_tree_state();
+        let mut endpoint = pruned.endpoint();
+        endpoint.rpc_providers = vec![
+            GuardianRpcProvider { name: "node".into(), url: pruned.url.clone(), operator: None },
+            GuardianRpcProvider { name: "gateway".into(), url: full.url.clone(), operator: None },
+        ];
+        verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap();
+        assert!(full.calls().iter().any(|call| method(call) == "eth_getTransactionReceipt"));
+        full.tamper_leaf.store(true, Ordering::Relaxed);
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
+        full.pruned.store(true, Ordering::Relaxed);
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
+        assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::L1ResponseMismatch)), "{error:?}");
     }
 
     #[tokio::test]

@@ -121,6 +121,10 @@ pub struct PoolConfig {
     pub quarantine_after: u32,
     pub quarantine_for: Duration,
     pub latency_alpha: f64,
+    /// When true, a provider past its cooldown serves one recovery probe at a
+    /// time and concurrent callers skip it. When false, every caller may use
+    /// any provider outside cooldown and quarantine; nothing is a probe.
+    pub probe_gate: bool,
 }
 
 impl Default for PoolConfig {
@@ -135,6 +139,7 @@ impl Default for PoolConfig {
             quarantine_after: 5,
             quarantine_for: Duration::from_secs(30 * 60),
             latency_alpha: 0.2,
+            probe_gate: true,
         }
     }
 }
@@ -309,7 +314,7 @@ impl<C: Clone> ProviderPool<C> {
                 Candidate {
                     index,
                     health: h.health(now, self.config.half_life),
-                    available: h.available(now),
+                    available: if self.config.probe_gate { h.available(now) } else { h.selectable(now) },
                 }
             })
             .collect();
@@ -323,7 +328,7 @@ impl<C: Clone> ProviderPool<C> {
         } else {
             best
         };
-        let probe = health[index].begin_attempt(now);
+        let probe = self.config.probe_gate && health[index].begin_attempt(now);
         Some(AttemptGuard { pool: self, index, probe, recorded: false })
     }
 
@@ -699,6 +704,55 @@ mod tests {
         // Five failed calls precede it; the sixth recorded call is the probe.
         while world.calls().len() < 6 { tokio::task::yield_now().await; }
         for _ in 0..3 { assert_eq!(call(&pool, &world, NoRetry).await.unwrap(), "b"); }
+        gate.notify_one();
+        assert_eq!(probe.await.unwrap().unwrap(), "a");
+    }
+
+    fn ungated() -> PoolConfig {
+        PoolConfig { failure_cooldown: Duration::ZERO, probe_gate: false, ..PoolConfig::default() }
+    }
+
+    async fn parallel_calls_after_one_failure(names: &[(&'static str, i32)]) -> (World, Vec<Result<&'static str, PoolError<CallOutcome>>>) {
+        let world = World::default();
+        let pool = pool_with(names, ungated());
+        world.set(names[0].0, Mode::Fail(CallOutcome::Server));
+        call(&pool, &world, NoRetry).await.unwrap_err();
+        world.set(names[0].0, Mode::Delay(Duration::from_millis(50)));
+        let calls: Vec<_> = (0..8).map(|_| {
+            let (p, w) = (pool.clone(), world.clone());
+            tokio::spawn(async move { call(&p, &w, Safe).await })
+        }).collect();
+        let mut results = Vec::new();
+        for call in calls { results.push(call.await.unwrap()); }
+        (world, results)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ungated_single_provider_serves_every_concurrent_call_after_a_failure() {
+        let (world, results) = parallel_calls_after_one_failure(&[("a", 10)]).await;
+        assert!(results.iter().all(|result| matches!(result, Ok("a"))), "{results:?}");
+        assert_eq!(world.calls().len(), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ungated_two_providers_serve_every_concurrent_call_after_a_failure() {
+        let (world, results) = parallel_calls_after_one_failure(&[("a", 10), ("b", 10)]).await;
+        assert!(results.iter().all(|result| matches!(result, Ok("b"))), "{results:?}");
+        assert_eq!(world.calls().len(), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gated_single_provider_refuses_concurrent_calls_during_a_probe() {
+        let world = World::default();
+        let pool = pool_with(&[("a", 10)], PoolConfig { failure_cooldown: Duration::ZERO, ..PoolConfig::default() });
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        call(&pool, &world, NoRetry).await.unwrap_err();
+        let gate = Arc::new(Notify::new());
+        world.set("a", Mode::Gate(gate.clone()));
+        let (p, w) = (pool.clone(), world.clone());
+        let probe = tokio::spawn(async move { call(&p, &w, Safe).await });
+        while world.calls().len() < 2 { tokio::task::yield_now().await; }
+        assert!(matches!(call(&pool, &world, Safe).await, Err(PoolError::Unavailable)));
         gate.notify_one();
         assert_eq!(probe.await.unwrap().unwrap(), "a");
     }

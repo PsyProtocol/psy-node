@@ -260,12 +260,12 @@ pub struct GuardianRpcProvider {
     pub url: String,
     pub operator: Option<String>,
 }
-/// Every URL keeps the L1 endpoint rule; an empty list or a repeated or blank name is a configuration error.
+/// Every URL keeps the L1 endpoint rule; an empty list, a blank name, or a repeated name or URL is a configuration error.
 pub fn validate_rpc_providers(providers: &[GuardianRpcProvider]) -> Result<(), GuardianSignError> {
     if providers.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
-    let mut names = BTreeSet::new();
+    let (mut names, mut urls) = (BTreeSet::new(), BTreeSet::new());
     for provider in providers {
-        if provider.name.trim().is_empty() || !names.insert(provider.name.as_str()) { return Err(GuardianSignError::AuthorizationMismatch); }
+        if provider.name.trim().is_empty() || !names.insert(provider.name.as_str()) || !urls.insert(provider.url.as_str()) { return Err(GuardianSignError::AuthorizationMismatch); }
         validate_endpoint(&provider.url, false, false)?;
     }
     Ok(())

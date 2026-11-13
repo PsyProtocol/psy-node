@@ -101,6 +101,11 @@ impl Health {
             || self.probe_in_flight)
     }
 
+    /// Outside cooldown and quarantine, ignoring any recovery probe in flight.
+    pub(crate) fn selectable(&self, now: Instant) -> bool {
+        !(self.quarantined(now) || self.retry_after.is_some_and(|until| now < until))
+    }
+
     /// Returns true when this attempt is the probe for a provider on probation.
     pub(crate) fn begin_attempt(&mut self, now: Instant) -> bool {
         let probe = self.on_probation(now) && !self.probe_in_flight;

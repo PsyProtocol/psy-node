@@ -19,6 +19,14 @@ struct L1RpcRoute { client: reqwest::Client, url: Arc<str> }
 #[derive(Debug)]
 enum L1RpcAttemptError { Transport, HttpStatus(StatusCode), UndecodableBody }
 
+/// A decoded JSON-RPC response read once at this boundary. `MissingData` asks the next provider; `Rejected` is final.
+enum JsonRpcAnswer<'a> { Result(&'a Value), MissingData, Rejected }
+
+/// Methods whose null result means the provider does not have the object, not that it does not exist.
+const NULL_MEANS_UNKNOWN_METHODS: [&str; 4] = ["eth_getTransactionReceipt", "eth_getBlockByNumber", "eth_getBlockByHash", "eth_getTransactionByHash"];
+/// Lowercased error-message fragments of nodes that lack the requested history (pruned or lagging state and headers).
+const MISSING_DATA_MESSAGES: [&str; 5] = ["historical state", "header not found", "missing trie node", "pruned", "not available"];
+
 /// Shared handle to the provider pool of one chain.
 pub(crate) struct L1RpcPool(Arc<ProviderPool<L1RpcRoute>>);
 
@@ -33,25 +41,31 @@ impl L1RpcPool {
         Ok(Self(pool))
     }
 
-    /// The JSON-RPC `result`. Any decoded answer, including an error object, a wrong id or a null result, is final.
+    /// The JSON-RPC `result`. A missing-data answer asks the next provider; any other decoded answer is final.
+    /// When every provider lacks the data, the last answer keeps today's `L1ResponseMismatch`.
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, GuardianSignError> {
         let request = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        let classify = |attempt: &Result<Value, L1RpcAttemptError>| classify(method, attempt);
         let response = self.0.call(RetryPolicy::SafeAcrossEndpoints, method, classify, |route| post(route, &request)).await.map_err(|error| match error {
             PoolError::Provider(L1RpcAttemptError::UndecodableBody) => GuardianSignError::L1ResponseMismatch,
             PoolError::Provider(L1RpcAttemptError::Transport | L1RpcAttemptError::HttpStatus(_)) | PoolError::Timeout | PoolError::Unavailable => GuardianSignError::L1RpcUnavailable,
         })?;
-        json_rpc_result(&response).cloned().ok_or(GuardianSignError::L1ResponseMismatch)
+        match read_answer(method, &response) {
+            JsonRpcAnswer::Result(result) => Ok(result.clone()),
+            JsonRpcAnswer::MissingData | JsonRpcAnswer::Rejected => Err(GuardianSignError::L1ResponseMismatch),
+        }
     }
 }
 
 /// Each attempt keeps the former 30 s request limit; one read may spend two full attempts.
-/// No cooldown or quarantine: a failed provider stays a fallback, and decayed health alone orders later reads.
+/// No cooldown, quarantine or probe gate: a failed provider stays usable by every concurrent read, and decayed health alone orders later reads.
 fn custody_pool_config() -> PoolConfig {
     PoolConfig {
         attempt_timeout: Duration::from_secs(30),
         total_timeout: Duration::from_secs(60),
         failure_cooldown: Duration::ZERO,
         quarantine_after: u32::MAX,
+        probe_gate: false,
         ..PoolConfig::default()
     }
 }
@@ -59,7 +73,7 @@ fn custody_pool_config() -> PoolConfig {
 fn build_pool(chain_index: u8, providers: &[GuardianRpcProvider], config: PoolConfig) -> Result<ProviderPool<L1RpcRoute>, GuardianSignError> {
     let mut specs = Vec::with_capacity(providers.len());
     for provider in providers {
-        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| GuardianSignError::L1RpcUnavailable)?;
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).pool_idle_timeout(Duration::from_secs(30)).build().map_err(|_| GuardianSignError::L1RpcUnavailable)?;
         let spec = ProviderSpec::new(provider.name.clone(), L1RpcRoute { client, url: provider.url.as_str().into() });
         specs.push(match &provider.operator { Some(operator) => spec.with_operator(operator.clone()), None => spec });
     }
@@ -77,15 +91,27 @@ async fn post(route: L1RpcRoute, request: &Value) -> Result<Value, L1RpcAttemptE
     serde_json::from_slice(&body).map_err(|_| L1RpcAttemptError::UndecodableBody)
 }
 
-fn json_rpc_result(response: &Value) -> Option<&Value> {
-    if response.get("error").is_some() || response.get("id") != Some(&json!(1)) { return None; }
-    response.get("result").filter(|result| !result.is_null())
+fn read_answer<'a>(method: &str, response: &'a Value) -> JsonRpcAnswer<'a> {
+    if response.get("id") != Some(&json!(1)) { return JsonRpcAnswer::Rejected; }
+    if let Some(error) = response.get("error") {
+        let message = error.get("message").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+        return if MISSING_DATA_MESSAGES.iter().any(|fragment| message.contains(fragment)) { JsonRpcAnswer::MissingData } else { JsonRpcAnswer::Rejected };
+    }
+    match response.get("result") {
+        Some(Value::Null) if NULL_MEANS_UNKNOWN_METHODS.contains(&method) => JsonRpcAnswer::MissingData,
+        Some(Value::Null) | None => JsonRpcAnswer::Rejected,
+        Some(result) => JsonRpcAnswer::Result(result),
+    }
 }
 
-fn classify(attempt: &Result<Value, L1RpcAttemptError>) -> CallOutcome {
+fn classify(method: &str, attempt: &Result<Value, L1RpcAttemptError>) -> CallOutcome {
     match attempt {
-        Ok(response) if json_rpc_result(response).is_some() => CallOutcome::Success,
-        Ok(_) | Err(L1RpcAttemptError::UndecodableBody) => CallOutcome::Application,
+        Ok(response) => match read_answer(method, response) {
+            JsonRpcAnswer::Result(_) => CallOutcome::Success,
+            JsonRpcAnswer::MissingData => CallOutcome::InvalidResponse,
+            JsonRpcAnswer::Rejected => CallOutcome::Application,
+        },
+        Err(L1RpcAttemptError::UndecodableBody) => CallOutcome::Application,
         Err(L1RpcAttemptError::Transport) => CallOutcome::Transport,
         Err(L1RpcAttemptError::HttpStatus(StatusCode::TOO_MANY_REQUESTS)) => CallOutcome::RateLimited,
         Err(L1RpcAttemptError::HttpStatus(status)) if status.is_server_error() => CallOutcome::Server,
@@ -101,7 +127,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[derive(Clone)]
-    enum Reply { Http(u16, String), Hang }
+    enum Reply { Http(u16, String), Hang, FailThen(usize, String) }
 
     struct MockL1 { url: String, requests: Arc<AtomicUsize>, server: tokio::task::JoinHandle<()> }
     impl Drop for MockL1 {
@@ -131,10 +157,16 @@ mod tests {
                             if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap(); }
                         }
                     }
+                    if length == 0 { return; }
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let Reply::Http(status, payload) = reply else { return std::future::pending().await };
+                    let seen = counter.fetch_add(1, Ordering::SeqCst);
+                    let (status, payload) = match reply {
+                        Reply::Http(status, payload) => (status, payload),
+                        Reply::FailThen(failures, _) if seen < failures => (503, String::new()),
+                        Reply::FailThen(_, payload) => (200, payload),
+                        Reply::Hang => return std::future::pending().await,
+                    };
                     let response = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
                     socket.into_inner().write_all(response.as_bytes()).await.unwrap();
                 });
@@ -191,12 +223,66 @@ mod tests {
     #[tokio::test]
     async fn decoded_answers_are_final_and_keep_their_error_code() {
         use GuardianSignError::{L1ResponseMismatch, L1RpcUnavailable};
-        assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}})).await, L1ResponseMismatch).await;
+        assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}})).await, L1ResponseMismatch).await;
+        assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"result":null})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":2,"result":"0x1"})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve(Reply::Http(200, "not json".into())).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve(Reply::Http(403, String::new())).await, L1RpcUnavailable).await;
         assert_final_without_failover(serve(Reply::Http(404, String::new())).await, L1RpcUnavailable).await;
+    }
+
+    fn missing_state() -> Value { json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"historical state 0x1234 is not available"}}) }
+
+    #[tokio::test]
+    async fn missing_data_asks_the_next_provider() {
+        for (method, missing) in [
+            ("eth_call", missing_state()),
+            ("eth_getBlockByNumber", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}})),
+            ("eth_call", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing trie node abc (path )"}})),
+            ("eth_getLogs", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Block has been pruned"}})),
+            ("eth_getTransactionReceipt", json!({"jsonrpc":"2.0","id":1,"result":null})),
+            ("eth_getBlockByNumber", json!({"jsonrpc":"2.0","id":1,"result":null})),
+            ("eth_getBlockByHash", json!({"jsonrpc":"2.0","id":1,"result":null})),
+            ("eth_getTransactionByHash", json!({"jsonrpc":"2.0","id":1,"result":null})),
+        ] {
+            let pruned = serve_json(missing.clone()).await;
+            let full = serve_result().await;
+            let result = pool(vec![pruned.provider("node"), full.provider("gateway")]).call(method, json!([])).await;
+            assert_eq!(result, Ok(json!("0x2a")), "{method} {missing}");
+            assert_eq!((pruned.requests(), full.requests()), (1, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_data_everywhere_keeps_the_former_error_code() {
+        for (method, missing) in [("eth_call", missing_state()), ("eth_getTransactionReceipt", json!({"jsonrpc":"2.0","id":1,"result":null}))] {
+            let first = serve_json(missing.clone()).await;
+            let second = serve_json(missing).await;
+            let result = pool(vec![first.provider("first"), second.provider("second")]).call(method, json!([])).await;
+            assert_eq!(result, Err(GuardianSignError::L1ResponseMismatch));
+            assert_eq!((first.requests(), second.requests()), (1, 1));
+        }
+    }
+
+    async fn parallel_reads(pool: &L1RpcPool) -> Vec<Result<Value, GuardianSignError>> {
+        futures::future::join_all((0..8).map(|_| pool.call("eth_chainId", json!([])))).await
+    }
+
+    #[tokio::test]
+    async fn every_concurrent_read_reaches_a_provider_after_a_failure() {
+        let only = serve(Reply::FailThen(1, json!({"jsonrpc":"2.0","id":1,"result":"0x2a"}).to_string())).await;
+        let single = pool(vec![only.provider("only")]);
+        assert_eq!(single.call("eth_chainId", json!([])).await, Err(GuardianSignError::L1RpcUnavailable));
+        assert!(parallel_reads(&single).await.iter().all(|result| *result == Ok(json!("0x2a"))));
+        assert_eq!(only.requests(), 9);
+
+        let primary = serve(Reply::FailThen(1, json!({"jsonrpc":"2.0","id":1,"result":"0x2a"}).to_string())).await;
+        let backup = serve_result().await;
+        let pair = pool(vec![primary.provider("primary"), backup.provider("backup")]);
+        assert_eq!(pair.call("eth_chainId", json!([])).await, Ok(json!("0x2a")));
+        assert!(parallel_reads(&pair).await.iter().all(|result| *result == Ok(json!("0x2a"))));
+        assert_eq!(primary.requests() + backup.requests(), 10);
     }
 
     #[tokio::test]
@@ -228,6 +314,7 @@ mod tests {
         for providers in [
             vec![],
             vec![provider("a", "https://a.example/rpc"), provider("a", "https://b.example/rpc")],
+            vec![provider("a", "https://a.example/rpc"), provider("b", "https://a.example/rpc")],
             vec![provider(" ", "https://a.example/rpc")],
             vec![provider("a", "https://a.example/rpc"), provider("b", "http://10.0.0.1:8545")],
         ] {

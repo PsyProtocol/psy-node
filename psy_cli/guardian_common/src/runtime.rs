@@ -728,6 +728,7 @@ mod tests {
             serde_json::json!([]),
             serde_json::json!({"name": "gateway", "url": "https://a.example/rpc"}),
             serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc"}, {"name": "gateway", "url": "https://b.example/rpc"}]),
+            serde_json::json!([{"name": "gateway", "url": "https://a.example/rpc"}, {"name": "node", "url": "https://a.example/rpc"}]),
             serde_json::json!([{"name": "", "url": "https://a.example/rpc"}]),
             serde_json::json!([{"url": "https://a.example/rpc"}]),
             serde_json::json!([{"name": "gateway"}]),
