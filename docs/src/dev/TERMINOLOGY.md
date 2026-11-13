@@ -182,6 +182,7 @@ PARTH is a forest. Do not invent a second name for a tree that already has one.
 | Deposit | L1→L2 lock via `Router` / `ERC20Gateway` / `Bridge`, claimed on L2 with `claim_deposit`. |
 | Withdrawal | L2 burn then L1 release via Groth16 `batchClaimWithdrawal` / `claimPendingWithdrawal`. |
 | Withdrawal nonce | The raw 32-byte field inside a withdrawal preimage. CLI: `withdraw --nonce`. Not the L1 key and not the services identity. |
+| Claim transaction nonce (`tx_nonce`) | The relayer L1 account nonce a signed `batchClaimWithdrawal` was signed with, recorded beside its `tx_hash` in a `ClaimHold::ReceiptUnknown` hold. Not the withdrawal nonce. |
 | Withdrawal identity | `Poseidon` of 35 felts, in order: `sender_user_id`, recipient u32×8, token u32×8, amount u32×8, nonce u32×8, `destination_chain_index`, `token_contract_id`. Node and services lookup, including the withdrawal-claim-proof match. Not the L1 key. |
 | Withdrawal L1 key | `keccak256` of those same 35 values as big-endian u32 words (140 bytes). Keys `claimedNullifiers`, `pendingWithdrawals`, `claimPendingWithdrawal`, and the indexed id on pending, claimed, and per-item receipt events. Not a hash of the Poseidon identity, not the raw nonce, and not a token/recipient/amount triple. |
 | Groth16 | Bridge wrapper proving system with circuit-specific setup material. |
