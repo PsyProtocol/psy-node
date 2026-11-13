@@ -695,8 +695,12 @@ async fn authorize_cached_response(db: &mut GuardianDb, request: &GuardianSignRe
         let canonical = guardian_common::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await?;
         save_guardian_account_result::<()>(db, request.network_magic, request.user_id, guardian_common::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash).map(|()| ())).await?;
     }
+    let mut token_checks = BTreeSet::new();
     for burn in &request.withdrawal_records {
-        guardian_common::verify_l1::verify_withdrawal_token(config.chain(burn.destination_chain_index)?, burn).await?;
+        let chain = config.chain(burn.destination_chain_index)?;
+        if token_checks.insert(super::verify::withdrawal_token_key(burn)) {
+            guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await?;
+        }
     }
     let (commitment, member_index) = authorize_current_proved_policy(request, config, public_key)?;
     db.authorize_response(request.network_magic, request.user_id, request.session_nonce, &canonical_bytes, |signed, _config| {
