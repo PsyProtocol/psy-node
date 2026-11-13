@@ -274,6 +274,47 @@ impl Drop for RequestSpan {
     }
 }
 
+/// Contract circuits whose prover data is estimated above this size prove one
+/// (or `PSY_LARGE_CFC_PROOF_SLOTS`) at a time: each such proof needs another
+/// ~2x its circuit size while it runs, and a few at once exhausted host memory.
+const LARGE_CFC_PROOF_BYTES: u64 = 2 << 30;
+
+struct ProofSlots {
+    available: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+fn large_cfc_proof_slots() -> &'static ProofSlots {
+    static SLOTS: std::sync::OnceLock<ProofSlots> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let slots = std::env::var("PSY_LARGE_CFC_PROOF_SLOTS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|slots| *slots > 0).unwrap_or(1);
+        ProofSlots { available: std::sync::Mutex::new(slots), released: std::sync::Condvar::new() }
+    })
+}
+
+/// Held for the duration of one large proof; blocks the calling (blocking
+/// pool) thread until a slot is free.
+struct LargeProofSlot(&'static ProofSlots);
+
+impl LargeProofSlot {
+    fn acquire() -> Self {
+        let slots = large_cfc_proof_slots();
+        let mut available = slots.available.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *available == 0 {
+            available = slots.released.wait(available).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *available -= 1;
+        Self(slots)
+    }
+}
+
+impl Drop for LargeProofSlot {
+    fn drop(&mut self) {
+        *self.0.available.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        self.0.released.notify_one();
+    }
+}
+
 /// The cached multisig circuit, built on first use. A panic during a build
 /// leaves the slot empty, so the next caller builds again.
 fn multisig_circuit(cell: &std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>) -> anyhow::Result<Arc<MultisigSignatureCircuit>> {
@@ -631,6 +672,13 @@ impl ProveProxyUserRpcServer for UserProveProvider {
             tokio::task::spawn_blocking(move || {
                 let fn_circuit = circuit_manager.contract_function_circuit(contract_id, fn_id)
                     .map_err(|err| ErrorObjectOwned::owned(1, "fn_circuit build error", Some(err.to_string())))?;
+                let estimated_bytes = fn_circuit.estimated_prover_bytes();
+                let _slot = (estimated_bytes > LARGE_CFC_PROOF_BYTES).then(|| {
+                    let waiting = web_time::Instant::now();
+                    let slot = LargeProofSlot::acquire();
+                    tracing::info!(contract_id, fn_id, estimated_bytes, waited_ms = waiting.elapsed().as_millis() as u64, "large contract proof slot acquired");
+                    slot
+                });
                 fn_circuit
                     .prove_base(&input)
                     .map_err(|err| ErrorObjectOwned::owned(1, "fn_circuit proving error", Some(err.to_string())))

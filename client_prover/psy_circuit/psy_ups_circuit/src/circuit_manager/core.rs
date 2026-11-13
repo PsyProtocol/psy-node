@@ -178,6 +178,9 @@ where
     shield_deposit_claim_minifier_circuit: OnceLock<ShieldDepositClaimCircuit<C, D>>,
 }
 
+/// Serializes contract prover circuit compilation (see `contract_prover_circuit`).
+static CONTRACT_CIRCUIT_COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Resident memory of this process in MiB (Linux `/proc/self/status`; zeros
 /// elsewhere), logged around circuit compilation to attribute memory spikes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -393,6 +396,10 @@ where
         state_tree_height: usize,
     ) -> Arc<DapenContractFunctionCircuit<C, D>> {
         let compile = || {
+            // A large contract circuit needs tens of GB while it compiles;
+            // concurrent compiles of different functions stacked past host
+            // memory. Compile one circuit at a time.
+            let _compile_guard = CONTRACT_CIRCUIT_COMPILE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let started = web_time::Instant::now();
             let before = process_memory_mib();
             let circuit = Arc::new(DapenContractFunctionCircuit::<C, D>::new(
