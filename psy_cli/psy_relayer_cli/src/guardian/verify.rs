@@ -180,14 +180,81 @@ pub fn verify_withdrawal_burn(config: &GuardianConfig, record: &WithdrawalBurnRe
     verify_path(&membership.merkle_proof, proof.contract_path.value, membership.merkle_proof.index, membership.leaf.qfhash::<PsyHasher>(), proof.contract_leaf.state_tree_height.to_canonical_u64() as usize)
 }
 
-pub async fn get_withdrawal_burn_proof(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, checkpoint_id: u64, record: &WithdrawalBurnRecord) -> Result<psy_provider::lps::WithdrawalBurnProof> {
+/// Withdrawal burn proofs read concurrently, bounded per request; results are consumed in record order.
+const WITHDRAWAL_RPC_CONCURRENCY: usize = 8;
+
+/// Reads every withdrawal of one request shares: they depend only on the request checkpoint or the token contract.
+pub struct WithdrawalProofReads {
+    checkpoint_id: u64,
+    checkpoint_path: MerkleProofCore<Hash4>,
+    checkpoint_leaf: tokio::sync::OnceCell<PsyCheckpointLeaf<F>>,
+    global_roots: tokio::sync::OnceCell<PsyCheckpointGlobalStateRoots<F>>,
+    contracts: BTreeMap<u32, tokio::sync::OnceCell<(PsyContractLeaf<F>, MerkleProofCore<Hash4>)>>,
+}
+impl WithdrawalProofReads {
+    pub fn new(checkpoint_id: u64, checkpoint_path: MerkleProofCore<Hash4>) -> Self {
+        let contracts = [psy_config::TOKEN_CONTRACT_ID, 4].into_iter().map(|id| (id, tokio::sync::OnceCell::new())).collect();
+        Self { checkpoint_id, checkpoint_path, checkpoint_leaf: Default::default(), global_roots: Default::default(), contracts }
+    }
+}
+
+pub async fn get_withdrawal_burn_proof(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, reads: &WithdrawalProofReads, record: &WithdrawalBurnRecord) -> Result<psy_provider::lps::WithdrawalBurnProof> {
+    let checkpoint_id = reads.checkpoint_id;
     if checkpoint_id > context.verified_checkpoint_id { return Err(GuardianSignError::CheckpointProofUnavailable); }
     token_contract(record.token_contract_id)?;
     let (base, capacity) = (WITHDRAWAL_MAP_BASE / 4, WITHDRAWAL_MAP_CAPACITY);
-    let mut proof = context.provider.get_withdrawal_burn_proof(QIMTMembershipProofRPCRequest { checkpoint_id, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: base, capacity }).await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
-    proof.checkpoint_path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id, checkpoint_id).await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
+    let (provider, user_id, contract_id) = (context.provider, u64::from(record.sender_user_id), record.token_contract_id);
+    let contract = reads.contracts.get(&contract_id).ok_or(GuardianSignError::ProofMismatch)?;
+    let read = async {
+        futures::try_join!(
+            provider.get_imt_membership_proof(QIMTMembershipProofRPCRequest { checkpoint_id, user_id, contract_id, key: withdrawal_key(record), state_slot_base: base, capacity }),
+            reads.checkpoint_leaf.get_or_try_init(|| provider.get_checkpoint_leaf_data(checkpoint_id)),
+            reads.global_roots.get_or_try_init(|| provider.get_checkpoint_global_state_roots(checkpoint_id)),
+            provider.get_user_leaf_data(checkpoint_id, user_id),
+            provider.get_user_tree_merkle_proof(checkpoint_id, user_id),
+            provider.get_user_contract_tree_merkle_proof(checkpoint_id, user_id, contract_id),
+            contract.get_or_try_init(|| async { futures::try_join!(provider.get_contract_leaf_data(u64::from(contract_id)), provider.get_contract_tree_merkle_proof(checkpoint_id, contract_id)) }),
+        )
+    };
+    let (record_membership, checkpoint_leaf, global_roots, user_leaf, user_path, contract_path, (contract_leaf, global_contract_path)) = read.await.map_err(|_| GuardianSignError::CheckpointProofUnavailable)?;
+    let proof = psy_provider::lps::WithdrawalBurnProof { checkpoint_id, checkpoint_leaf: checkpoint_leaf.clone(), global_roots: global_roots.clone(), checkpoint_path: reads.checkpoint_path.clone(), user_leaf, user_path, contract_path, contract_leaf: contract_leaf.clone(), global_contract_path: global_contract_path.clone(), record_membership };
     verify_withdrawal_burn(config, record, &proof, context.verified_checkpoint_tree_root)?;
     Ok(proof)
+}
+
+/// Router mapping read once per (chain, token, contract) in one request; each read pins its own finalized block.
+type WithdrawalTokenKey = (u8, [u32; 8], u32);
+pub fn withdrawal_token_key(burn: &WithdrawalBurnRecord) -> WithdrawalTokenKey { (burn.destination_chain_index, burn.token, burn.token_contract_id) }
+
+async fn verify_withdrawal_record<'a>(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, reads: &WithdrawalProofReads, token_checks: &BTreeMap<WithdrawalTokenKey, tokio::sync::OnceCell<()>>, historical: bool, burn: &'a WithdrawalBurnRecord) -> Result<&'a WithdrawalBurnRecord> {
+    let chain = config.chain(burn.destination_chain_index)?;
+    get_withdrawal_burn_proof(context, config, reads, burn).await?;
+    // Current Router mapping applies only to a fresh or pending sign of a
+    // canonical token address. A raw high-bit token slot is not truncated
+    // into that lookup; L1 rejects that exact slot before registration.
+    // An already-included session authenticates the burn proof and checkpoint.
+    if !historical {
+        let check = token_checks.get(&withdrawal_token_key(burn)).ok_or(GuardianSignError::WithdrawalMismatch)?;
+        check.get_or_try_init(|| async { guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await.map_err(guardian_common::verify_l1::relabel_withdrawal_mapping) }).await?;
+    }
+    Ok(burn)
+}
+
+/// Verifies every record with at most `WITHDRAWAL_RPC_CONCURRENCY` in flight, then assigns append
+/// indices strictly in record order; the first error in record order fails the request.
+async fn stage_withdrawal_appends<'a, Fut>(verifications: Vec<Fut>, pending: &GuardianHistory) -> Result<Vec<WithdrawalAppendRecord>>
+where Fut: Future<Output = Result<&'a WithdrawalBurnRecord>> {
+    use futures::StreamExt;
+    let mut appends = Vec::with_capacity(verifications.len());
+    let mut verified = futures::stream::iter(verifications).buffered(WITHDRAWAL_RPC_CONCURRENCY);
+    let mut counts = BTreeMap::new();
+    while let Some(burn) = verified.next().await {
+        let burn = burn?;
+        let count = counts.entry(burn.destination_chain_index).or_insert_with(|| pending.chains.get(&burn.destination_chain_index).map_or(0, |state| state.0));
+        appends.push(WithdrawalAppendRecord { chain_index: burn.destination_chain_index, append_index: *count, burn: burn.clone() });
+        *count = count.checked_add(1).ok_or(GuardianSignError::WithdrawalMismatch)?;
+    }
+    Ok(appends)
 }
 
 fn hash_words(hash: Hash4) -> [u64; 8] {
@@ -263,7 +330,6 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let mut calls = Vec::new();
     let mut five_row_layout = None;
     let mut appends = Vec::new();
-    let mut counts = BTreeMap::new();
     let mut staged_deposit_tree_states = Vec::with_capacity(request.deposit_anchors.len());
     let start_hash = supplied.finalization.submit_end_cap_input.core.state_transition.start_user_leaf_hash;
     if pending.nonce.checked_add(1) != Some(request.session_nonce) || pending.ending_leaf.is_some_and(|leaf| leaf != start_hash) { return Err(GuardianSignError::TraceMismatch.into()); }
@@ -290,22 +356,14 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
             calls.push(ContractCallArgs { contract_id: 2, method_name: "set_chain_root".into(), inputs });
             staged_deposit_tree_states.push(state);
         }
-        let mut withdrawals = Vec::with_capacity(request.withdrawal_records.len());
+        let reads = WithdrawalProofReads::new(checkpoint, checkpoint_path.clone());
+        let token_checks: BTreeMap<WithdrawalTokenKey, tokio::sync::OnceCell<()>> = if historical { BTreeMap::new() } else { request.withdrawal_records.iter().map(|burn| (withdrawal_token_key(burn), Default::default())).collect() };
+        let mut verifications = Vec::with_capacity(request.withdrawal_records.len());
         for burn in &request.withdrawal_records {
-            let chain = config.chain(burn.destination_chain_index)?;
-            get_withdrawal_burn_proof(context, config, checkpoint, burn).await?;
-            // Current Router mapping applies only to a fresh or pending sign of a
-            // canonical token address. A raw high-bit token slot is not truncated
-            // into that lookup; L1 rejects that exact slot before registration.
-            // An already-included session authenticates the burn proof and checkpoint.
-            if !historical {
-                guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await.map_err(guardian_common::verify_l1::relabel_withdrawal_mapping)?;
-            }
-            let count = counts.entry(burn.destination_chain_index).or_insert_with(|| pending.chains.get(&burn.destination_chain_index).map_or(0, |state| state.0));
-            appends.push(WithdrawalAppendRecord { chain_index: burn.destination_chain_index, append_index: *count, burn: burn.clone() });
-            *count = count.checked_add(1).ok_or(GuardianSignError::WithdrawalMismatch)?;
-            withdrawals.push(crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf_hex(withdrawal_leaf(burn)) });
+            verifications.push(verify_withdrawal_record(context, config, &reads, &token_checks, historical, burn));
         }
+        appends = stage_withdrawal_appends(verifications, pending).await?;
+        let withdrawals: Vec<_> = appends.iter().map(|append| { let burn = &append.burn; crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf_hex(withdrawal_leaf(burn)) } }).collect();
         let mut five_row_calls = calls.clone();
         five_row_calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls_with_five_row(&withdrawals));
         five_row_layout = Some(ContractCallData::new(five_row_calls));
@@ -1211,5 +1269,51 @@ mod tests {
         assert_eq!(burn.input_felt_count, 1);
         assert!(contract_method(4, "burn").is_err());
         assert!(contract_method(0, "transfer").is_err());
+    }
+
+    fn staged_burn(seed: u32, chain: u8) -> super::WithdrawalBurnRecord {
+        super::WithdrawalBurnRecord { sender_user_id: seed, token_contract_id: 4, destination_chain_index: chain, token: [0, 0, 0, 1, 2, 3, 4, 5], amount: [seed; 8], recipient: [7; 8], nonce: [seed; 8] }
+    }
+
+    async fn staged_verification<'a>(burn: &'a super::WithdrawalBurnRecord, delay_ms: u64, outcome: Option<super::GuardianSignError>, in_flight: &std::sync::atomic::AtomicUsize, peak: &std::sync::atomic::AtomicUsize) -> super::Result<&'a super::WithdrawalBurnRecord> {
+        use std::sync::atomic::Ordering::SeqCst;
+        peak.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        in_flight.fetch_sub(1, SeqCst);
+        outcome.map_or(Ok(burn), Err)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_withdrawal_verification_keeps_append_indexes_in_record_order() {
+        let (in_flight, peak) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        let records: Vec<_> = (0..20u32).map(|seed| staged_burn(seed, (seed % 2) as u8)).collect();
+        let mut pending = super::GuardianHistory::new();
+        pending.chains.insert(0, (5, [super::Hash4::ZERO; 32], super::Hash4::ZERO));
+        let verifications = records.iter().enumerate().map(|(position, burn)| staged_verification(burn, 100 - position as u64, None, &in_flight, &peak)).collect();
+        let appends = super::stage_withdrawal_appends(verifications, &pending).await.unwrap();
+        let staged: Vec<_> = appends.iter().map(|append| (append.chain_index, append.append_index, append.burn.nonce[0])).collect();
+        let expected: Vec<_> = (0..20u32).map(|seed| ((seed % 2) as u8, if seed % 2 == 0 { 5 + seed / 2 } else { seed / 2 }, seed)).collect();
+        assert_eq!(staged, expected);
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), super::WITHDRAWAL_RPC_CONCURRENCY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_failing_withdrawal_in_record_order_fails_the_request() {
+        let (in_flight, peak) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        let records: Vec<_> = (0..6u32).map(|seed| staged_burn(seed, 0)).collect();
+        let outcomes = [None, None, Some(super::GuardianSignError::CheckpointProofUnavailable), None, None, Some(super::GuardianSignError::WithdrawalMismatch)];
+        let delays = [10, 10, 500, 10, 10, 1];
+        let verifications = records.iter().zip(outcomes).zip(delays).map(|((burn, outcome), delay)| staged_verification(burn, delay, outcome, &in_flight, &peak)).collect();
+        let error = super::stage_withdrawal_appends(verifications, &super::GuardianHistory::new()).await.unwrap_err();
+        assert_eq!(error, super::GuardianSignError::CheckpointProofUnavailable);
+    }
+
+    #[test]
+    fn withdrawal_token_check_is_shared_only_by_the_same_chain_token_and_contract() {
+        let burn = staged_burn(1, 0);
+        assert_eq!(super::withdrawal_token_key(&burn), super::withdrawal_token_key(&staged_burn(2, 0)));
+        assert_ne!(super::withdrawal_token_key(&burn), super::withdrawal_token_key(&staged_burn(1, 1)));
+        assert_ne!(super::withdrawal_token_key(&burn), super::withdrawal_token_key(&super::WithdrawalBurnRecord { token_contract_id: 0, ..burn.clone() }));
+        assert_ne!(super::withdrawal_token_key(&burn), super::withdrawal_token_key(&super::WithdrawalBurnRecord { token: [0, 0, 0, 9, 2, 3, 4, 5], ..burn }));
     }
 }

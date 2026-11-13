@@ -3919,6 +3919,25 @@ enum PolicySignatures {
     Resume { expected_request_id: guardian_common::protocol::Hex32, responses: [guardian_common::protocol::GuardianSignResponse; 2] },
 }
 
+/// The coordinator commits a checkpoint before the Realm stores its user tree
+/// proofs. Wait for the bridge account's proof at `checkpoint` instead of
+/// abandoning the round, which would re-verify the whole request against a
+/// newer, equally unready checkpoint.
+async fn wait_bridge_user_tree_proof(provider: &RpcProvider, checkpoint: u64) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + BRIDGE_USER_TREE_PROOF_WAIT;
+    loop {
+        match provider.get_user_tree_merkle_proof(checkpoint, BRIDGE_USER_ID_U64).await {
+            Ok(_) => return Ok(()),
+            Err(error) if is_missing_checkpoint_proof(&error) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+const BRIDGE_USER_TREE_PROOF_WAIT: Duration = Duration::from_secs(180);
+
 pub(crate) async fn submit_guardian_calls(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<u64> {
     Ok(submit_guardian_operation(config, provider, calls, withdrawals, guardian_common::protocol::GuardianOperation::Bridge, None, &mut RelayerHistory::default(), PolicySignatures::None).await?.included_checkpoint_id)
 }
@@ -4051,6 +4070,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     let head = committed.checkpoint_id;
     let root = committed.checkpoint_tree_root;
+    wait_bridge_user_tree_proof(provider, head).await?;
     // Capture before refreshing: receipt repair may remove the pending marker.
     let pending = archive.pending_request()?;
     if let PolicySignatures::Resume { expected_request_id, responses } = &policy {
