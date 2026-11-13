@@ -52,11 +52,19 @@ pub struct ProposeWithdrawalsArgs {
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/// One L2 session holds at most `MAX_INTROSPECTABLE_TRANSACTIONS` (64) calls.
-/// Withdrawals pack in pairs, so 120 withdrawals are at most 60 calls; with up
-/// to three deposit roots a round stays at 63. The budget is shared round-robin
-/// by the chains that have pending withdrawals; the rest wait for the next round.
+/// Withdrawals one round admits across all chains when the L2 session has room.
 pub(crate) const MAX_WITHDRAWALS_PER_ROUND: usize = 120;
+/// Each destination chain may add one `set_chain_root` call to a round.
+pub(crate) const FIXED_CALLS_PER_CHAIN: usize = 1;
+const WITHDRAWALS_PER_CALL: usize = 2;
+
+/// Withdrawals one round may admit so that withdrawal pairs plus every chain's
+/// fixed calls fit one L2 session of `MAX_INTROSPECTABLE_TRANSACTIONS` calls.
+pub(crate) fn withdrawal_budget(chain_count: usize) -> usize {
+    let free_calls = psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS
+        .saturating_sub(chain_count * FIXED_CALLS_PER_CHAIN);
+    MAX_WITHDRAWALS_PER_ROUND.min(free_calls * WITHDRAWALS_PER_CALL)
+}
 
 /// Splits `budget` one withdrawal at a time across chains with pending rows, so a
 /// chain with a short backlog never holds back another chain's share.
@@ -561,7 +569,7 @@ pub async fn fetch_pending_bridge_withdrawals(
             page.sort_by_key(|withdrawal| withdrawal.event_id);
             pages.push((chain_index, offset, page));
         }
-        let shares = share_withdrawal_budget(&pages.iter().map(|(_, _, page)| page.len()).collect::<Vec<_>>(), MAX_WITHDRAWALS_PER_ROUND);
+        let shares = share_withdrawal_budget(&pages.iter().map(|(_, _, page)| page.len()).collect::<Vec<_>>(), withdrawal_budget(pages.len()));
         for ((chain_index, offset, mut page), share) in pages.into_iter().zip(shares) {
             let pending = page.len();
             page.truncate(share);
@@ -1040,6 +1048,14 @@ mod tests {
         assert_eq!(share_withdrawal_budget(&[500, 500, 500], 120), vec![40, 40, 40]);
         assert_eq!(share_withdrawal_budget(&[500, 1, 0], 4), vec![3, 1, 0]);
         assert_eq!(share_withdrawal_budget(&[], 120), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn withdrawal_budget_keeps_three_chains_at_the_cap_and_shrinks_beyond() {
+        assert_eq!(withdrawal_budget(3), MAX_WITHDRAWALS_PER_ROUND);
+        assert_eq!(withdrawal_budget(4), 120);
+        assert_eq!(withdrawal_budget(5), 118);
+        assert_eq!(withdrawal_budget(64), 0);
     }
 
     use super::*;

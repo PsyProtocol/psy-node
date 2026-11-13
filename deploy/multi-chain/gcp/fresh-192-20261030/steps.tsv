@@ -30,7 +30,7 @@
 80	py:accept_entrypoints	Check the public entrypoints and the freshness of the public L1 routes
 81	py:accept_p2p_rotation	Accept P2P rotation and recovery
 82	py:accept_faucet_batch	Accept concurrent Faucet batches
-83	py:accept_five_withdrawals	Accept batch_append_withdrawals_5
+83	py:accept_five_withdrawals	Accept five withdrawals appended in batches (pairs, or one five-row batch)
 84	py:accept_three_chains	Accept all three chains one at a time; the pause always comes back
 88	py:expand_coordinator_edges	Start the remaining coordinator edges after acceptance and check them behind the ingress
 85	py:deploy_monitoring	Deploy monitoring

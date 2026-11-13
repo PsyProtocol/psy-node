@@ -576,9 +576,9 @@ enum SignRoute {
     Bridge { request: GuardianSignRequest, request_id: Hex32, permit: tokio::sync::SemaphorePermit<'static> },
 }
 
-/// Everything before the service lock: media, body, schema-3 parse, and policy refusal.
 const SIGN_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Everything before the service lock: media, body, schema-3 parse, and policy refusal.
 async fn sign_route(request: Request<Incoming>) -> SignRoute {
     if request.method() != hyper::Method::POST || request.uri().path() != "/v1/sign-session" || request.uri().query().is_some() {
         return SignRoute::Refused(error_response(None, GuardianSignError::MalformedRequest));

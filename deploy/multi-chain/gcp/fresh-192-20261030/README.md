@@ -63,10 +63,10 @@ measurements do not replace the downstream rebuild and Genesis gates below.
 See [the latest preparation status](PREPARATION-STATUS.md) for local consumer
 commits, actual config evidence and remaining release work.
 
-The Relayer candidate already supports L2 withdrawal-tree append packs of
-1, 2 and 5. Five withdrawals use one `batch_append_withdrawals_5` call with
-176 Felt inputs, fitting 192. Use that existing packing rather than porting
-the old 128-word `2 + 2 + 1` workaround into this cohort. This is not five
+The Relayer packs L2 withdrawal-tree appends as one `append_withdrawal` plus
+`batch_append_withdrawals_2` pairs; the Guardian also accepts the five-row
+`batch_append_withdrawals_5` layout (176 Felt inputs, fitting 192). Step 83
+accepts either batch method. This is not five
 parallel L1 sends, nor a change to L1 deposit aggregation. Keep smaller-pack
 regressions and require real five-entry Guardian/SD-key/EndCap acceptance
 against the new Genesis before rollout.

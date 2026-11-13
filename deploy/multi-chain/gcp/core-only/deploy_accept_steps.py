@@ -39,6 +39,7 @@ SETTLE_WAIT_SECONDS = 60 * 60
 DEPOSIT_AMOUNT = 1_000_000
 WITHDRAW_AMOUNT = 500_000
 FIVE_DEPOSIT, FIVE_WITHDRAW, FIVE_USERS = 200_000, 100_000, ("u01", "u02", "u03", "u04", "u05")
+WITHDRAWAL_BATCH_METHODS = "batch_append_withdrawals_[25]"
 PSY_WITHDRAW_AMOUNT = 1_000_000
 BURST_USERS = tuple(f"u{index:02d}" for index in range(1, 11))
 SAMPLE_SECONDS = 120
@@ -542,7 +543,7 @@ def three_chains_verify(ctx):
     return {"chains": {chain: row["settled"] for chain, row in state["chains"].items()}, "skipped": SKIPPED, "unverified": UNVERIFIED}
 
 
-# ---- step 83: five withdrawals in one batch ----
+# ---- step 83: five withdrawals appended in batches ----
 
 def relayer_lines(ctx, pattern, since):
     host = release_lock.read_document(ctx.release_dir / "release.json")["core_placement"]["relayer"]
@@ -586,17 +587,18 @@ def five_apply(ctx):
         send_withdrawals(ctx, "accept_five_withdrawals", progress, plan, lambda key, nonce: withdraw_one(
             ctx, env, documents, chain, by_name[key], f"five-{key}", core["USDTToken"], FIVE_WITHDRAW, nonce=nonce))
         wait_balance(chain, core["USDTToken"], wallet, plan["baseline"] + FIVE_WITHDRAW * len(users))
-    batch = relayer_lines(ctx, "batch_append_withdrawals_5", started)
-    require(batch, "the Relayer never resolved batch_append_withdrawals_5 for these withdrawals")
+    batch = relayer_lines(ctx, WITHDRAWAL_BATCH_METHODS, started)
+    require(batch, "the Relayer never resolved batch_append_withdrawals_2 or _5 for these withdrawals")
     quarantined = relayer_lines(ctx, "quarantining withdrawal", started)
     require(not quarantined, f"the Relayer logged {len(quarantined)} quarantining withdrawal line(s) since the five withdrawals began")
-    progress["settled"] = {"returned": FIVE_WITHDRAW * len(users), "batch_5_lines": len(batch), "quarantine_lines": 0}
+    progress["settled"] = {"returned": FIVE_WITHDRAW * len(users), "batch_lines": len(batch), "quarantine_lines": 0}
     write_state(ctx, "accept_five_withdrawals", progress)
 
 
 def five_verify(ctx):
     state = recorded(ctx, "accept_five_withdrawals")
-    require(state.get("settled") and state["settled"]["batch_5_lines"] > 0, "the five-withdrawal batch was not recorded")
+    settled = state.get("settled") or {}
+    require(settled.get("batch_lines", settled.get("batch_5_lines", 0)) > 0, "the five-withdrawal batch was not recorded")
     require(state["settled"].get("quarantine_lines") == 0, "a quarantine line was recorded for the five withdrawals")
     return state["settled"]
 
