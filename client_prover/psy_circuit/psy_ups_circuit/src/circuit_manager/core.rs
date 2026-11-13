@@ -178,6 +178,33 @@ where
     shield_deposit_claim_minifier_circuit: OnceLock<ShieldDepositClaimCircuit<C, D>>,
 }
 
+/// Resident memory of this process in MiB (Linux `/proc/self/status`; zeros
+/// elsewhere), logged around circuit compilation to attribute memory spikes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessMemoryMib {
+    pub rss: u64,
+    pub anon: u64,
+    pub shmem: u64,
+}
+
+pub fn process_memory_mib() -> ProcessMemoryMib {
+    let mut memory = ProcessMemoryMib::default();
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(name), Some(kib)) = (fields.next(), fields.next().and_then(|value| value.parse::<u64>().ok())) else { continue };
+            match name {
+                "VmRSS:" => memory.rss = kib / 1024,
+                "RssAnon:" => memory.anon = kib / 1024,
+                "RssShmem:" => memory.shmem = kib / 1024,
+                _ => {}
+            }
+        }
+    }
+    memory
+}
+
 impl<C: GenericConfig<D> + 'static, const D: usize> PsyUPSStepCircuitManager<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
@@ -365,9 +392,23 @@ where
         fn_def: &DPNFunctionCircuitDefinition,
         state_tree_height: usize,
     ) -> Arc<DapenContractFunctionCircuit<C, D>> {
-        let compile = || Arc::new(DapenContractFunctionCircuit::<C, D>::new(
-            fn_def, state_tree_height, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false,
-        ));
+        let compile = || {
+            let started = web_time::Instant::now();
+            let before = process_memory_mib();
+            let circuit = Arc::new(DapenContractFunctionCircuit::<C, D>::new(
+                fn_def, state_tree_height, UPS_SESSION_PROOF_TREE_HEIGHT as usize, false,
+            ));
+            let after = process_memory_mib();
+            tracing::info!(
+                contract_id = key.0, fn_id = key.1, fn_name = %fn_def.name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                estimated_bytes = circuit.estimated_prover_bytes(),
+                rss_before_mib = before.rss, rss_after_mib = after.rss,
+                anon_after_mib = after.anon, shmem_after_mib = after.shmem,
+                "compiled contract prover circuit"
+            );
+            circuit
+        };
         let compiled_from_inputs = |circuit: &DapenContractFunctionCircuit<C, D>| {
             circuit.fn_def == *fn_def && circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
         };

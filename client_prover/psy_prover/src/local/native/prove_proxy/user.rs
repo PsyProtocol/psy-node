@@ -241,6 +241,39 @@ pub struct UserProveProvider {
     pub multisig_circuit: Arc<std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>>,
 }
 
+/// Requests currently being served, for the periodic memory log.
+static IN_FLIGHT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Counts one in-flight request and logs its duration and the process
+/// memory before and after, so memory spikes can be tied to requests.
+struct RequestSpan {
+    method: &'static str,
+    contract_id: u64,
+    fn_id: Option<u32>,
+    started: web_time::Instant,
+    before: psy_ups_circuit::circuit_manager::core::ProcessMemoryMib,
+}
+
+impl RequestSpan {
+    fn enter(method: &'static str, contract_id: u64, fn_id: Option<u32>) -> Self {
+        IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { method, contract_id, fn_id, started: web_time::Instant::now(), before: psy_ups_circuit::circuit_manager::core::process_memory_mib() }
+    }
+}
+
+impl Drop for RequestSpan {
+    fn drop(&mut self) {
+        let in_flight = IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+        let after = psy_ups_circuit::circuit_manager::core::process_memory_mib();
+        tracing::info!(
+            method = self.method, contract_id = self.contract_id, fn_id = ?self.fn_id,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            rss_before_mib = self.before.rss, rss_after_mib = after.rss, in_flight,
+            "prove proxy request finished"
+        );
+    }
+}
+
 /// The cached multisig circuit, built on first use. A panic during a build
 /// leaves the slot empty, so the next caller builds again.
 fn multisig_circuit(cell: &std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>>>) -> anyhow::Result<Arc<MultisigSignatureCircuit>> {
@@ -254,6 +287,25 @@ fn multisig_circuit(cell: &std::sync::Mutex<Option<Arc<MultisigSignatureCircuit>
 }
 
 impl UserProveProvider {
+    /// Logs process memory, in-flight requests and the contract prover cache
+    /// every 10 s, to attribute memory growth.
+    pub fn spawn_memory_log(&self) {
+        let circuit_manager = self.circuit_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let memory = psy_ups_circuit::circuit_manager::core::process_memory_mib();
+                let (cached_bytes, budget_bytes, cached_circuits) = circuit_manager.contract_prover_cache_usage();
+                tracing::info!(
+                    rss_mib = memory.rss, anon_mib = memory.anon, shmem_mib = memory.shmem,
+                    in_flight = IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed),
+                    cached_bytes, budget_bytes, cached_circuits,
+                    "prove proxy memory"
+                );
+            }
+        });
+    }
+
     /// Builds the multisig circuit in the background so the first request
     /// does not pay for it inside the client's request timeout.
     pub fn warm_multisig_circuit(&self) {
@@ -470,6 +522,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
     }
 
     async fn register_contract_circuits(&self, contract_id: u64, _contract_code: ContractCodeDefinition) -> Result<(), ErrorObjectOwned> {
+        let _span = RequestSpan::enter("register_contract_circuits", contract_id, None);
         self.register_contract_circuits_inner(contract_id)
             .await
             .map_err(|err| ErrorObjectOwned::owned(1, "register contract circuits error", Some(err.to_string())))
@@ -563,6 +616,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         input: DapenContractFunctionCircuitInput<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
         tracing::debug!("prove_contract_call contract_id: {}, fn_id: {}", contract_id, fn_id);
+        let _span = RequestSpan::enter("prove_contract_call", contract_id, Some(fn_id));
         if self.circuit_manager.contract_function_registration(contract_id, fn_id).is_none() {
             tracing::warn!("contract {} is not registered, can not get fn id", contract_id);
             tracing::warn!("register contract {} first", contract_id);
