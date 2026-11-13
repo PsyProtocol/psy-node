@@ -4046,6 +4046,9 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     use crate::guardian::verify::verify_guardian_session;
     use super::guardian_client::{GuardianClient, prove_pending_request};
     use psy_prover::trace::GeneratedTxTraceJson;
+    // The DPN executor asserts this bound; fail the round instead of panicking the daemon.
+    ensure!(calls.len() <= psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS,
+        "guardian operation has {} calls; one L2 session holds at most {}", calls.len(), psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS);
     let account = config.root.initial_account().map_err(|error| anyhow::anyhow!(error))?;
     let identity = config.root.account_public_key().map_err(|error| anyhow::anyhow!(error))?;
     let archive = &config.db;
@@ -6415,6 +6418,16 @@ mod tests {
         for (n, expected) in cases {
             assert_eq!(&optimal_batch_sizes(*n), expected, "n={n}");
         }
+    }
+
+    #[test]
+    fn capped_withdrawals_and_deposit_roots_fit_one_l2_session() {
+        let chains = 3;
+        let worst = (0..=chains * propose_withdrawals::MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND)
+            .map(|count| optimal_batch_sizes(count).len())
+            .max()
+            .unwrap();
+        assert!(worst + chains <= psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS, "{worst} batch calls");
     }
 
     #[test]

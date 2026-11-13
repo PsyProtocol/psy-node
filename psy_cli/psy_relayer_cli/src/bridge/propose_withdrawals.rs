@@ -52,6 +52,11 @@ pub struct ProposeWithdrawalsArgs {
 
 // ── constants ────────────────────────────────────────────────────────────────
 
+/// One L2 session holds at most `MAX_INTROSPECTABLE_TRANSACTIONS` (64) calls. Eighty
+/// withdrawals pack into at most 17 batch calls, so three chains plus their
+/// deposit roots stay within one session; the rest wait for the next round.
+pub(crate) const MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND: usize = 80;
+
 const UNKNOWN_WITHDRAWAL_TREE_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 // ── internal types ───────────────────────────────────────────────────────────
@@ -531,9 +536,14 @@ pub async fn fetch_pending_bridge_withdrawals(
         for &(chain_index, offset) in &requested {
             let mut page =
                 fetch_bridge_withdrawals(&http, &services_url, offset, Some(chain_index)).await?;
+            let pending = page.len();
+            // Appends must stay a prefix of each chain's leaves, so cap after ordering.
+            page.sort_by_key(|withdrawal| withdrawal.event_id);
+            page.truncate(MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND);
             tracing::info!(
                 chain_index,
-                withdrawals = page.len(),
+                withdrawals = pending,
+                admitted = page.len(),
                 offset,
                 "fetched bridge withdrawals for destination chain (single pass, no retry)"
             );
