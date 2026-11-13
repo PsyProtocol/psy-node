@@ -25,7 +25,7 @@ enum JsonRpcAnswer<'a> { Result(&'a Value), MissingData, Rejected }
 /// Methods whose null result means the provider does not have the object, not that it does not exist.
 const NULL_MEANS_UNKNOWN_METHODS: [&str; 4] = ["eth_getTransactionReceipt", "eth_getBlockByNumber", "eth_getBlockByHash", "eth_getTransactionByHash"];
 /// Lowercased error-message fragments of nodes that lack the requested history (pruned or lagging state and headers).
-const MISSING_DATA_MESSAGES: [&str; 5] = ["historical state", "header not found", "missing trie node", "pruned", "not available"];
+const MISSING_DATA_MESSAGES: [&str; 8] = ["historical state", "header not found", "header for hash not found", "unknown block", "block not found", "missing trie node", "pruned", "not available"];
 
 /// Shared handle to the provider pool of one chain.
 pub(crate) struct L1RpcPool(Arc<ProviderPool<L1RpcRoute>>);
@@ -225,6 +225,7 @@ mod tests {
         use GuardianSignError::{L1ResponseMismatch, L1RpcUnavailable};
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}})).await, L1ResponseMismatch).await;
+        assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"block 0x0b is not currently canonical"}})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":1,"result":null})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve_json(json!({"jsonrpc":"2.0","id":2,"result":"0x1"})).await, L1ResponseMismatch).await;
         assert_final_without_failover(serve(Reply::Http(200, "not json".into())).await, L1ResponseMismatch).await;
@@ -241,6 +242,9 @@ mod tests {
             ("eth_getBlockByNumber", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}})),
             ("eth_call", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing trie node abc (path )"}})),
             ("eth_getLogs", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Block has been pruned"}})),
+            ("eth_getLogs", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header for hash not found"}})),
+            ("eth_call", json!({"jsonrpc":"2.0","id":1,"error":{"code":-39001,"message":"Unknown block"}})),
+            ("eth_getBlockByHash", json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"block not found"}})),
             ("eth_getTransactionReceipt", json!({"jsonrpc":"2.0","id":1,"result":null})),
             ("eth_getBlockByNumber", json!({"jsonrpc":"2.0","id":1,"result":null})),
             ("eth_getBlockByHash", json!({"jsonrpc":"2.0","id":1,"result":null})),
@@ -283,6 +287,16 @@ mod tests {
         assert_eq!(pair.call("eth_chainId", json!([])).await, Ok(json!("0x2a")));
         assert!(parallel_reads(&pair).await.iter().all(|result| *result == Ok(json!("0x2a"))));
         assert_eq!(primary.requests() + backup.requests(), 10);
+    }
+
+    #[tokio::test]
+    async fn healthy_first_provider_serves_every_read() {
+        let first = serve_result().await;
+        let second = serve_result().await;
+        let pair = pool(vec![first.provider("gateway"), second.provider("node")]);
+        assert!(parallel_reads(&pair).await.iter().all(|result| *result == Ok(json!("0x2a"))));
+        assert_eq!(pair.call("eth_chainId", json!([])).await, Ok(json!("0x2a")));
+        assert_eq!((first.requests(), second.requests()), (9, 0));
     }
 
     #[tokio::test]
