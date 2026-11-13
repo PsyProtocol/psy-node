@@ -312,10 +312,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
         calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls(&withdrawals));
     } else { calls.push(policy_call(request.operation, &witness)?); }
     let expected = ContractCallData::new(calls);
-    // Sessions packed before pairs only carry five-row batches; both layouts bind the same records.
-    let supplied_calls = request.trace_json.decode()?.call_data;
-    let matches = |layout: &ContractCallData| serde_json::to_value(layout).map(|value| value == supplied_calls).map_err(|_| GuardianSignError::MalformedRequest);
-    if !matches(&expected)? && !five_row_layout.as_ref().map(matches).transpose()?.unwrap_or(false) { return Err(GuardianSignError::UnsupportedCall.into()); }
+    let expected = select_call_layout(&request.trace_json.decode()?.call_data, expected, five_row_layout)?;
     supplied.contract_codes = load_trace_contract_codes(context.provider, &supplied).await?;
     verify_trace_contracts(&supplied)?;
     let fees: Vec<_> = supplied.steps.iter().filter_map(|step| if let TraceStep::BurnFee(step) = step { Some(step) } else { None }).collect();
@@ -324,6 +321,18 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let ending_leaf_hash = supplied.finalization.submit_end_cap_input.core.new_user_leaf.qfhash::<PsyHasher>();
     tracing::debug!(session_nonce = request.session_nonce, historical, trace_ms = trace_started.elapsed().as_millis() as u64, "[verify_sign_request_trace] trace verified");
     Ok((VerifiedGuardianSession { trace: supplied, current_policy, ending_policy, starting_leaf_hash: start_hash, ending_leaf_hash, message, withdrawal_appends: appends }, expected, historical_checkpoint_root(&checkpoint_path), staged_deposit_tree_states))
+}
+
+/// The rebuilt calls that equal the supplied call data. Sessions packed before
+/// pairs only carry five-row batches; both layouts bind the same records, and
+/// later replay and stack-hash checks must use the layout that matched.
+fn select_call_layout(supplied: &serde_json::Value, pairs: ContractCallData, five_row: Option<ContractCallData>) -> Result<ContractCallData> {
+    let matches = |layout: &ContractCallData| serde_json::to_value(layout).map(|value| value == *supplied).map_err(|_| GuardianSignError::MalformedRequest);
+    if matches(&pairs)? { return Ok(pairs); }
+    match five_row {
+        Some(layout) if matches(&layout)? => Ok(layout),
+        _ => Err(GuardianSignError::UnsupportedCall),
+    }
 }
 
 pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, config: &GuardianConfig, request: &GuardianSignRequest) -> Result<(VerifiedGuardianSession, Vec<DepositTreeState>),GuardianAccountError> {
@@ -734,6 +743,23 @@ fn decode_endcap_proof(bytes: &[u8]) -> Result<plonky2::plonk::proof::ProofWithP
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn five_row_session_passes_on_with_its_own_layout() {
+        let records: Vec<_> = (1..=5u64).map(|seed| crate::bridge::propose_withdrawals::PendingWithdrawal {
+            event_id: seed as i64, checkpoint_id: 1, user_id: seed, sender_user_id: seed, contract_id: 4, destination_chain_index: 0,
+            token_address: [seed as u32; 8], amount: [1; 8], recipient: [2; 8], nonce: [seed as u32; 8], leaf_hash: String::new(),
+        }).collect();
+        let pairs = ContractCallData::new(crate::bridge::daemon::build_withdrawal_batch_calls(&records));
+        let five_row = ContractCallData::new(crate::bridge::daemon::build_withdrawal_batch_calls_with_five_row(&records));
+        let five_row_value = serde_json::to_value(&five_row).unwrap();
+        let chosen = select_call_layout(&five_row_value, pairs.clone(), Some(five_row.clone())).unwrap();
+        assert_eq!(serde_json::to_value(&chosen).unwrap(), five_row_value);
+        let pairs_value = serde_json::to_value(&pairs).unwrap();
+        assert_eq!(serde_json::to_value(&select_call_layout(&pairs_value, pairs.clone(), Some(five_row.clone())).unwrap()).unwrap(), pairs_value);
+        assert_eq!(select_call_layout(&five_row_value, pairs.clone(), None).unwrap_err(), GuardianSignError::UnsupportedCall);
+        assert_eq!(select_call_layout(&serde_json::json!([]), pairs, Some(five_row)).unwrap_err(), GuardianSignError::UnsupportedCall);
+    }
+
     use super::*;
 
     #[test]
