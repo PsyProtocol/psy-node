@@ -3380,11 +3380,12 @@ async fn build_multichain_l2_plan(
         }
 
         if append_business && pending > l2_count {
+            let configured_chain_id = guardian.root.chain(chain.chain_index).map_err(|error| anyhow::anyhow!(error))?.chain_id;
             let finalized_pending = chain.l1.with_rpc_failover("read_finalized_deposit_progress", |url| {
                 let url = url.to_string();
                 async move {
                     let provider = crate::bridge::l1_provider::connect_l1_readonly(url.parse()?)?;
-                    fetch_finalized_pending_deposit_count(&provider, chain.bridge).await
+                    fetch_finalized_pending_deposit_count(&provider, chain.bridge, configured_chain_id).await
                 }
             }).await?;
             // Latest remains the backlog metric, not Guardian admission. A
@@ -3895,10 +3896,12 @@ pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge
 
 const DEPOSIT_ADMISSION_MARGIN_BLOCKS: u64 = 2;
 
-async fn fetch_finalized_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+async fn fetch_finalized_pending_deposit_count(provider: &impl Provider, bridge: Address, configured_chain_id: U256) -> anyhow::Result<u32> {
+    let rpc_chain_id = U256::from(provider.get_chain_id().await?);
+    ensure!(rpc_chain_id == configured_chain_id, "L1 RPC reports chain id {rpc_chain_id}; deployment configures {configured_chain_id}");
     // The Guardian's admission rule, a few blocks deeper so the anchor built later on
     // another node (and each Guardian's own head) is at or above this count.
-    let confirmed = match guardian_common::verify_l1::deposit_confirmation_blocks(U256::from(provider.get_chain_id().await?)) {
+    let confirmed = match guardian_common::verify_l1::deposit_confirmation_blocks(configured_chain_id) {
         None => BlockNumberOrTag::Finalized,
         Some(depth) => BlockNumberOrTag::Number(provider.get_block_number().await?.saturating_sub(depth + DEPOSIT_ADMISSION_MARGIN_BLOCKS)),
     };
@@ -4720,11 +4723,11 @@ mod tests {
     }
 
     async fn finalized_deposit_fixture(latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
-        confirmed_deposit_fixture(1, latest, finalized, header_available).await
+        confirmed_deposit_fixture(1, 1, latest, finalized, header_available).await
     }
 
     /// The L1 head is block 1000; `finalized` is the count at the admission header, `latest` above it.
-    async fn confirmed_deposit_fixture(chain_id: u64, latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
+    async fn confirmed_deposit_fixture(configured_chain_id: u64, chain_id: u64, latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use serde_json::{json, Value};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -4753,7 +4756,7 @@ mod tests {
                     "eth_chainId" => json!(format!("0x{chain_id:x}")),
                     "eth_blockNumber" => json!("0x3e8"),
                     "eth_getBlockByNumber" => {
-                        let admission = match guardian_common::verify_l1::deposit_confirmation_blocks(U256::from(chain_id)) {
+                        let admission = match guardian_common::verify_l1::deposit_confirmation_blocks(U256::from(configured_chain_id)) {
                             None => json!("finalized"),
                             Some(depth) => json!(format!("0x{:x}", 1000 - depth - DEPOSIT_ADMISSION_MARGIN_BLOCKS)),
                         };
@@ -4776,7 +4779,7 @@ mod tests {
             }
         });
         let provider = alloy_provider::ProviderBuilder::new().connect_http(url.parse()?);
-        let result = tokio::time::timeout(Duration::from_secs(10), fetch_finalized_pending_deposit_count(&provider, Address::repeat_byte(1))).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), fetch_finalized_pending_deposit_count(&provider, Address::repeat_byte(1), U256::from(configured_chain_id))).await;
         server.abort();
         let requests = requests.lock().unwrap().clone();
         Ok((result??, requests))
@@ -4799,12 +4802,20 @@ mod tests {
 
     #[tokio::test]
     async fn testnet_deposit_count_is_read_its_confirmation_depth_below_latest() {
-        let (count, requests) = confirmed_deposit_fixture(11_155_111, 3, 2, true).await.unwrap();
+        let (count, requests) = confirmed_deposit_fixture(11_155_111, 11_155_111, 3, 2, true).await.unwrap();
         assert_eq!(count, 2);
         let methods = requests.iter().map(|request| request["method"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(methods, ["eth_chainId", "eth_blockNumber", "eth_getBlockByNumber", "eth_call"]);
         assert_eq!(requests[2]["params"][0], "0x3de");
         assert_eq!(requests[3]["params"][1]["requireCanonical"], true);
+    }
+
+    #[tokio::test]
+    async fn deposit_depth_follows_the_configured_chain_and_refuses_a_different_rpc_chain() {
+        let error = confirmed_deposit_fixture(1, 11_155_111, 3, 2, true).await.unwrap_err();
+        assert!(error.to_string().contains("deployment configures 1"), "{error}");
+        let error = confirmed_deposit_fixture(11_155_111, 1, 3, 2, true).await.unwrap_err();
+        assert!(error.to_string().contains("deployment configures 11155111"), "{error}");
     }
 
     #[tokio::test]
