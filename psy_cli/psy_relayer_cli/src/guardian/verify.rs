@@ -261,6 +261,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let witness = trace_policy(&supplied, config)?;
     let (current_policy, ending_policy) = witness.policies().map_err(|_| GuardianSignError::PolicyMismatch)?;
     let mut calls = Vec::new();
+    let mut five_row_layout = None;
     let mut appends = Vec::new();
     let mut counts = BTreeMap::new();
     let mut staged_deposit_tree_states = Vec::with_capacity(request.deposit_anchors.len());
@@ -305,10 +306,16 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
             *count = count.checked_add(1).ok_or(GuardianSignError::WithdrawalMismatch)?;
             withdrawals.push(crate::bridge::propose_withdrawals::PendingWithdrawal { event_id: 0, checkpoint_id: checkpoint, user_id: u64::from(burn.sender_user_id), sender_user_id: u64::from(burn.sender_user_id), contract_id: u64::from(burn.token_contract_id), destination_chain_index: u64::from(burn.destination_chain_index), token_address: burn.token, amount: burn.amount, recipient: burn.recipient, nonce: burn.nonce, leaf_hash: withdrawal_leaf_hex(withdrawal_leaf(burn)) });
         }
+        let mut five_row_calls = calls.clone();
+        five_row_calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls_with_five_row(&withdrawals));
+        five_row_layout = Some(ContractCallData::new(five_row_calls));
         calls.extend(crate::bridge::daemon::build_withdrawal_batch_calls(&withdrawals));
     } else { calls.push(policy_call(request.operation, &witness)?); }
     let expected = ContractCallData::new(calls);
-    if serde_json::to_value(&expected).map_err(|_| GuardianSignError::MalformedRequest)? != request.trace_json.decode()?.call_data { return Err(GuardianSignError::UnsupportedCall.into()); }
+    // Sessions packed before pairs only carry five-row batches; both layouts bind the same records.
+    let supplied_calls = request.trace_json.decode()?.call_data;
+    let matches = |layout: &ContractCallData| serde_json::to_value(layout).map(|value| value == supplied_calls).map_err(|_| GuardianSignError::MalformedRequest);
+    if !matches(&expected)? && !five_row_layout.as_ref().map(matches).transpose()?.unwrap_or(false) { return Err(GuardianSignError::UnsupportedCall.into()); }
     supplied.contract_codes = load_trace_contract_codes(context.provider, &supplied).await?;
     verify_trace_contracts(&supplied)?;
     let fees: Vec<_> = supplied.steps.iter().filter_map(|step| if let TraceStep::BurnFee(step) = step { Some(step) } else { None }).collect();
