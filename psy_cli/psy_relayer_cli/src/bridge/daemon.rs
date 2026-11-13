@@ -4070,7 +4070,6 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     let head = committed.checkpoint_id;
     let root = committed.checkpoint_tree_root;
-    wait_bridge_user_tree_proof(provider, head).await?;
     // Capture before refreshing: receipt repair may remove the pending marker.
     let pending = archive.pending_request()?;
     if let PolicySignatures::Resume { expected_request_id, responses } = &policy {
@@ -4084,6 +4083,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
             None => ensure!(pending.as_ref().is_some_and(|pending| pending.as_str() == bound.as_str()), "frozen policy request is not the retained pending request"),
         }
     }
+    wait_bridge_user_tree_proof(provider, head).await?;
     *retained = restore_relayer_history(&wallet, provider, config, head, root).await?;
     let pending_nonce = pending.as_ref().map(|request| request.decode().map(|request| request.session_nonce)).transpose()?;
     let pending_included = match (pending_nonce, archive.sessions(retained.history.nonce(), 1)?.sessions.into_iter().next()) {
@@ -4261,6 +4261,7 @@ async fn recover_guardian_inclusion(
     let start = request.decode_trace()?.anchor.start_checkpoint_id;
     let start_leaf = input.core.state_transition.start_user_leaf_hash;
     let head = crate::guardian::service::load_guardian_committed_head(provider, &provider.get_coordinator_url()?).await?;
+    wait_bridge_user_tree_proof(provider, head.checkpoint_id).await?;
     let predecessor = authenticated_account(provider, &config.root, start, head.checkpoint_id, head.checkpoint_tree_root).await?;
     let current = authenticated_account(provider, &config.root, head.checkpoint_id, head.checkpoint_id, head.checkpoint_tree_root).await?;
     if pending_transition_unfinished(request.session_nonce, start_leaf, predecessor, current)? { return Ok(None); }
