@@ -3878,10 +3878,18 @@ pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge
     u32::try_from(pending).context("pendingDepositCount exceeds u32")
 }
 
+const DEPOSIT_ADMISSION_MARGIN_BLOCKS: u64 = 2;
+
 async fn fetch_finalized_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
-    let block = provider.get_block_by_number(BlockNumberOrTag::Finalized).await?
-        .context("finalized L1 header unavailable")?;
-    ensure!(block.header.hash != B256::ZERO, "finalized L1 header hash is zero");
+    // The Guardian's admission rule, a few blocks deeper so the anchor built later on
+    // another node (and each Guardian's own head) is at or above this count.
+    let confirmed = match guardian_common::verify_l1::deposit_confirmation_blocks(U256::from(provider.get_chain_id().await?)) {
+        None => BlockNumberOrTag::Finalized,
+        Some(depth) => BlockNumberOrTag::Number(provider.get_block_number().await?.saturating_sub(depth + DEPOSIT_ADMISSION_MARGIN_BLOCKS)),
+    };
+    let block = provider.get_block_by_number(confirmed).await?
+        .context("confirmed L1 header unavailable")?;
+    ensure!(block.header.hash != B256::ZERO, "admission L1 header hash is zero");
     let call = pendingDepositCountCall {};
     let tx = TransactionRequest::default().to(bridge).input(call.abi_encode().into());
     let raw = provider.call(tx).block(BlockId::hash_canonical(block.header.hash)).await
@@ -4672,6 +4680,11 @@ mod tests {
     }
 
     async fn finalized_deposit_fixture(latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
+        confirmed_deposit_fixture(1, latest, finalized, header_available).await
+    }
+
+    /// The L1 head is block 1000; `finalized` is the count at the admission header, `latest` above it.
+    async fn confirmed_deposit_fixture(chain_id: u64, latest: u64, finalized: u64, header_available: bool) -> anyhow::Result<(u32, Vec<serde_json::Value>)> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use serde_json::{json, Value};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -4697,8 +4710,14 @@ mod tests {
                 let request: Value = serde_json::from_slice(&body).unwrap();
                 received.lock().unwrap().push(request.clone());
                 let result = match request["method"].as_str().unwrap() {
+                    "eth_chainId" => json!(format!("0x{chain_id:x}")),
+                    "eth_blockNumber" => json!("0x3e8"),
                     "eth_getBlockByNumber" => {
-                        assert_eq!(request["params"], json!(["finalized", false]));
+                        let admission = match guardian_common::verify_l1::deposit_confirmation_blocks(U256::from(chain_id)) {
+                            None => json!("finalized"),
+                            Some(depth) => json!(format!("0x{:x}", 1000 - depth - DEPOSIT_ADMISSION_MARGIN_BLOCKS)),
+                        };
+                        assert_eq!(request["params"], json!([admission, false]));
                         if header_available {
                             let mut block: alloy_rpc_types_eth::Block = Default::default();
                             block.header.hash = hash;
@@ -4733,9 +4752,19 @@ mod tests {
     async fn finalized_deposit_count_uses_canonical_hash_and_retains_ready_prefix() {
         let (count, requests) = finalized_deposit_fixture(3, 1, true).await.unwrap();
         assert_eq!(count, 1);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1]["params"][1]["requireCanonical"], true);
-        assert!(requests[1]["params"][1].get("blockHash").is_some());
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["params"][1]["requireCanonical"], true);
+        assert!(requests[2]["params"][1].get("blockHash").is_some());
+    }
+
+    #[tokio::test]
+    async fn testnet_deposit_count_is_read_its_confirmation_depth_below_latest() {
+        let (count, requests) = confirmed_deposit_fixture(11_155_111, 3, 2, true).await.unwrap();
+        assert_eq!(count, 2);
+        let methods = requests.iter().map(|request| request["method"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(methods, ["eth_chainId", "eth_blockNumber", "eth_getBlockByNumber", "eth_call"]);
+        assert_eq!(requests[2]["params"][0], "0x3de");
+        assert_eq!(requests[3]["params"][1]["requireCanonical"], true);
     }
 
     #[tokio::test]

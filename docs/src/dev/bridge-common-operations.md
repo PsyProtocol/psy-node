@@ -119,14 +119,26 @@ GET /api/v1/bridge/withdrawal-claim-proof
 
 ### Round-trip invariants
 
-The multichain Relayer admits deposits only through a fixed canonical finalized
-L1 header. It reads `pendingDepositCount` with an EIP-1898 block hash and
-`requireCanonical=true`, then requests the exact Services snapshot for that
-finalized prefix. Latest pending remains the backlog metric, not the admission
-target. Deposits beyond the finalized prefix wait without excluding another
-chain's ready calls or withdrawals. A missing finalized header or failed pinned
-read never falls back to latest or safe. Guardian independently verifies the
-anchor and contents; this admission rule does not replace its checks.
+The multichain Relayer admits deposits only through a fixed canonical admission
+L1 header. On a chain listed in `deposit_confirmation_blocks`
+(`psy_cli/guardian_common/src/verify_l1.rs`) that header is the listed depth
+below `latest`: Sepolia 8 and Base Sepolia 64 blocks, the minimum Envio reorg
+windows (deployed windows must not be smaller). The Relayer reads its target
+two blocks deeper so the anchor and each Guardian head sit at or above it.
+Every other chain, including BSC testnet and every mainnet, uses the
+`finalized` header. Withdrawal token-mapping checks always use `finalized`. The Relayer reads `pendingDepositCount` with an EIP-1898 block hash
+and `requireCanonical=true`, then requests the exact Services snapshot for that
+prefix. Latest pending remains the backlog metric, not the admission target.
+Deposits beyond the admitted prefix wait without excluding another chain's
+ready calls or withdrawals. A missing admission header or failed pinned read
+never falls back to latest or safe. Guardian applies the same rule, keyed on
+its configured chain id, to its own L1 head and independently verifies the
+anchor and contents; this admission rule does not replace its checks. A
+Guardian head below the anchor answers `FinalityPending` and the Relayer
+retries. A testnet reorg deeper than the listed depth is an accepted testnet
+risk with no automatic recovery: a saved or included anchor halts the account
+with `FinalityConflict`, a pending request's anchor is refused with
+`DepositMismatch`, and a deposit already included on L2 cannot be unwound.
 
 1. **Deposit leaf binding.** `note_commitment = PoseidonHash(nullifier_secret || note_secret)`.
 2. **Nullifier uniqueness.** Double-claims fail closed on the exact identity above, not on counts.

@@ -65,6 +65,17 @@ impl<'a> CustodyRpc<'a> {
         value.get("result").filter(|value| !value.is_null()).cloned().ok_or(GuardianSignError::L1ResponseMismatch)
     }
     async fn block(&self, number: Value) -> Result<Value> { self.call("eth_getBlockByNumber", json!([number,false])).await }
+    /// The newest header deposits may be admitted against: `finalized`, or on a
+    /// testnet `deposit_confirmation_blocks` below `latest`.
+    async fn confirmed_block(&self) -> Result<Value> {
+        let Some(depth) = deposit_confirmation_blocks(configured_chain_id(self.endpoint)?) else { return self.block(json!("finalized")).await };
+        let latest = quantity(&self.block(json!("latest")).await?["number"])?;
+        // A lagging load-balanced node may not serve that height yet; retry rather than refuse.
+        self.block(block_id(latest.saturating_sub(depth))).await.map_err(|error| match error {
+            GuardianSignError::L1ResponseMismatch => GuardianSignError::L1RpcUnavailable,
+            error => error,
+        })
+    }
     async fn eth_call(&self, address: Hex20, signature: &str, argument: Option<u64>, block: &Value) -> Result<[u8;32]> {
         let mut data = keccak256(signature.as_bytes())[..4].to_vec();
         if let Some(argument) = argument { data.extend_from_slice(&U256::from(argument).to_be_bytes::<32>()); }
@@ -145,6 +156,17 @@ fn configured_chain_id(chain: &ChainEndpoint) -> Result<U256> {
     Ok(chain.chain_id)
 }
 fn configured_bridge(chain: &ChainEndpoint) -> Hex20 { chain.bridge }
+
+/// Sepolia and Base Sepolia admit deposits this many blocks below `latest`, the
+/// minimum indexer reorg window for that chain. Every other chain waits for
+/// `finalized`, including BSC testnet, whose fast finality is already shorter.
+pub fn deposit_confirmation_blocks(chain_id: U256) -> Option<u64> {
+    match u64::try_from(chain_id).ok()? {
+        11_155_111 => Some(8),
+        84_532 => Some(64),
+        _ => None,
+    }
+}
 struct DerivedChain { router: Hex20 }
 fn provider_address(provider: Hex20, name: &[u8]) -> Vec<u8> {
     let mut data = keccak256(b"getAddress(bytes32)")[..4].to_vec();
@@ -221,7 +243,7 @@ async fn canonical_ancestor_header(rpc: &CustodyRpc<'_>, number: u64, finalized:
 
 pub async fn finalized_deposit_anchor(chain: &ChainEndpoint, old_count: u32, new_count: u32) -> Result<DepositAnchor> {
     let rpc = CustodyRpc::new(chain)?;
-    let finalized = rpc.block(json!("finalized")).await?;
+    let finalized = rpc.confirmed_block().await?;
     let number = quantity(&finalized["number"])?;
     if number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     verify_l1_chain(&rpc, chain, &block_id(number)).await?;
@@ -232,7 +254,7 @@ pub async fn finalized_deposit_anchor(chain: &ChainEndpoint, old_count: u32, new
 pub async fn verify_finalized_anchor(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<()> {
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     let rpc = CustodyRpc::new(chain)?;
-    let finalized = rpc.block(json!("finalized")).await?;
+    let finalized = rpc.confirmed_block().await?;
     verify_l1_chain(&rpc, chain, &block_id(anchor.block_number)).await?;
     verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &finalized).await
 }
@@ -245,7 +267,7 @@ pub async fn verify_finalized_anchor(chain: &ChainEndpoint, anchor: &DepositAnch
 pub async fn verify_saved_deposit_anchor_headers(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Hex32> {
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     let rpc = CustodyRpc::new(chain)?;
-    let finalized = rpc.block(json!("finalized")).await?;
+    let finalized = rpc.confirmed_block().await?;
     saved_anchor_canonical_hash(&rpc, chain, anchor, &finalized).await
 }
 
@@ -306,7 +328,7 @@ async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &Ch
         return Err(GuardianSignError::DepositMismatch.into());
     }
     let rpc = CustodyRpc::new(chain)?;
-    let finalized = rpc.block(json!("finalized")).await?;
+    let finalized = rpc.confirmed_block().await?;
     // ANY saved deposit-tree-state reuse — exact replay or warm forward extend — is gated here so
     // a caller cannot skip it: the stored body must pass core
     // `DepositTreeState::validate()` (count/partial-page bindings, hash
@@ -354,7 +376,7 @@ async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &Ch
         if index + 1 == anchor.old_count { old_root = root; }
     }
     if occupied_partial_page_hashes.len() != (anchor.new_count % 32) as usize { return Err(GuardianSignError::DepositMismatch.into()); }
-    verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&rpc.block(json!("finalized")).await?).await?;
+    verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&rpc.confirmed_block().await?).await?;
     Ok((old_root,root,DepositTreeState {count:anchor.new_count,frontier,root,anchor:anchor.clone(),event_block,previous_count:anchor.old_count,previous_root:old_root,occupied_partial_page_hashes}))
 }
 
@@ -469,14 +491,14 @@ pub async fn fetch_deposit_records(chain: &ChainEndpoint, anchor: &DepositAnchor
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     if anchor.old_count >= anchor.new_count { return Err(GuardianSignError::DepositMismatch); }
     let rpc = CustodyRpc::new(chain)?;
-    let finalized = rpc.block(json!("finalized")).await?;
+    let finalized = rpc.confirmed_block().await?;
     verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &finalized).await?;
     let pinned = json!({"blockHash": anchor.block_hash, "requireCanonical": true});
     let derived = verify_l1_chain(&rpc, chain, &pinned).await?;
     if U256::from_be_bytes(rpc.eth_call(configured_bridge(chain), "pendingDepositCount()", None, &pinned).await?) < U256::from(anchor.new_count) { return Err(GuardianSignError::DepositMismatch); }
     let (mut events, _) = fetch_deposit_events(&rpc, chain, derived.router, anchor, 0, chain.deployment_block, &pinned).await?;
     let records = (0..anchor.new_count).map(|index| events.remove(&index).map(|(_, record)| record).ok_or(GuardianSignError::DepositMismatch)).collect::<Result<Vec<_>>>()?;
-    verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &rpc.block(json!("finalized")).await?).await?;
+    verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &rpc.confirmed_block().await?).await?;
     Ok(records)
 }
 
@@ -744,7 +766,8 @@ mod tests {
     }
 
     const CHAIN_INDEX: u8 = 1;
-    const CHAIN_ID: u64 = 97;
+    // A chain without a testnet confirmation depth, so these fixtures exercise `finalized`.
+    const CHAIN_ID: u64 = 1;
     const HEIGHT_A: u64 = 1_000;
     const HEIGHT_B: u64 = 1_005;
     const SAVED_COUNT: u32 = 100;
@@ -994,6 +1017,7 @@ mod tests {
                 if params[1] != serde_json::json!(false) { return Err("full blocks are unused"); }
                 let tag = params[0].as_str().ok_or("block tag")?;
                 if tag == "finalized" { return Ok(header(HEIGHT_B, HASH_B)); }
+                if tag == "latest" { return Ok(header(HEIGHT_B + 8, [0x7f; 32])); }
                 let number = parse_qty(&params[0]).ok_or("block number")?;
                 let hash = match number {
                     HEIGHT_A => if reorg { HASH_A_REORG } else { HASH_A },
@@ -1145,6 +1169,24 @@ mod tests {
         assert!(leaves.iter().all(|call| call_height(&call["params"][1]) == Some(HEIGHT_B)));
         let receipts: std::collections::BTreeSet<_> = calls.iter().filter(|call| method(call) == "eth_getTransactionReceipt").map(|call| call["params"][0].as_str().unwrap().to_owned()).collect();
         assert_eq!(receipts.len(), usize::try_from(NEW_COUNT - SAVED_COUNT).unwrap());
+    }
+
+    #[tokio::test]
+    async fn testnet_admits_deposits_its_confirmation_depth_below_latest() {
+        assert_eq!(deposit_confirmation_blocks(U256::from(11_155_111u64)), Some(8));
+        assert_eq!(deposit_confirmation_blocks(U256::from(84_532u64)), Some(64));
+        assert_eq!(deposit_confirmation_blocks(U256::from(97u8)), None);
+        assert_eq!(deposit_confirmation_blocks(U256::from(1u8)), None);
+        let fixture = serve_l1(prepare_new_batch().server).await;
+        let finalized_endpoint = fixture.endpoint();
+        let testnet_endpoint = ChainEndpoint { chain_id: U256::from(11_155_111u64), ..fixture.endpoint() };
+        let header = CustodyRpc::new(&testnet_endpoint).unwrap().confirmed_block().await.unwrap();
+        assert_eq!(quantity(&header["number"]).unwrap(), HEIGHT_B);
+        let calls = fixture.calls();
+        assert_eq!(calls.iter().map(|call| call["params"][0].clone()).collect::<Vec<_>>(), vec![serde_json::json!("latest"), block_id(HEIGHT_B)]);
+        fixture.clear();
+        CustodyRpc::new(&finalized_endpoint).unwrap().confirmed_block().await.unwrap();
+        assert_eq!(fixture.calls()[0]["params"][0], "finalized");
     }
 
     #[tokio::test]
