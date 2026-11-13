@@ -158,8 +158,10 @@ fn contract_height(contract_id: u32) -> Result<u16> {
 /// The IMT sentinel is the map base; records occupy the following felts.
 const WITHDRAWAL_MAP_BASE: u64 = 8_589_934_680;
 const WITHDRAWAL_MAP_CAPACITY: u64 = 1_048_576;
+const WITHDRAWAL_TOKEN_CONTRACT_IDS: [u32; 2] = [psy_config::TOKEN_CONTRACT_ID, 4];
+
 fn token_contract(id: u32) -> Result<()> {
-    if matches!(id, psy_config::TOKEN_CONTRACT_ID | 4) { Ok(()) } else { Err(GuardianSignError::ProofMismatch) }
+    if WITHDRAWAL_TOKEN_CONTRACT_IDS.contains(&id) { Ok(()) } else { Err(GuardianSignError::ProofMismatch) }
 }
 
 pub fn verify_withdrawal_burn(config: &GuardianConfig, record: &WithdrawalBurnRecord, proof: &psy_provider::lps::WithdrawalBurnProof, verified_checkpoint_root: Hash4) -> Result<()> {
@@ -183,7 +185,7 @@ pub fn verify_withdrawal_burn(config: &GuardianConfig, record: &WithdrawalBurnRe
 /// Withdrawal burn proofs read concurrently, bounded per request; results are consumed in record order.
 const WITHDRAWAL_RPC_CONCURRENCY: usize = 8;
 
-/// Reads every withdrawal of one request shares: they depend only on the request checkpoint or the token contract.
+/// Reads shared by every withdrawal of one request: they depend only on the request checkpoint or the token contract.
 pub struct WithdrawalProofReads {
     checkpoint_id: u64,
     checkpoint_path: MerkleProofCore<Hash4>,
@@ -193,7 +195,7 @@ pub struct WithdrawalProofReads {
 }
 impl WithdrawalProofReads {
     pub fn new(checkpoint_id: u64, checkpoint_path: MerkleProofCore<Hash4>) -> Self {
-        let contracts = [psy_config::TOKEN_CONTRACT_ID, 4].into_iter().map(|id| (id, tokio::sync::OnceCell::new())).collect();
+        let contracts = WITHDRAWAL_TOKEN_CONTRACT_IDS.into_iter().map(|id| (id, tokio::sync::OnceCell::new())).collect();
         Self { checkpoint_id, checkpoint_path, checkpoint_leaf: Default::default(), global_roots: Default::default(), contracts }
     }
 }
