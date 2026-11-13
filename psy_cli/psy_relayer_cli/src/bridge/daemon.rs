@@ -6382,7 +6382,7 @@ mod tests {
     #[test]
     fn capped_withdrawals_and_deposit_roots_fit_one_l2_session() {
         let chains = 3;
-        let worst = (0..=chains * propose_withdrawals::MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND)
+        let worst = (0..=propose_withdrawals::MAX_WITHDRAWALS_PER_ROUND)
             .map(|count| optimal_batch_sizes(count).len())
             .max()
             .unwrap();

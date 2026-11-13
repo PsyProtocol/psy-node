@@ -52,11 +52,30 @@ pub struct ProposeWithdrawalsArgs {
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/// One L2 session holds at most `MAX_INTROSPECTABLE_TRANSACTIONS` (64) calls, and the
-/// Guardian sign request grows with every withdrawal (about 100 MB for 240). Withdrawals
-/// pack in pairs, so 36 per chain is 18 calls; three chains plus their deposit roots
-/// make 57. The rest wait for the next round.
-pub(crate) const MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND: usize = 36;
+/// One L2 session holds at most `MAX_INTROSPECTABLE_TRANSACTIONS` (64) calls.
+/// Withdrawals pack in pairs, so 120 withdrawals are at most 60 calls; with up
+/// to three deposit roots a round stays at 63. The budget is shared round-robin
+/// by the chains that have pending withdrawals; the rest wait for the next round.
+pub(crate) const MAX_WITHDRAWALS_PER_ROUND: usize = 120;
+
+/// Splits `budget` one withdrawal at a time across chains with pending rows, so a
+/// chain with a short backlog never holds back another chain's share.
+fn share_withdrawal_budget(pending_counts: &[usize], budget: usize) -> Vec<usize> {
+    let mut shares = vec![0; pending_counts.len()];
+    let mut remaining = budget;
+    while remaining > 0 {
+        let mut granted = false;
+        for (share, &pending) in shares.iter_mut().zip(pending_counts) {
+            if remaining > 0 && *share < pending {
+                *share += 1;
+                remaining -= 1;
+                granted = true;
+            }
+        }
+        if !granted { break; }
+    }
+    shares
+}
 
 const UNKNOWN_WITHDRAWAL_TREE_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -534,13 +553,18 @@ pub async fn fetch_pending_bridge_withdrawals(
     if requested.is_empty() {
         service_withdrawals = fetch_bridge_withdrawals(&http, &services_url, 0, None).await?;
     } else {
+        let mut pages = Vec::with_capacity(requested.len());
         for &(chain_index, offset) in &requested {
             let mut page =
                 fetch_bridge_withdrawals(&http, &services_url, offset, Some(chain_index)).await?;
-            let pending = page.len();
             // Appends must stay a prefix of each chain's leaves, so cap after ordering.
             page.sort_by_key(|withdrawal| withdrawal.event_id);
-            page.truncate(MAX_WITHDRAWALS_PER_CHAIN_PER_ROUND);
+            pages.push((chain_index, offset, page));
+        }
+        let shares = share_withdrawal_budget(&pages.iter().map(|(_, _, page)| page.len()).collect::<Vec<_>>(), MAX_WITHDRAWALS_PER_ROUND);
+        for ((chain_index, offset, mut page), share) in pages.into_iter().zip(shares) {
+            let pending = page.len();
+            page.truncate(share);
             tracing::info!(
                 chain_index,
                 withdrawals = pending,
@@ -1008,6 +1032,16 @@ pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn withdrawal_budget_goes_round_robin_and_never_exceeds_pending() {
+        assert_eq!(share_withdrawal_budget(&[500, 41, 49], 120), vec![40, 40, 40]);
+        assert_eq!(share_withdrawal_budget(&[500, 10, 0], 120), vec![110, 10, 0]);
+        assert_eq!(share_withdrawal_budget(&[5, 3, 0], 120), vec![5, 3, 0]);
+        assert_eq!(share_withdrawal_budget(&[500, 500, 500], 120), vec![40, 40, 40]);
+        assert_eq!(share_withdrawal_budget(&[500, 1, 0], 4), vec![3, 1, 0]);
+        assert_eq!(share_withdrawal_budget(&[], 120), Vec::<usize>::new());
+    }
+
     use super::*;
 
     fn withdrawal_page(event_ids: &[i64], total: i64) -> serde_json::Value {
