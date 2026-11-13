@@ -6481,12 +6481,14 @@ mod tests {
 
     #[test]
     fn capped_withdrawals_and_deposit_roots_fit_one_l2_session() {
-        let chains = 3;
-        let worst = (0..=propose_withdrawals::MAX_WITHDRAWALS_PER_ROUND)
-            .map(|count| optimal_batch_sizes(count).len())
-            .max()
-            .unwrap();
-        assert!(worst + chains <= psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS, "{worst} batch calls");
+        for chains in 1..=psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS {
+            let worst = (0..=propose_withdrawals::withdrawal_budget(chains))
+                .map(|count| optimal_batch_sizes(count).len())
+                .max()
+                .unwrap();
+            let fixed = chains * propose_withdrawals::FIXED_CALLS_PER_CHAIN;
+            assert!(worst + fixed <= psy_config::network_constants::MAX_INTROSPECTABLE_TRANSACTIONS, "{chains} chains: {worst} batch calls");
+        }
     }
 
     #[test]
