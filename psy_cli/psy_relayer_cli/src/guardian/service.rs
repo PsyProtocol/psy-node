@@ -289,6 +289,25 @@ fn enroll_guardian_account(wallet: &mut psy_prover::wallet::memory_wallet::PsyMe
     Ok(())
 }
 
+/// Builds the wallet's multisig circuit before the listener opens, so the first
+/// sign request does not pay for it, and fails closed when it differs from the recorded fingerprint.
+fn ensure_multisig_circuit(wallet: &psy_prover::wallet::memory_wallet::PsyMemoryWallet, fingerprint: Hash4) -> Result<(), GuardianSignError> {
+    let started = Instant::now();
+    let built = match wallet.get_multisig_circuit() {
+        Ok(circuit) => circuit.get_fingerprint(),
+        Err(error) => {
+            tracing::error!(error = %error, "guardian multisig circuit build failed");
+            return Err(GuardianSignError::PolicyMismatch);
+        }
+    };
+    if built != fingerprint {
+        tracing::error!(built = %built, recorded = %fingerprint, "guardian multisig circuit fingerprint differs from the recorded one");
+        return Err(GuardianSignError::PolicyMismatch);
+    }
+    tracing::info!(build_ms = started.elapsed().as_millis() as u64, "guardian multisig circuit built");
+    Ok(())
+}
+
 fn journal_parts(runtime: &GuardianRuntimeConfig) -> Result<(PathBuf, PathBuf), GuardianSignError> {
     let path = Path::new(&runtime.db_path);
     let relative = path.file_name().map(PathBuf::from).ok_or(GuardianSignError::AuthorizationMismatch)?;
@@ -389,6 +408,7 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
     let mut wallet = psy_prover::session::session::WalletSession::new_with_provider(&stable.network, provider, None).await.map_err(|_| GuardianSignError::KeyUnavailable)?;
     let fingerprint = guardian_common::protocol::multisig_fingerprint()?;
     enroll_guardian_account(&mut wallet.wallet, stable.initial_account()?, fingerprint, stable.account_public_key()?)?;
+    tokio::task::block_in_place(|| ensure_multisig_circuit(&wallet.wallet, fingerprint))?;
     let mut db = open_guardian_journal(&runtime, &wallet.st_provider, network_magic, &stable, guardian_id, public_key).await?;
     let sessions = Arc::new(db.session_reader());
     let sessions_user = stable.user_id();
@@ -1162,6 +1182,13 @@ mod tests {
         assert_eq!(enroll_guardian_account(&mut wrong_key, account.clone(), identity.fingerprint, Hash4::ZERO), Err(GuardianSignError::AccountIdentityConflict));
         let mut wrong_fingerprint = PsyMemoryWallet::new(Vec::new());
         assert_eq!(enroll_guardian_account(&mut wrong_fingerprint, account, Hash4::ZERO, public_key), Err(GuardianSignError::AccountIdentityConflict));
+    }
+
+    #[test]
+    fn startup_builds_multisig_circuit_matching_recorded_fingerprint() {
+        let wallet = psy_prover::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new());
+        assert_eq!(ensure_multisig_circuit(&wallet, Hash4::from_values(1, 2, 3, 4)), Err(GuardianSignError::PolicyMismatch));
+        ensure_multisig_circuit(&wallet, guardian_common::protocol::multisig_fingerprint().unwrap()).unwrap();
     }
 
     #[test]
