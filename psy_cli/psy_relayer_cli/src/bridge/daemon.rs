@@ -586,9 +586,9 @@ fn select_deposit_append_target(
 /// withdrawals, so no L2 work advances the cursor and landing equals the
 /// window bound.
 ///
-/// Multichain does not use this helper. Its proof range is the selected
-/// catch-up window, frozen at the next slower chain cursor. Extending that
-/// range to a later L2 landing would persist a start the faster chain rejects.
+/// Multichain does not use this helper. Its catch-up window stays frozen at
+/// the next slower chain cursor, because extending it would persist a start
+/// the faster chain rejects; see `select_multichain_proof_endpoint`.
 fn select_finalize_to_checkpoint(
     _window_to_checkpoint: u64,
     l2_landing_checkpoint: u64,
@@ -721,12 +721,16 @@ fn validate_range_against_cursors(
 
 /// Proof endpoint of a fresh multichain round.
 ///
-/// The selected window is the only range every chain cursor can accept, so
-/// it stays frozen even when L2 inclusion lands later. `landed` is recorded
-/// separately and is not a finalization endpoint. A round that submitted no
-/// new L2 work keeps the same window.
-fn select_multichain_proof_endpoint(window_to_checkpoint: u64, _submitted_l2_work: bool, _landed: u64) -> u64 {
-    window_to_checkpoint
+/// A catch-up window stays frozen: cursors may differ, and a faster chain
+/// already past the window start rejects a longer range. A normal round has
+/// equal cursors, so it extends to the confirmed L2 landing and settles its
+/// own appends now instead of one round later. `confirmed_landing` is set
+/// only for a guardian operation waited to the confirmation lag.
+fn select_multichain_proof_endpoint(window: RelayerWindow, confirmed_landing: Option<u64>) -> u64 {
+    match confirmed_landing {
+        Some(landed) if !window.is_catchup_batch => window.to_checkpoint.max(landed),
+        _ => window.to_checkpoint,
+    }
 }
 
 /// Replace a saved range that at least one chain cursor can no longer start.
@@ -1221,11 +1225,9 @@ async fn run_multichain(
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
-            let landed = pending_landed.map_or(landed, |pending| pending.max(landed));
-            // The selected catch-up window is the proof endpoint. L2 landing
-            // is a separate checkpoint and must not extend the range: a
-            // faster chain already past the window start rejects that start.
-            select_multichain_proof_endpoint(window.to_checkpoint, submitted_l2_work, landed)
+            // An empty plan returns the raw head, which is not a confirmed landing.
+            let confirmed_landing = fresh_landed.then_some(landed).max(pending_landed);
+            select_multichain_proof_endpoint(window, confirmed_landing)
         } else {
             window.to_checkpoint
         };
@@ -7739,7 +7741,7 @@ mod tests {
         // up. Deposit and withdrawal appends stay suppressed.
         assert!(window.is_catchup_batch);
         let landed = 70;
-        let proof_to = select_multichain_proof_endpoint(window.to_checkpoint, true, landed);
+        let proof_to = select_multichain_proof_endpoint(window, Some(landed));
         assert_eq!(proof_to, 60);
         assert_ne!(proof_to, landed);
         let range = PendingFinalizationRange { from_checkpoint: from, to_checkpoint: proof_to };
@@ -7748,6 +7750,29 @@ mod tests {
         // The poisoned range the old landing extension used to persist.
         let poisoned = PendingFinalizationRange { from_checkpoint: 51, to_checkpoint: 70 };
         assert!(chain_finalization_required(60, poisoned).is_err());
+    }
+
+    #[test]
+    fn multichain_proof_endpoint_extends_a_normal_round_to_the_l2_landing() {
+        // Equal cursors at 50 select 51..=77. L2 lands at 100 and is settled now.
+        let (from, window) = select_multichain_relayer_window(&[50, 50, 50], 80, 3, 64).unwrap();
+        assert_eq!((from, window.to_checkpoint), (51, 77));
+        assert!(!window.is_catchup_batch);
+        let proof_to = select_multichain_proof_endpoint(window, Some(100));
+        assert_eq!(proof_to, 100);
+        assert_eq!(select_multichain_proof_endpoint(window, Some(70)), 77);
+        let range = PendingFinalizationRange { from_checkpoint: from, to_checkpoint: proof_to };
+        validate_range_against_cursors(range, &[(0, 50), (1, 50), (2, 50)]).unwrap();
+        // No confirmed landing (no L2 work, or an empty plan's raw head) keeps the window.
+        assert_eq!(select_multichain_proof_endpoint(window, None), 77);
+    }
+
+    #[test]
+    fn multichain_proof_endpoint_stays_frozen_for_an_oversized_equal_cursor_backlog() {
+        // Equal cursors but a gap above max_checkpoint_batch: a catch-up batch.
+        let (_, window) = select_multichain_relayer_window(&[50, 50], 300, 3, 64).unwrap();
+        assert!(window.is_catchup_batch);
+        assert_eq!(select_multichain_proof_endpoint(window, Some(320)), window.to_checkpoint);
     }
 
     #[test]
